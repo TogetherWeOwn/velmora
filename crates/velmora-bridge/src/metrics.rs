@@ -420,8 +420,12 @@ impl RequestObservation {
     /// a 500. For observed failures, count the wire status and attribute
     /// that 500 to conversion, not to a stage of the original response.
     pub fn response_status(&mut self, method: &str, admin: bool, intended: u16, wire: u16) -> u16 {
+        // A 500 made by the conversion is put down to it, for the log
+        // line too; only a counted one changes the status counted.
+        if intended != wire && wire >= 500 {
+            self.mark_fault(FailureStage::Other, Fault::named("ResponseConversion"));
+        }
         if intended != wire && self.records_failure(method, admin, wire) {
-            self.mark_stage(FailureStage::Other);
             wire
         } else {
             intended

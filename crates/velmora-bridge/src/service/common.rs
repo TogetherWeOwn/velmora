@@ -1015,7 +1015,10 @@ pub(super) async fn restore_gate_observed<
 ) -> Result<(), S3Response> {
     match bridge.catalog.restore_pending().await {
         Ok(false) => Ok(()),
-        Ok(true) => Err(writes_refused()),
+        Ok(true) => {
+            observed.mark_fault(Stage::Other, Fault::named("RestorePending"));
+            Err(writes_refused())
+        }
         Err(error) => {
             observed.mark_error(Stage::Lookup, &error);
             Err(catalog_error(error))

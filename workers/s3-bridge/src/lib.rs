@@ -27,6 +27,7 @@ mod queues;
 mod r2;
 mod recovery_audit;
 mod recovery_log;
+mod request_log;
 
 use std::cell::RefCell;
 use std::future::poll_fn;
@@ -226,16 +227,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             let out = early(resp);
             let mut observed = initial();
             observed.mark_fault(Stage::Other, Fault::named("Config"));
-            let (status, line) = ingress::settled_log_line(
-                &method,
-                "-",
-                &request_id,
+            let status = request_log::Answered {
+                method: &method,
+                target: "-",
+                request_id: &request_id,
                 admin,
-                intended,
-                out.status_code(),
-                &mut observed,
-            );
-            console_log!("{line}");
+            }
+            .finish(intended, out.status_code(), &mut observed);
             count(status, 1, 0, observed);
             return Ok(out);
         }
@@ -246,16 +244,14 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             // The answer first: the line has the status the client got.
             let out = early(e.response());
             let mut observed = initial();
-            let (status, line) = ingress::settled_log_line(
-                &method,
-                "-",
-                &request_id,
+            observed.mark_fault(Stage::Other, Fault::named("RequestConversion"));
+            let status = request_log::Answered {
+                method: &method,
+                target: "-",
+                request_id: &request_id,
                 admin,
-                e.status(),
-                out.status_code(),
-                &mut observed,
-            );
-            console_log!("{line}");
+            }
+            .finish(e.status(), out.status_code(), &mut observed);
             count(status, bridge.cfg.metrics_sample, 0, observed);
             return Ok(out);
         }
@@ -287,16 +283,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // HTTP conversion can itself turn a response into a 500: the line has
     // the status the client got and, for a 5xx, what the handler observed
     // of it (stage, error variant, provider code; names and numbers only).
-    let (metrics_status, line) = ingress::settled_log_line(
-        &method,
-        &target,
-        &request_id,
+    let metrics_status = request_log::Answered {
+        method: &method,
+        target: &target,
+        request_id: &request_id,
         admin,
-        status,
-        out.status_code(),
-        &mut get,
-    );
-    console_log!("{line}");
+    }
+    .finish(status, out.status_code(), &mut get);
     if let Some(line) = env::memory_line(&bridge) {
         console_log!("{line}");
     }
@@ -744,37 +737,38 @@ async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
 
 #[cfg(test)]
 mod request_log_wiring {
-    /// The fetch handler, as compiled: its request lines.
+    /// The fetch handler, as compiled.
     const SOURCE: &str = include_str!("lib.rs");
 
-    /// Every request line of the fetch handler is the settled one, made
-    /// with the request's own observation: a line written another way, or
-    /// with a fresh observation in place of the handler's, would log a
-    /// 5xx without its reason.
+    /// The lines themselves are tested in `request_log`; this checks that
+    /// the handler writes none of its own and settles each of its three
+    /// answers there, the handled one with the handler's own observation.
     #[test]
-    fn every_request_line_is_settled_with_the_request_observation() {
+    fn every_answer_is_finished_by_the_request_log() {
         let code = SOURCE
             .split("#[cfg(test)]\nmod request_log_wiring")
             .next()
             .unwrap();
-        for direct in ["ingress::log_line(", "ingress::log_line_with("] {
-            assert!(!code.contains(direct), "{direct} bypasses the settled line");
+        for direct in ["ingress::log_line", "settled_log_line("] {
+            assert!(!code.contains(direct), "{direct} bypasses request_log");
         }
         let calls: Vec<&str> = code
-            .split("ingress::settled_log_line(")
+            .split("request_log::Answered {")
             .skip(1)
-            .map(|call| call.split(");").next().unwrap())
+            .map(|call| call.split(";").next().unwrap())
             .collect();
-        // The config refusal, the request that does not convert, and
-        // every handled request.
         assert_eq!(calls.len(), 3, "{calls:?}");
-        let handled = calls
+        assert!(calls
             .iter()
-            .filter(|call| call.contains("&mut get"))
-            .count();
-        assert_eq!(handled, 1, "the handled request logs its own observation");
-        assert!(calls.iter().all(|call| call.contains("out.status_code()")));
-        // The observation the handler filled is the one logged.
+            .all(|call| call.contains(".finish(") && call.contains("out.status_code()")));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("&mut get"))
+                .count(),
+            1,
+            "the handled request logs its own observation"
+        );
         assert!(code.contains("let mut get = got.into_inner().unwrap_or_else(initial);"));
     }
 }

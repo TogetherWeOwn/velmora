@@ -216,6 +216,7 @@ where
 {
     let (bucket, key) = authed.object()?;
     if !bridge.cfg.server_side_copy {
+        observed.mark_fault(Stage::Other, Fault::named("CopyDisabled"));
         return Err(S3Response::error(
             501,
             "NotImplemented",

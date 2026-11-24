@@ -1191,8 +1191,18 @@ fn a_server_error_line_names_what_failed_and_nothing_else() {
         !line.contains("stage=-") && !line.contains("err=-"),
         "{line}"
     );
-    // A 5xx with nothing observed says so; below 500 the line is as it was.
-    assert!(ingress::log_line("GET", "/b/k", 503, "-").ends_with(" stage=- err=- code=-"));
+    // A request that did not convert to a handler request: its 500 is
+    // named, never left as dashes. Below 500 the line is as it was.
+    let mut early = RequestObservation::default();
+    early.mark_fault(
+        FailureStage::Other,
+        velmora_bridge::metrics::Fault::named("RequestConversion"),
+    );
+    let (_, line) = ingress::settled_log_line("GET", "-", "ray-1", false, 500, 500, &mut early);
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=other err=RequestConversion code=-"),
+        "{line}"
+    );
     assert_eq!(
         ingress::log_line_with("PUT", target, 404, "ray-1", Some(&observed)),
         ingress::log_line("PUT", target, 404, "ray-1")
@@ -1405,7 +1415,7 @@ fn the_settled_line_has_the_wire_status_and_its_reason() {
     );
     assert_eq!(counted, 500);
     assert!(
-        line.ends_with(" status=500 id=ray-1 stage=other err=- code=-"),
+        line.ends_with(" status=500 id=ray-1 stage=other err=ResponseConversion code=-"),
         "{line}"
     );
     assert!(!line.contains("secret-key"), "{line}");

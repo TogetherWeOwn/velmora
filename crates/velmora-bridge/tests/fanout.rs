@@ -354,6 +354,60 @@ async fn frozen_parent_refuses_a_cold_extent_in_the_last_subrange() {
     assert_no_frozen_writes(&rig);
 }
 
+/// The frozen preflight answers the same 503 for a piece it cannot find
+/// and for one whose heads failed; the log names which.
+#[tokio::test]
+async fn frozen_preflight_logs_a_missing_extent_and_a_failed_head_apart() {
+    for fail_head in [false, true] {
+        let (rig, signer, _, extents) = frozen_fixture(CHUNK).await;
+        let id = &extents.last().unwrap().id;
+        rig.bridge
+            .cache
+            .inner
+            .delete(&id.cache_key())
+            .await
+            .unwrap();
+        if fail_head {
+            // The one safety head of the preflight (the only piece the
+            // cache lacks) fails. The wire counts the catalogue's calls
+            // too: five come before it.
+            rig.bridge.safety.trip.arm(5, Trip::Fail);
+        } else {
+            rig.bridge
+                .safety
+                .inner
+                .delete(&id.safety_key())
+                .await
+                .unwrap();
+        }
+        let req = signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "big"),
+            &[],
+            &[],
+            Vec::new(),
+        );
+        let mut get = GetObservation::default();
+        let calls = rig.bridge.safety.trip.calls();
+        let resp = Rc::clone(&rig.bridge)
+            .handle_observed(req.into_request(), &mut get)
+            .await;
+        // Three auth reads, the generation, its extents, then the head.
+        assert_eq!(rig.bridge.safety.trip.calls() - calls, 6);
+        assert_frozen_refusal(resp);
+        assert_eq!(
+            get.log_fields(),
+            if fail_head {
+                "stage=r2 err=Blob code=-"
+            } else {
+                "stage=r2 err=ExtentMissing code=-"
+            }
+        );
+        assert_no_frozen_writes(&rig);
+    }
+}
+
 #[tokio::test]
 async fn frozen_child_uses_safety_or_refuses_without_writes_after_parent_preflight() {
     for (chunk, evict) in [(SLICE, 0), (CHUNK, 2)] {

@@ -266,3 +266,114 @@ async fn a_head_bucket_and_an_unsupported_route_log_their_reason() {
     resp.expect(501);
     assert_eq!(fields(&line), "stage=other err=UnsupportedRoute code=-");
 }
+
+/// An upload of one part, ready to complete: the Complete request.
+async fn ready_upload(rig: &Rig, signer: &Signer, key: &str) -> Req {
+    let target = path(BUCKET, key);
+    let created = rig
+        .call(signer, Method::Post, &target, &[("uploads", "")], &[], b"")
+        .await;
+    created.expect(200);
+    let id = created.values("UploadId").remove(0);
+    let uploaded = rig
+        .call(
+            signer,
+            Method::Put,
+            &target,
+            &[("partNumber", "1"), ("uploadId", &id)],
+            &[],
+            b"payload",
+        )
+        .await;
+    uploaded.expect(200);
+    let etag = uploaded.header("etag").unwrap().to_owned();
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    signer.sign(
+        rig.now(),
+        Method::Post,
+        &target,
+        &[("uploadId", &id)],
+        &[],
+        xml.into_bytes(),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fenced_exhausted_and_restore_refusals_log_why() {
+    let rig = rig();
+    let (_, signer) = rig.standard(BUCKET).await;
+    let sql = &rig.bridge.catalog.sql;
+
+    // The batch failed and the fence showed that nothing was published.
+    let complete = ready_upload(&rig, &signer, KEY).await;
+    sql.fail_publish.set(Some(PublishFault::NotApplied));
+    let (resp, line) = logged(&rig, complete).await;
+    resp.expect_error(500, "InternalError");
+    assert_eq!(fields(&line), "stage=commit err=Fenced code=-");
+
+    // The same, with the catalogue overloaded.
+    let complete = ready_upload(&rig, &signer, KEY).await;
+    sql.fail_publish.set(Some(PublishFault::PgOverloaded));
+    let (resp, line) = logged(&rig, complete).await;
+    resp.expect_error(503, "SlowDown");
+    assert_eq!(fields(&line), "stage=commit err=FencedOverloaded code=-");
+
+    // A PUT whose every attempt is refused by its guard. (Complete runs
+    // out of attempts only when the key outruns each attempt's id; a
+    // guard that refuses with nothing changed is `InvalidPart` there.)
+    sql.refuse_publishes.set(u32::MAX);
+    let put = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[],
+        b"x".to_vec(),
+    );
+    let (resp, line) = logged(&rig, put).await;
+    sql.refuse_publishes.set(0);
+    resp.expect_error(503, "SlowDown");
+    assert_eq!(fields(&line), "stage=commit err=AttemptsExhausted code=-");
+
+    // A replay under way refuses a PUT before its body is read.
+    sql.apply(
+        "INSERT INTO restore_state (id, state, since_ms, started_at) \
+         VALUES (1, 'replaying', 0, 1);",
+    )
+    .unwrap();
+    let put = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[],
+        b"x".to_vec(),
+    );
+    let (resp, line) = logged(&rig, put).await;
+    resp.expect(503);
+    assert_eq!(fields(&line), "stage=other err=RestorePending code=-");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_copy_that_is_switched_off_logs_copy_disabled() {
+    let mut cfg = config(Vec::new());
+    cfg.server_side_copy = false;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "source", b"payload")
+        .await
+        .expect(200);
+    let req = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[("x-amz-copy-source", &format!("/{BUCKET}/source"))],
+        vec![],
+    );
+    let (resp, line) = logged(&rig, req).await;
+    resp.expect_error(501, "NotImplemented");
+    assert_eq!(fields(&line), "stage=other err=CopyDisabled code=-");
+}
