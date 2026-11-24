@@ -2123,13 +2123,9 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
 mod pg_plan_tests {
     use super::super::gc::GC_ORPHAN_WINDOW_PG;
     use super::{MARK_SENT_PG, REDRIVE_PG, REDRIVE_WINDOW_PG};
+    use crate::gate::pg_background_fixture::{self as fixture, sql as pg};
     use serde_json::Value;
-    use std::path::{Path, PathBuf};
-    use tokio_postgres::{NoTls, SimpleQueryMessage, Transaction};
-
-    fn pg(sql: &str) -> String {
-        sql.replace('?', "$")
-    }
+    use tokio_postgres::{SimpleQueryMessage, Transaction};
 
     async fn explain(tx: &Transaction<'_>, statement: &str) -> Value {
         let sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE {statement}");
@@ -2167,35 +2163,11 @@ mod pg_plan_tests {
 
     #[tokio::test]
     async fn postgres_background_windows_keep_bounded_scans() {
-        let Ok(url) = std::env::var("VELMORA_TEST_PG_URL") else {
+        let Some(mut db) = fixture::connect().await else {
             return;
         };
-        let migrations = std::env::var_os("VELMORA_TEST_PG_BASELINE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/s3-bridge/pg")
-            });
-        let (mut db, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
-        let driver = tokio::spawn(conn);
-        let tx = db.transaction().await.unwrap();
-        let pid: i32 = tx
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap()
-            .get(0);
-        let schema = format!("outbox_plan_{pid}");
-        tx.batch_execute(&format!(
-            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, pg_temp"
-        ))
-        .await
-        .unwrap();
-        let migration = |name: &str| std::fs::read_to_string(migrations.join(name)).unwrap();
-        tx.batch_execute(&migration("0001_baseline_pre.sql"))
-            .await
-            .unwrap();
-        tx.batch_execute(
-            "INSERT INTO usage_global(id) VALUES (1), (2);
-             INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
+        let tx = fixture::transaction_seeded(&mut db,
+            "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
                  VALUES ('b','bucket','owner',''::bytea,1,0);
              INSERT INTO generations (id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
                  SELECT 'g'||lpad(i::text,6,'0'),'b','key','live',1,'etag','{}','{}',1,0
@@ -2220,10 +2192,7 @@ mod pg_plan_tests {
                  SELECT 'upload'||seq,'b','key','{}','{}','open',0 FROM extents WHERE seq IS NOT NULL;
              INSERT INTO upload_parts (upload_id,part_number,extent_id,size,etag,uploaded_at)
                  SELECT 'upload'||seq,1,id,1,'etag',0 FROM extents WHERE seq IS NOT NULL;",
-        ).await.unwrap();
-        tx.batch_execute(&migration("0002_baseline_post.sql"))
-            .await
-            .unwrap();
+        ).await;
         tx.batch_execute(
             "ANALYZE extents; ANALYZE outbox; ANALYZE generation_extents; ANALYZE generations; \
                           ANALYZE gc; ANALYZE uploads; ANALYZE upload_parts",
@@ -2282,7 +2251,275 @@ mod pg_plan_tests {
             .unwrap();
         assert!(candidates.iter().all(|row| row.get::<_, bool>(3)));
         tx.rollback().await.unwrap();
-        drop(db);
-        driver.await.unwrap().unwrap();
+    }
+
+    const BUCKET: &str = "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at)
+      VALUES ('b','bucket','owner',X'',1,0);
+      INSERT INTO generations(id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
+      VALUES ('g','b','key','live',6,'etag','{}','{}',6,0);";
+    const REVIVE_FIXTURE: &str = "INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,
+      plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
+      VALUES ('z','b','g','committed',0,0,1,1,X'',X'',X'',X'','held',0),
+             ('a','b','g','committed',1,1,1,1,X'',X'',X'',X'','held',0),
+             ('y','b','g','committed',2,2,1,1,X'',X'',X'',X'','held',0),
+             ('b','b','g','committed',3,3,1,1,X'',X'',X'',X'','releasing',0),
+             ('x','b','g','committed',4,4,1,1,X'',X'',X'',X'','released',0),
+             ('c','b',NULL,'staged',NULL,NULL,1,1,X'',X'',X'',X'','held',0);
+      INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,lease_token,lease_owner,lease_until)
+      VALUES ('z','g','post',10,0,9,'old',NULL), ('a','g','post',10,0,9,'old',NULL),
+             ('y','g','cancelled',10,0,9,'old',25), ('b','g','cancelled',10,0,9,'old',25),
+             ('x','g','cancelled',10,0,9,'old',25), ('c','g','cancelled',10,0,9,'old',25);";
+
+    #[tokio::test]
+    async fn due_and_revive_match_sqlite_rowid_and_postgres_seq() {
+        use super::{DUE_PAGE, DUE_PAGE_PG, REVIVE, REVIVE_PG, REVIVE_WINDOW, REVIVE_WINDOW_PG};
+        use crate::testkit::RusqliteSql;
+        use rusqlite::params;
+        const STATE: &str = "SELECT extent_id,stage,lease_token,lease_owner,lease_until FROM outbox
+                             WHERE extent_id NOT IN ('z','a') ORDER BY extent_id";
+        let expected = [
+            ("b".to_string(), "release".to_string(), 10_i64, None, None),
+            (
+                "c".to_string(),
+                "cancelled".to_string(),
+                9,
+                Some("old".to_string()),
+                Some(25_i64),
+            ),
+            ("x".to_string(), "done".to_string(), 10, None, None),
+            ("y".to_string(), "post".to_string(), 10, None, None),
+        ];
+        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
+        sqlite.apply(BUCKET).unwrap();
+        sqlite.apply(REVIVE_FIXTURE).unwrap();
+        sqlite.with_conn(|db| {
+            let mut due = db.prepare(DUE_PAGE).unwrap();
+            let due = due
+                .query_map(params![20, 2, 20, "post"], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(due, ["z", "a"]);
+            for (after, page, revived) in [(2, [3, 4], 2), (4, [5, 6], 1)] {
+                let mut stmt = db.prepare(REVIVE_WINDOW).unwrap();
+                let window = stmt
+                    .query_map(params![after, 2], |r| r.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(window, page);
+                let mut stmt = db.prepare(REVIVE).unwrap();
+                let mut rows = stmt.query(params![30, after, page[1]]).unwrap();
+                let mut count = 0;
+                while rows.next().unwrap().is_some() {
+                    count += 1;
+                }
+                assert_eq!(count, revived);
+            }
+            assert!(db
+                .prepare(REVIVE_WINDOW)
+                .unwrap()
+                .query(params![6, 2])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none());
+            let mut stmt = db.prepare(STATE).unwrap();
+            let state = stmt
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(state, expected);
+        });
+        let Some(mut db) = fixture::connect().await else {
+            return;
+        };
+        let tx = fixture::transaction(&mut db).await;
+        for sql in [BUCKET, REVIVE_FIXTURE] {
+            tx.batch_execute(&sql.replace("X''", "''::bytea"))
+                .await
+                .unwrap();
+        }
+        let due: Vec<String> = tx
+            .query(&pg(DUE_PAGE_PG), &[&20_i64, &2_i64, &20_i64, &"post"])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(due, ["z", "a"]);
+        for (after, page, revived) in [(2_i64, [3_i64, 4_i64], 2), (4, [5, 6], 1)] {
+            let window: Vec<i64> = tx
+                .query(&pg(REVIVE_WINDOW_PG), &[&after, &2_i64])
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            assert_eq!(window, page);
+            assert_eq!(
+                tx.query(&pg(REVIVE_PG), &[&30_i64, &after, &page[1]])
+                    .await
+                    .unwrap()
+                    .len(),
+                revived
+            );
+        }
+        assert!(tx
+            .query(&pg(REVIVE_WINDOW_PG), &[&6_i64, &2_i64])
+            .await
+            .unwrap()
+            .is_empty());
+        type RevivedRow = (String, String, i64, Option<String>, Option<i64>);
+        let state: Vec<RevivedRow> = tx
+            .query(STATE, &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .collect();
+        assert_eq!(state, expected);
+        tx.rollback().await.unwrap();
+    }
+
+    const RELEASE_FIXTURE: &str = "INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,
+      plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,article_count,plan_rev)
+      VALUES ('e','b','g','committed',0,0,1,1,X'',X'',X'',X'','held',0,2,1);
+      INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,lease_token,lease_owner,lease_until)
+      VALUES ('e','g','release',10,10,7,'job',30);
+      INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token)
+      VALUES ('e','alpha','p',12,1,2,2,'ok','body',7), ('e','beta','q',13,1,2,2,'ok','body',7);";
+
+    const STAT_ONLY: &str =
+        "UPDATE verifications SET kind='stat', articles_present=2, articles_ok=0;";
+    const BODY_ON_RECORD: &str = "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token)
+           VALUES ('e','alpha','p',9,1,2,2,'ok','body',6);";
+    const ESCALATE: &str =
+        "INSERT INTO verify_escalations(backbone,until,raised_at,extent_id,result)
+           VALUES ('alpha',100,1,'e','missing');";
+
+    #[tokio::test]
+    async fn release_guard_matches_sqlite_and_postgres_across_22_cases() {
+        use super::{
+            GUARD_RELEASE_AT_VERIFY, GUARD_RELEASE_AT_VERIFY_PG, GUARD_RELEASE_JOB,
+            GUARD_RELEASE_JOB_PG,
+        };
+        use crate::testkit::RusqliteSql;
+        use rusqlite::params;
+        let stat_with_body = format!("{STAT_ONLY}{BODY_ON_RECORD}");
+        let escalated_stat = format!("{STAT_ONLY}{ESCALATE}");
+        // name, at verify, need_full, light, fixture changes, allow
+        let cases = [
+            ("fresh body passes", false, 1_i64, 0_i64, "", true),
+            ("extra uncounted failure", false, 1, 0, "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token) VALUES ('e','extra','p',14,1,0,2,'missing','body',7);", true),
+            ("stat with body on record", false, 1, 0, stat_with_body.as_str(), true),
+            ("unsampled light stat", false, 0, 1, STAT_ONLY, true),
+            ("escalated with body on record", false, 0, 1, ESCALATE, true),
+            ("at verify while held", true, 1, 0, "", true),
+            ("finish interrupted release", false, 1, 0, "UPDATE extents SET safety_state='releasing';", true),
+            ("lease inclusive at now", false, 1, 0, "UPDATE outbox SET lease_until=20;", true),
+            ("only one pass", false, 1, 0, "DELETE FROM verifications WHERE backbone='beta';", false),
+            ("second backbone not counted", false, 1, 0, "UPDATE verifications SET backbone='extra' WHERE backbone='beta';", false),
+            ("stale pass token", false, 1, 0, "UPDATE verifications SET lease_token=6 WHERE backbone='beta';", false),
+            ("pass before claim", false, 1, 0, "UPDATE verifications SET verified_at=9 WHERE backbone='beta';", false),
+            ("pass after decision time", false, 1, 0, "UPDATE verifications SET verified_at=21 WHERE backbone='beta';", false),
+            ("later failed body", false, 1, 0, "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token) VALUES ('e','alpha','p',14,1,0,2,'missing','body',7);", false),
+            ("incomplete pass", false, 1, 0, "UPDATE verifications SET articles_ok=1 WHERE backbone='alpha';", false),
+            ("wrong lease token", false, 1, 0, "UPDATE outbox SET lease_token=8;", false),
+            ("expired lease", false, 1, 0, "UPDATE outbox SET lease_until=19;", false),
+            ("already released", false, 1, 0, "UPDATE extents SET safety_state='released';", false),
+            ("no live reference", false, 1, 0, "UPDATE generations SET state='superseded';", false),
+            ("at verify while releasing", true, 1, 0, "UPDATE extents SET safety_state='releasing';", false),
+            ("escalated with stat only", false, 0, 1, escalated_stat.as_str(), false),
+            ("full sample without body", false, 1, 1, STAT_ONLY, false),
+        ];
+        const LABELS: &str = r#"["alpha","beta"]"#;
+        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
+        sqlite.apply(BUCKET).unwrap();
+        sqlite.apply(RELEASE_FIXTURE).unwrap();
+        sqlite.with_conn(|db| {
+            for (name, whole, full, light, changes, allowed) in cases {
+                db.execute_batch("SAVEPOINT release_case").unwrap();
+                let (query, stage) = if whole {
+                    db.execute_batch("UPDATE outbox SET stage='verify'")
+                        .unwrap();
+                    (GUARD_RELEASE_AT_VERIFY, "verify")
+                } else {
+                    (GUARD_RELEASE_JOB, "release")
+                };
+                db.execute_batch(changes).unwrap();
+                let result = db.execute(
+                    query,
+                    params!["e", "g", stage, 7, 2, 20, LABELS, full, light],
+                );
+                if allowed {
+                    assert_eq!(result.unwrap_or_else(|err| panic!("{name}: {err}")), 0);
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ConstraintViolation),
+                        "{name}"
+                    );
+                }
+                db.execute_batch("ROLLBACK TO release_case; RELEASE release_case")
+                    .unwrap();
+            }
+        });
+        let Some(mut db) = fixture::connect().await else {
+            return;
+        };
+        let mut tx = fixture::transaction(&mut db).await;
+        for sql in [BUCKET, RELEASE_FIXTURE] {
+            tx.batch_execute(&sql.replace("X''", "''::bytea"))
+                .await
+                .unwrap();
+        }
+        use tokio_postgres::types::Type;
+        const T: Type = Type::TEXT;
+        const I: Type = Type::INT8;
+        let types = [T, T, T, I, I, I, T, I, I];
+        let at_verify = tx
+            .prepare_typed(&pg(GUARD_RELEASE_AT_VERIFY_PG), &types)
+            .await
+            .unwrap();
+        let release = tx
+            .prepare_typed(&pg(GUARD_RELEASE_JOB_PG), &types)
+            .await
+            .unwrap();
+        for (name, whole, full, light, changes, allowed) in cases {
+            let case = tx.transaction().await.unwrap();
+            let (query, stage) = if whole {
+                case.batch_execute("UPDATE outbox SET stage='verify'")
+                    .await
+                    .unwrap();
+                (&at_verify, "verify")
+            } else {
+                (&release, "release")
+            };
+            case.batch_execute(changes).await.unwrap();
+            let result = case
+                .execute(
+                    query,
+                    &[
+                        &"e", &"g", &stage, &7_i64, &2_i64, &20_i64, &LABELS, &full, &light,
+                    ],
+                )
+                .await;
+            if allowed {
+                assert_eq!(result.unwrap_or_else(|err| panic!("{name}: {err}")), 0);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.as_db_error().and_then(|e| e.constraint()),
+                    Some("tx_guard_ok"),
+                    "{name}: {error:?}"
+                );
+            }
+            case.rollback().await.unwrap();
+        }
+        tx.rollback().await.unwrap();
     }
 }

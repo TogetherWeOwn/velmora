@@ -411,3 +411,109 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         ),
     ]
 }
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod postgres_tests {
+    use super::{SEED_SLOTS, SEED_SLOTS_PG, TAKE_ASC, TAKE_ASC_PG, TAKE_DESC, TAKE_DESC_PG};
+    use crate::{gate::pg_background_fixture as pg, testkit::RusqliteSql};
+    use rusqlite::{params, OptionalExtension};
+
+    #[tokio::test]
+    async fn permit_quotas_match_sqlite_and_postgres() {
+        // provider, holder, pool, IP limit, background, expected free slot
+        let cases = [
+            ("p", "job1", Some("pool"), Some(2_i64), 1_i64, Some(0_i64)),
+            ("q", "job2", Some("pool"), Some(2), 1, None), // Pool spans providers.
+            ("p", "job2", None, Some(2), 1, None),         // Background IP reserve.
+            ("p", "job1", None, Some(2), 1, Some(1)),      // Same job adds no IP.
+            ("p", "reader", None, Some(2), 0, Some(3)),    // Read reserve.
+            ("p", "other-reader", None, Some(2), 0, None), // Slot 2 free, IP cap full.
+            ("q", "unlimited", None, None, 0, Some(3)),    // Both limits NULL.
+        ];
+        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
+        sqlite.with_conn(|db| {
+            for provider in ["p", "q"] {
+                assert_eq!(db.execute(SEED_SLOTS, params![provider, 4]).unwrap(), 4);
+                assert_eq!(db.execute(SEED_SLOTS, params![provider, 4]).unwrap(), 0);
+            }
+            for (provider, holder, pool, ips, background, slot) in cases {
+                let (query, cap) = if background == 1 {
+                    (TAKE_ASC, 3)
+                } else {
+                    (TAKE_DESC, 4)
+                };
+                let found = db
+                    .query_row(
+                        query,
+                        params![
+                            provider,
+                            holder,
+                            50,
+                            cap,
+                            10,
+                            pool,
+                            1,
+                            ips,
+                            background,
+                            ips.map(|n| n - 1)
+                        ],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .unwrap();
+                assert_eq!(found, slot.map(|s| (s, 1)), "{provider}/{holder}");
+            }
+        });
+        let Some(mut db) = pg::connect().await else {
+            return;
+        };
+        let tx = pg::transaction(&mut db).await;
+        let seed = pg::sql(SEED_SLOTS_PG);
+        for provider in ["p", "q"] {
+            assert_eq!(tx.execute(&seed, &[&provider, &4_i64]).await.unwrap(), 4);
+            assert_eq!(tx.execute(&seed, &[&provider, &4_i64]).await.unwrap(), 0);
+        }
+        use tokio_postgres::types::Type;
+        // Match the adapter's explicit INT8 and TEXT wire types, not
+        // PostgreSQL's inference for untyped integer or JSON literals.
+        const T: Type = Type::TEXT;
+        const I: Type = Type::INT8;
+        let types = [T, T, I, I, I, T, I, I, I, I];
+        let take_asc = tx
+            .prepare_typed(&pg::sql(TAKE_ASC_PG), &types)
+            .await
+            .unwrap();
+        let take_desc = tx
+            .prepare_typed(&pg::sql(TAKE_DESC_PG), &types)
+            .await
+            .unwrap();
+        for (provider, holder, pool, ips, background, slot) in cases {
+            let (query, cap) = if background == 1 {
+                (&take_asc, 3_i64)
+            } else {
+                (&take_desc, 4_i64)
+            };
+            let found = tx
+                .query_opt(
+                    query,
+                    &[
+                        &provider,
+                        &holder,
+                        &50_i64,
+                        &cap,
+                        &10_i64,
+                        &pool,
+                        &1_i64,
+                        &ips,
+                        &background,
+                        &ips.map(|n| n - 1),
+                    ],
+                )
+                .await
+                .unwrap()
+                .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)));
+            assert_eq!(found, slot.map(|s| (s, 1)), "{provider}/{holder}");
+        }
+        tx.rollback().await.unwrap();
+    }
+}

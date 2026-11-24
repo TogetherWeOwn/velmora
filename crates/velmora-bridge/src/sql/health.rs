@@ -272,3 +272,73 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (STRIKE_PG.to_owned(), vec![T, I, I, I, I, I, T]),
     ]
 }
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod postgres_tests {
+    use super::{PROVIDER_LOAD, PROVIDER_LOAD_PG};
+    use crate::{gate::pg_background_fixture as pg, testkit::RusqliteSql};
+
+    #[tokio::test]
+    async fn provider_load_matches_sqlite_and_postgres() {
+        const FIXTURE: &str = "INSERT INTO provider_permits(provider_id,slot,token,holder,lease_until,background) VALUES
+          ('p',0,3,'invocation',40,1), ('p',1,2,'invocation',40,0), ('p',2,1,'expired',39,1);
+          INSERT INTO provider_health(provider_id,failures,cooldowns,cooldown_until,last_failure_reason) VALUES
+          ('p',2,1,90,'connect_refused'), ('q',0,0,0,NULL);";
+        let expected = [
+            (
+                "p".to_string(),
+                [2, 6, 2, 1, 90, 1, 1],
+                Some("connect_refused".to_string()),
+            ),
+            ("q".to_string(), [0; 7], None),
+        ];
+        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
+        sqlite.apply(FIXTURE).unwrap();
+        let loaded = sqlite.with_conn(|db| {
+            let mut stmt = db.prepare(PROVIDER_LOAD).unwrap();
+            stmt.query_map([40_i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    [
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ],
+                    r.get(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        });
+        assert_eq!(loaded, expected);
+        let Some(mut db) = pg::connect().await else {
+            return;
+        };
+        let tx = pg::transaction(&mut db).await;
+        tx.batch_execute(FIXTURE).await.unwrap();
+        // SUM(bigint) returns NUMERIC; the production adapter converts it
+        // to an integral i64. Cast only to assert the returned fixture values.
+        let sql = format!("SELECT id,held::bigint,uses::bigint,failures,cooldowns,until,holders,jobs,reason \
+            FROM ({}) AS loads(id,held,uses,failures,cooldowns,until,holders,jobs,reason) ORDER BY id", pg::sql(PROVIDER_LOAD_PG));
+        let loaded: Vec<_> = tx
+            .query(&sql, &[&40_i64])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    core::array::from_fn(|i| r.get::<_, i64>(i + 1)),
+                    r.get::<_, Option<String>>(8),
+                )
+            })
+            .collect();
+        assert_eq!(loaded, expected);
+        tx.rollback().await.unwrap();
+    }
+}

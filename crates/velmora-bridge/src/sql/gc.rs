@@ -876,7 +876,27 @@ mod tests {
              CREATE TABLE tx_guard (ok INTEGER NOT NULL CHECK (ok = 1));",
         )
         .unwrap();
-        for (value, parsed) in [
+        for (value, cutoff, allowed) in verdict_cases() {
+            db.execute(
+                "INSERT OR REPLACE INTO scan_cursors VALUES ('bucket', ?1)",
+                [value],
+            )
+            .unwrap();
+            let result = db.execute(GUARD_BUCKET_FOUND_CLEAN, params!["bucket", cutoff]);
+            if allowed {
+                assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ConstraintViolation),
+                    "{value} at {cutoff}"
+                );
+            }
+        }
+    }
+
+    fn verdict_cases() -> impl Iterator<Item = (&'static str, i64, bool)> {
+        [
             ("clean:123", Some(123)),
             ("clean:123x", Some(123)),
             ("clean:", None),
@@ -888,25 +908,51 @@ mod tests {
             ("clean:9223372036854775808", Some(i64::MAX)),
             ("clean:99999999999999999999", Some(i64::MAX)),
             ("dirty", None),
-        ] {
-            db.execute(
-                "INSERT OR REPLACE INTO scan_cursors VALUES ('bucket', ?1)",
-                [value],
-            )
-            .unwrap();
-            for cutoff in [0, 1, 122, 123, i64::MAX - 1, i64::MAX] {
-                let allowed = parsed.is_some_and(|time| time > cutoff);
-                let result = db.execute(GUARD_BUCKET_FOUND_CLEAN, params!["bucket", cutoff]);
-                if allowed {
-                    assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
-                } else {
-                    assert_eq!(
-                        result.unwrap_err().sqlite_error_code(),
-                        Some(rusqlite::ErrorCode::ConstraintViolation),
-                        "{value} at {cutoff}"
-                    );
-                }
+            ("clean:0", Some(0)),
+            ("clean:-5", None),
+            ("clean: 5", None),
+            ("clean:+5", None),
+            ("clean:12.9", Some(12)),
+            ("clean:1e5", Some(1)),
+            ("CLEAN:5", None),
+            ("clean:١", None),
+            ("clean:0000x", Some(0)),
+        ]
+        .into_iter()
+        .flat_map(|(value, parsed)| {
+            [-1, 0, 1, 11, 122, 123, i64::MAX - 1, i64::MAX]
+                .into_iter()
+                .map(move |cutoff| (value, cutoff, parsed.is_some_and(|time| time > cutoff)))
+        })
+    }
+
+    #[cfg(feature = "pg-test-record")]
+    #[tokio::test]
+    async fn postgres_bucket_verdict_matches_sqlite_cases() {
+        use crate::gate::pg_background_fixture as pg;
+        let Some(mut db) = pg::connect().await else {
+            return;
+        };
+        let mut tx = pg::transaction(&mut db).await;
+        let guard = pg::sql(super::GUARD_BUCKET_FOUND_CLEAN_PG);
+        for (value, cutoff, allowed) in verdict_cases() {
+            let case = tx.transaction().await.unwrap();
+            case.execute("INSERT INTO scan_cursors VALUES ('bucket', $1)", &[&value])
+                .await
+                .unwrap();
+            let result = case.execute(&guard, &[&"bucket", &cutoff]).await;
+            if allowed {
+                assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.as_db_error().and_then(|e| e.constraint()),
+                    Some("tx_guard_ok"),
+                    "{value} at {cutoff}: {error:?}"
+                );
             }
+            case.rollback().await.unwrap();
         }
+        tx.rollback().await.unwrap();
     }
 }
