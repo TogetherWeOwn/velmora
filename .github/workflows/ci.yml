@@ -337,7 +337,8 @@ jobs:
           bridge_paths='^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)'
           bridge=$(git diff --no-renames --name-only -z HEAD^1 HEAD | {
             matched=false
-            while IFS= read -r -d '' path; do
+            # Read bytes so malformed UTF-8 cannot swallow a NUL delimiter.
+            while LC_ALL=C IFS= read -r -d '' path; do
               if [[ $path =~ $bridge_paths ]]; then
                 matched=true
               fi
