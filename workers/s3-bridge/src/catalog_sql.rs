@@ -2,7 +2,7 @@
 
 use velmora_bridge::pg::{is_postgres_read_only, is_read_only, PgConfig, PgSql};
 use velmora_bridge::{BridgeError, Dialect, Result, Row, Sql, SqlValue};
-use worker::Env;
+use worker::{js_sys::Reflect, wasm_bindgen::JsValue, Env};
 
 use crate::d1::D1Sql;
 use crate::pgsql::HyperdriveConnect;
@@ -23,6 +23,8 @@ const PG_DRILL_LIMIT: u16 = 5; // Hyperdrive minimum
 const PG_OPS_RESERVE: u16 = 4;
 const PG_UNASSIGNED_MIN: u16 = 3;
 
+/// Checks the source budget only; cutover deploy preflight must check the
+/// actual Hyperdrive configurations and origin capacity against this budget.
 const fn connection_budget_ok(max_connections: u16, superuser_reserved: u16, drill: u16) -> bool {
     let usable = max_connections.saturating_sub(superuser_reserved);
     let pooled = PG_WRITE_LIMIT + PG_READ_LIMIT + drill;
@@ -59,6 +61,22 @@ fn pipeline(value: Option<&str>) -> core::result::Result<bool, &'static str> {
     }
 }
 
+fn optional_text(
+    env: &Env,
+    name: &str,
+    invalid: &'static str,
+) -> core::result::Result<Option<String>, &'static str> {
+    let name = JsValue::from_str(name);
+    if !Reflect::has(env, &name).map_err(|_| invalid)? {
+        return Ok(None);
+    }
+    Reflect::get(env, &name)
+        .map_err(|_| invalid)?
+        .as_string()
+        .map(Some)
+        .ok_or(invalid)
+}
+
 pub enum CatalogSql {
     D1(D1Sql),
     D1Frozen(D1Sql),
@@ -68,8 +86,9 @@ pub enum CatalogSql {
 
 impl CatalogSql {
     pub fn from_env(env: &Env) -> core::result::Result<Self, &'static str> {
-        let var = |name| env.var(name).ok().map(|v| v.to_string());
-        let backend = Backend::parse(var("CATALOG_BACKEND").as_deref())?;
+        let backend = Backend::parse(
+            optional_text(env, "CATALOG_BACKEND", "invalid CATALOG_BACKEND")?.as_deref(),
+        )?;
         match backend {
             Backend::D1 | Backend::D1Frozen => {
                 let d1 = D1Sql::new(env.d1("CATALOG").map_err(|_| "missing binding CATALOG")?);
@@ -81,7 +100,9 @@ impl CatalogSql {
             }
             Backend::Pg | Backend::PgFrozen => {
                 let config = PgConfig {
-                    pipeline: pipeline(var("PG_PIPELINE").as_deref())?,
+                    pipeline: pipeline(
+                        optional_text(env, "PG_PIPELINE", "invalid PG_PIPELINE")?.as_deref(),
+                    )?,
                     ..PgConfig::default()
                 };
                 let writer = HyperdriveConnect::new(
