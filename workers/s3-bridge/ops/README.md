@@ -1940,6 +1940,23 @@ parent's response and telemetry are unchanged.
 Production sets it in the `[vars]` table of `workers/s3-bridge/wrangler.toml`;
 a Dashboard-only variable does not survive the next CI deploy.
 
+`R2_PUT_RETRY` is off unless its value is exactly `on`. When enabled,
+streamed single-extent PutObject and UploadPart may replay the sealed
+bytes after an unnumbered R2 network loss, timeout, or internal error,
+or R2 codes `10001`, `10043`, and `10058`. A stream fault or any other
+numeric code does not retry. The ciphertext copy (up to
+16 MiB plus encryption overhead) is kept only if the byte budget can
+reserve it immediately. Up to two retries use 1 s and 2 s backoffs plus
+up to 250 ms jitter; none starts more than 20 s into the safety write.
+Each successful store receipt must match the sealed size and MD5.
+Production turns it on in the `[vars]` table of
+`workers/s3-bridge/wrangler.toml`. To turn it off, set it to `off` there
+or roll back to the previous Worker version.
+
+When testing this switch, count `retries=` on HTTP 200 request lines to
+see recoveries. Compare byte-budget 503s and cold-read budget waits with
+the switch off: holding the copy can leave less room for cold reads.
+
 A failed queue wake-up does not produce an `outbox` response stage. The
 write has already committed, and the dispatcher can resend from the
 outbox. The response and its count remain those of a successful write.

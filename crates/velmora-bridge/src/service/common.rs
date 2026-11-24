@@ -2,8 +2,11 @@
 //! authentication, error rendering, the mutation gates and the stored
 //! metadata encoding.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use futures_util::{stream, StreamExt};
 
 use velmora_s3_proto::mutation::UploadMetadata;
 use velmora_s3_proto::{
@@ -12,23 +15,23 @@ use velmora_s3_proto::{
 };
 use zeroize::Zeroizing;
 
-use velmora::rng::SystemRng;
+use velmora::rng::{uniform_below, SystemRng};
 use velmora_s3_proto::UploadValidator;
 
 use crate::config::{BridgeConfig, Maintenance, REAL_DATA_READY};
 use crate::crypto::{unwrap_secret, DataKey, ExtentSealer};
 use crate::entry::Entry;
 use crate::ingress::{
-    seal_upload, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
+    seal_upload, ByteBudget, Charge, IngressError, SealedUpload, UploadLengths, UploadReadError,
 };
-use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
+use crate::metrics::{transient_put, FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Body, BridgeError, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus,
-    OutboxStage, Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs,
-    JOB_VERSION,
+    Body, BridgeError, Bucket, BucketId, ByteStream, ExtentId, GenerationId, GenerationRow, Job,
+    KeyStatus, OutboxStage, Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response,
+    UnixMs, JOB_VERSION,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -1075,6 +1078,69 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
     }
 }
 
+const REPLAY_BACKOFF_MS: [u32; 2] = [1_000, 2_000];
+const REPLAY_JITTER_MS: u64 = 250;
+const REPLAY_CUTOFF_MS: i64 = 20_000;
+const REPLAY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A single charged allocation, shared with the owning streams. The
+/// charge stays live even if a store holds a stream after returning.
+struct ReplayCopy {
+    bytes: RefCell<Vec<u8>>,
+    size: usize,
+    _charge: Charge,
+}
+
+impl ReplayCopy {
+    fn reserve(budget: &ByteBudget, size: u64) -> Option<Rc<Self>> {
+        let capacity = usize::try_from(size).ok()?;
+        let charge = budget.try_charge_in_turn(size)?;
+        Some(Rc::new(Self {
+            bytes: RefCell::new(Vec::with_capacity(capacity)),
+            size: capacity,
+            _charge: charge,
+        }))
+    }
+
+    fn tee(self: &Rc<Self>, source: ByteStream) -> ByteStream {
+        let mut owner = Some(Rc::clone(self));
+        source
+            .inspect(move |item| {
+                let Some(copy) = &owner else { return };
+                let mut bytes = copy.bytes.borrow_mut();
+                match item {
+                    Ok(piece) if piece.len() <= copy.size - bytes.len() => {
+                        bytes.extend_from_slice(piece);
+                        if bytes.len() < copy.size {
+                            return;
+                        }
+                    }
+                    _ => bytes.clear(),
+                }
+                // The sealer gives its last piece only once it is done.
+                // The consumer need not poll for EOF to release its copy.
+                drop(bytes);
+                owner = None;
+            })
+            .boxed_local()
+    }
+
+    fn is_whole(&self) -> bool {
+        self.bytes.borrow().len() == self.size
+    }
+
+    fn stream(self: &Rc<Self>) -> ByteStream {
+        stream::unfold(Some((Rc::clone(self), 0)), |cursor| async move {
+            let (copy, offset) = cursor?;
+            let end = (offset + REPLAY_CHUNK_BYTES).min(copy.size);
+            let piece = copy.bytes.borrow()[offset..end].to_vec();
+            let next = (end < copy.size).then_some((copy, end));
+            Some((Ok(piece), next))
+        })
+        .boxed_local()
+    }
+}
+
 /// Stores one upload body as one extent in the safety store **while the
 /// body arrives**: each chunk is decoded, sealed and handed to the store
 /// as it comes, so sealing runs beside the store's write instead of
@@ -1094,11 +1160,13 @@ pub(super) async fn send_post_jobs<C, B, N, J, K, T>(
 ///   answer is `500` and the blob stays an unreferenced orphan, as after
 ///   a failed catalogue write: a handler never deletes from the safety
 ///   store.
-/// - **One attempt.** A store that fails ends the request with `500`
-///   and the client sends the body again.
+/// - **A bounded replay, when enabled and there is room.** Only a whole
+///   sealed copy can be put again, under the same fresh key, after a
+///   transient R2 fault. The copy must fit without waiting.
 ///
 /// The extent `blob` names must be newly minted (see [`ExtentSealer`]).
-/// `charge` is the one taken for this body.
+/// The caller takes `charge` from the same request's `replay_budget`
+/// when it enables replay, so a waiting charge gets its turn.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn store_streamed<B: BlobStore>(
     safety: &B,
@@ -1108,8 +1176,12 @@ pub(super) async fn store_streamed<B: BlobStore>(
     bdk: &DataKey,
     blob: StreamMeta<'_>,
     charge: &Charge,
+    replay_budget: Option<&ByteBudget>,
+    clock: &impl Clock,
     observed: &mut RequestObservation,
 ) -> Result<SealedUpload, UploadReadError> {
+    let timing =
+        replay_budget.and_then(|budget| budget.sleeper().map(|sleep| (budget, sleep, clock.now())));
     let sealer = ExtentSealer::begin(
         bdk,
         blob.bucket,
@@ -1119,10 +1191,14 @@ pub(super) async fn store_streamed<B: BlobStore>(
     )
     .map_err(|_| IngressError::Internal)?;
     let cipher_size = sealer.cipher_size();
+    let replay = timing.and_then(|(budget, _, _)| ReplayCopy::reserve(budget, cipher_size));
     let (stream, seal) = seal_upload(body, lengths, validator, sealer, charge)?;
-    let receipt = safety
-        .put_stream(&blob.extent.safety_key(), cipher_size, stream, &blob)
-        .await;
+    let stream = match &replay {
+        Some(copy) => copy.tee(stream),
+        None => stream,
+    };
+    let key = blob.extent.safety_key();
+    let receipt = safety.put_stream(&key, cipher_size, stream, &blob).await;
     let fault = match (receipt, seal.outcome()) {
         // The body was refused: that is the answer, whatever the store
         // made of the stream that ended in an error.
@@ -1133,21 +1209,46 @@ pub(super) async fn store_streamed<B: BlobStore>(
             }
             return Err(refused);
         }
-        (Ok(receipt), Ok(upload))
-            if receipt.size == upload.sealed.cipher_size
-                && receipt.md5 == upload.sealed.cipher_md5 =>
-        {
-            return Ok(upload);
-        }
-        // The store failed.
-        (Err(error), _) => Fault::of(&error),
-        // The store answered without reading the stream to its end.
+        // No complete seal: do not replay, regardless of the store's answer.
+        (Err(error), Err(None)) => Fault::of(&error),
         (Ok(_), Err(None)) => Fault::named("StoreStoppedReading"),
-        // The store holds other bytes than were sealed.
-        (Ok(receipt), Ok(upload)) if receipt.size != upload.sealed.cipher_size => {
-            Fault::named("StoredSizeMismatch")
+        (mut receipt, Ok(upload)) => {
+            if let Some(((_, sleep, started), copy)) =
+                timing.zip(replay).filter(|(_, copy)| copy.is_whole())
+            {
+                let elapsed = || clock.now().0.saturating_sub(started.0).max(0);
+                for base in REPLAY_BACKOFF_MS {
+                    if !matches!(receipt.as_ref(), Err(error) if transient_put(error)) {
+                        break;
+                    }
+                    let jitter = uniform_below(&mut SystemRng, REPLAY_JITTER_MS + 1).unwrap_or(0);
+                    let pause = base + jitter as u32;
+                    if elapsed().saturating_add(i64::from(pause)) > REPLAY_CUTOFF_MS {
+                        break;
+                    }
+                    sleep(pause).await;
+                    // A timer can be polled later than its requested delay.
+                    if elapsed() > REPLAY_CUTOFF_MS {
+                        break;
+                    }
+                    observed.record_put_retry();
+                    receipt = safety
+                        .put_stream(&key, cipher_size, copy.stream(), &blob)
+                        .await;
+                }
+            }
+            // Apply the same comparison before publishing after any attempt.
+            match receipt {
+                Err(error) => Fault::of(&error),
+                Ok(receipt) if receipt.size != upload.sealed.cipher_size => {
+                    Fault::named("StoredSizeMismatch")
+                }
+                Ok(receipt) if receipt.md5 != upload.sealed.cipher_md5 => {
+                    Fault::named("StoredMd5Mismatch")
+                }
+                Ok(_) => return Ok(upload),
+            }
         }
-        (Ok(_), Ok(_)) => Fault::named("StoredMd5Mismatch"),
     };
     observed.mark_fault(Stage::R2, fault);
     Err(IngressError::Internal.into())
