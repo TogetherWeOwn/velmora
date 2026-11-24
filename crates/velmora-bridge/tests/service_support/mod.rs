@@ -613,10 +613,13 @@ impl Sql for FailSql {
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         if self.frozen.get() {
             // Some writes use query for RETURNING, not exec or batch.
-            let readonly = self
-                .inner
-                .with_conn(|conn| conn.prepare(sql).map(|stmt| stmt.readonly()))
-                .map_err(|e| BridgeError::Sql(e.to_string()))?;
+            let readonly = match &self.inner {
+                TestSql::Sqlite(db) => db
+                    .with_conn(|conn| conn.prepare(sql).map(|stmt| stmt.readonly()))
+                    .map_err(|e| BridgeError::Sql(e.to_string()))?,
+                #[cfg(feature = "testkit-pg")]
+                TestSql::Postgres(_) => velmora_bridge::pg::is_postgres_read_only(sql),
+            };
             if !readonly {
                 self.frozen_write_attempts
                     .set(self.frozen_write_attempts.get() + 1);
