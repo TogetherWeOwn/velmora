@@ -154,6 +154,12 @@ impl Fx {
 
     /// One column of an object's extent row, as text.
     async fn extent(&self, o: &Obj, column: &str) -> String {
+        let db = &self.cat.sql.0;
+        let column = match column {
+            "hex(plan)" => db.fixture(column, "upper(encode(plan, 'hex'))"),
+            "hex(parity)" => db.fixture(column, "upper(encode(parity, 'hex'))"),
+            column => column,
+        };
         let expression = if column.contains(" IS ") {
             format!("CASE WHEN {column} THEN '1' ELSE '0' END")
         } else {
@@ -5154,7 +5160,7 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     ] {
         db.apply(script).unwrap();
     }
-    let fx = Fx::on(TestSql::Sqlite(db)).await;
+    let fx = Fx::on(TestSql::Sqlite(Box::new(db))).await;
     // A packed plan, and two extents without a plan.
     let packed = fx.two_articles("packed").await;
     let rows = fx.publish(&fx.bucket, "rows").await;

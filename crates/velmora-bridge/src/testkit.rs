@@ -39,7 +39,7 @@ pub use postgres::TestPostgres;
 /// Selects the catalogue fixture explicitly requested by the test environment.
 /// A configured PostgreSQL connection that fails never falls back to SQLite.
 pub enum TestSql {
-    Sqlite(RusqliteSql),
+    Sqlite(Box<RusqliteSql>),
     #[cfg(feature = "testkit-pg")]
     Postgres(Box<TestPostgres>),
 }
@@ -72,9 +72,11 @@ impl TestSql {
             ));
         }
         if armed {
-            RusqliteSql::with_schema().map(Self::Sqlite)
+            RusqliteSql::with_schema().map(Box::new).map(Self::Sqlite)
         } else {
-            RusqliteSql::with_schema_unarmed().map(Self::Sqlite)
+            RusqliteSql::with_schema_unarmed()
+                .map(Box::new)
+                .map(Self::Sqlite)
         }
     }
 

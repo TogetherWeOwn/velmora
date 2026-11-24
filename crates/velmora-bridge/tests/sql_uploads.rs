@@ -1038,8 +1038,8 @@ async fn upload_listing_normalizes_nul_in_prefix_key_and_id_markers() {
     q.after = Some(("foo\0bar".into(), Some(before.as_str().into())));
     let ids = |rows: Vec<OpenUpload>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
     assert_eq!(
-        ids(fx.cat.list_uploads(&fx.bucket, &q).await.unwrap()),
-        [next_key.clone()]
+        ids(fx.cat.list_uploads(&fx.bucket, &q).await.unwrap()).as_slice(),
+        std::slice::from_ref(&next_key)
     );
 
     q.after = Some(("foo".into(), Some(format!("{before}\0suffix"))));

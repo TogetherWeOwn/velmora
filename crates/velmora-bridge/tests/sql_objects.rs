@@ -1442,11 +1442,15 @@ async fn list_query_budget_returns_valid_partial_page() {
     let seed = fx.put(&b.id, "zz-last", T0).await;
     // 260 directories of 262 keys: more keys per directory than one
     // query fetches at max-keys 250, so every common prefix costs a query.
+    let key = fx.cat.sql.db.fixture(
+        "printf('d%03d/f%03d', i, j)",
+        "'d' || lpad(i::text, 3, '0') || '/f' || lpad(j::text, 3, '0')",
+    );
     fx.run(&format!(
         "WITH RECURSIVE d(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM d WHERE i < 259), \
                         f(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM f WHERE j < 261) \
          INSERT INTO objects(bucket_id, key, generation_id) \
-         SELECT '{}', printf('d%03d/f%03d', i, j), '{}' FROM d, f",
+         SELECT '{}', {key}, '{}' FROM d, f",
         b.id, seed.generation.id
     ));
 

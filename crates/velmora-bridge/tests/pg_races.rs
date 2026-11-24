@@ -328,35 +328,42 @@ async fn s2_eight_takeover_contenders_leave_one_owner_and_fence_stale_writes() {
         .unwrap()
         .unwrap();
     let t2 = later.plus_ms(600_001);
-    let verify = claim(OutboxStage::Verify, t2, "verifier-new")
-        .await
-        .unwrap()
-        .unwrap();
-    let v = VerificationRow {
+    let pass = |at, backbone: &str| VerificationRow {
         extent_id: lease.extent.clone(),
-        backbone: "bb".into(),
+        backbone: backbone.into(),
         provider_id: "p1".into(),
-        verified_at: t2,
+        verified_at: at,
         plan_rev: 1,
         articles_ok: articles.len() as u32,
         articles_total: articles.len() as u32,
         result: VerifyResult::Ok,
         kind: VerifyKind::Body,
     };
+    // The old holder records a full pass immediately before the takeover,
+    // in the same millisecond. It is still fresh even after updated_at moves.
     assert!(matches!(
-        c.record_verification(&stale_verify, &v).await,
+        c.record_verification(&stale_verify, &pass(t2, "bb")).await,
+        Ok(VerifyRecord::Stored)
+    ));
+    let verify = claim(OutboxStage::Verify, t2, "verifier-new")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(verify.token > stale_verify.token);
+    assert!(matches!(
+        c.record_verification(&stale_verify, &pass(t2, "other"))
+            .await,
         Ok(VerifyRecord::Fenced)
     ));
     for mode in [None, Some(false), Some(true)] {
         let outcome = c
             .release_at_verify(&stale_verify, 1, &["bb".into()], "[]", t2, mode)
             .await;
-        assert!(matches!(outcome, Ok(Guard::Lost)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(Guard::Lost)),
+            "release at verify ({mode:?}): {outcome:?}"
+        );
     }
-    assert!(matches!(
-        c.record_verification(&verify, &v).await,
-        Ok(VerifyRecord::Stored)
-    ));
     assert!(c
         .advance(&verify, OutboxStage::Release, t2, t2)
         .await
@@ -366,6 +373,10 @@ async fn s2_eight_takeover_contenders_leave_one_owner_and_fence_stale_writes() {
         .unwrap()
         .unwrap();
     let t3 = t2.plus_ms(600_001);
+    assert!(matches!(
+        c.record_verification(&stale_release, &pass(t3, "bb")).await,
+        Ok(VerifyRecord::Stored)
+    ));
     let release = claim(OutboxStage::Release, t3, "releaser-new")
         .await
         .unwrap()
@@ -375,22 +386,42 @@ async fn s2_eight_takeover_contenders_leave_one_owner_and_fence_stale_writes() {
     let outcome = c
         .begin_release(&stale_release, 1, &["bb".into()], "[]", t3)
         .await;
-    assert!(matches!(outcome, Ok(Guard::Lost)), "{outcome:?}");
+    assert!(
+        matches!(outcome, Ok(Guard::Lost)),
+        "begin release: {outcome:?}"
+    );
     for need_full in [false, true] {
         let outcome = c
             .begin_release_light(&stale_release, 1, &["bb".into()], "[]", t3, need_full)
             .await;
-        assert!(matches!(outcome, Ok(Guard::Lost)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(Guard::Lost)),
+            "begin light release ({need_full}): {outcome:?}"
+        );
     }
-    assert!(matches!(
-        c.finish_release(&stale_release, t3).await,
-        Ok(false)
-    ));
-    assert!(matches!(
-        c.reopen_release(&stale_release, t3).await,
-        Ok(false)
-    ));
     assert_eq!(rows(&c, snapshot, &bound).await, before);
+
+    let t4 = t3.plus_ms(1);
+    assert!(matches!(
+        c.record_verification(&release, &pass(t4, "bb")).await,
+        Ok(VerifyRecord::Stored)
+    ));
+    assert!(matches!(
+        c.begin_release(&release, 1, &["bb".into()], "[]", t4).await,
+        Ok(Guard::Applied(()))
+    ));
+    let state = "SELECT safety_state FROM extents WHERE id = ?1";
+    let releasing = vec![vec![SqlValue::Text("releasing".into())]];
+    assert_eq!(rows(&c, state, &bound).await, releasing);
+    assert!(
+        matches!(c.finish_release(&stale_release, t4).await, Ok(false)),
+        "stale finish changed a releasing extent"
+    );
+    assert!(
+        matches!(c.reopen_release(&stale_release, t4).await, Ok(false)),
+        "stale reopen changed a releasing extent"
+    );
+    assert_eq!(rows(&c, state, &bound).await, releasing);
 }
 
 #[tokio::test]

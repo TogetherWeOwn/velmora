@@ -1423,9 +1423,17 @@ async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
             assert_eq!(report.unreadable, names, "{report:?}");
         }
         assert_eq!(live_ids(&rig), [lingering.as_str(), solo.id.as_str()]);
-        assert_eq!(rig.count("extents WHERE hex(plan) = 'FF'"), 3);
+        let bad_plan = rig
+            .bridge
+            .catalog
+            .sql
+            .inner
+            .fixture("hex(plan) = 'FF'", "encode(plan, 'hex') = 'ff'");
+        assert_eq!(rig.count(&format!("extents WHERE {bad_plan}")), 3);
         assert_eq!(
-            rig.count("extents WHERE hex(plan) = 'FF' AND safety_state = 'deleted'"),
+            rig.count(&format!(
+                "extents WHERE {bad_plan} AND safety_state = 'deleted'"
+            )),
             1
         );
         assert_eq!(
@@ -2847,9 +2855,20 @@ async fn answers(
     all
 }
 
+// The full SQLite history sweep is inexpensive in memory. Use the same
+// 40 operations and replay assertions for eight PostgreSQL seeds per
+// shape: the native run with every SQLite seed timed out after 15 min.
+fn recovery_seeds(start: u64, end: u64) -> std::ops::Range<u64> {
+    if velmora_bridge::testkit::TestSql::postgres_selected() {
+        start..start + 8
+    } else {
+        start..end
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
-    for seed in 0..150u64 {
+    for seed in recovery_seeds(0, 150) {
         let rig = rig_selected();
         let (_, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
@@ -2871,7 +2890,7 @@ async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_across_an_export_replay_to_the_same_answers() {
-    for seed in 1000..1300u64 {
+    for seed in recovery_seeds(1000, 1300) {
         let rig = rig_selected();
         let (_, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
@@ -3048,7 +3067,7 @@ async fn random_faulty_write(
 /// restores: it sorts after every record stored before it.
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_with_faults_replay_to_the_same_answers() {
-    for seed in 2000..2200u64 {
+    for seed in recovery_seeds(2000, 2200) {
         let rig = rig_selected();
         let (bucket, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
@@ -3873,7 +3892,7 @@ async fn answers_of_a_replay(
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
     let (mut in_flat, mut in_tenant) = (0, 0);
-    for seed in 5000..5120u64 {
+    for seed in recovery_seeds(5000, 5120) {
         let mut had = Vec::new();
         for mixed in [false, true] {
             let mut rig = rig_selected();
@@ -3915,7 +3934,15 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
         assert_eq!(had[0], had[1], "seed {seed}");
     }
     // The histories did put records in both layouts.
-    assert!(in_flat > 500 && in_tenant > 500, "{in_flat} {in_tenant}");
+    let minimum = if velmora_bridge::testkit::TestSql::postgres_selected() {
+        8
+    } else {
+        500
+    };
+    assert!(
+        in_flat > minimum && in_tenant > minimum,
+        "{in_flat} {in_tenant}"
+    );
 }
 
 /// A delete is a tombstone, and it removes what was written before it

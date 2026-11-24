@@ -770,7 +770,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
         nntp,
         cfg,
         budget,
-        TestSql::Sqlite(RusqliteSql::with_schema().unwrap()),
+        TestSql::Sqlite(Box::new(RusqliteSql::with_schema().unwrap())),
     )
 }
 
