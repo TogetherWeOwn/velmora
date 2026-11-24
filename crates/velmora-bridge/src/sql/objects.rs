@@ -391,6 +391,15 @@ macro_rules! retiring {
 /// references (a copy) is left alone. They must run before the pointer is
 /// moved or removed and after the replacing generation, if any, has its
 /// extent references; all are no-ops when the key has no live object.
+pub(super) fn retire_live(
+    bucket: &BucketId,
+    key: &str,
+    to: GenerationState,
+    now: UnixMs,
+) -> Vec<Stmt> {
+    retire_live_in(Dialect::Sqlite, bucket, key, to, now)
+}
+
 pub(super) fn retire_live_in(
     dialect: Dialect,
     bucket: &BucketId,

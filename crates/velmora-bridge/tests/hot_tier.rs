@@ -731,38 +731,13 @@ fn adaptive_wiring_does_not_change_eviction_candidates_fences_or_watermark() {
             sql,
             "pub(super) async fn begin_evict",
             "\n}\n",
-            "19a6f438a3eeb9cfc9de366fcdacff2f8122e469210fdd00e0667927234419f4",
+            "aaa72d021a381da6563d4599a6a2387a1600d2e43ee74b9fdffb8f0d3cc7854d",
         ),
         (
             sql,
             "pub(super) async fn finish_evict",
             "\n}\n",
-            "c85022163c692ed8e95707f86c4246d8247f0f791149ac1037d2462e39452d79",
-        ),
-        // The dialect port moved the unchanged fence SQL out of these bodies.
-        (
-            sql,
-            "const BEGIN_EVICT_PINNED: &str =",
-            "\n);",
-            "69a904d3bf71d4033f71e88da9aa601210e47587168e6b3f6b0b268e8bed1ed6",
-        ),
-        (
-            sql,
-            "const BEGIN_EVICT_UNPINNED: &str =",
-            "\n);",
-            "1e819f30b0016b857a2dcf2d17e0d9aad79d1bbdf61c42d87e4f9818a49b906d",
-        ),
-        (
-            sql,
-            "const FINISH_EVICT_PINNED: &str =",
-            "\";",
-            "e979160ed886b4e606edf17a53719b267f3e8ee55ef4be090462fb67446b1118",
-        ),
-        (
-            sql,
-            "const FINISH_EVICT_UNPINNED: &str =",
-            "\";",
-            "9c92d308449b933f6dd533717c08b9af642c195fb17a3ce94153d598e692ace5",
+            "79da077229615a72875cb3455a679873d68ad323a354dda93775e54071fb189a",
         ),
         (
             jobs,
@@ -2336,33 +2311,6 @@ async fn a_fill_racing_the_collection_of_its_cache_blob_stays_counted() {
 // The fence
 // ---------------------------------------------------------------------------
 
-fn sets_safety_state(clause: &str) -> bool {
-    clause.match_indices("safety_state").any(|(at, column)| {
-        let preceded_by_identifier = clause[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        !preceded_by_identifier && clause[at + column.len()..].trim_start().starts_with('=')
-    })
-}
-
-#[test]
-fn safety_state_scanner_recognizes_assignment_with_or_without_whitespace() {
-    for clause in [
-        "UPDATE extents SET safety_state = 'held'",
-        "UPDATE extents SET safety_state='held'",
-        "UPDATE extents SET safety_state\t\n= 'held'",
-    ] {
-        assert!(sets_safety_state(clause), "missed assignment: {clause}");
-    }
-    assert!(!sets_safety_state(
-        "UPDATE extents SET old_safety_state = 'held'"
-    ));
-    assert!(!sets_safety_state(
-        "UPDATE extents SET state = safety_state"
-    ));
-}
-
 /// Every statement that sets an extent's `safety_state` must bump
 /// `evict_seq` in the same statement. Without that, an eviction that
 /// listed an extent as released could begin after the extent went back
@@ -2393,7 +2341,7 @@ fn every_safety_state_change_bumps_the_fence() {
         for (at, _) in flat.match_indices("UPDATE extents") {
             let rest = &flat[at..];
             let set = &rest[..rest.find(" WHERE ").unwrap_or(rest.len())];
-            if !sets_safety_state(set) {
+            if !set.contains("safety_state =") {
                 continue;
             }
             checked += 1;

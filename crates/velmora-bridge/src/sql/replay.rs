@@ -18,7 +18,7 @@
 //! published, which is what makes "already present" a safe reason to
 //! skip a manifest.
 
-use super::objects::{clear_floor, ms, opt, retire_live_in, text, uint};
+use super::objects::{clear_floor, ms, opt, retire_live, text, uint};
 use super::uploads::int;
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlLimits, SqlValue};
@@ -56,7 +56,9 @@ pub(super) async fn replay_probe<S: Sql>(
     let rows = c
         .sql
         .query(
-            REPLAY_PROBE,
+            "SELECT (SELECT COUNT(*) FROM generations WHERE id = ?1), \
+                    (SELECT COUNT(*) FROM objects WHERE bucket_id = ?2 AND key = ?3 \
+                       AND generation_id > ?1)",
             &[
                 text(g.id.as_str()),
                 text(g.bucket_id.as_str()),
@@ -72,9 +74,10 @@ pub(super) async fn replay_probe<S: Sql>(
     })
 }
 
-fn bucket_insert(dialect: crate::ports::Dialect, b: &Bucket) -> Stmt {
+fn bucket_insert(b: &Bucket) -> Stmt {
     (
-        dialect.pick(INSERT_BUCKET, INSERT_BUCKET_PG),
+        "INSERT OR IGNORE INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
+           created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         vec![
             text(b.id.as_str()),
             text(&b.name),
@@ -87,10 +90,13 @@ fn bucket_insert(dialect: crate::ports::Dialect, b: &Bucket) -> Stmt {
     )
 }
 
-fn article_insert(dialect: crate::ports::Dialect, a: &ArticleRow) -> Result<Stmt> {
+fn article_insert(a: &ArticleRow) -> Result<Stmt> {
     Ok((
         // Beside a packed plan a row is never read: none is written.
-        dialect.pick(INSERT_ARTICLE, INSERT_ARTICLE_PG),
+        "INSERT OR IGNORE INTO articles(extent_id, idx, message_id, newsgroup, headers, \
+           cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
+           WHERE (SELECT plan FROM extents WHERE id = ?1) IS NULL",
         vec![
             text(a.extent_id.as_str()),
             SqlValue::Int(i64::from(a.idx)),
@@ -108,12 +114,7 @@ fn article_insert(dialect: crate::ports::Dialect, a: &ArticleRow) -> Result<Stmt
 
 /// The statements for one extent. Every one is a no-op on a catalogue
 /// that already has what it would write.
-fn extent_stmts(
-    dialect: crate::ports::Dialect,
-    x: &ReplayExtent,
-    now: UnixMs,
-    out: &mut Vec<Stmt>,
-) -> Result<()> {
+fn extent_stmts(x: &ReplayExtent, now: UnixMs, out: &mut Vec<Stmt>) -> Result<()> {
     let e = &x.row;
     let id = || text(e.id.as_str());
     let safety = if x.safety_present {
@@ -122,7 +123,10 @@ fn extent_stmts(
         SafetyState::Deleted
     };
     out.push((
-        dialect.pick(INSERT_EXTENT, INSERT_EXTENT_PG),
+        "INSERT OR IGNORE INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
+           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
+         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
         vec![
             id(),
             text(e.bucket_id.as_str()),
@@ -148,7 +152,10 @@ fn extent_stmts(
         (Some(plan), Some(packed)) => {
             let (parity, parity_count) = parity_of(x, packed);
             out.push((
-                RESTORE_PACKED_PLAN,
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
+                   parity = ?5, parity_count = ?6 \
+                 WHERE id = ?1 AND plan IS NULL \
+                   AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)",
                 vec![
                     id(),
                     SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
@@ -161,10 +168,11 @@ fn extent_stmts(
         }
         (Some(plan), None) => {
             for a in plan {
-                out.push(article_insert(dialect, a)?);
+                out.push(article_insert(a)?);
             }
             out.push((
-                RESTORE_UNPACKED_COUNT,
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
+                 WHERE id = ?1 AND article_count IS NULL",
                 vec![
                     id(),
                     SqlValue::Int(i64::try_from(plan.len()).unwrap_or(i64::MAX)),
@@ -178,12 +186,24 @@ fn extent_stmts(
         // The pinned copy is given up only after the articles were read
         // back, so what is left of the pipeline has nothing to do. Reads
         // verify every byte against the digests either way.
-        out.push((SET_ABSENT_SAFETY, vec![id()]));
-        out.push((TERMINATE_ABSENT_OUTBOX, vec![id(), ms(now)]));
-        out.push((RESTORE_ARTICLES_POSTED, vec![id()]));
+        out.push((
+            "UPDATE extents SET safety_state = 'deleted', evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND safety_state IN ('held', 'releasing')",
+            vec![id()],
+        ));
+        out.push((
+            "UPDATE outbox SET stage = 'done', lease_owner = NULL, lease_until = NULL, \
+               sent_at = NULL, updated_at = ?2 WHERE extent_id = ?1 AND stage IN ('post', 'verify', 'release')",
+            vec![id(), ms(now)],
+        ));
+        out.push((
+            "UPDATE articles SET state = 'posted' WHERE extent_id = ?1 AND state = 'planned'",
+            vec![id()],
+        ));
         // The same for a packed plan: posted, at a time nobody knows.
         out.push((
-            RESTORE_EXTENT_POSTED,
+            "UPDATE extents SET posted_at = ?2 \
+             WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL",
             vec![id(), SqlValue::Int(crate::plan::POSTED_AT_UNKNOWN)],
         ));
     }
@@ -236,7 +256,7 @@ struct LostAddendum {
     /// SQL literal (`quote`) of `extents.parity_count`.
     plan: Vec<u8>,
     stored: SqlValue,
-    stored_count: SqlValue,
+    stored_count: String,
     /// The record's addendum and the number of its articles.
     parity: SqlValue,
     parity_count: SqlValue,
@@ -264,10 +284,19 @@ async fn unreadable_plans<S: Sql>(
     let mut out = Vec::new();
     let mut addenda = Vec::new();
     for chunk in extents.chunks(LOST_CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(",");
         let rows = c
             .sql
             .query(
-                &unreadable_plan_sql(c.sql.dialect(), chunk.len()),
+                &format!(
+                    "SELECT id, cipher_size, plan, parity, \
+                       CASE WHEN typeof(parity_count) = 'real' \
+                           OR (typeof(parity_count) = 'integer' \
+                             AND parity_count NOT BETWEEN 0 AND 4294967295) \
+                         THEN quote(parity_count) ELSE parity_count END, \
+                       quote(parity_count) \
+                     FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
+                ),
                 &chunk
                     .iter()
                     .map(|x| text(x.row.id.as_str()))
@@ -280,12 +309,15 @@ async fn unreadable_plans<S: Sql>(
             let cipher_size: u64 = r.num()?;
             let stored = r.blob()?;
             let parity = r.opt_blob()?;
-            // On D1, an invalid numeric value is projected as text so
-            // damage to one row does not stop replay of the others.
-            // The CAS binds the SQLite storage literal, or the exact
-            // nullable BIGINT on Postgres (with null-safe equality).
+            // As it is stored: a count that is no number is damage of
+            // this row, and must not stop the replay of the others. A
+            // fraction, or a number no count can be, is read as its
+            // text (a row cannot carry every number).
+            // The statements are keyed on the literal of the value, the
+            // same text for the same stored value whatever its type: a
+            // number that went through a text is not always itself.
             let count = r.value()?;
-            let count_cas = r.value()?;
+            let count_literal = r.text()?;
             let Some(x) = chunk.iter().find(|x| x.row.id == id) else {
                 continue;
             };
@@ -310,7 +342,7 @@ async fn unreadable_plans<S: Sql>(
                         extent: id,
                         plan: stored,
                         stored: on_row,
-                        stored_count: count_cas,
+                        stored_count: count_literal,
                         parity: from_record,
                         parity_count: record_count,
                     });
@@ -352,9 +384,9 @@ pub(super) async fn replay_extents<S: Sql>(
     let mut stmts: Vec<Stmt> = Vec::new();
     for x in extents {
         if stmts.is_empty() {
-            stmts.push(bucket_insert(c.sql.dialect(), bucket));
+            stmts.push(bucket_insert(bucket));
         }
-        extent_stmts(c.sql.dialect(), x, now, &mut stmts)?;
+        extent_stmts(x, now, &mut stmts)?;
         for u in unreadable.iter().filter(|u| u.extent == x.row.id) {
             let Some(plan) = &u.plan else { continue };
             // Keyed on the very value that was read: a plan that
@@ -379,19 +411,24 @@ pub(super) async fn replay_extents<S: Sql>(
                 ]
             };
             stmts.push((
-                c.sql
-                    .dialect()
-                    .pick(DROP_PASSES_FOR_SWAP, DROP_PASSES_FOR_SWAP_PG),
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
                 swapped(),
             ));
             stmts.push((
-                c.sql
-                    .dialect()
-                    .pick(FENCE_CLAIMS_FOR_SWAP, FENCE_CLAIMS_FOR_SWAP_PG),
+                "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
+                   lease_until = NULL, \
+                   cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
+                 WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS NOT ?3)",
                 swapped(),
             ));
             stmts.push((
-                REPLACE_UNREADABLE_PLAN,
+                "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
+                   parity = ?6, parity_count = ?7 \
+                 WHERE id = ?1 AND plan = ?5",
                 vec![
                     text(x.row.id.as_str()),
                     SqlValue::Int(i64::try_from(x.plan.as_ref().map_or(0, Vec::len)).unwrap_or(0)),
@@ -414,13 +451,13 @@ pub(super) async fn replay_extents<S: Sql>(
                     text(a.extent.as_str()),
                     SqlValue::Blob(a.plan.clone()),
                     a.stored.clone(),
-                    a.stored_count.clone(),
+                    text(&a.stored_count),
                 ]
             };
             stmts.push((
-                c.sql
-                    .dialect()
-                    .pick(DROP_PASSES_FOR_ADDENDUM, DROP_PASSES_FOR_ADDENDUM_PG),
+                "DELETE FROM verifications WHERE extent_id = ?1 \
+                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
+                     AND parity IS ?3 AND quote(parity_count) = ?4)",
                 read(),
             ));
             // And ends every claim on the extent: a job in flight read
@@ -429,11 +466,12 @@ pub(super) async fn replay_extents<S: Sql>(
             // on, so what it finds is not recorded and it releases
             // nothing; the row is free for a job that reads the plan as
             // it is now.
-            stmts.push((c.sql.dialect().pick(FENCE_CLAIMS, FENCE_CLAIMS_PG), read()));
+            stmts.push((FENCE_CLAIMS, read()));
             let mut params = read();
             params.extend([a.parity.clone(), a.parity_count.clone()]);
             stmts.push((
-                c.sql.dialect().pick(REPLACE_ADDENDUM, REPLACE_ADDENDUM_PG),
+                "UPDATE extents SET parity = ?5, parity_count = ?6 \
+                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND quote(parity_count) = ?4",
                 params,
             ));
         }
@@ -458,14 +496,25 @@ pub(super) async fn replay_damaged<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
 ) -> Result<(u64, Vec<GenerationId>)> {
-    let count = c.sql.query(COUNT_DAMAGED, &[]).await?;
+    const DAMAGED: &str = "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
+         JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
+           AND e.plan IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
+    let count = c
+        .sql
+        .query(&format!("SELECT COUNT(*) {DAMAGED}"), &[])
+        .await?;
     let count = match count.first().map(Vec::as_slice) {
         Some([SqlValue::Int(n)]) => u64::try_from(*n).unwrap_or(0),
         _ => return Err(BridgeError::Sql("row decode: damaged count".into())),
     };
     let rows = c
         .sql
-        .query(LIST_DAMAGED, &[SqlValue::Int(i64::from(limit))])
+        .query(
+            &format!("SELECT o.generation_id {DAMAGED} ORDER BY o.generation_id LIMIT ?1"),
+            &[SqlValue::Int(i64::from(limit))],
+        )
         .await?;
     let mut ids = Vec::with_capacity(rows.len());
     for row in rows {
@@ -486,7 +535,8 @@ pub(super) async fn held_extents<S: Sql>(
     let rows = c
         .sql
         .query(
-            REPLAY_HELD_PAGE,
+            "SELECT id FROM extents WHERE id > ?1 AND safety_state IN ('held', 'releasing') \
+             ORDER BY id LIMIT ?2",
             &[text(after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
@@ -514,7 +564,13 @@ pub(super) async fn restore_begin<S: Sql>(
         // before it when the two fall into one millisecond. It is read
         // first and the batch commits only if it is still the same, so
         // that the batch needs no result row: the mark it wrote is known.
-        let rows = c.sql.query(REPLAY_STATE, &[]).await?;
+        let rows = c
+            .sql
+            .query(
+                "SELECT started_at, state = 'complete', since_ms FROM restore_state WHERE id = 1",
+                &[],
+            )
+            .await?;
         let before = match rows.first().map(Vec::as_slice) {
             None => None,
             Some([SqlValue::Int(mark), SqlValue::Int(ended), SqlValue::Int(point)]) => {
@@ -539,12 +595,17 @@ pub(super) async fn restore_begin<S: Sql>(
             .ok_or(BridgeError::Invalid("a record key without its prefix"))?;
         let stmts: Vec<Stmt> = vec![
             (
-                c.sql.dialect().pick(GUARD_REPLAY_RUN, GUARD_REPLAY_RUN_PG),
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+                   (SELECT started_at FROM restore_state WHERE id = 1) IS NOT ?1",
                 vec![opt(before, SqlValue::Int)],
             ),
             // The rule above, held by the batch itself: it does not
             // rest on the row that was read.
-            (GUARD_REPLAY_WINDOW, vec![ms(since)]),
+            (
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM restore_state \
+                   WHERE id = 1 AND state <> 'complete' AND since_ms >= 0 AND ?1 > since_ms)",
+                vec![ms(since)],
+            ),
             // The intents of a restored catalogue can name the blobs of
             // objects that were acknowledged after its backup; their
             // rows only come back with the replay. No sweep may read
@@ -556,8 +617,20 @@ pub(super) async fn restore_begin<S: Sql>(
             // record (one minted before `since`): the row is then still
             // the only sign of a record without an object, and no sweep
             // deletes anything of a `kept` write.
-            (PRUNE_WRITE_INTENTS, vec![text(first_read)]),
-            (ARM_REPLAY, vec![ms(since), SqlValue::Int(run)]),
+            (
+                "DELETE FROM write_intents WHERE NOT \
+                   (state = 'kept' AND generation_id IS NOT NULL AND generation_id <= ?1)",
+                vec![text(first_read)],
+            ),
+            (
+                "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
+                 VALUES (1, 'replaying', ?1, ?2, NULL) \
+                 ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
+                   started_at = excluded.started_at, \
+                   finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
+                   reached_extent = NULL",
+                vec![ms(since), SqlValue::Int(run)],
+            ),
         ];
         match c.sql.batch(stmts).await {
             Ok(_) => return Ok(Ok(UnixMs(run))),
@@ -597,17 +670,36 @@ pub(super) async fn restore_finish<S: Sql>(
         .sql
         .batch(vec![
             (
-                c.sql.dialect().pick(LEVEL_STAMP, LEVEL_STAMP_PG),
+                "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
+                 SELECT 1, ?1, ?3, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
+                   WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
+                   AND (SELECT counter FROM rollback_stamp WHERE id = 1) IS ?4 \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   counter = max(counter, excluded.counter), rolled_back_at = NULL",
                 vec![int(stamp)?, ms(run), text(catalogue), seen],
             ),
-            (FINISH_REPLAY_STATE, vec![ms(now), ms(run), int(stamp)?]),
+            (
+                "UPDATE restore_state SET state = 'complete', \
+                   finished_at = COALESCE(finished_at, ?1) \
+                 WHERE id = 1 AND started_at = ?2 AND (state = 'complete' OR EXISTS \
+                   (SELECT 1 FROM rollback_stamp WHERE id = 1 AND counter >= ?3 \
+                    AND rolled_back_at IS NULL))",
+                vec![ms(now), ms(run), int(stamp)?],
+            ),
         ])
         .await?;
     Ok(changed.get(1) == Some(&1))
 }
 
 pub(super) async fn stamp<S: Sql>(c: &SqlCatalog<S>, catalogue: &str) -> Result<StampRow> {
-    let rows = c.sql.query(READ_STAMP, &[text(catalogue)]).await?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT counter, rolled_back_at IS NOT NULL, catalogue_id = ?1 \
+             FROM rollback_stamp WHERE id = 1",
+            &[text(catalogue)],
+        )
+        .await?;
     match rows.first().map(Vec::as_slice) {
         None => Ok(StampRow {
             counter: None,
@@ -633,8 +725,24 @@ pub(super) async fn stamp_advance<S: Sql>(
     catalogue: &str,
 ) -> Result<bool> {
     let changed = match from {
-        None => c.sql.exec(SEED_STAMP, &[text(catalogue)]).await?,
-        Some(from) => c.sql.exec(ADVANCE_STAMP, &[int(from)?]).await?,
+        None => {
+            c.sql
+                .exec(
+                    "INSERT INTO rollback_stamp(id, counter, catalogue_id) VALUES (1, 1, ?1) \
+                     ON CONFLICT(id) DO NOTHING",
+                    &[text(catalogue)],
+                )
+                .await?
+        }
+        Some(from) => {
+            c.sql
+                .exec(
+                    "UPDATE rollback_stamp SET counter = counter + 1 \
+                     WHERE id = 1 AND counter = ?1 AND rolled_back_at IS NULL",
+                    &[int(from)?],
+                )
+                .await?
+        }
     };
     Ok(changed == 1)
 }
@@ -652,16 +760,36 @@ pub(super) async fn stamp_rolled_back<S: Sql>(
         // Without a row the counter is 0: behind every stamp object.
         None => {
             c.sql
-                .exec(SEED_ROLLBACK_MARK, &[ms(now), text(catalogue)])
+                .exec(
+                    "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
+                     VALUES (1, 0, ?2, ?1) ON CONFLICT(id) DO NOTHING",
+                    &[ms(now), text(catalogue)],
+                )
                 .await?
         }
-        Some(seen) => c.sql.exec(MARK_ROLLBACK, &[ms(now), int(seen)?]).await?,
+        Some(seen) => {
+            c.sql
+                .exec(
+                    "UPDATE rollback_stamp SET rolled_back_at = ?1 \
+                     WHERE id = 1 AND counter = ?2 AND rolled_back_at IS NULL",
+                    &[ms(now), int(seen)?],
+                )
+                .await?
+        }
     };
     Ok(changed == 1)
 }
 
 pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
-    let rows = c.sql.query(REPLAY_ACTIVE, &[]).await?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT (SELECT COUNT(*) FROM restore_state WHERE state <> 'complete') \
+                  + (SELECT COUNT(*) FROM rollback_stamp \
+                     WHERE id = 1 AND rolled_back_at IS NOT NULL)",
+            &[],
+        )
+        .await?;
     match rows.first().map(Vec::as_slice) {
         Some([SqlValue::Int(n)]) => Ok(*n != 0),
         _ => Err(BridgeError::Sql("row decode: restore state".into())),
@@ -674,14 +802,26 @@ pub(super) async fn restore_pending<S: Sql>(c: &SqlCatalog<S>) -> Result<bool> {
 /// start of a request is read before the batch runs, and a replay that
 /// started in between must not find a write committed under it.
 pub(super) fn guard_no_replay() -> Stmt {
-    (GUARD_NO_REPLAY, Vec::new())
+    (
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete') \
+           OR EXISTS (SELECT 1 FROM rollback_stamp WHERE id = 1 AND rolled_back_at IS NOT NULL)",
+        Vec::new(),
+    )
 }
 
 pub(super) async fn restore_progress<S: Sql>(
     c: &SqlCatalog<S>,
     run: UnixMs,
 ) -> Result<Option<RestoreProgress>> {
-    let rows = c.sql.query(REPLAY_PROGRESS, &[ms(run)]).await?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT since_ms, reached_phase, reached_after, reached_extent, state = 'complete' \
+             FROM restore_state WHERE id = 1 AND started_at = ?1",
+            &[ms(run)],
+        )
+        .await?;
     let bad = || BridgeError::Sql("row decode: restore progress".into());
     match rows.first().map(Vec::as_slice) {
         None => Ok(None),
@@ -714,7 +854,9 @@ pub(super) async fn restore_advance<S: Sql>(
 ) -> Result<()> {
     c.sql
         .exec(
-            ADVANCE_REPLAY_PROGRESS,
+            "UPDATE restore_state SET reached_phase = ?2, reached_after = ?3, reached_extent = ?4 \
+             WHERE id = 1 AND started_at = ?1 AND (reached_phase IS NULL \
+               OR (reached_phase, reached_after, reached_extent) < (?2, ?3, ?4))",
             &[
                 ms(run),
                 SqlValue::Int(i64::from(next.phase)),
@@ -725,6 +867,10 @@ pub(super) async fn restore_advance<S: Sql>(
         .await?;
     Ok(())
 }
+
+/// An extent with neither a pinned copy nor an article plan.
+const NO_COPY: &str = "e.safety_state = 'deleted' AND e.plan IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)";
 
 /// Extent ids per statement of [`unreadable_plans`].
 const LOST_CHUNK: usize = 50;
@@ -746,9 +892,11 @@ async fn has_lost_extent<S: Sql>(c: &SqlCatalog<S>, values: &[String]) -> Result
         let rows = c
             .sql
             .query_after_refusal(
-                c.sql
-                    .dialect()
-                    .pick(EXTENT_HAS_NO_COPY, EXTENT_HAS_NO_COPY_PG),
+                &format!(
+                    "SELECT 1 FROM json_each(?1) j \
+                       CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
+                      WHERE {NO_COPY} LIMIT 1"
+                ),
                 &[SqlValue::Text(value.clone())],
             )
             .await?;
@@ -777,9 +925,9 @@ async fn has_unread_extent<S: Sql>(
         let sizes = c
             .sql
             .query(
-                c.sql
-                    .dialect()
-                    .pick(UNREAD_PLAN_SIZES, UNREAD_PLAN_SIZES_PG),
+                "SELECT e.id, length(e.plan) FROM json_each(?1) j \
+                   CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
+                  WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL",
                 &[SqlValue::Text(value)],
             )
             .await?;
@@ -794,9 +942,9 @@ async fn has_unread_extent<S: Sql>(
             let rows = c
                 .sql
                 .query(
-                    c.sql
-                        .dialect()
-                        .pick(UNREAD_PLAN_VALUES, UNREAD_PLAN_VALUES_PG),
+                    "SELECT e.id, e.cipher_size, e.plan FROM json_each(?1) j \
+                       CROSS JOIN extents e ON e.id = j.value \
+                      WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL",
                     &[SqlValue::Text(ids)],
                 )
                 .await?;
@@ -879,7 +1027,10 @@ pub(super) async fn replay_twin<S: Sql>(
     let wanted = placements.len() as u64;
     let held = count(
         c.sql
-            .query_after_refusal(COUNT_REPLAY_EXTENTS, &[text(live.id.as_str())])
+            .query_after_refusal(
+                "SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1",
+                &[text(live.id.as_str())],
+            )
             .await?,
     )?;
     if held != wanted {
@@ -890,9 +1041,10 @@ pub(super) async fn replay_twin<S: Sql>(
         same += count(
             c.sql
                 .query_after_refusal(
-                    c.sql
-                        .dialect()
-                        .pick(COUNT_MATCHED_PLACEMENTS, COUNT_MATCHED_PLACEMENTS_PG),
+                    "SELECT COUNT(*) FROM json_each(?2) j CROSS JOIN generation_extents ge \
+                         ON ge.generation_id = ?1 AND ge.seq = json_extract(j.value,'$[1]') \
+                      WHERE ge.extent_id = json_extract(j.value,'$[0]') \
+                        AND ge.plain_offset = json_extract(j.value,'$[2]')",
                     &[text(live.id.as_str()), SqlValue::Text(value)],
                 )
                 .await?,
@@ -909,7 +1061,8 @@ async fn has_older<S: Sql>(
     g: &GenerationRow,
     after_refusal: bool,
 ) -> Result<bool> {
-    let sql = HAS_OLDER_GENERATION;
+    let sql = "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
+               AND id < ?3 LIMIT 1";
     let params = [
         text(g.bucket_id.as_str()),
         text(&g.key),
@@ -962,7 +1115,9 @@ pub(super) async fn replay_publish<S: Sql>(
     let bucket = || text(g.bucket_id.as_str());
     let mut stmts: Vec<Stmt> = Vec::with_capacity(12 + 2 * values.len());
     stmts.push((
-        GUARD_REPLAY_NEW_GENERATION,
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
+         OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
+                    AND generation_id > ?1)",
         vec![gen_id(), bucket(), text(&g.key)],
     ));
     stmts.push(clear_floor(&g.bucket_id, &g.key, &g.id));
@@ -971,8 +1126,7 @@ pub(super) async fn replay_publish<S: Sql>(
     // holds is shared with it (this generation is a copy of that one, or
     // that one of this) and gets a second reference. Two statements per
     // value of placements, not two per extent.
-    stmts.extend(super::publish::adopt_in(
-        c.sql.dialect(),
+    stmts.extend(super::publish::adopt(
         &g.id,
         &g.bucket_id,
         super::publish::Source::Record,
@@ -980,7 +1134,17 @@ pub(super) async fn replay_publish<S: Sql>(
     ));
     // The referenced extents tile the object exactly, each with its key.
     stmts.push((
-        GUARD_REPLAY_TILING,
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+           (SELECT COUNT(*) FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             WHERE ge.generation_id = ?1 AND e.wrapped_file_key IS NOT NULL) <> ?2 \
+           OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM generation_extents ge \
+                 JOIN extents e ON e.id = ge.extent_id WHERE ge.generation_id = ?1) <> ?3 \
+           OR EXISTS (SELECT 1 FROM (SELECT ge.plain_offset AS plain_offset, \
+                SUM(e.plain_size) OVER (ORDER BY ge.seq \
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
+                FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+               WHERE ge.generation_id = ?1) \
+              WHERE plain_offset <> COALESCE(expected, 0))",
         vec![
             gen_id(),
             SqlValue::Int(i64::from(g.extent_count)),
@@ -990,15 +1154,24 @@ pub(super) async fn replay_publish<S: Sql>(
     // A generation that cannot be read in full replaces nothing. On a
     // key without an older generation it is published, so that the key
     // answers with an error and not with "no such key".
-    stmts.push((GUARD_DAMAGED_REPLAY, vec![gen_id(), bucket(), text(&g.key)]));
+    stmts.push((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations \
+           WHERE bucket_id = ?2 AND key = ?3 AND id < ?1) \
+         AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' AND e.plan IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))",
+        vec![gen_id(), bucket(), text(&g.key)],
+    ));
     // An extent whose pinned copy is held goes through post and verify
     // again: posting a planned article twice is harmless, and the read
     // back is the evidence a release needs. The obligation stays under
     // the generation the extent was first written for.
     stmts.push((
-        c.sql
-            .dialect()
-            .pick(INSERT_REPLAY_OUTBOX, INSERT_REPLAY_OUTBOX_PG),
+        "INSERT OR IGNORE INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
+         SELECT e.id, e.generation_id, \
+                CASE e.safety_state WHEN 'held' THEN 'post' ELSE 'done' END, ?2, ?2 \
+           FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1",
         vec![gen_id(), ms(now)],
     ));
     // A shared extent can have left service earlier in this replay: the
@@ -1006,20 +1179,34 @@ pub(super) async fn replay_publish<S: Sql>(
     // before this one. It is back in service now, so its obligation runs
     // again, and the collection queued for it is called off below.
     // Nothing collects while a restore runs, so no delete is under way.
-    stmts.push((REARM_REPLAY_OUTBOX, vec![gen_id(), ms(now)]));
+    stmts.push((
+        "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
+                                          WHERE e.id = outbox.extent_id) \
+                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
+                                   ELSE 'done' END, \
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?2, updated_at = ?2, \
+                sent_at = NULL, lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL \
+          WHERE stage = 'cancelled' AND extent_id IN \
+                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
+        vec![gen_id(), ms(now)],
+    ));
     // Its open GC rows are closed: they were queued for a retirement
     // that this reference undoes. When the extent really leaves service,
     // the retirement that takes its last reference queues fresh rows.
-    stmts.push((CLOSE_REPLAY_GC, vec![gen_id(), ms(now)]));
-    stmts.extend(retire_live_in(
-        c.sql.dialect(),
+    stmts.push((
+        "UPDATE gc SET done_at = ?2 WHERE done_at IS NULL AND extent_id IN \
+                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)",
+        vec![gen_id(), ms(now)],
+    ));
+    stmts.extend(retire_live(
         &g.bucket_id,
         &g.key,
         GenerationState::Superseded,
         now,
     ));
     stmts.push((
-        SET_REPLAY_LIVE_POINTER,
+        "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
         vec![bucket(), text(&g.key), gen_id()],
     ));
     match c.sql.batch(stmts).await {
@@ -1040,7 +1227,9 @@ pub(super) async fn replay_publish<S: Sql>(
 /// The row of `g` as the live generation it describes.
 fn insert_live(g: &GenerationRow) -> Result<Stmt> {
     Ok((
-        INSERT_REPLAY_GENERATION,
+        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
         vec![
             text(g.id.as_str()),
             text(g.bucket_id.as_str()),
@@ -1054,423 +1243,4 @@ fn insert_live(g: &GenerationRow) -> Result<Stmt> {
             ms(g.created_at),
         ],
     ))
-}
-
-const FENCE_CLAIMS_PG: &str =
-    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL, \
-       cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
-     WHERE extent_id = ?1 \
-       AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-         AND parity IS NOT DISTINCT FROM ?3 AND parity_count IS NOT DISTINCT FROM ?4::bigint)";
-
-const INSERT_BUCKET: &str =
-    "INSERT OR IGNORE INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
-           created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)";
-
-const INSERT_BUCKET_PG: &str =
-    "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
-           created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING";
-
-const INSERT_ARTICLE: &str =
-    "INSERT OR IGNORE INTO articles(extent_id, idx, message_id, newsgroup, headers, \
-           cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
-           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
-           WHERE (SELECT plan FROM extents WHERE id = ?1) IS NULL";
-
-const INSERT_ARTICLE_PG: &str =
-    "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
-           cipher_offset, cipher_len, payload_sha256, yenc_name, state) \
-           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 \
-           WHERE (SELECT plan FROM extents WHERE id = ?1) IS NULL ON CONFLICT DO NOTHING";
-
-const INSERT_EXTENT: &str =
-    "INSERT OR IGNORE INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
-           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
-         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)";
-
-const INSERT_EXTENT_PG: &str = "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
-           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
-         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13) ON CONFLICT DO NOTHING";
-
-const DROP_PASSES_FOR_SWAP: &str = "DELETE FROM verifications WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS NOT ?3)";
-
-const DROP_PASSES_FOR_SWAP_PG: &str = "DELETE FROM verifications WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS DISTINCT FROM ?3)";
-
-const FENCE_CLAIMS_FOR_SWAP: &str =
-    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
-                   lease_until = NULL, \
-                   cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
-                 WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS NOT ?3)";
-
-const FENCE_CLAIMS_FOR_SWAP_PG: &str =
-    "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = NULL, \
-                   lease_until = NULL, \
-                   cursor = CASE stage WHEN 'verify' THEN 0 ELSE cursor END \
-                 WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS DISTINCT FROM ?3)";
-
-const DROP_PASSES_FOR_ADDENDUM: &str = "DELETE FROM verifications WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS ?3 AND quote(parity_count) = ?4)";
-
-const DROP_PASSES_FOR_ADDENDUM_PG: &str = "DELETE FROM verifications WHERE extent_id = ?1 \
-                   AND EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND plan = ?2 \
-                     AND parity IS NOT DISTINCT FROM ?3 AND parity_count IS NOT DISTINCT FROM ?4::bigint)";
-
-const REPLACE_ADDENDUM: &str = "UPDATE extents SET parity = ?5, parity_count = ?6 \
-                 WHERE id = ?1 AND plan = ?2 AND parity IS ?3 AND quote(parity_count) = ?4";
-
-const REPLACE_ADDENDUM_PG: &str = "UPDATE extents SET parity = ?5, parity_count = ?6 \
-                 WHERE id = ?1 AND plan = ?2 AND parity IS NOT DISTINCT FROM ?3 AND parity_count IS NOT DISTINCT FROM ?4::bigint";
-
-fn unreadable_plan_sql(dialect: crate::ports::Dialect, arity: usize) -> String {
-    let marks = vec!["?"; arity].join(",");
-    match dialect {
-        crate::ports::Dialect::Sqlite => format!(
-            "SELECT id, cipher_size, plan, parity, \
-                       CASE WHEN typeof(parity_count) = 'real' \
-                           OR (typeof(parity_count) = 'integer' \
-                             AND parity_count NOT BETWEEN 0 AND 4294967295) \
-                         THEN quote(parity_count) ELSE parity_count END, \
-                       quote(parity_count) \
-                     FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
-        ),
-        crate::ports::Dialect::Postgres => format!(
-            "SELECT id, cipher_size, plan, parity, \
-            parity_count, parity_count FROM extents WHERE id IN ({marks}) AND plan IS NOT NULL"
-        ),
-    }
-}
-
-const GUARD_REPLAY_RUN: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-                   (SELECT started_at FROM restore_state WHERE id = 1) IS NOT ?1";
-
-const GUARD_REPLAY_RUN_PG: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-                   (SELECT started_at FROM restore_state WHERE id = 1) IS DISTINCT FROM ?1";
-
-const LEVEL_STAMP: &str = "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
-                 SELECT 1, ?1, ?3, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
-                   WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
-                   AND (SELECT counter FROM rollback_stamp WHERE id = 1) IS ?4 \
-                 ON CONFLICT(id) DO UPDATE SET \
-                   counter = max(counter, excluded.counter), rolled_back_at = NULL";
-
-const LEVEL_STAMP_PG: &str = "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
-                 SELECT 1, ?1, ?3, NULL WHERE EXISTS (SELECT 1 FROM restore_state \
-                   WHERE id = 1 AND started_at = ?2 AND state = 'replaying') \
-                   AND (SELECT counter FROM rollback_stamp WHERE id = 1) IS NOT DISTINCT FROM ?4 \
-                 ON CONFLICT(id) DO UPDATE SET \
-                   counter = GREATEST(rollback_stamp.counter, excluded.counter), rolled_back_at = NULL";
-
-macro_rules! damaged {
-    () => {
-        "FROM objects o WHERE EXISTS (SELECT 1 FROM generation_extents ge \
-         JOIN extents e ON e.id = ge.extent_id \
-         WHERE ge.generation_id = o.generation_id AND e.safety_state = 'deleted' \
-           AND e.plan IS NULL \
-           AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))"
-    };
-}
-
-const COUNT_DAMAGED: &str = concat!("SELECT COUNT(*) ", damaged!());
-const LIST_DAMAGED: &str = concat!(
-    "SELECT o.generation_id ",
-    damaged!(),
-    " ORDER BY o.generation_id LIMIT ?1"
-);
-
-const UNREAD_PLAN_SIZES: &str = "SELECT e.id, length(e.plan) FROM json_each(?1) j \
-                   CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
-                  WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL";
-
-const UNREAD_PLAN_SIZES_PG: &str =
-    "SELECT e.id, octet_length(e.plan) FROM jsonb_array_elements(?1::jsonb) AS j(value) \
-                   JOIN extents e ON e.id = (j.value->>0) \
-                  WHERE e.safety_state = 'deleted' AND e.plan IS NOT NULL";
-
-const UNREAD_PLAN_VALUES: &str = "SELECT e.id, e.cipher_size, e.plan FROM json_each(?1) j \
-                       CROSS JOIN extents e ON e.id = j.value \
-                      WHERE +e.safety_state = 'deleted' AND e.plan IS NOT NULL";
-
-const UNREAD_PLAN_VALUES_PG: &str =
-    "SELECT e.id, e.cipher_size, e.plan FROM jsonb_array_elements_text(?1::jsonb) AS j(value) \
-                       JOIN extents e ON e.id = j.value \
-                      WHERE e.safety_state = 'deleted' AND e.plan IS NOT NULL";
-
-const COUNT_MATCHED_PLACEMENTS: &str =
-    "SELECT COUNT(*) FROM json_each(?2) j CROSS JOIN generation_extents ge \
-                         ON ge.generation_id = ?1 AND ge.seq = json_extract(j.value,'$[1]') \
-                      WHERE ge.extent_id = json_extract(j.value,'$[0]') \
-                        AND ge.plain_offset = json_extract(j.value,'$[2]')";
-
-const COUNT_MATCHED_PLACEMENTS_PG: &str =
-    "SELECT COUNT(*) FROM jsonb_array_elements(?2::jsonb) AS j(value) JOIN generation_extents ge \
-                         ON ge.generation_id = ?1 AND ge.seq = (j.value->>1)::bigint \
-                      WHERE ge.extent_id = (j.value->>0) \
-                        AND ge.plain_offset = (j.value->>2)::bigint";
-
-macro_rules! no_copy {
-    () => {
-        "e.safety_state = 'deleted' AND e.plan IS NULL \
-     AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id)"
-    };
-}
-
-const EXTENT_HAS_NO_COPY: &str = concat!(
-    "SELECT 1 FROM json_each(?1) j \
-                       CROSS JOIN extents e ON e.id = json_extract(j.value,'$[0]') \
-                      WHERE ",
-    no_copy!(),
-    " LIMIT 1"
-);
-const EXTENT_HAS_NO_COPY_PG: &str = concat!(
-    "SELECT 1 FROM jsonb_array_elements(?1::jsonb) AS j(value) \
-                       JOIN extents e ON e.id = (j.value->>0) \
-                      WHERE ",
-    no_copy!(),
-    " LIMIT 1"
-);
-
-const INSERT_REPLAY_OUTBOX: &str =
-    "INSERT OR IGNORE INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-         SELECT e.id, e.generation_id, \
-                CASE e.safety_state WHEN 'held' THEN 'post' ELSE 'done' END, ?2, ?2 \
-           FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1";
-
-const INSERT_REPLAY_OUTBOX_PG: &str =
-    "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at) \
-         SELECT e.id, e.generation_id, \
-                CASE e.safety_state WHEN 'held' THEN 'post' ELSE 'done' END, ?2, ?2 \
-           FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1 ON CONFLICT DO NOTHING";
-
-const REPLAY_PROBE: &str = "SELECT (SELECT COUNT(*) FROM generations WHERE id = ?1), \
-                    (SELECT COUNT(*) FROM objects WHERE bucket_id = ?2 AND key = ?3 \
-                       AND generation_id > ?1)";
-
-const RESTORE_PACKED_PLAN: &str =
-    "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
-                   parity = ?5, parity_count = ?6 \
-                 WHERE id = ?1 AND plan IS NULL \
-                   AND NOT EXISTS (SELECT 1 FROM articles WHERE extent_id = ?1)";
-
-const RESTORE_UNPACKED_COUNT: &str = "UPDATE extents SET article_count = ?2, plan_rev = ?3 \
-                 WHERE id = ?1 AND article_count IS NULL";
-
-const SET_ABSENT_SAFETY: &str =
-    "UPDATE extents SET safety_state = 'deleted', evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND safety_state IN ('held', 'releasing')";
-
-const TERMINATE_ABSENT_OUTBOX: &str = "UPDATE outbox SET stage = 'done', lease_owner = NULL, lease_until = NULL, \
-               sent_at = NULL, updated_at = ?2 WHERE extent_id = ?1 AND stage IN ('post', 'verify', 'release')";
-
-const RESTORE_ARTICLES_POSTED: &str =
-    "UPDATE articles SET state = 'posted' WHERE extent_id = ?1 AND state = 'planned'";
-
-const RESTORE_EXTENT_POSTED: &str = "UPDATE extents SET posted_at = ?2 \
-             WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL";
-
-const REPLACE_UNREADABLE_PLAN: &str =
-    "UPDATE extents SET article_count = ?2, plan_rev = ?3, plan = ?4, \
-                   parity = ?6, parity_count = ?7 \
-                 WHERE id = ?1 AND plan = ?5";
-
-const REPLAY_HELD_PAGE: &str =
-    "SELECT id FROM extents WHERE id > ?1 AND safety_state IN ('held', 'releasing') \
-             ORDER BY id LIMIT ?2";
-
-const REPLAY_STATE: &str =
-    "SELECT started_at, state = 'complete', since_ms FROM restore_state WHERE id = 1";
-
-const GUARD_REPLAY_WINDOW: &str =
-    "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM restore_state \
-                   WHERE id = 1 AND state <> 'complete' AND since_ms >= 0 AND ?1 > since_ms)";
-
-const PRUNE_WRITE_INTENTS: &str = "DELETE FROM write_intents WHERE NOT \
-                   (state = 'kept' AND generation_id IS NOT NULL AND generation_id <= ?1)";
-
-const ARM_REPLAY: &str = "INSERT INTO restore_state(id, state, since_ms, started_at, finished_at) \
-                 VALUES (1, 'replaying', ?1, ?2, NULL) \
-                 ON CONFLICT(id) DO UPDATE SET state = 'replaying', since_ms = excluded.since_ms, \
-                   started_at = excluded.started_at, \
-                   finished_at = NULL, reached_phase = NULL, reached_after = NULL, \
-                   reached_extent = NULL";
-
-const FINISH_REPLAY_STATE: &str = "UPDATE restore_state SET state = 'complete', \
-                   finished_at = COALESCE(finished_at, ?1) \
-                 WHERE id = 1 AND started_at = ?2 AND (state = 'complete' OR EXISTS \
-                   (SELECT 1 FROM rollback_stamp WHERE id = 1 AND counter >= ?3 \
-                    AND rolled_back_at IS NULL))";
-
-const READ_STAMP: &str = "SELECT counter, rolled_back_at IS NOT NULL, catalogue_id = ?1 \
-             FROM rollback_stamp WHERE id = 1";
-
-const SEED_STAMP: &str = "INSERT INTO rollback_stamp(id, counter, catalogue_id) VALUES (1, 1, ?1) \
-                     ON CONFLICT(id) DO NOTHING";
-
-const ADVANCE_STAMP: &str = "UPDATE rollback_stamp SET counter = counter + 1 \
-                     WHERE id = 1 AND counter = ?1 AND rolled_back_at IS NULL";
-
-const SEED_ROLLBACK_MARK: &str =
-    "INSERT INTO rollback_stamp(id, counter, catalogue_id, rolled_back_at) \
-                     VALUES (1, 0, ?2, ?1) ON CONFLICT(id) DO NOTHING";
-
-const MARK_ROLLBACK: &str = "UPDATE rollback_stamp SET rolled_back_at = ?1 \
-                     WHERE id = 1 AND counter = ?2 AND rolled_back_at IS NULL";
-
-const REPLAY_ACTIVE: &str =
-    "SELECT (SELECT COUNT(*) FROM restore_state WHERE state <> 'complete') \
-                  + (SELECT COUNT(*) FROM rollback_stamp \
-                     WHERE id = 1 AND rolled_back_at IS NOT NULL)";
-
-const GUARD_NO_REPLAY: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
-           (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete') \
-           OR EXISTS (SELECT 1 FROM rollback_stamp WHERE id = 1 AND rolled_back_at IS NOT NULL)";
-
-const REPLAY_PROGRESS: &str =
-    "SELECT since_ms, reached_phase, reached_after, reached_extent, state = 'complete' \
-             FROM restore_state WHERE id = 1 AND started_at = ?1";
-
-const ADVANCE_REPLAY_PROGRESS: &str =
-    "UPDATE restore_state SET reached_phase = ?2, reached_after = ?3, reached_extent = ?4 \
-             WHERE id = 1 AND started_at = ?1 AND (reached_phase IS NULL \
-               OR (reached_phase, reached_after, reached_extent) < (?2, ?3, ?4))";
-
-const COUNT_REPLAY_EXTENTS: &str =
-    "SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1";
-
-const HAS_OLDER_GENERATION: &str = "SELECT 1 FROM generations WHERE bucket_id = ?1 AND key = ?2 \
-               AND id < ?3 LIMIT 1";
-
-const GUARD_REPLAY_NEW_GENERATION: &str =
-    "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations WHERE id = ?1) \
-         OR EXISTS (SELECT 1 FROM objects WHERE bucket_id = ?2 AND key = ?3 \
-                    AND generation_id > ?1)";
-
-const GUARD_REPLAY_TILING: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-           (SELECT COUNT(*) FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-             WHERE ge.generation_id = ?1 AND e.wrapped_file_key IS NOT NULL) <> ?2 \
-           OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM generation_extents ge \
-                 JOIN extents e ON e.id = ge.extent_id WHERE ge.generation_id = ?1) <> ?3 \
-           OR EXISTS (SELECT 1 FROM (SELECT ge.plain_offset AS plain_offset, \
-                SUM(e.plain_size) OVER (ORDER BY ge.seq \
-                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected \
-                FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-               WHERE ge.generation_id = ?1) \
-              WHERE plain_offset <> COALESCE(expected, 0))";
-
-const GUARD_DAMAGED_REPLAY: &str =
-    "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM generations \
-           WHERE bucket_id = ?2 AND key = ?3 AND id < ?1) \
-         AND EXISTS (SELECT 1 FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-          WHERE ge.generation_id = ?1 AND e.safety_state = 'deleted' AND e.plan IS NULL \
-            AND NOT EXISTS (SELECT 1 FROM articles a WHERE a.extent_id = e.id))";
-
-const REARM_REPLAY_OUTBOX: &str = "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
-                                          WHERE e.id = outbox.extent_id) \
-                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
-                                   ELSE 'done' END, \
-                attempts = 0, cursor = 0, last_error = NULL, next_at = ?2, updated_at = ?2, \
-                sent_at = NULL, lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL \
-          WHERE stage = 'cancelled' AND extent_id IN \
-                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)";
-
-const CLOSE_REPLAY_GC: &str = "UPDATE gc SET done_at = ?2 WHERE done_at IS NULL AND extent_id IN \
-                (SELECT extent_id FROM generation_extents WHERE generation_id = ?1)";
-
-const SET_REPLAY_LIVE_POINTER: &str =
-    "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id";
-
-const INSERT_REPLAY_GENERATION: &str =
-    "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)";
-
-/// Actual Postgres texts and representative wire types for typed PREPARE.
-#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
-pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
-    const I: SqlValue = SqlValue::Int(0);
-    const T: SqlValue = SqlValue::Text(String::new());
-    const B: SqlValue = SqlValue::Blob(Vec::new());
-    let mut statements = vec![
-        (FENCE_CLAIMS_PG.to_owned(), vec![T, B, B, I]),
-        (INSERT_BUCKET_PG.to_owned(), vec![T, T, T, B, I, I, I]),
-        (
-            INSERT_ARTICLE_PG.to_owned(),
-            vec![T, I, T, T, B, I, I, B, T, T],
-        ),
-        (
-            INSERT_EXTENT_PG.to_owned(),
-            vec![T, T, I, I, B, I, B, B, B, B, T, I, I],
-        ),
-        (DROP_PASSES_FOR_SWAP_PG.to_owned(), vec![T, B, B]),
-        (FENCE_CLAIMS_FOR_SWAP_PG.to_owned(), vec![T, B, B]),
-        (DROP_PASSES_FOR_ADDENDUM_PG.to_owned(), vec![T, B, B, I]),
-        (REPLACE_ADDENDUM_PG.to_owned(), vec![T, B, B, I, B, I]),
-        (GUARD_REPLAY_RUN_PG.to_owned(), vec![I]),
-        (LEVEL_STAMP_PG.to_owned(), vec![I, I, T, I]),
-        (COUNT_DAMAGED.to_owned(), vec![]),
-        (LIST_DAMAGED.to_owned(), vec![I]),
-        (UNREAD_PLAN_SIZES_PG.to_owned(), vec![T]),
-        (UNREAD_PLAN_VALUES_PG.to_owned(), vec![T]),
-        (COUNT_MATCHED_PLACEMENTS_PG.to_owned(), vec![T, T]),
-        (EXTENT_HAS_NO_COPY_PG.to_owned(), vec![T]),
-        (INSERT_REPLAY_OUTBOX_PG.to_owned(), vec![T, I]),
-        (REPLAY_PROBE.to_owned(), vec![T, T, T]),
-        (RESTORE_PACKED_PLAN.to_owned(), vec![T, I, I, B, B, I]),
-        (RESTORE_UNPACKED_COUNT.to_owned(), vec![T, I, I]),
-        (SET_ABSENT_SAFETY.to_owned(), vec![T]),
-        (TERMINATE_ABSENT_OUTBOX.to_owned(), vec![T, I]),
-        (RESTORE_ARTICLES_POSTED.to_owned(), vec![T]),
-        (RESTORE_EXTENT_POSTED.to_owned(), vec![T, I]),
-        (
-            REPLACE_UNREADABLE_PLAN.to_owned(),
-            vec![T, I, I, B, B, B, I],
-        ),
-        (REPLAY_HELD_PAGE.to_owned(), vec![T, I]),
-        (REPLAY_STATE.to_owned(), vec![]),
-        (GUARD_REPLAY_WINDOW.to_owned(), vec![I]),
-        (PRUNE_WRITE_INTENTS.to_owned(), vec![T]),
-        (ARM_REPLAY.to_owned(), vec![I, I]),
-        (FINISH_REPLAY_STATE.to_owned(), vec![I, I, I]),
-        (READ_STAMP.to_owned(), vec![T]),
-        (SEED_STAMP.to_owned(), vec![T]),
-        (ADVANCE_STAMP.to_owned(), vec![I]),
-        (SEED_ROLLBACK_MARK.to_owned(), vec![I, T]),
-        (MARK_ROLLBACK.to_owned(), vec![I, I]),
-        (REPLAY_ACTIVE.to_owned(), vec![]),
-        (GUARD_NO_REPLAY.to_owned(), vec![]),
-        (REPLAY_PROGRESS.to_owned(), vec![I]),
-        (ADVANCE_REPLAY_PROGRESS.to_owned(), vec![I, I, T, I]),
-        (COUNT_REPLAY_EXTENTS.to_owned(), vec![T]),
-        (HAS_OLDER_GENERATION.to_owned(), vec![T, T, T]),
-        (GUARD_REPLAY_NEW_GENERATION.to_owned(), vec![T, T, T]),
-        (GUARD_REPLAY_TILING.to_owned(), vec![T, I, I]),
-        (GUARD_DAMAGED_REPLAY.to_owned(), vec![T, T, T]),
-        (REARM_REPLAY_OUTBOX.to_owned(), vec![T, I]),
-        (CLOSE_REPLAY_GC.to_owned(), vec![T, I]),
-        (SET_REPLAY_LIVE_POINTER.to_owned(), vec![T, T, T]),
-        (
-            INSERT_REPLAY_GENERATION.to_owned(),
-            vec![T, T, T, I, T, T, T, T, I, I],
-        ),
-    ];
-    statements.extend((1..=LOST_CHUNK).map(|arity| {
-        (
-            unreadable_plan_sql(crate::ports::Dialect::Postgres, arity),
-            vec![T; arity],
-        )
-    }));
-    statements
 }
