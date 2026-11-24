@@ -2052,9 +2052,14 @@ async fn pg_overload_fences_complete_and_discards_its_record() {
         id: &upload,
     };
     let (mut expected_upload, expected_parts) = catalog.upload(&target).await.unwrap().unwrap();
-    let extents = sql.query("SELECT * FROM extents", &[]).await.unwrap();
+    let extents = sql
+        .db
+        .fixture_query("SELECT * FROM extents", &[])
+        .await
+        .unwrap();
     let pieces = sql
-        .query("SELECT * FROM upload_part_extents", &[])
+        .db
+        .fixture_query("SELECT * FROM upload_part_extents", &[])
         .await
         .unwrap();
     let safety_before = rig.bridge.safety.keys();
@@ -2078,11 +2083,15 @@ async fn pg_overload_fences_complete_and_discards_its_record() {
         "only the revision fence should change the upload"
     );
     assert_eq!(
-        sql.query("SELECT * FROM extents", &[]).await.unwrap(),
+        sql.db
+            .fixture_query("SELECT * FROM extents", &[])
+            .await
+            .unwrap(),
         extents
     );
     assert_eq!(
-        sql.query("SELECT * FROM upload_part_extents", &[])
+        sql.db
+            .fixture_query("SELECT * FROM upload_part_extents", &[])
             .await
             .unwrap(),
         pieces
