@@ -26,8 +26,9 @@ use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnecto
 use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
-    Body, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage,
-    Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs, JOB_VERSION,
+    Body, BridgeError, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus,
+    OutboxStage, Perm, Precondition, PreconditionError, RespBody, S3Request, S3Response, UnixMs,
+    JOB_VERSION,
 };
 
 /// Longest accepted origin-form target: a 1024-byte key with every byte
@@ -104,6 +105,18 @@ pub(super) fn s3_error(code: ErrorCode) -> S3Response {
 /// keys or provider replies.
 pub(super) fn internal() -> S3Response {
     s3_error(ErrorCode::InternalError)
+}
+
+/// Only a classified PostgreSQL overload asks the client to slow down.
+/// Unknown outcomes and all existing D1 errors retain their old response.
+pub(super) fn catalog_error(error: BridgeError) -> S3Response {
+    if error.is_pg_overloaded() {
+        let mut response = s3_error(ErrorCode::SlowDown);
+        response.headers.push(("retry-after".into(), "1".into()));
+        response
+    } else {
+        internal()
+    }
 }
 
 /// `503 ServiceUnavailable` with `Retry-After`: the object exists but its
@@ -472,7 +485,7 @@ where
             .catalog
             .access_key(&authority.akid)
             .await
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
             .filter(|row| row.status == KeyStatus::Active);
         // Under maintenance the catalogue may be a restored copy that
         // still holds a key revoked after it was taken, until the first
@@ -613,7 +626,7 @@ pub(super) async fn check_precondition<
         .catalog
         .live_generation(bucket, key)
         .await
-        .map_err(|_| internal())?;
+        .map_err(catalog_error)?;
     condition
         .check(live.as_ref().map(|g| g.etag.as_str()))
         .map_err(precondition_error)
@@ -659,7 +672,7 @@ pub(super) async fn hold_precondition<
         .raise_floor(bucket, key, id, false)
         .await
         .inspect_err(observed.on_error(Stage::Commit))
-        .map_err(|_| internal())?;
+        .map_err(catalog_error)?;
     check_precondition(bridge, bucket, key, condition)
         .await
         .inspect_err(observed.on_error(Stage::Lookup))
@@ -872,7 +885,7 @@ pub(super) async fn restore_gate<
     match bridge.catalog.restore_pending().await {
         Ok(false) => Ok(()),
         Ok(true) => Err(writes_refused()),
-        Err(_) => Err(internal()),
+        Err(error) => Err(catalog_error(error)),
     }
 }
 

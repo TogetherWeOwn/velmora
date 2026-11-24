@@ -30,9 +30,9 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate, check_precondition, checksum_json, conditional_gate, discard_before_retry,
-    from_proto, hold_precondition, internal, metadata_json, restore_failure, restore_gate,
-    s3_error, send_post_jobs, store_streamed, writes_refused,
+    authenticate, catalog_error, check_precondition, checksum_json, conditional_gate,
+    discard_before_retry, from_proto, hold_precondition, internal, metadata_json, restore_failure,
+    restore_gate, s3_error, send_post_jobs, store_streamed, writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::unwrap_bdk;
@@ -254,14 +254,14 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
         .await
         .map_err(|error| {
             observed.mark_stage(Stage::storage(&error));
-            internal()
+            catalog_error(error)
         })?;
         let refused = match bridge
             .catalog
             .commit_generation(&commit, condition.as_ref(), record)
             .await
             .inspect_err(observed.on_error(Stage::Commit))
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
         {
             PublishOutcome::Applied => break commit.generation.id.clone(),
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
@@ -297,7 +297,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             .newest_id(&bucket.id, key)
             .await
             .inspect_err(observed.on_error(Stage::Lookup))
-            .map_err(|_| internal())?;
+            .map_err(catalog_error)?;
         rng.fill_bytes(&mut generation_rand)
             .map_err(|_| internal())?;
         let id = id_after(bridge.clock.now(), newest.as_ref(), generation_rand);
@@ -404,9 +404,9 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
                 .map_err(|resp| restore_failure(observed, resp))?;
             return Err(writes_refused());
         }
-        Err(_) => {
+        Err(error) => {
             observed.mark_stage(Stage::Commit);
-            return Err(internal());
+            return Err(catalog_error(error));
         }
     }
 
@@ -537,10 +537,10 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
                 observed.mark_stage(Stage::Commit);
                 return Err(internal());
             }
-            Err(_) => {
+            Err(error) => {
                 give_up(bridge, &write).await;
                 observed.mark_stage(Stage::Commit);
-                return Err(internal());
+                return Err(catalog_error(error));
             }
         }
         // The stamp is raised with the id on the rows and before the
@@ -591,14 +591,14 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
         .await
         .map_err(|error| {
             observed.mark_stage(Stage::storage(&error));
-            internal()
+            catalog_error(error)
         })?;
         let refused = match bridge
             .catalog
             .commit_sliced(&commit, &write, condition.as_ref(), record)
             .await
             .inspect_err(observed.on_error(Stage::Commit))
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
         {
             PublishOutcome::Applied => break,
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
@@ -633,17 +633,21 @@ async fn put_sliced<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: K
                 .newest_id(&bucket.id, key)
                 .await
                 .inspect_err(observed.on_error(Stage::Lookup))
-                .ok()?;
-            rng.fill_bytes(&mut generation_rand).ok()?;
-            Some(id_after(
+                .map_err(catalog_error)?;
+            rng.fill_bytes(&mut generation_rand)
+                .map_err(|_| internal())?;
+            Ok::<_, S3Response>(id_after(
                 bridge.clock.now(),
                 newest.as_ref(),
                 generation_rand,
             ))
         };
-        let Some(id) = next.await else {
-            give_up(bridge, &write).await;
-            return Err(internal());
+        let id = match next.await {
+            Ok(id) => id,
+            Err(response) => {
+                give_up(bridge, &write).await;
+                return Err(response);
+            }
         };
         for e in &mut commit.extents {
             e.generation_id = Some(id.clone());

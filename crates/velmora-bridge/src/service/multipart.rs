@@ -131,8 +131,12 @@ impl From<UploadReadError> for Fail {
 }
 
 impl From<BridgeError> for Fail {
-    fn from(_: BridgeError) -> Self {
-        Fail::Internal
+    fn from(error: BridgeError) -> Self {
+        if error.is_pg_overloaded() {
+            Fail::S3(ErrorCode::SlowDown)
+        } else {
+            Fail::Internal
+        }
     }
 }
 

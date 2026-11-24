@@ -25,8 +25,9 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    check_precondition, discard_before_retry, hold_precondition, internal, metadata_json,
-    restore_failure, restore_gate, s3_error, stored_checksum, stored_headers, unavailable, Authed,
+    catalog_error, check_precondition, discard_before_retry, hold_precondition, internal,
+    metadata_json, restore_failure, restore_gate, s3_error, stored_checksum, stored_headers,
+    unavailable, Authed,
 };
 use crate::config::SINGLE_RECORD_EXTENTS;
 use crate::metrics::{FailureStage as Stage, RequestObservation};
@@ -123,7 +124,7 @@ where
         .catalog
         .live_generation(&bucket.id, key)
         .await
-        .map_err(|_| internal())?
+        .map_err(catalog_error)?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -177,7 +178,7 @@ where
         .catalog
         .live_object(&bucket.id, key)
         .await
-        .map_err(|_| internal())?
+        .map_err(catalog_error)?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -349,7 +350,7 @@ where
         .await
         .map_err(|error| {
             observed.mark_stage(Stage::storage(&error));
-            internal()
+            catalog_error(error)
         })?;
         drop(extents);
         let copy = CopyGeneration {
@@ -363,7 +364,7 @@ where
             .copy_generation(&copy, condition.as_ref(), record)
             .await
             .inspect_err(observed.on_error(Stage::Commit))
-            .map_err(|_| internal())?
+            .map_err(catalog_error)?
         {
             PublishOutcome::Applied => {
                 return result
