@@ -2166,8 +2166,11 @@ mod pg_plan_tests {
         let Some(mut db) = fixture::connect().await else {
             return;
         };
-        let tx = fixture::transaction_seeded(&mut db,
-            "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
+        // Start pinned, then make the middle span sparse through fenced transitions.
+        const RELEASE_GAP: &str =
+            "UPDATE extents SET safety_state = 'released', evict_seq = evict_seq + 1 \
+            WHERE seq BETWEEN 10000 AND 79000 AND seq % 137 <> 0;";
+        let seed = "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
                  VALUES ('b','bucket','owner',''::bytea,1,0);
              INSERT INTO generations (id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
                  SELECT 'g'||lpad(i::text,6,'0'),'b','key','live',1,'etag','{}','{}',1,0
@@ -2176,7 +2179,7 @@ mod pg_plan_tests {
                                   media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
                  SELECT 'x'||lpad(i::text,6,'0'),'b','g'||lpad(i::text,6,'0'),'committed',i,i-1,1,1,
                         ''::bytea,''::bytea,''::bytea,''::bytea,
-                        CASE WHEN i < 10000 OR i > 79000 OR i % 137 = 0 THEN 'held' ELSE 'released' END,0
+                        'held',0
                    FROM generate_series(1,100000) i;
              INSERT INTO generation_extents (generation_id,seq,extent_id,plain_offset)
                  SELECT generation_id,seq,id,plain_offset FROM extents;
@@ -2191,8 +2194,8 @@ mod pg_plan_tests {
              INSERT INTO uploads (id,bucket_id,key,content_json,user_meta_json,state,initiated_at)
                  SELECT 'upload'||seq,'b','key','{}','{}','open',0 FROM extents WHERE seq IS NOT NULL;
              INSERT INTO upload_parts (upload_id,part_number,extent_id,size,etag,uploaded_at)
-                 SELECT 'upload'||seq,1,id,1,'etag',0 FROM extents WHERE seq IS NOT NULL;",
-        ).await;
+                 SELECT 'upload'||seq,1,id,1,'etag',0 FROM extents WHERE seq IS NOT NULL;";
+        let tx = fixture::transaction_seeded(&mut db, &format!("{seed}{RELEASE_GAP}")).await;
         tx.batch_execute(
             "ANALYZE extents; ANALYZE outbox; ANALYZE generation_extents; ANALYZE generations; \
                           ANALYZE gc; ANALYZE uploads; ANALYZE upload_parts",
@@ -2257,13 +2260,15 @@ mod pg_plan_tests {
       VALUES ('b','bucket','owner',X'',1,0);
       INSERT INTO generations(id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
       VALUES ('g','b','key','live',6,'etag','{}','{}',6,0);";
+    const REVIVE_RELEASE_ONE: &str = "UPDATE extents SET safety_state = 'released', \
+      evict_seq = evict_seq + 1 WHERE id = 'x';";
     const REVIVE_FIXTURE: &str = "INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,
       plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
       VALUES ('z','b','g','committed',0,0,1,1,X'',X'',X'',X'','held',0),
              ('a','b','g','committed',1,1,1,1,X'',X'',X'',X'','held',0),
              ('y','b','g','committed',2,2,1,1,X'',X'',X'',X'','held',0),
              ('b','b','g','committed',3,3,1,1,X'',X'',X'',X'','releasing',0),
-             ('x','b','g','committed',4,4,1,1,X'',X'',X'',X'','released',0),
+             ('x','b','g','committed',4,4,1,1,X'',X'',X'',X'','held',0),
              ('c','b',NULL,'staged',NULL,NULL,1,1,X'',X'',X'',X'','held',0);
       INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,lease_token,lease_owner,lease_until)
       VALUES ('z','g','post',10,0,9,'old',NULL), ('a','g','post',10,0,9,'old',NULL),
@@ -2292,6 +2297,7 @@ mod pg_plan_tests {
         let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
         sqlite.apply(BUCKET).unwrap();
         sqlite.apply(REVIVE_FIXTURE).unwrap();
+        sqlite.apply(REVIVE_RELEASE_ONE).unwrap();
         sqlite.with_conn(|db| {
             let mut due = db.prepare(DUE_PAGE).unwrap();
             let due = due
@@ -2338,7 +2344,7 @@ mod pg_plan_tests {
             return;
         };
         let tx = fixture::transaction(&mut db).await;
-        for sql in [BUCKET, REVIVE_FIXTURE] {
+        for sql in [BUCKET, REVIVE_FIXTURE, REVIVE_RELEASE_ONE] {
             tx.batch_execute(&sql.replace("X''", "''::bytea"))
                 .await
                 .unwrap();
@@ -2419,7 +2425,7 @@ mod pg_plan_tests {
             ("unsampled light stat", false, 0, 1, STAT_ONLY, true),
             ("escalated with body on record", false, 0, 1, ESCALATE, true),
             ("at verify while held", true, 1, 0, "", true),
-            ("finish interrupted release", false, 1, 0, "UPDATE extents SET safety_state='releasing';", true),
+            ("finish interrupted release", false, 1, 0, "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = 'e';", true),
             ("lease inclusive at now", false, 1, 0, "UPDATE outbox SET lease_until=20;", true),
             ("only one pass", false, 1, 0, "DELETE FROM verifications WHERE backbone='beta';", false),
             ("second backbone not counted", false, 1, 0, "UPDATE verifications SET backbone='extra' WHERE backbone='beta';", false),
@@ -2430,9 +2436,9 @@ mod pg_plan_tests {
             ("incomplete pass", false, 1, 0, "UPDATE verifications SET articles_ok=1 WHERE backbone='alpha';", false),
             ("wrong lease token", false, 1, 0, "UPDATE outbox SET lease_token=8;", false),
             ("expired lease", false, 1, 0, "UPDATE outbox SET lease_until=19;", false),
-            ("already released", false, 1, 0, "UPDATE extents SET safety_state='released';", false),
+            ("already released", false, 1, 0, "UPDATE extents SET safety_state = 'released', evict_seq = evict_seq + 1 WHERE id = 'e';", false),
             ("no live reference", false, 1, 0, "UPDATE generations SET state='superseded';", false),
-            ("at verify while releasing", true, 1, 0, "UPDATE extents SET safety_state='releasing';", false),
+            ("at verify while releasing", true, 1, 0, "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = 'e';", false),
             ("escalated with stat only", false, 0, 1, escalated_stat.as_str(), false),
             ("full sample without body", false, 1, 1, STAT_ONLY, false),
         ];
