@@ -1996,7 +1996,7 @@ backend. Stop writers and arm the D1 restore fence before taking a **full**
 export with `catalog-export.sh`. Keep its verified manifest and original SQL;
 the wrapper disables Wrangler disk logging and redacts upload/download URLs.
 Do not run raw `wrangler d1 export` to obtain this receipt. Keep the frozen D1.
-Never use a live export, a subset of tables, or a reverse PG-to-D1 copy to roll back. Run these host tools from a trusted checkout with Python 3, psycopg 3.2+
+Never use a live export, a subset of tables, or a reverse PG-to-D1 copy to roll back. Run these host tools from a trusted checkout with Python 3.11+, psycopg 3.2+
 (`psycopg[binary]`), `sqlite3` with `-safe`, `psql`, and `zstd` for a compressed
 export. Keep the inputs, working files and output receipts in a private
 operator-owned directory (`umask 077`).
@@ -2020,7 +2020,28 @@ operator-owned directory (`umask 077`).
    use capped indexed rowid pages. It never counts or scans an unbounded D1
    table. The load/copy and verify modes do not call D1. Use the manifest
    returned by `catalog-export.sh` and its original SQL or verified, reassembled
-   `.zst` file. Keep the generated SQLite seal beside `frozen.sqlite`.
+   `.zst` file. The export command removes its staging files. In a new private
+   working directory, retrieve the exact printed bucket and manifest key via
+   the exporter's configured R2 rclone remote. Stop on any missing part or
+   size/digest mismatch; do not run `catalog-import.sh` to retrieve the files.
+
+   ```sh
+   set -eu
+   umask 077
+   rclone copyto -- "$EXPORT_REMOTE:$EXPORT_BUCKET/$MANIFEST_KEY" export.manifest.json
+   jq -er '.parts[] | [.key, .bytes, .sha256] | @tsv' export.manifest.json > export.parts.tsv
+   : > export.sql.zst
+   while IFS="$(printf '\t')" read -r key bytes digest; do
+     rclone copyto -- "$EXPORT_REMOTE:$EXPORT_BUCKET/$key" export.part
+     test "$(wc -c < export.part)" -eq "$bytes"
+     printf '%s  export.part\n' "$digest" | sha256sum --check --status
+     cat export.part >> export.sql.zst
+   done < export.parts.tsv
+   test "$(wc -c < export.sql.zst)" -eq "$(jq -er .zst_bytes export.manifest.json)"
+   printf '%s  export.sql.zst\n' "$(jq -er .zst_sha256 export.manifest.json)" | sha256sum --check --status
+   ```
+
+   Keep the generated SQLite seal beside `frozen.sqlite`.
 
    ```sh
    python3 ops/pg-copy.py --capture-boundaries --f1 f1.json > boundaries.json

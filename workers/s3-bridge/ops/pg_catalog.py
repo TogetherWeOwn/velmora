@@ -266,7 +266,25 @@ def cloudflare(path, payload=None):
 
 def d1_query(uuid, sql, params):
     require(D1_UUID.fullmatch(uuid or ""), "remote D1 operation requires a database UUID")
-    result = cloudflare(f"/d1/database/{uuid}/query", dict(sql=sql, params=params)).get("result")
+    # Every caller supplies a fixed SQL template whose '?' occurrences are
+    # binds. The D1 REST API accepts only string params; preserve SQLite types
+    # explicitly instead of relying on column affinity or implicit conversion.
+    fragments = sql.split("?")
+    require(len(fragments) == len(params) + 1, "invalid D1 bind count")
+    wire_sql, wire_params = [fragments[0]], []
+    for value, following in zip(params, fragments[1:]):
+        if value is None:
+            wire_sql.append("NULL")
+        elif safe_int(value):
+            wire_sql.append("CAST(? AS INTEGER)")
+            wire_params.append(str(value))
+        elif type(value) is str:
+            wire_sql.append("?")
+            wire_params.append(value)
+        else:
+            raise Failure("unsupported D1 bind type")
+        wire_sql.append(following)
+    result = cloudflare(f"/d1/database/{uuid}/query", dict(sql="".join(wire_sql), params=wire_params)).get("result")
     require(isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict)
             and result[0].get("success") is True and isinstance(result[0].get("results"), list)
             and isinstance(result[0].get("meta"), dict), "D1 query response invalid; stop")

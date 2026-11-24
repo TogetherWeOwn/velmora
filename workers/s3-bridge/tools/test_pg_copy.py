@@ -11,12 +11,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 
 BRIDGE = Path(__file__).resolve().parents[1]
 OPS = BRIDGE / "ops"
 sys.path.insert(0, str(OPS))
-from pg_catalog import Failure, capture_boundaries, pg_settings, seal_path, sqlite_boundaries, write_seal
+from pg_catalog import Failure, capture_boundaries, d1_query, pg_settings, seal_path, sqlite_boundaries, write_seal
 
 ATTEMPT = "0" * 31 + "1"
 D1_ID = "00000000-0000-0000-0000-000000000005"
@@ -248,6 +249,31 @@ class CopyTests(unittest.TestCase):
         with self.assertRaisesRegex(Failure, "invalid PGBRANCHID"):
             pg_settings(path, "kofra_ro")
 
+    def test_remote_fences_use_d1_string_binds_without_losing_sqlite_types(self):
+        statement = runpy.run_path(str(OPS / "pg-cutover-disarm.py"))["statement"]
+        with sqlite3.connect(self.db) as db:
+            db.row_factory = sqlite3.Row
+            def rest(path, payload):
+                self.assertTrue(path.endswith(f"/{D1_ID}/query"))
+                self.assertTrue(all(type(value) is str for value in payload["params"]))
+                before = db.total_changes
+                rows = [dict(r) for r in db.execute(payload["sql"], payload["params"])]
+                return dict(result=[dict(success=True, results=rows, meta={"changes": db.total_changes-before})])
+            def change(operation, receipt):
+                sql, args = statement(operation, receipt)
+                return d1_query(D1_ID, sql, args)["meta"]["changes"]
+            with patch("pg_catalog.cloudflare", side_effect=rest):
+                self.assertEqual(change("r0", F1), 1)
+                self.assertEqual(dict(db.execute("SELECT * FROM restore_state").fetchone()), BEFORE)
+                self.assertEqual(change("arm-f1", F1), 1)
+                self.assertEqual(dict(db.execute("SELECT * FROM restore_state").fetchone()), ARMED)
+                self.assertEqual(change("mark-f7", F1), 1)
+                self.assertEqual(change("r0", F1), 0)
+                db.execute("DELETE FROM restore_state")
+                fresh = dict(F1, restore_state_before=None, restore_state_armed=dict(ARMED, started_at=0))
+                self.assertEqual(change("arm-f1", fresh), 1)
+                self.assertEqual(dict(db.execute("SELECT * FROM restore_state").fetchone()), fresh["restore_state_armed"])
+
     def test_worker_history_allows_only_f6_pg_versions(self):
         verify = runpy.run_path(str(OPS / "pg-cutover-disarm.py"))["verify_deploy_history"]
         def deploy(name, when):
@@ -377,7 +403,8 @@ class CopyTests(unittest.TestCase):
         self.assertIn("non-empty", result.stderr)
         conn.execute("DELETE FROM tx_guard")
         from psycopg import sql
-        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO kofra_app").format(sql.Identifier(conn.info.parameter_status("search_path"))))
+        schema = conn.execute("SELECT current_schema()").fetchone()[0]
+        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO kofra_app").format(sql.Identifier(schema)))
         result = self.copy("--pg-env", env, "--apply")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("USAGE", result.stderr)
