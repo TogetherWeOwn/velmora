@@ -1245,7 +1245,17 @@ async fn a_warm_extent_ends_the_connections_of_a_cold_body() {
 /// dropped gives everything back.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
-    let cold = cold_rig().await;
+    tokio::task::LocalSet::new()
+        .run_until(cold_body_waits_for_reader())
+        .await;
+}
+
+async fn cold_body_waits_for_reader() {
+    // Without a spawner, this producer is only polled by the reader, so
+    // waiting after the headers cannot finish its outstanding cache write.
+    // A spawner without a sleeper lets the write finish but does not enable
+    // read-ahead: the producer settles and waits for the next pull.
+    let cold = cold_rig_on(2, None, Some(local_spawner())).await;
     let rig = &cold.rig;
     let parts = [
         pattern(77, 300_000),
@@ -1254,6 +1264,21 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
     ];
     let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
     let budget = &rig.bridge.budget;
+    let settle = |piece_bytes| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if budget.in_use() <= piece_bytes
+                    && rig.bridge.nntp.live() == 0
+                    && free_slots(rig).await == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache write, connections, and slots settle before the next pull");
+    };
     let open = || {
         let req = cold.signer.sign(
             rig.now(),
@@ -1268,6 +1293,7 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
 
     let resp = open().await;
     assert_eq!(resp.status, 200);
+    settle(300_000).await;
     assert_eq!(budget.in_use(), 300_000);
     assert!(cached(rig, &extents[0]) && !cached(rig, &extents[1]));
     assert_eq!(rig.bridge.nntp.live(), 0, "no connection sits idle");
@@ -1283,6 +1309,7 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
     );
 
     assert_eq!(body.next().await.unwrap().unwrap(), parts[1]);
+    settle(0).await;
     assert!(cached(rig, &extents[1]) && !cached(rig, &extents[2]));
     assert_eq!(rig.bridge.nntp.live(), 0);
 
