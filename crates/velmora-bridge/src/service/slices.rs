@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 
 use crate::crypto::{seal_extent, DataKey, SealedExtent};
 use crate::ingress::{Charge, IngressError, UploadLengths};
+use crate::metrics::Fault;
 use crate::ports::{BlobMeta, BlobStore};
 use crate::types::{Body, BucketId, ExtentId};
 
@@ -29,8 +30,9 @@ pub(super) enum SliceError {
     Ingress(IngressError),
     /// The validator refused the body (framing, signature, digest).
     Proto(ErrorCode),
-    /// The blob store failed. Slices stored so far stay.
-    Store,
+    /// The blob store failed, the last attempt with this fault. Slices
+    /// stored so far stay.
+    Store(Fault),
     /// A seal or local invariant failed.
     Internal,
 }
@@ -141,6 +143,7 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
     ) -> Result<(), SliceError> {
         let id = self.ids.get(stored.len()).ok_or(SliceError::Internal)?;
         let mut rng = Replay::new(&mut *self.rng);
+        let mut fault = Fault::named("NoAttempt");
         for _ in 0..PUT_ATTEMPTS {
             rng.at = 0;
             let mut sealed = seal_extent(self.bdk, self.bucket, id, plain, &mut rng)
@@ -159,16 +162,19 @@ impl<B: BlobStore, R: FillRandom> SliceSink<'_, B, R> {
                     },
                 )
                 .await;
-            if put.is_ok() {
-                stored.push(StoredSlice {
-                    plain_size: plain.len() as u64,
-                    cipher_size,
-                    sealed,
-                });
-                return Ok(());
+            match put {
+                Ok(()) => {
+                    stored.push(StoredSlice {
+                        plain_size: plain.len() as u64,
+                        cipher_size,
+                        sealed,
+                    });
+                    return Ok(());
+                }
+                Err(e) => fault = Fault::of(&e),
             }
         }
-        Err(SliceError::Store)
+        Err(SliceError::Store(fault))
     }
 }
 

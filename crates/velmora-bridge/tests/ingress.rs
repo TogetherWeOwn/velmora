@@ -1169,6 +1169,46 @@ fn log_redacts_credentials() {
     assert!(admin.contains("bucket=_admin"), "{admin}");
 }
 
+#[test]
+fn a_server_error_line_names_what_failed_and_nothing_else() {
+    use velmora_bridge::metrics::{FailureStage, RequestObservation};
+    let mut observed = RequestObservation::default();
+    observed.mark_error(
+        FailureStage::Commit,
+        &BridgeError::Sql("d1: overloaded".into()),
+    );
+    let target = "/photos/holiday/secret.jpg?X-Amz-Signature=abc";
+    let line = ingress::log_line_with("PUT", target, 500, "ray-1", Some(&observed));
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=commit err=Sql code=d1_overloaded"),
+        "{line}"
+    );
+    for leak in ["holiday", "secret", "Signature"] {
+        assert!(!line.contains(leak), "{leak} leaked: {line}");
+    }
+    // An observed 5xx never logs an all-dash reason.
+    assert!(
+        !line.contains("stage=-") && !line.contains("err=-"),
+        "{line}"
+    );
+    // A request that did not convert to a handler request: its 500 is
+    // named, never left as dashes. Below 500 the line is as it was.
+    let mut early = RequestObservation::default();
+    early.mark_fault(
+        FailureStage::Other,
+        velmora_bridge::metrics::Fault::named("RequestConversion"),
+    );
+    let (_, line) = ingress::settled_log_line("GET", "-", "ray-1", false, 500, 500, &mut early);
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=other err=RequestConversion code=-"),
+        "{line}"
+    );
+    assert_eq!(
+        ingress::log_line_with("PUT", target, 404, "ray-1", Some(&observed)),
+        ingress::log_line("PUT", target, 404, "ray-1")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Config bound
 // ---------------------------------------------------------------------------
@@ -1357,4 +1397,46 @@ async fn the_budget_counts_waits_and_refusals_of_requests_and_jobs_apart() {
     assert_eq!(budget.in_use(), 10);
     drop((first, served));
     assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn the_settled_line_has_the_wire_status_and_its_reason() {
+    use velmora_bridge::metrics::{FailureStage, RequestObservation};
+    // The handler meant 200; HTTP conversion answered 500 instead.
+    let mut observed = RequestObservation::default();
+    let (counted, line) = ingress::settled_log_line(
+        "GET",
+        "/b/secret-key",
+        "ray-1",
+        false,
+        200,
+        500,
+        &mut observed,
+    );
+    assert_eq!(counted, 500);
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=other err=ResponseConversion code=-"),
+        "{line}"
+    );
+    assert!(!line.contains("secret-key"), "{line}");
+
+    // A 5xx the handler observed keeps its reason: never all dashes.
+    let mut observed = RequestObservation::default();
+    observed.mark_error(
+        FailureStage::R2,
+        &BridgeError::Blob("r2: put failed: internal (10001)".into()),
+    );
+    let (counted, line) =
+        ingress::settled_log_line("PUT", "/b/k", "ray-1", false, 500, 500, &mut observed);
+    assert_eq!(counted, 500);
+    assert!(
+        line.ends_with(" status=500 id=ray-1 stage=r2 err=Blob code=r2_put_internal_10001"),
+        "{line}"
+    );
+    assert!(!line.contains("err=- code=-"), "{line}");
+
+    // Below 500 the line has no reason, whatever was observed.
+    let (_, line) =
+        ingress::settled_log_line("PUT", "/b/k", "ray-1", false, 404, 404, &mut observed);
+    assert!(line.ends_with(" status=404 id=ray-1"), "{line}");
 }

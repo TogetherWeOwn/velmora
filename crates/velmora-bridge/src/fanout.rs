@@ -54,7 +54,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::metrics::{GetFailureStage as Stage, GetObservation};
+use crate::metrics::{Fault, GetFailureStage as Stage, GetObservation};
 use crate::ports::Kek;
 use crate::types::{BucketId, GenerationId, KekBytes, RespBody, S3Request, S3Response, UnixMs};
 
@@ -340,6 +340,20 @@ pub enum FanoutError {
     Pipe,
 }
 
+impl FanoutError {
+    /// The fault for the request log: the variant, and the status a
+    /// sub-request answered with.
+    pub fn fault(self) -> Fault {
+        match self {
+            FanoutError::Mint => Fault::named("Mint"),
+            FanoutError::Transport => Fault::named("Transport"),
+            FanoutError::Status(status) => Fault::upstream("Status", status),
+            FanoutError::Length => Fault::named("Length"),
+            FanoutError::Pipe => Fault::named("Pipe"),
+        }
+    }
+}
+
 /// The answer to one sub-request, body unread.
 pub struct SubResponse<B> {
     pub status: u16,
@@ -485,7 +499,7 @@ impl Fanout {
         match self.open(pipe, 0).await {
             Ok(body) => Ok(body),
             Err((FanoutError::Status(503), Some(body))) => {
-                observed.mark_stage(Stage::SubrangeStatus);
+                observed.mark_fault(Stage::SubrangeStatus, Fault::upstream("Status", 503));
                 let bytes = pipe.refusal(body, MAX_REFUSAL_BYTES).await;
                 let mut resp = S3Response {
                     status: 503,
@@ -499,13 +513,14 @@ impl Fanout {
                 if let Some(body) = body {
                     pipe.discard(body).await;
                 }
-                observed.mark_stage(match cause {
+                let stage = match cause {
                     FanoutError::Mint | FanoutError::Status(403) => Stage::Grant,
                     FanoutError::Transport => Stage::SubrangeTransport,
                     FanoutError::Length => Stage::SubrangeLength,
                     FanoutError::Status(_) => Stage::SubrangeStatus,
                     FanoutError::Pipe => Stage::Other,
-                });
+                };
+                observed.mark_fault(stage, cause.fault());
                 Err(fallback())
             }
         }

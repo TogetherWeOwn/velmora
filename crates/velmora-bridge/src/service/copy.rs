@@ -18,6 +18,8 @@
 //! - a source `versionId`. There is no versioning;
 //! - a checksum algorithm other than the one stored with the source.
 
+use std::cell::Cell;
+
 use velmora::rng::{FillRandom, SystemRng};
 use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{
@@ -25,12 +27,12 @@ use velmora_s3_proto::{
 };
 
 use super::common::{
-    catalog_error, check_precondition, discard_before_retry, hold_precondition, internal,
-    metadata_json, restore_failure, restore_gate, s3_error, stored_checksum, stored_headers,
-    unavailable, Authed,
+    catalog_error, check_precondition_observed, discard_before_retry, hold_precondition, internal,
+    mark_noted, metadata_json, noted, restore_gate_observed, s3_error, stored_checksum,
+    stored_headers, unavailable, Authed,
 };
 use crate::config::SINGLE_RECORD_EXTENTS;
-use crate::metrics::{FailureStage as Stage, RequestObservation};
+use crate::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, PublishOutcome,
 };
@@ -111,6 +113,7 @@ pub(super) async fn source_generation<C, B, N, J, K, T>(
     headers: &Headers,
     bucket: &Bucket,
     key: &str,
+    fault: &Cell<Option<Fault>>,
 ) -> Result<GenerationRow, S3Response>
 where
     C: Catalog,
@@ -124,7 +127,7 @@ where
         .catalog
         .live_generation(&bucket.id, key)
         .await
-        .map_err(catalog_error)?
+        .map_err(|e| noted(fault, e))?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -161,6 +164,7 @@ async fn source_object<C, B, N, J, K, T>(
     headers: &Headers,
     bucket: &Bucket,
     key: &str,
+    fault: &Cell<Option<Fault>>,
 ) -> Result<(GenerationRow, Vec<ExtentRow>), S3Response>
 where
     C: Catalog,
@@ -170,7 +174,7 @@ where
     K: Kek,
     T: Clock,
 {
-    let seen = source_generation(bridge, headers, bucket, key).await?;
+    let seen = source_generation(bridge, headers, bucket, key, fault).await?;
     if seen.extent_count > SINGLE_RECORD_EXTENTS {
         return Err(source_too_large());
     }
@@ -178,7 +182,7 @@ where
         .catalog
         .live_object(&bucket.id, key)
         .await
-        .map_err(catalog_error)?
+        .map_err(|e| noted(fault, e))?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -212,6 +216,7 @@ where
 {
     let (bucket, key) = authed.object()?;
     if !bridge.cfg.server_side_copy {
+        observed.mark_fault(Stage::Other, Fault::named("CopyDisabled"));
         return Err(S3Response::error(
             501,
             "NotImplemented",
@@ -263,13 +268,12 @@ where
         // answered before anything is written for the copy, the floor of
         // the key included.
         if let Some(condition) = &condition {
-            check_precondition(bridge, &bucket.id, key, condition)
-                .await
-                .inspect_err(observed.on_error(Stage::Lookup))?;
+            check_precondition_observed(bridge, &bucket.id, key, condition, observed).await?;
         }
-        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source)
+        let fault = Cell::new(None);
+        let (from, extents) = source_object(bridge, &authed.headers, bucket, &source, &fault)
             .await
-            .inspect_err(observed.on_error(Stage::Lookup))?;
+            .inspect_err(|_| mark_noted(observed, Stage::Lookup, &fault))?;
         observed.record_size(from.size);
         // The copy keeps the checksum stored with the source. Computing
         // another one would mean reading every byte.
@@ -349,7 +353,7 @@ where
         )
         .await
         .map_err(|error| {
-            observed.mark_stage(Stage::storage(&error));
+            observed.mark_error(Stage::storage(&error), &error);
             catalog_error(error)
         })?;
         drop(extents);
@@ -373,7 +377,10 @@ where
                     .map_err(|_| internal());
             }
             PublishOutcome::Refused(record) | PublishOutcome::Fenced(record) => record,
-            PublishOutcome::FencedOverloaded(_) => return Err(s3_error(ErrorCode::SlowDown)),
+            PublishOutcome::FencedOverloaded(_) => {
+                observed.mark_fault(Stage::Commit, Fault::named("FencedOverloaded"));
+                return Err(s3_error(ErrorCode::SlowDown));
+            }
         };
         // The source was overwritten or deleted since it was read, the
         // destination got a generation this id does not sort after, or
@@ -391,11 +398,9 @@ where
         .await?;
         // Refused as well when a replay started after this request
         // passed the gate.
-        restore_gate(bridge)
-            .await
-            .map_err(|resp| restore_failure(observed, resp))?;
+        restore_gate_observed(bridge, observed).await?;
         // Plan again against what is live now.
     }
-    observed.mark_stage(Stage::Commit);
+    observed.mark_fault(Stage::Commit, Fault::named("AttemptsExhausted"));
     Err(unavailable())
 }

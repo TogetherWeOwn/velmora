@@ -18,7 +18,7 @@ use velmora_bridge::fanout::{
     FanoutError, SubPipe, SubRequest, SubResponse, INTERNAL_TARGET, TOKEN_HEADER,
 };
 use velmora_bridge::ingress::IngressError;
-use velmora_bridge::metrics::{GetFailureStage as Stage, GetObservation};
+use velmora_bridge::metrics::{Fault, GetFailureStage as Stage, GetObservation};
 use velmora_bridge::{RespBody, S3Response};
 use worker::js_sys::{BigInt, Function, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -58,15 +58,21 @@ pub struct SelfPipe {
 
 impl SelfPipe {
     /// The pipe and the readable end the client's response is made of.
-    /// `None` without the binding or the stream (fail closed).
-    fn new(env: &Env, len: u64) -> Option<(SelfPipe, worker::web_sys::ReadableStream)> {
-        let binding = Reflect::get(env.as_ref(), &key(BINDING)).ok()?;
-        if !Reflect::get(&binding, &key("fetch")).ok()?.is_function() {
-            return None;
+    /// Without the binding (`NoBinding`) or the stream (`PipeSetup`) there
+    /// is none (fail closed); the name is for the request log.
+    fn new(
+        env: &Env,
+        len: u64,
+    ) -> Result<(SelfPipe, worker::web_sys::ReadableStream), &'static str> {
+        let binding = Reflect::get(env.as_ref(), &key(BINDING)).map_err(|_| "NoBinding")?;
+        let fetch = Reflect::get(&binding, &key("fetch")).map_err(|_| "NoBinding")?;
+        if !fetch.is_function() {
+            return Err("NoBinding");
         }
-        let fixed = worker::worker_sys::FixedLengthStream::new_big_int(BigInt::from(len)).ok()?;
+        let fixed = worker::worker_sys::FixedLengthStream::new_big_int(BigInt::from(len))
+            .map_err(|_| "PipeSetup")?;
         let writable = fixed.writable().into();
-        Some((SelfPipe { binding, writable }, fixed.readable()))
+        Ok((SelfPipe { binding, writable }, fixed.readable()))
     }
 }
 
@@ -209,10 +215,13 @@ pub async fn respond(
             crate::http::to_response(resp.with_request_id(request_id)),
         )
     };
-    let Some((pipe, readable)) = SelfPipe::new(env, fan.len()) else {
-        observed.mark_stage(Stage::SubrangeTransport);
-        console_error!("fanout: no service binding or stream");
-        return refuse(IngressError::Internal.response());
+    let (pipe, readable) = match SelfPipe::new(env, fan.len()) {
+        Ok(made) => made,
+        Err(cause) => {
+            observed.mark_fault(Stage::SubrangeTransport, Fault::named(cause));
+            console_error!("fanout: no service binding or stream");
+            return refuse(IngressError::Internal.response());
+        }
     };
     let first = match fan
         .open_first_observed(&pipe, || IngressError::Internal.response(), observed)
@@ -238,7 +247,7 @@ pub async fn respond(
             .with_encode_body(EncodeBody::Manual))
     })();
     let Ok(resp) = built else {
-        observed.mark_stage(Stage::Other);
+        observed.mark_fault(Stage::Other, Fault::named("ResponseBuild"));
         pipe.discard(first).await;
         pipe.abort().await;
         return refuse(IngressError::Internal.response());

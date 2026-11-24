@@ -492,6 +492,9 @@ pub struct FailSql {
     pub frozen_write_attempts: Cell<u32>,
     /// Fails the next batch that publishes a generation, once.
     pub fail_publish: Cell<Option<PublishFault>>,
+    /// Refuses this many of the next batches that publish a generation,
+    /// each by its guard.
+    pub refuse_publishes: Cell<u32>,
     fail_next_batch: Cell<bool>,
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
@@ -530,6 +533,8 @@ pub enum PublishFault {
     /// Run in full and refused by a guard at its end, and then as
     /// `Overloaded`: what D1 did after a large refused batch.
     RefusedOverloaded(u32),
+    /// Not applied, answered as the PostgreSQL adapter answers overload.
+    PgOverloaded,
 }
 
 /// What D1 answers while a database is over its budget of the last ten
@@ -678,7 +683,17 @@ impl Sql for FailSql {
                     stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
                     return self.inner.batch(stmts).await;
                 }
+                Some(PublishFault::PgOverloaded) => {
+                    return Err(BridgeError::Sql("pg: overloaded".into()));
+                }
                 None => {}
+            }
+            let refuse = self.refuse_publishes.get();
+            if refuse > 0 {
+                // Run in full and refused by a guard at its end.
+                self.refuse_publishes.set(refuse - 1);
+                stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
+                return self.inner.batch(stmts).await;
             }
         }
         let stall = self.stall_batch_key.get().is_some_and(|key| {
@@ -774,6 +789,7 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 frozen: Cell::new(false),
                 frozen_write_attempts: Cell::new(0),
                 fail_publish: Cell::new(None),
+                refuse_publishes: Cell::new(0),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),

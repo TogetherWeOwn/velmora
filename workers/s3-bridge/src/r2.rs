@@ -85,8 +85,39 @@ impl R2Blobs {
     }
 }
 
-fn blob_err(class: &'static str) -> impl Fn(worker::Error) -> BridgeError {
-    move |_| BridgeError::Blob(format!("r2: {class} failed"))
+/// `r2: <op> failed[: <class>][ (<code>)]`. Of R2's message only a class
+/// from a fixed list and the code it ends with are kept (R2 ends its
+/// errors with one, e.g. `(10001)`), for the request log
+/// (`velmora_bridge::metrics::Fault`); never the text itself.
+fn blob_err(op: &'static str) -> impl Fn(worker::Error) -> BridgeError {
+    move |e| BridgeError::Blob(format!("r2: {op} failed{}", r2_detail(&e.to_string())))
+}
+
+fn r2_detail(text: &str) -> String {
+    let class = if text.contains("Network connection lost") {
+        ": network lost"
+    } else if text.contains("timed out") || text.contains("timeout") {
+        ": timeout"
+    } else if text.contains("internal error") {
+        ": internal"
+    } else if text.contains("stream") {
+        ": stream"
+    } else {
+        ""
+    };
+    match r2_code(text) {
+        Some(code) => format!("{class} ({code})"),
+        None => class.to_string(),
+    }
+}
+
+/// The number in parentheses that an R2 error ends with.
+fn r2_code(text: &str) -> Option<u32> {
+    let digits = text.trim_end().strip_suffix(')')?.rsplit_once('(')?.1;
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -496,6 +527,38 @@ impl BlobStore for R2Blobs {
 mod tests {
     use super::*;
     use velmora_bridge::{BucketId, ExtentId};
+
+    #[test]
+    fn an_r2_error_keeps_its_class_and_code_only() {
+        let err = |text: &str| match blob_err("put")(worker::Error::RustError(text.into())) {
+            BridgeError::Blob(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            err("put: We encountered an internal error. Please try again. (10001)"),
+            "r2: put failed: internal (10001)"
+        );
+        assert_eq!(
+            err("Network connection lost."),
+            "r2: put failed: network lost"
+        );
+        assert_eq!(
+            err("put: The specified object name is not valid. (10020)"),
+            "r2: put failed (10020)"
+        );
+        // Text that is not R2's code is dropped, whatever it holds.
+        assert_eq!(err("put: photos/2024 (secret)"), "r2: put failed");
+        assert_eq!(err("put: (1234567)"), "r2: put failed");
+        for text in [
+            "put: We encountered an internal error. Please try again. (10001)",
+            "Network connection lost.",
+            "put: (10058)",
+        ] {
+            let fault = velmora_bridge::metrics::Fault::of(&BridgeError::Blob(err(text)));
+            assert_eq!(fault.variant(), "Blob");
+            assert!(fault.code().starts_with("r2_put"), "{}", fault.code());
+        }
+    }
 
     #[test]
     fn metadata_names_bucket_extent_and_digest() {

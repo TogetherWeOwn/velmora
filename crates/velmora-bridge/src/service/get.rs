@@ -19,7 +19,7 @@ use futures_util::stream::{self, Stream, StreamExt};
 use velmora_s3_proto::{plan_read, Conditions, ErrorCode, ObjectMetadata};
 
 use super::common::{
-    authenticate, internal, s3_error, stored_checksum, stored_headers, unavailable,
+    authenticate_observed, internal, s3_error, stored_checksum, stored_headers, unavailable,
 };
 use crate::config::MAX_EXTENT_BYTES_LIMIT;
 use crate::crypto::{cipher_span, open_range, unwrap_bdk};
@@ -29,7 +29,7 @@ use crate::fetch::{
     ColdFetch, ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
-use crate::metrics::{GetFailureStage as Stage, GetObservation};
+use crate::metrics::{Fault, GetFailureStage as Stage, GetObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, GenerationId, RespBody, Result, S3Request,
@@ -177,23 +177,33 @@ enum ReadFail {
     Busy(Stage),
     /// No source holds the extent intact: `503 ServiceUnavailable`.
     Unavailable(Stage),
-    Internal(Stage),
+    /// With the port error behind it, when there was one.
+    Internal(Stage, Option<Fault>),
 }
 
 impl ReadFail {
     fn cold_error(error: BridgeError) -> Self {
-        Self::Internal(match error {
+        let stage = match error {
             BridgeError::Sql(_) | BridgeError::GuardFailed => Stage::Lookup,
             BridgeError::Blob(_) => Stage::R2,
             BridgeError::Nntp(_) => Stage::Nntp,
             BridgeError::Crypto(_) => Stage::Decrypt,
             _ => Stage::Other,
-        })
+        };
+        Self::Internal(stage, Some(Fault::of(&error)))
+    }
+
+    /// Marks this failure on `observed`: its stage, and its error if known.
+    fn mark(&self, observed: &mut GetObservation) {
+        match *self {
+            Self::Internal(stage, Some(fault)) => observed.mark_fault(stage, fault),
+            _ => observed.mark_stage(self.stage()),
+        }
     }
 
     fn stage(&self) -> Stage {
         match *self {
-            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage) => stage,
+            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage, _) => stage,
         }
     }
 
@@ -201,7 +211,7 @@ impl ReadFail {
         match self {
             ReadFail::Busy(_) => s3_error(ErrorCode::SlowDown),
             ReadFail::Unavailable(_) => unavailable(),
-            ReadFail::Internal(_) => internal(),
+            ReadFail::Internal(..) => internal(),
         }
     }
 
@@ -212,7 +222,7 @@ impl ReadFail {
             ReadFail::Unavailable(_) => {
                 BridgeError::Invalid("read interrupted: extent unavailable")
             }
-            ReadFail::Internal(_) => BridgeError::Invalid("read interrupted"),
+            ReadFail::Internal(..) => BridgeError::Invalid("read interrupted"),
         }
     }
 }
@@ -371,14 +381,14 @@ async fn read<
     hit_flush: Option<Spawner>,
 ) -> core::result::Result<S3Response, S3Response> {
     observed.mark_stage(Stage::Auth);
-    let authed = authenticate(bridge, &req).await?;
+    let authed = authenticate_observed(bridge, &req, observed).await?;
     let (bucket, key) = authed.object()?;
     observed.mark_stage(Stage::Lookup);
     let Some(generation) = bridge
         .catalog
         .live_generation(&bucket.id, key)
         .await
-        .map_err(|_| internal())?
+        .map_err(|e| lookup_failed(observed, &e))?
     else {
         return Err(s3_error(ErrorCode::NoSuchKey));
     };
@@ -523,7 +533,7 @@ async fn plan_pieces(
     let extents = catalog
         .extents_in(generation, start, end)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| lookup_failed(observed, &e))?;
     observed.mark_stage(Stage::Plan);
     pieces(extents, start, end - start)
         .filter(|todo| !todo.is_empty())
@@ -576,7 +586,7 @@ async fn granted<
         .catalog
         .generation_by_id(&grant.bucket, &grant.generation)
         .await
-        .map_err(|_| internal())?;
+        .map_err(|e| lookup_failed(observed, &e))?;
     observed.mark_stage(Stage::Grant);
     let (bucket, generation) = generation.ok_or_else(internal)?;
     observed.record_size(generation.size);
@@ -606,33 +616,44 @@ async fn preflight<B: BlobStore>(
     todo: &[Piece],
     observed: &mut GetObservation,
 ) -> core::result::Result<(), S3Response> {
+    // A failed head counts as a miss, as before; its error is kept for
+    // the request log when the piece is missing from both tiers.
+    let fault = std::cell::Cell::new(None);
+    let fault = &fault;
     let missing = stream::iter(todo)
         .map(|piece| async move {
             let extent = &piece.extent;
             let size = Some(extent.cipher_size);
-            bridge
-                .cache
-                .head(&extent.id.cache_key())
-                .await
-                .ok()
-                .flatten()
-                != size
-                && bridge
-                    .safety
-                    .head(&extent.id.safety_key())
-                    .await
-                    .ok()
-                    .flatten()
-                    != size
+            let mut failed = None;
+            let mut seen = |head: Result<Option<u64>>| match head {
+                Ok(found) => found,
+                Err(error) => {
+                    failed = Some(Fault::of(&error));
+                    None
+                }
+            };
+            let missing = seen(bridge.cache.head(&extent.id.cache_key()).await) != size
+                && seen(bridge.safety.head(&extent.id.safety_key()).await) != size;
+            if missing {
+                fault.set(failed.or_else(|| fault.get()));
+            }
+            missing
         })
         .buffer_unordered(4)
         .any(futures_util::future::ready)
         .await;
     if missing {
-        observed.mark_stage(Stage::R2);
+        let fault = fault.get().unwrap_or(Fault::named("ExtentMissing"));
+        observed.mark_fault(Stage::R2, fault);
         return Err(unavailable());
     }
     Ok(())
+}
+
+/// `500` for a catalogue read of the GET path, marked with its error.
+fn lookup_failed(observed: &mut GetObservation, error: &BridgeError) -> S3Response {
+    observed.mark_error(Stage::Lookup, error);
+    internal()
 }
 
 /// Streams plaintext from the validated pieces in order.
@@ -675,7 +696,7 @@ async fn body<
     let first = match items.next().await {
         Some((Ok(held), hit_bytes)) => (Ok(held), hit_bytes),
         Some((Err(fail), _)) => {
-            observed.mark_stage(fail.stage());
+            fail.mark(observed);
             return Err(fail.response());
         }
         None => {
@@ -1066,7 +1087,7 @@ where
                 )
                 .await
                 .map_err(|fail| {
-                    observed.mark_stage(fail.stage());
+                    fail.mark(observed);
                     fail.response()
                 })?,
             );
@@ -1080,7 +1101,7 @@ where
             read_piece(bridge, bucket, piece, first_eligible_at)
                 .await
                 .map_err(|fail| {
-                    observed.mark_stage(fail.stage());
+                    fail.mark(observed);
                     fail.response()
                 })?,
         );
@@ -1492,7 +1513,8 @@ where
                     break;
                 };
                 drop(src);
-                let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
+                let held =
+                    retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget, None))?;
                 if !self.no_cold_fill {
                     self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 }
@@ -1509,7 +1531,7 @@ where
         self.until = None;
         self.from_r2 = false;
         let span = cipher_span(extent.plain_size, piece.off, piece.len)
-            .ok_or(ReadFail::Internal(Stage::Plan))?;
+            .ok_or(ReadFail::Internal(Stage::Plan, None))?;
         match self.warm(bucket, piece, span).await {
             Err(ReadFail::Unavailable(_)) => {}
             found => {
@@ -1618,7 +1640,7 @@ where
                     drop(work);
                     let held = room
                         .try_charge(plain.len() as u64)
-                        .ok_or(ReadFail::Internal(Stage::Budget))?;
+                        .ok_or(ReadFail::Internal(Stage::Budget, None))?;
                     let spent = Rc::clone(&self.spent);
                     self.put = prepare_verified_fill(
                         &room,
@@ -1821,20 +1843,49 @@ mod tests {
 
     #[test]
     fn cold_read_port_errors_keep_their_dependency_stage() {
-        for (error, expected) in [
-            (BridgeError::Sql("fixture".into()), Stage::Lookup),
-            (BridgeError::GuardFailed, Stage::Lookup),
-            (BridgeError::Blob("fixture".into()), Stage::R2),
+        for (error, expected, fields) in [
+            (
+                BridgeError::Sql("d1: network lost: statement failed".into()),
+                Stage::Lookup,
+                "stage=lookup err=Sql code=d1_network_lost",
+            ),
+            (
+                BridgeError::Sql(crate::fetch::CATALOGUE_FAILED.into()),
+                Stage::Lookup,
+                "stage=lookup err=Sql code=cold_catalogue",
+            ),
+            (
+                BridgeError::GuardFailed,
+                Stage::Lookup,
+                "stage=lookup err=GuardFailed code=-",
+            ),
+            (
+                BridgeError::Blob("r2: get failed (10001)".into()),
+                Stage::R2,
+                "stage=r2 err=Blob code=r2_get_10001",
+            ),
             (
                 BridgeError::Nntp(velmora::Error::Io(std::io::ErrorKind::TimedOut.into())),
                 Stage::Nntp,
+                "stage=nntp err=Nntp code=nntp_io_timed_out",
             ),
-            (BridgeError::Crypto("fixture"), Stage::Decrypt),
-            (BridgeError::Invalid("fixture"), Stage::Other),
+            (
+                BridgeError::Crypto("fixture"),
+                Stage::Decrypt,
+                "stage=decrypt err=Crypto code=-",
+            ),
+            (
+                BridgeError::Invalid("fixture"),
+                Stage::Other,
+                "stage=other err=Invalid code=-",
+            ),
         ] {
             let fail = ReadFail::cold_error(error);
             assert_eq!(fail.stage(), expected);
             assert_eq!(fail.response().status, 500);
+            let mut observed = GetObservation::default();
+            fail.mark(&mut observed);
+            assert_eq!(observed.log_fields(), fields);
         }
     }
 
