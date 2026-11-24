@@ -15,7 +15,8 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use futures_util::{Stream, StreamExt};
 use velmora_bridge::remote::{
-    s3_error_code, HttpRequest, HttpResponse, HttpSend, Problem, TransportError, MAX_AUDIT_BYTES,
+    s3_audit_error_code, s3_error_code, HttpRequest, HttpResponse, HttpSend, Problem,
+    TransportError, MAX_AUDIT_BYTES,
 };
 
 use worker::{
@@ -46,6 +47,12 @@ fn fits(have: usize, more: usize, most: usize) -> bool {
     have.checked_add(more).is_some_and(|all| all <= most)
 }
 
+fn probe_audit_code(response: &HttpResponse) -> bool {
+    (400..500).contains(&response.status)
+        && response.status != 429
+        && s3_error_code(response).is_none()
+}
+
 // Keep at most 4 KiB while recovering an XML-only error code. A failed
 // read does not invalidate the status, and the body never leaves here.
 async fn attach_audit_code(
@@ -58,9 +65,10 @@ async fn attach_audit_code(
         };
         let take = chunk.len().min(AUDIT_ERROR_LIMIT - response.body.len());
         response.body.extend_from_slice(&chunk[..take]);
-        if let Some(code) = s3_error_code(&response) {
-            // Once a known code is available, a stall in the rest of
-            // the body must not discard it at the exchange timeout.
+        if let Some(code) = s3_audit_error_code(&response.body) {
+            // Return the code before any stall in the rest of the body.
+            // A previously unrecognized header must not shadow it.
+            response.headers.retain(|(name, _)| name != CODE_HEADER);
             response.headers.push((CODE_HEADER.into(), code.into()));
             break;
         }
@@ -99,15 +107,12 @@ async fn exchange(
         .filter_map(|name| Some(((*name).to_string(), answer.headers().get(name).ok()??)))
         .collect();
     if status_only(request, status) {
-        let ambiguous = (400..500).contains(&status)
-            && status != 429
-            && !headers.iter().any(|(name, _)| name == CODE_HEADER);
         let response = HttpResponse {
             status,
             headers,
             body: Vec::new(),
         };
-        if ambiguous {
+        if probe_audit_code(&response) {
             status_on_timeout.set(Some(status));
             if let Ok(chunks) = answer.stream() {
                 return Ok(Some(attach_audit_code(response, chunks).await));
@@ -186,15 +191,30 @@ impl HttpSend for FetchHttp {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_audit_code, fits, HttpResponse, AUDIT_ERROR_LIMIT};
+    use super::{attach_audit_code, fits, probe_audit_code, HttpResponse, AUDIT_ERROR_LIMIT};
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
     #[test]
     fn xml_only_audit_error_keeps_only_a_bounded_known_code_and_its_status() {
         let message = b"<Error><Code>SlowDown</Code><Message>untrusted</Message></Error>";
+        let mut long = b"<Error><Code>SlowDown</Code><Message>".to_vec();
+        long.resize(AUDIT_ERROR_LIMIT + 1, b'x');
         for (chunks, want) in [
             (vec![Ok(message.to_vec())], Some("SlowDown")),
+            (vec![Ok(long)], Some("SlowDown")),
+            (vec![Ok(b"<Error><Code>SlowDown".to_vec())], None),
+            (vec![Ok(b"<Error><Code>Unrecognized</Code>".to_vec())], None),
+            (
+                vec![Ok(
+                    b"<Error><Message><Code>SlowDown</Code></Message></Error>".to_vec(),
+                )],
+                None,
+            ),
+            (
+                vec![Ok(b"<Error><!-- <Code>SlowDown</Code> --></Error>".to_vec())],
+                None,
+            ),
             (
                 vec![Ok(vec![b' '; AUDIT_ERROR_LIMIT]), Ok(message.to_vec())],
                 None,
@@ -222,6 +242,65 @@ mod tests {
                 want
             );
         }
+    }
+
+    #[test]
+    fn audit_code_does_not_wait_for_the_error_envelope_to_end() {
+        use futures_util::StreamExt;
+        let chunks = futures_util::stream::iter([
+            Ok(b"<?xml version=\"1.0\"?><Error><Co".to_vec()),
+            Ok(b"de>SlowDown</Code><Message>".to_vec()),
+        ])
+        .chain(futures_util::stream::pending());
+        let response = HttpResponse {
+            status: 400,
+            headers: vec![],
+            body: vec![],
+        };
+        let future = attach_audit_code(response, chunks);
+        let Poll::Ready(answer) =
+            std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a complete Code element must not wait for the envelope to close");
+        };
+        assert_eq!(answer.status, 400);
+        assert_eq!(
+            answer.headers,
+            [("x-amz-error-code".into(), "SlowDown".into())]
+        );
+        assert!(answer.body.is_empty());
+    }
+
+    #[test]
+    fn audit_code_replaces_an_unrecognized_header_with_the_xml_code() {
+        let response = HttpResponse {
+            status: 400,
+            headers: vec![("x-amz-error-code".into(), "Unrecognized".into())],
+            body: vec![],
+        };
+        assert!(probe_audit_code(&response));
+        assert!(!probe_audit_code(&HttpResponse {
+            status: 429,
+            ..response.clone()
+        }));
+        assert!(!probe_audit_code(&HttpResponse {
+            headers: vec![("x-amz-error-code".into(), "AccessDenied".into())],
+            ..response.clone()
+        }));
+        let chunks =
+            futures_util::stream::iter([Ok(b"<Error><Code>SlowDown</Code></Error>".to_vec())]);
+        let future = attach_audit_code(response, chunks);
+        let Poll::Ready(answer) =
+            std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the fixture completes synchronously");
+        };
+        assert_eq!(answer.status, 400);
+        assert_eq!(
+            answer.headers,
+            [("x-amz-error-code".into(), "SlowDown".into())]
+        );
+        assert!(answer.body.is_empty());
     }
 
     #[test]

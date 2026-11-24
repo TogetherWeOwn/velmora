@@ -137,6 +137,24 @@ test("an empty log waits from first seen before missing history can page", async
   }
 });
 
+test("successful empty audits during the quiet-upload sampling gap do not page", async () => {
+  const f = fixture();
+  f.healthy(T0); // Final recent sample, four hours after the upload.
+  const empty = { detail: '{"counts":{"checked":0,"source_errors":0}}' };
+  for (let hour = 1; hour <= 44; hour++) {
+    const at = T0 + hour * HOUR;
+    f.row("job", at, { swept: 1 });
+    f.row("audit", at, empty);
+    assert.equal(has(await f.check(at), AUDIT), false, `hour ${hour}`);
+  }
+  const deadline = T0 + 46 * HOUR;
+  f.row("job", deadline, { swept: 1 });
+  for (const detail of [null, "invalid JSON", '{"counts":{"checked":0,"source_errors":1}}']) {
+    f.row("audit", deadline, { detail });
+    assert.equal(has(await f.check(deadline), AUDIT), true, "failed or unknown runs do not count as clean");
+  }
+});
+
 test("a mismatch during startup can page before the missing-history thresholds", async () => {
   const f = fixture();
   f.row("audit", T0, { checked: 1, problems: 1 });

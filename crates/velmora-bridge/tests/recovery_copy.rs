@@ -219,16 +219,21 @@ async fn recovery_jobs_are_wire_compatible_with_the_strict_previous_decoder() {
     assert_eq!(
         serde_json::from_str::<PreviousJob>(&new.to_json()).unwrap(),
         PreviousJob::RecoveryCopy {
-            v: JOB_VERSION,
+            // The previous Worker only dispatches wire version 1.
+            v: 1,
             pass: slot,
             cursor: String::new()
         }
     );
     w.record("m/art/x_1", b"legacy copy").await;
-    let raw = format!(r#"{{"t":"recovery_copy","v":{JOB_VERSION},"pass":{NOW},"cursor":""}}"#);
-    let Job::RecoveryCopy { pass, cursor, .. } = Job::from_json(&raw).unwrap() else {
+    let raw = format!(r#"{{"t":"recovery_copy","v":1,"pass":{NOW},"cursor":""}}"#);
+    let Job::RecoveryCopy { v, pass, cursor } = Job::from_json(&raw).unwrap() else {
         unreachable!()
     };
+    assert_eq!(
+        v, JOB_VERSION,
+        "the current Worker must dispatch the legacy job"
+    );
     let (outcome, counts, why) = w.copier().run_job(&w.jobs, pass, &cursor).await;
     assert_eq!((outcome, why), (JobOutcome::Ack, None));
     assert_eq!(counts.unwrap().copied, 1);
@@ -308,6 +313,48 @@ async fn independent_audit_classifies_equal_missing_different_refused_and_unavai
             1,
             "one bounded GET per source record"
         );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn audit_distinguishes_missing_bucket_from_missing_key() {
+    use velmora_bridge::audit::audit;
+    for (code, missing, refused) in [
+        (Some("NoSuchBucket"), 0, 1),
+        (Some("BucketNotFound"), 0, 1),
+        (Some("NoSuchKey"), 1, 0),
+        (Some("Unrecognized"), 1, 0),
+        (None, 1, 0),
+    ] {
+        let w = World::new();
+        let mut source = AuditShelf::default();
+        let at = NOW - 2 * 3_600_000;
+        source.rows.insert(
+            format!("m/g_{at:013x}_sample"),
+            (2, at, Some(b"ok".to_vec())),
+        );
+        *w.e2.get_answer.borrow_mut() = Some(HttpResponse {
+            status: 404,
+            headers: vec![],
+            body: code
+                .map(|code| format!("<Error><Code>{code}</Code></Error>").into_bytes())
+                .unwrap_or_default(),
+        });
+        let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
+        assert_eq!(
+            (
+                counts.checked,
+                counts.missing,
+                counts.refused,
+                counts.unavailable
+            ),
+            (1, missing, refused, 0),
+            "{code:?}"
+        );
+        let p = w.e2.problems.borrow()[0];
+        assert_eq!(p.kind, if refused == 1 { "refused" } else { "missing" });
+        assert_eq!(p.code, code.filter(|code| *code != "Unrecognized"));
+        assert_eq!(w.e2.log.borrow().len(), 1);
     }
 }
 
@@ -456,6 +503,29 @@ async fn audit_continues_past_a_full_recent_page_of_oversized_records() {
     let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
     assert_eq!((counts.checked, counts.missing), (1, 1));
     assert_eq!(source.lists.get(), 6, "exactly one continuation page");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dense_timestamp_ties_still_yield_a_bounded_sample() {
+    use velmora_bridge::audit::{audit, PAGE_SIZE};
+    let w = World::new();
+    let mut source = AuditShelf::default();
+    let at = NOW - 4 * 3_600_000;
+    for n in 0..=PAGE_SIZE {
+        let key = format!("m/g_{at:013x}_{n:05}");
+        source
+            .rows
+            .insert(key.clone(), (2, at, Some(b"ok".to_vec())));
+        if n < PAGE_SIZE {
+            w.e2.set(&key, b"ok");
+        }
+    }
+    let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
+    // The highest key is on page two. The time-bounded probe can skip it
+    // once it has enough equally recent records; no tie coverage is promised.
+    assert_eq!((counts.checked, counts.equal, counts.missing), (10, 10, 0));
+    assert!(source.lists.get() <= 4 * 25 + 2);
+    assert_eq!(w.e2.log.borrow().len(), 10);
 }
 
 #[tokio::test(flavor = "current_thread")]

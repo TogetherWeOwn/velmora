@@ -2,7 +2,8 @@
 // it ages out of its own window. The walk, not this sample, covers all keys.
 const HOUR = 3_600_000;
 const PROBLEM_LIMIT = 200;
-const unavailable = "COALESCE(json_extract(CASE WHEN json_valid(detail) THEN detail END, '$.counts.unavailable'), 0)";
+const count = (field) => `json_extract(CASE WHEN json_valid(detail) THEN detail END, '$.counts.${field}')`;
+const unavailable = `COALESCE(${count("unavailable")}, 0)`;
 const firstOf = (kind) => `COALESCE((SELECT at FROM recovery_copy_log WHERE kind = '${kind}' ORDER BY at LIMIT 1), ?1)`;
 
 export const SQL = Object.freeze({
@@ -15,7 +16,7 @@ export const SQL = Object.freeze({
       WHERE kind = 'walk' AND at > ?3 AND at <= ?1 ORDER BY at DESC LIMIT 1) AS walk_at,
     MIN(${["job", "walk", "audit"].map(firstOf).join(", ")}) AS first_at`,
   audit: `SELECT MAX(problems) AS problems,
-      MAX(CASE WHEN at > ?2 AND checked > 0 THEN at END) AS checked_at,
+      MAX(CASE WHEN at > ?2 AND (checked > 0 OR ${count("source_errors")} = 0) THEN at END) AS completed_at,
       MAX(CASE WHEN at > ?4 AND checked > ${unavailable} THEN at END) AS readable_at,
       COUNT(DISTINCT CASE WHEN at > ?4 AND checked > 0 AND checked = ${unavailable} THEN pass END) AS unavailable_passes
     FROM recovery_copy_log WHERE kind = 'audit' AND at > ?3 AND at <= ?1`,
@@ -55,7 +56,9 @@ export async function recoveryConditions(db, now, firstSeen = now) {
   }
   const notes = [];
   if (audit.problems > 0) notes.push("An audit in the last 24 h found missing, different or refused records.");
-  if (age >= 2 * HOUR && audit.checked_at == null) notes.push("No audit checked any records in the last 2 h.");
+  // A quiet keyspace can leave both sampling windows empty. Only count an
+  // empty run when the audit explicitly reports that its source reads worked.
+  if (age >= 2 * HOUR && audit.completed_at == null) notes.push("No audit checked records or completed without source errors in the last 2 h.");
   if (age >= HOUR && audit.readable_at == null && audit.unavailable_passes >= 2) {
     notes.push("Audit GETs were unavailable in multiple passes, with no usable result in the last hour.");
   }

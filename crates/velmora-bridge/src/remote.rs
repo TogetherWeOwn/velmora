@@ -31,6 +31,7 @@
 use std::fmt;
 
 use base64::Engine;
+use quick_xml::{events::Event, Reader};
 use sha2::{Digest, Sha256};
 /// The longest list answer that is read.
 pub use velmora_s3_proto::sign::MAX_LIST_BYTES;
@@ -156,48 +157,77 @@ impl Operation {
 /// Cap an independent audit GET at 1 MiB.
 pub const MAX_AUDIT_BYTES: usize = 1 << 20;
 
+fn known_s3_error_code(value: &str) -> Option<&'static str> {
+    [
+        "AccessDenied",
+        "AccountProblem",
+        "AllAccessDisabled",
+        "AuthorizationHeaderMalformed",
+        "BucketNotFound",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidArgument",
+        "InvalidBucketName",
+        "InvalidRequest",
+        "InvalidToken",
+        "MethodNotAllowed",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "NotImplemented",
+        "QuotaExceeded",
+        "RequestTimeTooSkewed",
+        "ServiceUnavailable",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+        "StorageQuotaExceeded",
+        "SubscriptionExpired",
+    ]
+    .into_iter()
+    .find(|code| *code == value)
+}
+
 /// A known S3 code from a header or bounded XML; never provider text.
 pub fn s3_error_code(response: &HttpResponse) -> Option<&'static str> {
     // HEAD commonly has no body. Never retain provider-controlled text.
-    let known = |value: &str| {
-        [
-            "AccessDenied",
-            "AccountProblem",
-            "AllAccessDisabled",
-            "AuthorizationHeaderMalformed",
-            "BucketNotFound",
-            "ExpiredToken",
-            "InvalidAccessKeyId",
-            "InvalidArgument",
-            "InvalidBucketName",
-            "InvalidRequest",
-            "InvalidToken",
-            "MethodNotAllowed",
-            "NoSuchBucket",
-            "NoSuchKey",
-            "NotImplemented",
-            "QuotaExceeded",
-            "RequestTimeTooSkewed",
-            "ServiceUnavailable",
-            "SignatureDoesNotMatch",
-            "SlowDown",
-            "StorageQuotaExceeded",
-            "SubscriptionExpired",
-        ]
-        .into_iter()
-        .find(|code| *code == value)
-    };
     response
         .header("x-amz-error-code")
-        .and_then(known)
+        .and_then(known_s3_error_code)
         .or_else(|| {
             let body = std::str::from_utf8(&response.body).ok()?;
             let (_, error) = body.split_once("<Error>")?;
             let (error, _) = error.split_once("</Error>")?;
             let (_, code) = error.split_once("<Code>")?;
             let (code, _) = code.split_once("</Code>")?;
-            known(code.trim())
+            known_s3_error_code(code.trim())
         })
+}
+
+/// Read a complete, direct `Error/Code` from an already bounded audit prefix.
+/// The enclosing error can still be streaming; no provider text escapes.
+pub fn s3_audit_error_code(prefix: &[u8]) -> Option<&'static str> {
+    let mut xml = Reader::from_reader(prefix);
+    xml.config_mut().trim_text(true);
+    loop {
+        match xml.read_event().ok()? {
+            Event::Decl(_) | Event::Comment(_) => {}
+            Event::Start(tag) if tag.name().as_ref() == "Error" => break,
+            _ => return None,
+        }
+    }
+    loop {
+        match xml.read_event().ok()? {
+            Event::Start(tag) if tag.name().as_ref() == "Code" => {
+                let code = xml.read_text(tag.name()).ok()?;
+                return known_s3_error_code(code.trim());
+            }
+            Event::Start(tag) => {
+                xml.read_to_end(tag.name()).ok()?;
+            }
+            Event::Empty(tag) if tag.name().as_ref() == "Code" => return None,
+            Event::Empty(_) | Event::Comment(_) => {}
+            _ => return None,
+        }
+    }
 }
 
 /// Why a request to the store did not do what was asked. Carries a
@@ -572,7 +602,12 @@ impl<H: HttpSend> S3Remote<H> {
         match r.status {
             200 => Ok(Some(r.body)),
             404 => {
-                self.problem(op, "missing", Some(404), s3_error_code(&r));
+                let code = s3_error_code(&r);
+                if matches!(code, Some("NoSuchBucket" | "BucketNotFound")) {
+                    self.problem(op, "refused", Some(404), code);
+                    return Err(RemoteError::Refused(404));
+                }
+                self.problem(op, "missing", Some(404), code);
                 Ok(None)
             }
             status => {
