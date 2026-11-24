@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -149,6 +150,23 @@ class CopyTests(unittest.TestCase):
         result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
         self.assertIn("scan_cursors: frozen D1 source boundary mismatch", result.stderr)
         self.assertFalse(dest.exists())
+
+    def test_zstd_expansion_is_bounded_by_verified_manifest(self):
+        if not shutil.which("zstd"):
+            self.skipTest("zstd is not installed")
+        dump = self.path / "export.zst"
+        with sqlite3.connect(self.db) as db, dump.open("wb") as out:
+            contents = "\n".join(db.iterdump()).encode()
+            subprocess.run(["zstd", "-c"], input=contents, stdout=out, check=True)
+        self.manifest_for(contents[:-1])
+        dest = self.path / "loaded.sqlite"
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zstd output exceeds", result.stderr)
+        self.assertFalse(dest.exists())
+        self.manifest_for(contents)
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wrangler_style_export_is_transactional_and_rejects_raw_nul(self):
         dump = self.path / "wrangler.sql"

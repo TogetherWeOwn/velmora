@@ -2,6 +2,7 @@
 """Load an existing Wrangler D1 export locally, census it, and optionally COPY to PG."""
 
 import argparse
+from contextlib import closing
 from hashlib import sha256
 import json
 import os
@@ -59,6 +60,18 @@ def load_stream(stream, command, manifest):
         require(loader.wait() == 0, f"local SQLite export load exited {loader.returncode}")
 
 
+def expand_zstd(inp, expanded, limit):
+    with subprocess.Popen(["zstd", "-dc"], stdin=inp, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as decoder:
+        with closing(decoder.stdout) as src:
+            remaining = limit
+            while part := src.read(min(1 << 20, remaining + 1)):
+                require(len(part) <= remaining, "zstd output exceeds the verified SQL byte count")
+                expanded.write(part)
+                remaining -= len(part)
+        require(decoder.wait() == 0, "zstd export decompression failed")
+    expanded.seek(0)
+
+
 def load_dump(dump, target, manifest, boundaries, receipt):
     require(not target.exists(), "refusing to overwrite the SQLite source")
     # Safe CLI mode disallows shell escapes and opening another database. The
@@ -70,9 +83,7 @@ def load_dump(dump, target, manifest, boundaries, receipt):
             inp.seek(0)
             if compressed:
                 with tempfile.TemporaryFile(dir=target.absolute().parent) as expanded:
-                    result = subprocess.run(["zstd", "-dc"], stdin=inp, stdout=expanded, stderr=subprocess.DEVNULL)
-                    require(result.returncode == 0, "zstd export decompression failed")
-                    expanded.seek(0)
+                    expand_zstd(inp, expanded, manifest["sql_bytes"])
                     verify_dump(expanded, manifest)
                     load_stream(expanded, command, manifest)
             else:
