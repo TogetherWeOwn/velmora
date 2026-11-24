@@ -20,7 +20,7 @@ use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::{Bridge, Clock, UnixMs};
 use worker::Env;
 
-use crate::d1::D1Sql;
+use crate::catalog_sql::CatalogSql;
 use crate::e2::FetchHttp;
 use crate::gate::{DoTransport, GATE_BINDING};
 use crate::jobs::{abandon_from_var, set_abandon, DEV_ABANDON_JOB_N};
@@ -40,7 +40,7 @@ impl Clock for WorkerClock {
 }
 
 pub type WorkerBridge =
-    Bridge<SqlCatalog<D1Sql>, R2Blobs, WorkerConnector, QueueSink, KekRing, WorkerClock>;
+    Bridge<SqlCatalog<CatalogSql>, R2Blobs, WorkerConnector, QueueSink, KekRing, WorkerClock>;
 
 /// Var or secret by name; `None` when absent.
 fn lookup(env: &Env, name: &str) -> Option<String> {
@@ -149,7 +149,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     ISOLATE.with(|c| c.set(built_at));
     set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
-    let catalog = D1Sql::new(env.d1("CATALOG").map_err(binding("CATALOG"))?);
+    let catalog = CatalogSql::from_env(env)?;
     // `PERMITS`: where provider permits come from. With the gate bound,
     // a Worker on `d1` still tells a gate that holds slot rows to let
     // go, so the switch can be turned back.

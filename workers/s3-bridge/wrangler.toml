@@ -34,6 +34,9 @@ mode = "targeted"
 region = "aws:us-east-1"
 
 [vars]
+# PostgreSQL bindings are activated only during the catalogue cutover.
+CATALOG_BACKEND = "d1"
+PG_PIPELINE = "1"
 ENVIRONMENT = "prod"
 S3_HOST = "velmora-s3.<account>.workers.dev"
 S3_REGION = "auto"
@@ -306,6 +309,20 @@ binding = "CATALOG"
 database_name = "velmora-catalog"
 database_id = "<from wrangler d1 create>"
 migrations_dir = "migrations"
+
+# Activate and supply real config IDs together at cutover. Leaving these
+# commented preserves stock D1 deploys (unbound or fake IDs would fail deploy).
+# Hyperdrive origin: PgBouncer (6432); direct PostgreSQL (5432) is the fallback.
+# Configure the host/port on Hyperdrive, not in Worker code. Disable caching.
+# Initial origin limits: writes 5, reads 8. Direct fallback on 25 connections:
+# 3 superuser-reserved; 5 write + 8 read + 5 temporary drill + 4 ops = 22.
+# Without the drill there are 5 spare. Do not reuse a drill ID in production.
+# [[hyperdrive]]
+# binding = "CATALOG_PG_W"
+# id = "<write Hyperdrive config ID>"
+# [[hyperdrive]]
+# binding = "CATALOG_PG_R"
+# id = "<read Hyperdrive config ID>"
 
 # Production data lives in US East (ENAM). R2 honours a location hint only the
 # first time a bucket name is created, so the region is part of the name.

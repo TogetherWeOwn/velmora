@@ -1760,3 +1760,72 @@ async fn upload_part_reads_no_other_part_of_the_upload() {
         assert!(by_part >= 3, "part {n}: the GC select and the piece delete");
     }
 }
+
+#[tokio::test]
+async fn nul_upload_id_is_unknown_on_all_multipart_paths() {
+    let rig = Rig::new().await;
+    // Use an otherwise-valid length so this exercises the character check.
+    let id = concat!("0000000000000000", "\0", "000000000000000");
+    assert_eq!(id.len(), 32);
+    let path = object_path("alpha", KEY);
+    let requests = [
+        ("UploadPart", part_req(RW_KEY, "alpha", KEY, id, 1, b"part")),
+        (
+            "UploadPartCopy",
+            sign(
+                RW_KEY,
+                Method::Put,
+                &path,
+                &[("partNumber", "1"), ("uploadId", id)],
+                &[("x-amz-copy-source", "/alpha/src")],
+                Vec::new(),
+            ),
+        ),
+        (
+            "CompleteMultipartUpload",
+            complete_req(RW_KEY, "alpha", KEY, id, &[(1, "part")], &[]),
+        ),
+        ("AbortMultipartUpload", abort_req(RW_KEY, "alpha", KEY, id)),
+        (
+            "ListParts",
+            sign(
+                RW_KEY,
+                Method::Get,
+                &path,
+                &[("uploadId", id)],
+                &[],
+                Vec::new(),
+            ),
+        ),
+    ];
+    let sql = &rig.bridge.catalog.sql;
+    for (operation, request) in requests {
+        *sql.recorded.borrow_mut() = Some(Vec::new());
+        let response = rig.send(request).await;
+        assert_eq!(response.outcome(), "404 NoSuchUpload", "{operation}");
+        let statements = sql.recorded.borrow_mut().take().unwrap();
+        assert!(
+            statements
+                .iter()
+                .flat_map(|(_, args)| args)
+                .all(|p| !matches!(p,SqlValue::Text(s) if s.contains('\0'))),
+            "{operation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nul_in_presigned_access_key_is_rejected_before_lookup() {
+    let rig = Rig::new().await;
+    let sql = &rig.bridge.catalog.sql;
+    *sql.recorded.borrow_mut() = Some(Vec::new());
+    let sig = "0".repeat(64);
+    let response = rig.send(Req {
+        method: Method::Get,
+        target: format!("/alpha/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%00B%2F20260412%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20260412T000000Z&X-Amz-Expires=30&X-Amz-SignedHeaders=host&X-Amz-Signature={sig}"),
+        headers: vec![("host".into(), S3_HOST.into())],
+        body: Vec::new(),
+    }).await;
+    assert_eq!(response.outcome(), "400 AuthorizationQueryParametersError");
+    assert!(sql.recorded.borrow_mut().take().unwrap().is_empty());
+}

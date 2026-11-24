@@ -2543,6 +2543,7 @@ dependencies = [
 name = "velmora-s3-bridge"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "futures-util",
  "serde",
  "serde_json",

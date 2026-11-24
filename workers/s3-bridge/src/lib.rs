@@ -11,6 +11,7 @@
 //! closed). Logs carry method, bucket, key hash, status and request ID;
 //! never credentials, presigned queries, bodies or provider text.
 
+mod catalog_sql;
 mod d1;
 mod e2;
 mod env;
@@ -20,6 +21,7 @@ mod http;
 mod jobs;
 mod metrics;
 mod nntp;
+mod pgsql;
 mod queue_attempt;
 mod queues;
 mod r2;
