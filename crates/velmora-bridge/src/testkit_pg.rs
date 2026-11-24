@@ -94,74 +94,87 @@ pub(crate) async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)>
 // leased, connect as before rather than serializing tests through the pool.
 const MAX_IDLE_SESSIONS: usize = 4;
 
-struct Driver(JoinHandle<()>);
+// Unlike DISCARD ALL, this preserves the driver's internal type-lookup
+// prepared statements. Catalogue operations do not change authorization.
+const RESET_SESSION: &str = "CLOSE ALL; RESET ALL; UNLISTEN *; \
+    SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES";
 
-impl Drop for Driver {
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
-struct IdleSession {
-    client: Client,
-    driver: Driver,
+type Session = (Client, AbortOnDrop<()>);
+
+struct PendingSession {
     runtime: Id,
+    reset: AbortOnDrop<Option<Session>>,
+}
+
+#[derive(Default)]
+struct SessionPool(Mutex<Vec<PendingSession>>);
+
+impl SessionPool {
+    fn take_pending(&self, runtime: Id) -> Option<PendingSession> {
+        let mut pending = self.0.lock().unwrap();
+        // Only the originating runtime can drive the socket and reset task.
+        let index = pending
+            .iter()
+            .rposition(|session| session.runtime == runtime)?;
+        Some(pending.swap_remove(index))
+    }
+
+    async fn checkout(&self, config: &Config, runtime: Id) -> Result<Session> {
+        while let Some(mut pending) = self.take_pending(runtime) {
+            // A failed reset is never reused. If checkout is cancelled while
+            // waiting, dropping the reset task also retires its driver.
+            if let Ok(Some(session)) = (&mut pending.reset.0).await {
+                if !session.0.is_closed() {
+                    return Ok(session);
+                }
+            }
+        }
+        let (client, driver) = connect(config).await?;
+        Ok((client, AbortOnDrop(driver)))
+    }
+
+    fn checkin(&self, runtime: Id, session: Session) {
+        let mut pending = self.0.lock().unwrap();
+        if pending.len() < MAX_IDLE_SESSIONS {
+            // Start reset now, even if no later operation checks out this
+            // session. Do not delay the caller of an already confirmed write.
+            let reset = tokio::spawn(async move {
+                session.0.batch_execute(RESET_SESSION).await.ok()?;
+                Some(session)
+            });
+            pending.push(PendingSession {
+                runtime,
+                reset: AbortOnDrop(reset),
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct NativePgConnect {
     config: Config,
-    idle: Arc<Mutex<Vec<IdleSession>>>,
-}
-
-impl NativePgConnect {
-    fn new(config: Config) -> Self {
-        Self {
-            config,
-            idle: Arc::default(),
-        }
-    }
-
-    fn take_idle(&self, runtime: Id) -> Option<IdleSession> {
-        let mut idle = self.idle.lock().unwrap();
-        idle.retain(|session| !session.client.is_closed());
-        // A current-thread runtime drives its sockets only while it runs.
-        // In particular, a synchronous fixture query uses its own runtime.
-        let index = idle
-            .iter()
-            .rposition(|session| session.runtime == runtime)?;
-        Some(idle.swap_remove(index))
-    }
+    pool: Option<Arc<SessionPool>>,
 }
 
 impl PgConnect for NativePgConnect {
     async fn connect(&self) -> Result<PgConnection> {
-        let runtime = Handle::current().id();
-        let (client, driver) = if let Some(session) = self.take_idle(runtime) {
-            // Await a successful reset before handing out the session. A
-            // rejected or cancelled reset retires it via the driver guard.
-            if session.client.batch_execute("DISCARD ALL").await.is_ok() {
-                (session.client, session.driver)
-            } else {
-                drop(session);
-                let (client, task) = connect(&self.config).await?;
-                (client, Driver(task))
-            }
-        } else {
-            let (client, task) = connect(&self.config).await?;
-            (client, Driver(task))
+        let Some(pool) = &self.pool else {
+            let (client, driver) = connect(&self.config).await?;
+            return Ok(PgConnection::new(client, move || driver.abort()));
         };
-        let idle = Arc::clone(&self.idle);
+        let runtime = Handle::current().id();
+        let (client, driver) = pool.checkout(&self.config, runtime).await?;
+        let pool = Arc::clone(pool);
         Ok(PgConnection::recyclable(client, move |client| {
-            let session = IdleSession {
-                client,
-                driver,
-                runtime,
-            };
-            let mut idle = idle.lock().unwrap();
-            if idle.len() < MAX_IDLE_SESSIONS {
-                idle.push(session);
-            }
+            pool.checkin(runtime, (client, driver));
         }))
     }
 }
@@ -196,18 +209,26 @@ impl TestPostgres {
         let lock_key = i64::from_be_bytes(hash[..8].try_into().unwrap());
         let mut scoped = base.clone();
         scoped.options(format!("-c search_path={schema},pg_temp"));
-        let connector = NativePgConnect::new(scoped);
-        let sql = || {
+        // Arbitrary fixture SQL can leave session state that RESET cannot
+        // erase (for example, a custom GUC placeholder). Never pool it.
+        let connector = NativePgConnect {
+            config: scoped,
+            pool: None,
+        };
+        let sql = |connector: NativePgConnect| {
             PgSql::new(
                 connector.clone(),
-                connector.clone(),
+                connector,
                 PgConfig {
                     lock_key,
                     ..PgConfig::default()
                 },
             )
         };
-        let catalog = sql();
+        let catalog = sql(NativePgConnect {
+            config: connector.config.clone(),
+            pool: Some(Arc::default()),
+        });
         #[cfg(feature = "pg-test-record")]
         let catalog = if _record {
             catalog.with_statement_recording()
@@ -230,7 +251,7 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            fixture_sql: sql(),
+            fixture_sql: sql(connector.clone()),
             connector,
         })
     }

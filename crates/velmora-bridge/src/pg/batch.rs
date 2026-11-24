@@ -262,3 +262,17 @@ where
     commit.map_err(|_| error::statement_failed())?;
     Ok(values)
 }
+
+#[cfg(all(feature = "testkit-pg", not(target_arch = "wasm32")))]
+impl Reply {
+    /// Check the count and run the real decoder before offering the native
+    /// test session for reuse. The caller still owns the reply; ordinary
+    /// exec/batch replies have no collected rows.
+    pub(super) fn can_recycle(&self) -> bool {
+        self.changed().is_ok()
+            && self
+                .rows
+                .iter()
+                .all(|row| value::decode(row.clone()).is_ok())
+    }
+}
