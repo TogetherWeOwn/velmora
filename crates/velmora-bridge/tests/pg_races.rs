@@ -633,16 +633,23 @@ async fn stage_replay_orphan(c: &SqlCatalog<TestSql>, b: &Bucket) -> (ExtentId, 
 #[tokio::test]
 async fn replay_marker_refuses_orphan_claims_in_both_orders() {
     use velmora_bridge::replay::ReplayPublish;
-    for replay_first in [false, true] {
-        let Some(c) = catalogue() else { return };
+    for (started_before_cutoff, replay_first) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let c = SqlCatalog::new(TestSql::with_schema().unwrap());
         let b = bucket(&c, 4).await;
         let (extent_id, gc) = stage_replay_orphan(&c, &b).await;
         let now = NOW.plus_ms(32 * 86_400_000);
-        // This is the same catalogue marker normally installed by restore.
-        c.restore_begin(NOW, now)
+        let cutoff = NOW.plus_ms(1);
+        let started_at = if started_before_cutoff { NOW } else { now };
+        // An older, still-running restore must block GC even when the
+        // separate guard for restores since the cutoff doesn't apply.
+        let mark = c
+            .restore_begin(NOW, started_at)
             .await
             .unwrap()
             .expect("restore starts");
+        assert_eq!(mark < cutoff, started_before_cutoff);
         assert!(c.restore_pending().await.unwrap());
         let gen = generation(&b, "replay", 200);
         let placements = [ExtentPlacement {
@@ -651,7 +658,7 @@ async fn replay_marker_refuses_orphan_claims_in_both_orders() {
             plain_offset: 0,
         }];
         let gc = [gc];
-        let claim = || c.gc_orphan_claim(&gc, now, NOW.plus_ms(1));
+        let claim = || c.gc_orphan_claim(&gc, now, cutoff);
         let replay = || c.replay_publish(&gen, &placements, now);
         // The writer lock serializes these transactions. Exercise both
         // serial orders explicitly, rather than relying on wake order.
@@ -663,12 +670,10 @@ async fn replay_marker_refuses_orphan_claims_in_both_orders() {
             (claimed, replay().await)
         };
         status.unwrap();
-        assert_eq!(claimed, [false], "replay_first={replay_first}");
-        assert_eq!(
-            published.unwrap(),
-            ReplayPublish::Published,
-            "replay_first={replay_first}"
-        );
+        let case =
+            format!("started_before_cutoff={started_before_cutoff}, replay_first={replay_first}");
+        assert_eq!(claimed, [false], "{case}");
+        assert_eq!(published.unwrap(), ReplayPublish::Published, "{case}");
         let (head, extents) = c.live_object(&b.id, &gen.key).await.unwrap().unwrap();
         assert_eq!(head.id, gen.id);
         assert_eq!(extents.len(), 1);
