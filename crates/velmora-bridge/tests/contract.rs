@@ -703,6 +703,15 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // R2 put retry: absent or blank is off, so no safety write is
+        // replayed and no ciphertext copy is held.
+        if name == "R2_PUT_RETRY" {
+            for _ in 0..2 {
+                assert!(!load(&vars).unwrap().r2_put_retry);
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // Where permits come from: absent or blank is the catalogue's
         // slot rows, as before the switch existed. The Worker reads it,
         // not this configuration.

@@ -1949,6 +1949,9 @@ numeric code does not retry. The ciphertext copy (up to
 reserve it immediately. Up to two retries use 1 s and 2 s backoffs plus
 up to 250 ms jitter; none starts more than 20 s into the safety write.
 Each successful store receipt must match the sealed size and MD5.
+Production turns it on in the `[vars]` table of
+`workers/s3-bridge/wrangler.toml`. To turn it off, set it to `off` there
+or roll back to the previous Worker version.
 
 When testing this switch, count `retries=` on HTTP 200 request lines to
 see recoveries. Compare byte-budget 503s and cold-read budget waits with
