@@ -81,7 +81,10 @@ pub const MAX_FANOUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_SUBRANGES: u64 = 8192;
 /// Most retries in one download, over all its sub-ranges.
 pub const MAX_RETRIES: u32 = 1024;
-const _: () = assert!(MAX_SUBRANGES + (MAX_RETRIES as u64) < 9_500);
+/// Budget for the front's probes, sub-ranges and retries, leaving room
+/// for authentication and catalogue lookups within the platform limit.
+pub(crate) const FRONT_SUBREQUEST_BUDGET: u64 = 9_500;
+const _: () = assert!(MAX_SUBRANGES + (MAX_RETRIES as u64) < FRONT_SUBREQUEST_BUDGET);
 
 /// Attempts at one sub-request before the download is given up, and the
 /// pause before the second and the third.

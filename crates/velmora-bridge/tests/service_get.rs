@@ -910,6 +910,70 @@ async fn frozen_get_refuses_cold_extents_before_headers_or_writes() {
 }
 
 #[tokio::test]
+async fn frozen_warm_get_skips_a_due_hot_hit_flush() {
+    let mut cfg = config(Vec::new());
+    cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
+    let rig = rig_with(NoNntp, cfg);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "hot", b"hot").await.expect(200);
+    let sql = &rig.bridge.catalog.sql;
+    let flushes = Rc::new(RefCell::new(Vec::new()));
+    let spawner: Spawner = {
+        let flushes = Rc::clone(&flushes);
+        Rc::new(move |work| flushes.borrow_mut().push(work))
+    };
+    // The first hit on this test thread would flush immediately. Run the
+    // identical request unfrozen afterwards to prove the flush was due.
+    for frozen in [true, false] {
+        sql.frozen.set(frozen);
+        let req = signer.sign(
+            rig.now(),
+            Method::Get,
+            &path(BUCKET, "hot"),
+            &[],
+            &[],
+            vec![],
+        );
+        let resp = Rc::clone(&rig.bridge)
+            .handle_observed_with_hit_flush(
+                req.into_request(),
+                &mut Default::default(),
+                Some(Rc::clone(&spawner)),
+            )
+            .await;
+        assert_eq!(resp.status, 200);
+        let RespBody::Stream(mut stream) = resp.body else {
+            panic!("expected the warm body");
+        };
+        assert_eq!(stream.next().await.unwrap().unwrap(), b"hot");
+        assert!(stream.next().await.is_none());
+        assert_eq!(flushes.borrow().len(), usize::from(!frozen));
+        assert_eq!(sql.frozen_write_attempts.get(), 0);
+    }
+}
+
+#[tokio::test]
+async fn frozen_test_catalogue_refuses_writes_sent_as_queries() {
+    let rig = rig();
+    let sql = &rig.bridge.catalog.sql;
+    sql.frozen.set(true);
+    let before = sql.query("SELECT ok FROM tx_guard", &[]).await.unwrap();
+    let err = sql
+        .query(
+            "WITH value(ok) AS (SELECT 1) INSERT INTO tx_guard(ok) SELECT ok FROM value RETURNING ok",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BridgeError::Sql(message) if message == "catalog: frozen"));
+    assert_eq!(sql.frozen_write_attempts.get(), 1);
+    assert_eq!(
+        sql.query("SELECT ok FROM tx_guard", &[]).await.unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn frozen_revocation_does_not_leave_a_durable_record() {
     use velmora_bridge::config::Maintenance;
     use velmora_bridge::recovery::revocation_recorded;

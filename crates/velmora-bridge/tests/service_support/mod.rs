@@ -228,6 +228,8 @@ pub struct Blobs {
     /// Every call crosses it first.
     pub trip: Tripwire,
     pub fail_put: Cell<bool>,
+    pub frozen: Cell<bool>,
+    pub frozen_write_attempts: Cell<u32>,
     /// Puts of keys with this prefix fail.
     pub fail_put_prefix: RefCell<Option<String>>,
     /// Every put that was sent, also one that failed: its key and the
@@ -318,8 +320,20 @@ impl std::ops::Deref for Blobs {
     }
 }
 
+impl Blobs {
+    fn allow_write(&self) -> Result<()> {
+        if self.frozen.get() {
+            self.frozen_write_attempts
+                .set(self.frozen_write_attempts.get() + 1);
+            return Err(BridgeError::Blob("store: frozen".into()));
+        }
+        Ok(())
+    }
+}
+
 impl BlobStore for Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.allow_write()?;
         self.puts
             .borrow_mut()
             .push((key.to_string(), Sha256::digest(&bytes).into()));
@@ -355,6 +369,7 @@ impl BlobStore for Blobs {
         meta: &StreamMeta<'_>,
     ) -> Result<PutReceipt> {
         use futures_util::StreamExt as _;
+        self.allow_write()?;
         let at = self.streams.borrow().len();
         self.streams.borrow_mut().push(StreamSeen {
             key: key.to_string(),
@@ -410,6 +425,7 @@ impl BlobStore for Blobs {
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
+        self.allow_write()?;
         fire(&self.before_delete, key);
         if self.fail_delete.borrow().as_deref() == Some(key) {
             return Err(BridgeError::Blob("store down".into()));
@@ -421,6 +437,7 @@ impl BlobStore for Blobs {
         self.trip.guard(blob_down, self.inner.delete(key)).await
     }
     async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        self.allow_write()?;
         // The faults of `delete` hold for the delete of a record too.
         if self.fail_delete.borrow().as_deref() == Some(refused.key().as_str()) {
             return Err(BridgeError::Blob("store down".into()));
@@ -576,6 +593,18 @@ impl Sql for FailSql {
     }
 
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if self.frozen.get() {
+            // Some writes use query for RETURNING, not exec or batch.
+            let readonly = self
+                .inner
+                .with_conn(|conn| conn.prepare(sql).map(|stmt| stmt.readonly()))
+                .map_err(|e| BridgeError::Sql(e.to_string()))?;
+            if !readonly {
+                self.frozen_write_attempts
+                    .set(self.frozen_write_attempts.get() + 1);
+                return Err(BridgeError::Sql("catalog: frozen".into()));
+            }
+        }
         self.over_budget()?;
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
