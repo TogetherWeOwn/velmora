@@ -8,10 +8,12 @@
 //! validated. Statements are fixed-shape and bind at most 21 parameters.
 
 use super::intents::{part_intents_close, part_intents_open};
-use super::objects::{clear_floor, guard_newest, guard_precondition, successor};
+use super::objects::{
+    before_nul, clear_floor, guard_newest, guard_precondition, skip_prefix_bound, successor,
+};
 use super::replay::guard_no_replay;
 use super::SqlCatalog;
-use crate::ports::{Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
+use crate::ports::{Dialect, Guard, PublishOutcome, Row, Sql, SqlValue, UploadTarget};
 use crate::recovery::Recorded;
 use crate::types::{
     BridgeError, BucketId, CompleteUpload, ExtentId, ExtentRow, ExtentState, GenerationId,
@@ -161,11 +163,7 @@ fn target(t: &UploadTarget<'_>) -> Vec<SqlValue> {
 /// First statement of every upload mutation: the upload exists for this
 /// exact target and is still `open`.
 fn guard_open(t: &UploadTarget<'_>) -> Stmt {
-    (
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
-         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open')",
-        target(t),
-    )
+    (GUARD_OPEN, target(t))
 }
 
 /// GC rows for this upload's part extents that are still `staged`: all of
@@ -177,31 +175,14 @@ fn guard_open(t: &UploadTarget<'_>) -> Stmt {
 /// SQLite cannot seek on that `OR`, so the one-part form would walk every
 /// part of the upload (rows read growing with the part count on each
 /// UploadPart). Each text seeks the primary key on what it binds.
-fn gc_staged_parts(id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt {
-    macro_rules! gc_staged {
-        ($filter:literal) => {
-            concat!(
-                "INSERT INTO gc(extent_id, action, due_at) \
-                 SELECT p.extent_id, a.action, a.due_at FROM \
-                   (SELECT extent_id FROM upload_parts WHERE upload_id = ?1",
-                $filter,
-                " UNION ALL SELECT extent_id FROM upload_part_extents WHERE upload_id = ?1",
-                $filter,
-                ") p \
-                 JOIN extents e ON e.id = p.extent_id \
-                 JOIN (SELECT 'delete_safety' AS action, ?2 AS due_at \
-                       UNION ALL SELECT 'shred_key', ?3) a \
-                 WHERE e.state = 'staged'"
-            )
-        };
-    }
+fn gc_staged_parts(dialect: Dialect, id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt {
     let mut params = vec![text(id.as_str()), ms(now), ms(now.plus_ms(SHRED_GRACE_MS))];
     let sql = match part_number {
         Some(n) => {
             params.push(SqlValue::Int(i64::from(n)));
-            gc_staged!(" AND part_number = ?4")
+            dialect.pick(GC_STAGED_PART, GC_STAGED_PART_PG)
         }
-        None => gc_staged!(""),
+        None => dialect.pick(GC_STAGED_ALL, GC_STAGED_ALL_PG),
     };
     (sql, params)
 }
@@ -210,10 +191,7 @@ fn gc_staged_parts(id: &UploadId, part_number: Option<u16>, now: UnixMs) -> Stmt
 /// For a batch that closes the upload, after the extents were adopted or
 /// sent to GC.
 fn drop_pieces(id: &UploadId) -> Stmt {
-    (
-        "DELETE FROM upload_part_extents WHERE upload_id = ?1",
-        vec![text(id.as_str())],
-    )
+    (DROP_PIECES, vec![text(id.as_str())])
 }
 
 // ---------------------------------------------------------------------------
@@ -229,9 +207,7 @@ pub(super) async fn create_upload<S: Sql>(c: &SqlCatalog<S>, u: &UploadRow) -> R
     let opened = c
         .sql
         .exec(
-            "INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
-               revision, initiated_at) SELECT ?1, ?2, ?3, ?4, ?5, 'open', 0, ?6 \
-             WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?2)",
+            CREATE_UPLOAD,
             &[
                 text(u.id.as_str()),
                 text(u.bucket_id.as_str()),
@@ -261,28 +237,30 @@ pub(super) async fn list_uploads<S: Sql>(
     bucket: &BucketId,
     q: &UploadListQuery,
 ) -> Result<Vec<OpenUpload>> {
-    if q.limit == 0 {
+    if q.limit == 0 || q.prefix.contains('\0') {
         return Ok(Vec::new());
     }
     let mut from = q.prefix.clone(); // inclusive lower bound
     if let Some(done) = &q.skip_prefix {
-        match successor(done) {
+        match skip_prefix_bound(done) {
             Some(s) => from = from.max(s),
             None => return Ok(Vec::new()),
         }
     }
     let (after_key, after_id) = match &q.after {
-        Some((key, id)) => (key.as_str(), id.as_deref().unwrap_or(AFTER_EVERY_UPLOAD_ID)),
+        Some((key, _)) if key.contains('\0') => (before_nul(key), AFTER_EVERY_UPLOAD_ID),
+        Some((key, id)) => (
+            key.as_str(),
+            before_nul(id.as_deref().unwrap_or(AFTER_EVERY_UPLOAD_ID)),
+        ),
         None => ("", ""),
     };
     let upper = successor(&q.prefix);
-    let sql = format!(
-        "SELECT key, id, initiated_at FROM uploads \
-         WHERE bucket_id = ?1 AND state = 'open' AND key >= ?2 \
-           AND (key > ?3 OR (key = ?3 AND id > ?4)) {} \
-         ORDER BY key, id LIMIT ?5",
-        if upper.is_some() { "AND key < ?6" } else { "" }
-    );
+    let sql = if upper.is_some() {
+        LIST_UPLOADS_BELOW
+    } else {
+        LIST_UPLOADS
+    };
     let mut params = vec![
         text(bucket.as_str()),
         text(&from),
@@ -291,7 +269,7 @@ pub(super) async fn list_uploads<S: Sql>(
         SqlValue::Int(i64::from(q.limit)),
     ];
     params.extend(upper.as_deref().map(text));
-    let rows = c.sql.query(&sql, &params).await?;
+    let rows = c.sql.query(sql, &params).await?;
     rows.into_iter()
         .map(|row| {
             let mut r = Cols::new(row);
@@ -310,13 +288,7 @@ pub(super) async fn upload_state<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
 ) -> Result<Option<UploadState>> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT state FROM uploads WHERE id = ?1 AND bucket_id = ?2 AND key = ?3",
-            &target(t),
-        )
-        .await?;
+    let rows = c.sql.query(UPLOAD_STATE, &target(t)).await?;
     match rows.into_iter().next() {
         Some(row) => Ok(Some(Cols::new(row).parsed(UploadState::parse)?)),
         None => Ok(None),
@@ -330,15 +302,7 @@ pub(super) async fn upload<S: Sql>(
     c: &SqlCatalog<S>,
     t: &UploadTarget<'_>,
 ) -> Result<Option<(UploadRow, Vec<UploadPartRow>)>> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT id, bucket_id, key, content_json, user_meta_json, state, revision, \
-               completed_generation_id, complete_digest, result_etag, initiated_at \
-             FROM uploads WHERE id = ?1 AND bucket_id = ?2 AND key = ?3",
-            &target(t),
-        )
-        .await?;
+    let rows = c.sql.query(READ_UPLOAD, &target(t)).await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -359,14 +323,7 @@ pub(super) async fn upload<S: Sql>(
         result_etag: r.opt_text()?,
         initiated_at: UnixMs(r.num()?),
     };
-    let rows = c
-        .sql
-        .query(
-            "SELECT upload_id, part_number, extent_id, size, etag, uploaded_at \
-             FROM upload_parts WHERE upload_id = ?1 ORDER BY part_number",
-            &[text(t.id.as_str())],
-        )
-        .await?;
+    let rows = c.sql.query(READ_PARTS, &[text(t.id.as_str())]).await?;
     let mut parts = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -389,10 +346,7 @@ pub(super) async fn upload<S: Sql>(
 /// The insert of one staged part extent.
 fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
     Ok((
-        "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
-           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
-           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
-         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
+        INSERT_STAGED,
         vec![
             text(e.id.as_str()),
             text(e.bucket_id.as_str()),
@@ -416,6 +370,7 @@ fn staged_extent(e: &ExtentRow) -> Result<Stmt> {
 /// number, whose extents go to GC) and the rows of the extents after the
 /// first. They follow the guards of the batch.
 fn part_statements(
+    dialect: Dialect,
     t: &UploadTarget<'_>,
     part: &UploadPartRow,
     extents: &[ExtentRow],
@@ -440,15 +395,12 @@ fn part_statements(
     let number = || SqlValue::Int(i64::from(part.part_number));
     let mut stmts = Vec::with_capacity(2 * extents.len() + 2);
     // Before the upsert: this still names the part being replaced.
-    stmts.push(gc_staged_parts(t.id, Some(part.part_number), now));
+    stmts.push(gc_staged_parts(dialect, t.id, Some(part.part_number), now));
     for e in extents {
         stmts.push(staged_extent(e)?);
     }
     stmts.push((
-        "INSERT INTO upload_parts(upload_id, part_number, extent_id, size, etag, uploaded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(upload_id, part_number) DO UPDATE SET extent_id = excluded.extent_id, \
-           size = excluded.size, etag = excluded.etag, uploaded_at = excluded.uploaded_at",
+        UPSERT_PART,
         vec![
             text(t.id.as_str()),
             number(),
@@ -459,14 +411,10 @@ fn part_statements(
         ],
     ));
     // The extents after the first of the part that was replaced.
-    stmts.push((
-        "DELETE FROM upload_part_extents WHERE upload_id = ?1 AND part_number = ?2",
-        vec![text(t.id.as_str()), number()],
-    ));
+    stmts.push((CLEAR_PART_PIECES, vec![text(t.id.as_str()), number()]));
     for (piece, e) in extents.iter().enumerate().skip(1) {
         stmts.push((
-            "INSERT INTO upload_part_extents(upload_id, part_number, piece, extent_id) \
-             VALUES (?1, ?2, ?3, ?4)",
+            INSERT_PART_PIECE,
             vec![
                 text(t.id.as_str()),
                 number(),
@@ -479,11 +427,7 @@ fn part_statements(
 }
 
 fn bump_revision(t: &UploadTarget<'_>) -> Stmt {
-    (
-        "UPDATE uploads SET revision = revision + 1 \
-         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'",
-        target(t),
-    )
+    (BUMP_REVISION, target(t))
 }
 
 /// Stores one part of one extent: the staged extent, the part row
@@ -497,7 +441,13 @@ pub(super) async fn put_upload_part<S: Sql>(
     now: UnixMs,
 ) -> Result<Guard<()>> {
     let mut stmts = vec![guard_open(t)];
-    stmts.extend(part_statements(t, part, std::slice::from_ref(e), now)?);
+    stmts.extend(part_statements(
+        c.sql.dialect(),
+        t,
+        part,
+        std::slice::from_ref(e),
+        now,
+    )?);
     stmts.push(bump_revision(t));
     guarded(c, stmts).await
 }
@@ -516,8 +466,8 @@ pub(super) async fn put_upload_part_sliced<S: Sql>(
     now: UnixMs,
 ) -> Result<Guard<()>> {
     let mut stmts = vec![guard_open(t), guard_no_replay()];
-    let part_stmts = part_statements(t, part, extents, now)?;
-    stmts.extend(part_intents_open(write, extents.len())?);
+    let part_stmts = part_statements(c.sql.dialect(), t, part, extents, now)?;
+    stmts.extend(part_intents_open(c.sql.dialect(), write, extents.len())?);
     stmts.extend(part_stmts);
     stmts.extend(part_intents_close(write, extents.len())?);
     stmts.push(bump_revision(t));
@@ -533,9 +483,7 @@ pub(super) async fn extents_held<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT (SELECT COUNT(*) FROM upload_parts WHERE upload_id = ?1 AND part_number <> ?2) \
-                  + (SELECT COUNT(*) FROM upload_part_extents \
-                      WHERE upload_id = ?1 AND part_number <> ?2)",
+            HELD_EXTENTS,
             &[text(upload.as_str()), SqlValue::Int(i64::from(except))],
         )
         .await?;
@@ -554,13 +502,9 @@ pub(super) async fn abort_upload<S: Sql>(
 ) -> Result<Guard<()>> {
     let stmts = vec![
         guard_open(t),
-        gc_staged_parts(t.id, None, now),
+        gc_staged_parts(c.sql.dialect(), t.id, None, now),
         drop_pieces(t.id),
-        (
-            "UPDATE uploads SET state = 'aborted', revision = revision + 1 \
-             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'",
-            target(t),
-        ),
+        (ABORT, target(t)),
     ];
     guarded(c, stmts).await
 }
@@ -581,6 +525,13 @@ macro_rules! adopted {
     () => {
         "generation_extents ge CROSS JOIN extents e ON e.id = ge.extent_id \
           WHERE ge.generation_id = ?1 AND +e.generation_id = ?1 AND +e.seq = ge.seq"
+    };
+}
+
+macro_rules! adopted_pg {
+    () => {
+        "generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+          WHERE ge.generation_id = ?1 AND e.generation_id = ?1 AND e.seq = ge.seq"
     };
 }
 
@@ -638,19 +589,13 @@ pub(super) async fn complete_upload<S: Sql>(
     let mut stmts: Vec<Stmt> = Vec::with_capacity(17 + values.len());
     let mut guard = target(t);
     guard.push(int(revision)?);
-    stmts.push((
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
-         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
-        guard,
-    ));
+    stmts.push((GUARD_REVISION, guard));
     stmts.push(guard_no_replay());
     stmts.extend(condition.map(|c| guard_precondition(t.bucket, t.key, c)));
     stmts.push(guard_newest(t.bucket, t.key, &g.id));
     stmts.push(clear_floor(t.bucket, t.key, &g.id));
     stmts.push((
-        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)",
+        INSERT_GENERATION,
         vec![
             gen_id(),
             text(g.bucket_id.as_str()),
@@ -666,7 +611,8 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     // One statement per value of placements, not one per extent. Only a
     // staged extent of a part of this upload is taken.
-    stmts.extend(super::publish::adopt(
+    stmts.extend(super::publish::adopt_in(
+        c.sql.dialect(),
         &g.id,
         t.bucket,
         super::publish::Source::Upload(t.id),
@@ -681,30 +627,15 @@ pub(super) async fn complete_upload<S: Sql>(
     // an adopted extent always is one of ([`super::publish`]); below
     // from the references this statement leaves, one per adopted extent.
     stmts.push((
-        "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-         SELECT e.generation_id, e.seq, e.id, e.plain_offset \
-           FROM (SELECT extent_id FROM upload_parts WHERE upload_id = ?2 \
-                 UNION SELECT extent_id FROM upload_part_extents WHERE upload_id = ?2) p \
-          CROSS JOIN extents e ON e.id = p.extent_id \
-          WHERE +e.generation_id = ?1",
+        c.sql
+            .dialect()
+            .pick(ADOPTED_REFERENCES, ADOPTED_REFERENCES_PG),
         vec![gen_id(), text(t.id.as_str())],
     ));
     stmts.push((
-        concat!(
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
-               OR (SELECT COUNT(*) FROM ",
-            adopted!(),
-            ") <> ?2 \
-               OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM ",
-            adopted!(),
-            ") <> ?3 \
-               OR EXISTS (SELECT 1 FROM (SELECT e.plain_offset AS plain_offset, \
-                    SUM(e.plain_size) OVER (ORDER BY ge.seq \
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected FROM ",
-            adopted!(),
-            ") WHERE plain_offset <> COALESCE(expected, 0))"
-        ),
+        c.sql
+            .dialect()
+            .pick(GUARD_ADOPTED_LAYOUT, GUARD_ADOPTED_LAYOUT_PG),
         vec![
             gen_id(),
             SqlValue::Int(i64::from(g.extent_count)),
@@ -713,33 +644,22 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     // A part of several extents is adopted whole and in body order.
     stmts.push((
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
-           (SELECT 1 FROM upload_part_extents x \
-              JOIN upload_parts p ON p.upload_id = x.upload_id \
-               AND p.part_number = x.part_number \
-              JOIN extents e0 ON e0.id = p.extent_id \
-              JOIN extents e ON e.id = x.extent_id \
-             WHERE x.upload_id = ?1 \
-               AND ((e.generation_id IS ?2) <> (e0.generation_id IS ?2) \
-                    OR (e0.generation_id IS ?2 AND e.seq <> e0.seq + x.piece)))",
+        c.sql
+            .dialect()
+            .pick(GUARD_COMPLETE_PIECES, GUARD_COMPLETE_PIECES_PG),
         vec![text(t.id.as_str()), gen_id()],
     ));
     stmts.push((
-        concat!(
-            // Marked as sent from the start (`sent_at`): the caller
-            // sends the post jobs itself (`Catalog::complete_upload`).
-            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
-             SELECT e.id, e.generation_id, 'post', ?2, ?2, ?2 FROM ",
-            adopted!()
-        ),
+        c.sql.dialect().pick(POST_ADOPTED, POST_ADOPTED_PG),
         vec![gen_id(), ms(now)],
     ));
     // After adoption: whatever is still staged was not listed.
-    stmts.push(gc_staged_parts(t.id, None, now));
+    stmts.push(gc_staged_parts(c.sql.dialect(), t.id, None, now));
     // Nothing reads the order within a part once the upload is closed.
     stmts.push(drop_pieces(t.id));
     // Retire the generation the live pointer names, before moving it.
-    stmts.extend(super::objects::retire_live(
+    stmts.extend(super::objects::retire_live_in(
+        c.sql.dialect(),
         t.bucket,
         t.key,
         GenerationState::Superseded,
@@ -747,11 +667,7 @@ pub(super) async fn complete_upload<S: Sql>(
     ));
     let mut pointer = key();
     pointer.push(gen_id());
-    stmts.push((
-        "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
-        pointer,
-    ));
+    stmts.push((UPSERT_POINTER, pointer));
     let mut receipt = target(t);
     receipt.extend([
         int(revision)?,
@@ -759,12 +675,7 @@ pub(super) async fn complete_upload<S: Sql>(
         SqlValue::Blob(digest.to_vec()),
         text(&g.etag),
     ]);
-    stmts.push((
-        "UPDATE uploads SET state = 'completed', revision = revision + 1, \
-           completed_generation_id = ?5, complete_digest = ?6, result_etag = ?7 \
-         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
-        receipt,
-    ));
+    stmts.push((COMPLETE_RECEIPT, receipt));
     if record.generation() != &g.id {
         return Err(BridgeError::Invalid(
             "the recovery record is of another generation",
@@ -787,23 +698,488 @@ pub(super) async fn complete_upload<S: Sql>(
     // that a replay cannot publish an upload the client aborts later.
     let mut open_at = target(t);
     open_at.push(int(revision)?);
-    let fence = vec![
-        (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
-             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)",
-            open_at.clone(),
-        ),
-        (
-            "UPDATE uploads SET revision = revision + 1 \
-             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4",
-            open_at,
-        ),
-    ];
+    let fence = vec![(GUARD_REVISION, open_at.clone()), (FENCE_REVISION, open_at)];
     match c.sql.batch(fence).await {
-        Ok(_) => Ok(PublishOutcome::Fenced(
-            record.refused(super::GuardRefused(())),
-        )),
+        Ok(_) => {
+            let unpublished = record.refused(super::GuardRefused(()));
+            if failed.is_pg_overloaded() {
+                Ok(PublishOutcome::FencedOverloaded(unpublished))
+            } else {
+                Ok(PublishOutcome::Fenced(unpublished))
+            }
+        }
         // Still unknown, or it had applied: the record stays.
         Err(_) => Err(failed),
+    }
+}
+
+const GUARD_OPEN: &str =
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
+         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open')";
+
+const DROP_PIECES: &str = "DELETE FROM upload_part_extents WHERE upload_id = ?1";
+
+const CREATE_UPLOAD: &str =
+    "INSERT INTO uploads(id, bucket_id, key, content_json, user_meta_json, state, \
+               revision, initiated_at) SELECT ?1, ?2, ?3, ?4, ?5, 'open', 0, ?6 \
+             WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?2)";
+
+const UPLOAD_STATE: &str =
+    "SELECT state FROM uploads WHERE id = ?1 AND bucket_id = ?2 AND key = ?3";
+
+const READ_UPLOAD: &str =
+    "SELECT id, bucket_id, key, content_json, user_meta_json, state, revision, \
+               completed_generation_id, complete_digest, result_etag, initiated_at \
+             FROM uploads WHERE id = ?1 AND bucket_id = ?2 AND key = ?3";
+
+const READ_PARTS: &str = "SELECT upload_id, part_number, extent_id, size, etag, uploaded_at \
+             FROM upload_parts WHERE upload_id = ?1 ORDER BY part_number";
+
+const INSERT_STAGED: &str =
+    "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+           plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
+           plain_sha256, cipher_sha256, safety_state, article_count, plan_rev, created_at) \
+         VALUES (?1,?2,NULL,'staged',NULL,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)";
+
+const UPSERT_PART: &str =
+    "INSERT INTO upload_parts(upload_id, part_number, extent_id, size, etag, uploaded_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(upload_id, part_number) DO UPDATE SET extent_id = excluded.extent_id, \
+           size = excluded.size, etag = excluded.etag, uploaded_at = excluded.uploaded_at";
+
+const CLEAR_PART_PIECES: &str =
+    "DELETE FROM upload_part_extents WHERE upload_id = ?1 AND part_number = ?2";
+
+const INSERT_PART_PIECE: &str =
+    "INSERT INTO upload_part_extents(upload_id, part_number, piece, extent_id) \
+             VALUES (?1, ?2, ?3, ?4)";
+
+const BUMP_REVISION: &str = "UPDATE uploads SET revision = revision + 1 \
+         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'";
+
+const HELD_EXTENTS: &str =
+    "SELECT (SELECT COUNT(*) FROM upload_parts WHERE upload_id = ?1 AND part_number <> ?2) \
+                  + (SELECT COUNT(*) FROM upload_part_extents \
+                      WHERE upload_id = ?1 AND part_number <> ?2)";
+
+const ABORT: &str = "UPDATE uploads SET state = 'aborted', revision = revision + 1 \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open'";
+
+const GUARD_REVISION: &str =
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM uploads \
+         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4)";
+
+const INSERT_GENERATION: &str =
+    "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,'live',?4,?5,?6,?7,?8,?9,?10,NULL)";
+
+const ADOPTED_REFERENCES_PG: &str =
+    "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT e.generation_id, e.seq, e.id, e.plain_offset \
+           FROM (SELECT extent_id FROM upload_parts WHERE upload_id = ?2 \
+                 UNION SELECT extent_id FROM upload_part_extents WHERE upload_id = ?2) p \
+          JOIN extents e ON e.id = p.extent_id \
+          WHERE e.generation_id = ?1 \
+          ON CONFLICT (generation_id, seq) DO NOTHING";
+
+const ADOPTED_REFERENCES: &str =
+    "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT e.generation_id, e.seq, e.id, e.plain_offset \
+           FROM (SELECT extent_id FROM upload_parts WHERE upload_id = ?2 \
+                 UNION SELECT extent_id FROM upload_part_extents WHERE upload_id = ?2) p \
+          CROSS JOIN extents e ON e.id = p.extent_id \
+          WHERE +e.generation_id = ?1";
+
+const GUARD_COMPLETE_PIECES_PG: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM upload_part_extents x \
+              JOIN upload_parts p ON p.upload_id = x.upload_id \
+               AND p.part_number = x.part_number \
+              JOIN extents e0 ON e0.id = p.extent_id \
+              JOIN extents e ON e.id = x.extent_id \
+             WHERE x.upload_id = ?1 \
+               AND ((e.generation_id IS NOT DISTINCT FROM ?2) <> (e0.generation_id IS NOT DISTINCT FROM ?2) \
+                    OR ((e0.generation_id IS NOT DISTINCT FROM ?2) AND e.seq <> e0.seq + x.piece)))";
+
+const GUARD_COMPLETE_PIECES: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM upload_part_extents x \
+              JOIN upload_parts p ON p.upload_id = x.upload_id \
+               AND p.part_number = x.part_number \
+              JOIN extents e0 ON e0.id = p.extent_id \
+              JOIN extents e ON e.id = x.extent_id \
+             WHERE x.upload_id = ?1 \
+               AND ((e.generation_id IS ?2) <> (e0.generation_id IS ?2) \
+                    OR (e0.generation_id IS ?2 AND e.seq <> e0.seq + x.piece)))";
+
+const UPSERT_POINTER: &str =
+    "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id";
+
+const COMPLETE_RECEIPT: &str = "UPDATE uploads SET state = 'completed', revision = revision + 1, \
+           completed_generation_id = ?5, complete_digest = ?6, result_etag = ?7 \
+         WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4";
+
+const FENCE_REVISION: &str = "UPDATE uploads SET revision = revision + 1 \
+             WHERE id = ?1 AND bucket_id = ?2 AND key = ?3 AND state = 'open' AND revision = ?4";
+
+macro_rules! gc_staged {
+    ($filter:literal, $join:literal) => {
+        concat!(
+            "INSERT INTO gc(extent_id, action, due_at) \
+             SELECT p.extent_id, a.action, a.due_at FROM \
+               (SELECT extent_id FROM upload_parts WHERE upload_id = ?1",
+            $filter,
+            " UNION ALL SELECT extent_id FROM upload_part_extents WHERE upload_id = ?1",
+            $filter,
+            ") p \
+             JOIN extents e ON e.id = p.extent_id ",
+            $join,
+            "JOIN (SELECT 'delete_safety' AS action, ?2 AS due_at \
+                   UNION ALL SELECT 'shred_key', ?3) a \
+             WHERE e.state = 'staged'"
+        )
+    };
+}
+
+const GC_STAGED_ALL: &str = gc_staged!("", "");
+
+const GC_STAGED_ALL_PG: &str = gc_staged!("", "CROSS ");
+
+const GC_STAGED_PART: &str = gc_staged!(" AND part_number = ?4", "");
+
+const GC_STAGED_PART_PG: &str = gc_staged!(" AND part_number = ?4", "CROSS ");
+
+const LIST_UPLOADS: &str = "SELECT key, id, initiated_at FROM uploads \
+         WHERE bucket_id = ?1 AND state = 'open' AND key >= ?2 \
+           AND (key > ?3 OR (key = ?3 AND id > ?4))  \
+         ORDER BY key, id LIMIT ?5";
+
+const LIST_UPLOADS_BELOW: &str = "SELECT key, id, initiated_at FROM uploads \
+         WHERE bucket_id = ?1 AND state = 'open' AND key >= ?2 \
+           AND (key > ?3 OR (key = ?3 AND id > ?4)) AND key < ?6 \
+         ORDER BY key, id LIMIT ?5";
+
+const GUARD_ADOPTED_LAYOUT: &str = concat!(
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
+               OR (SELECT COUNT(*) FROM ",
+    adopted!(),
+    ") <> ?2 \
+               OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM ",
+    adopted!(),
+    ") <> ?3 \
+               OR EXISTS (SELECT 1 FROM (SELECT e.plain_offset AS plain_offset, \
+                    SUM(e.plain_size) OVER (ORDER BY ge.seq \
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected FROM ",
+    adopted!(),
+    ") WHERE plain_offset <> COALESCE(expected, 0))"
+);
+
+const GUARD_ADOPTED_LAYOUT_PG: &str = concat!(
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2 \
+               OR (SELECT COUNT(*) FROM ",
+    adopted_pg!(),
+    ") <> ?2 \
+               OR (SELECT COALESCE(SUM(e.plain_size), 0) FROM ",
+    adopted_pg!(),
+    ") <> ?3 \
+               OR EXISTS (SELECT 1 FROM (SELECT e.plain_offset AS plain_offset, \
+                    SUM(e.plain_size) OVER (ORDER BY ge.seq \
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS expected FROM ",
+    adopted_pg!(),
+    ") WHERE plain_offset <> COALESCE(expected, 0))"
+);
+
+const POST_ADOPTED: &str = concat!(
+    // Marked as sent from the start (`sent_at`): the caller
+    // sends the post jobs itself (`Catalog::complete_upload`).
+    "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+             SELECT e.id, e.generation_id, 'post', ?2, ?2, ?2 FROM ",
+    adopted!()
+);
+
+const POST_ADOPTED_PG: &str = concat!(
+    // Marked as sent from the start (`sent_at`): the caller
+    // sends the post jobs itself (`Catalog::complete_upload`).
+    "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+             SELECT e.id, e.generation_id, 'post', ?2, ?2, ?2 FROM ",
+    adopted_pg!()
+);
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<Stmt> {
+    super::pg_manifest(&[
+        (GUARD_OPEN, "TTT"),
+        (DROP_PIECES, "T"),
+        (CREATE_UPLOAD, "TTTTTI"),
+        (UPLOAD_STATE, "TTT"),
+        (READ_UPLOAD, "TTT"),
+        (READ_PARTS, "T"),
+        (INSERT_STAGED, "TTIIBIBBBBTII"),
+        (INSERT_STAGED, "TTIIBINBBBTII"),
+        (UPSERT_PART, "TITITI"),
+        (CLEAR_PART_PIECES, "TI"),
+        (INSERT_PART_PIECE, "TIIT"),
+        (BUMP_REVISION, "TTT"),
+        (HELD_EXTENTS, "TI"),
+        (ABORT, "TTT"),
+        (GUARD_REVISION, "TTTI"),
+        (INSERT_GENERATION, "TTTITTTTII"),
+        (INSERT_GENERATION, "TTTITNTTII"),
+        (ADOPTED_REFERENCES_PG, "TT"),
+        (GUARD_COMPLETE_PIECES_PG, "TT"),
+        (UPSERT_POINTER, "TTT"),
+        (COMPLETE_RECEIPT, "TTTITBT"),
+        (FENCE_REVISION, "TTTI"),
+        (GC_STAGED_ALL_PG, "TII"),
+        (GC_STAGED_PART_PG, "TIII"),
+        (LIST_UPLOADS, "TTTTI"),
+        (LIST_UPLOADS_BELOW, "TTTTIT"),
+        (GUARD_ADOPTED_LAYOUT_PG, "TII"),
+        (POST_ADOPTED_PG, "TI"),
+    ])
+}
+
+#[cfg(test)]
+mod complete_fence_tests {
+    use super::*;
+    use crate::ports::Catalog;
+    use crate::testkit::RusqliteSql;
+    use crate::types::{Bucket, ExtentPlacement, GenerationRow, SafetyState};
+    use std::cell::Cell;
+
+    struct FailOnce<S> {
+        inner: S,
+        error: Cell<Option<BridgeError>>,
+    }
+
+    impl<S: Sql> Sql for FailOnce<S> {
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+
+        async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+
+        async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+            self.inner.exec(sql, params).await
+        }
+
+        async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<u64>> {
+            if let Some(error) = self.error.take() {
+                return Err(error);
+            }
+            self.inner.batch(stmts).await
+        }
+    }
+
+    async fn complete_after_fence<S: Sql>(sql: S, overloaded: bool) {
+        let cat = SqlCatalog::new(FailOnce {
+            inner: sql,
+            error: Cell::new(None),
+        });
+        let now = UnixMs(1);
+        let bucket = BucketId::new("b_fixture");
+        let upload = UploadId::new("u_fixture");
+        let target = UploadTarget {
+            bucket: &bucket,
+            key: "fixture",
+            id: &upload,
+        };
+        assert!(matches!(
+            cat.create_bucket(&Bucket {
+                id: bucket.clone(),
+                name: "fence-test".into(),
+                owner: "fixture".into(),
+                bdk_wrapped: vec![0; 73],
+                kek_version: 1,
+                disposable: false,
+                created_at: now,
+            })
+            .await
+            .unwrap(),
+            Guard::Applied(())
+        ));
+        cat.create_upload(&UploadRow {
+            id: upload.clone(),
+            bucket_id: bucket.clone(),
+            key: target.key.into(),
+            content_json: "{}".into(),
+            user_meta_json: "{}".into(),
+            state: UploadState::Open,
+            revision: 0,
+            completed_generation_id: None,
+            complete_digest: None,
+            result_etag: None,
+            initiated_at: now,
+        })
+        .await
+        .unwrap();
+
+        let mut placements = Vec::new();
+        for part_number in 1..=2 {
+            let extent = ExtentRow {
+                id: ExtentId::new(format!("x_fixture_{part_number}")),
+                bucket_id: bucket.clone(),
+                generation_id: None,
+                state: ExtentState::Staged,
+                seq: None,
+                plain_offset: None,
+                plain_size: 1,
+                cipher_size: 65,
+                media_header: vec![0; 48],
+                key_mode: 1,
+                wrapped_file_key: Some(vec![1; 73]),
+                plain_md5: [0; 16],
+                plain_sha256: [0; 32],
+                cipher_sha256: [0; 32],
+                safety_state: SafetyState::Held,
+                article_count: None,
+                plan_rev: 0,
+                last_verified_at: None,
+                release_evidence: None,
+                released_at: None,
+                created_at: now,
+            };
+            let part = UploadPartRow {
+                upload_id: upload.clone(),
+                part_number,
+                extent_id: extent.id.clone(),
+                size: 1,
+                etag: format!("part-{part_number}"),
+                uploaded_at: now,
+            };
+            assert!(matches!(
+                cat.put_upload_part(&target, &part, &extent, now)
+                    .await
+                    .unwrap(),
+                Guard::Applied(())
+            ));
+            placements.push(ExtentPlacement {
+                extent_id: extent.id,
+                seq: u32::from(part_number - 1),
+                plain_offset: u64::from(part_number - 1),
+            });
+        }
+        let (before, original_parts) = cat.upload(&target).await.unwrap().unwrap();
+        let id = GenerationId::new("g_before_fence");
+        let digest = [7; 32];
+        let completion = CompleteUpload {
+            generation: GenerationRow {
+                id: id.clone(),
+                bucket_id: bucket.clone(),
+                key: target.key.into(),
+                state: GenerationState::Live,
+                size: 2,
+                etag: "result".into(),
+                checksum_json: None,
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                extent_count: 2,
+                created_at: now,
+                retired_at: None,
+            },
+            placements,
+            now,
+        };
+        cat.sql.error.set(Some(BridgeError::Sql(
+            if overloaded {
+                "pg: overloaded"
+            } else {
+                "fixture: unknown commit"
+            }
+            .into(),
+        )));
+        let result = cat
+            .complete_upload(
+                &target,
+                before.revision,
+                &digest,
+                &completion,
+                None,
+                Recorded::for_test(&id),
+            )
+            .await
+            .unwrap();
+        let record = match result {
+            PublishOutcome::FencedOverloaded(record) if overloaded => record,
+            PublishOutcome::Fenced(record) if !overloaded => record,
+            PublishOutcome::Fenced(_) => {
+                panic!("Complete returned ordinary Fenced after PostgreSQL overload")
+            }
+            _ => panic!("Complete did not return the expected fenced outcome"),
+        };
+        assert_eq!(record.generation(), &id);
+        let (fenced, retained_parts) = cat.upload(&target).await.unwrap().unwrap();
+        assert_eq!(fenced.state, UploadState::Open);
+        assert_eq!(fenced.revision, before.revision + 1);
+        assert_eq!(retained_parts, original_parts);
+        assert!(matches!(
+            cat.complete_upload(
+                &target,
+                before.revision,
+                &digest,
+                &completion,
+                None,
+                Recorded::for_test(&id)
+            )
+            .await
+            .unwrap(),
+            PublishOutcome::Refused(_)
+        ));
+
+        // The next Complete request retains the upload, digest and parts,
+        // but publishes a fresh generation at the new upload revision.
+        let mut retry = completion;
+        let retry_id = GenerationId::new("g_retry");
+        retry.generation.id = retry_id.clone();
+        assert!(matches!(
+            cat.complete_upload(
+                &target,
+                fenced.revision,
+                &digest,
+                &retry,
+                None,
+                Recorded::for_test(&retry_id)
+            )
+            .await
+            .unwrap(),
+            PublishOutcome::Applied
+        ));
+        let (completed, parts) = cat.upload(&target).await.unwrap().unwrap();
+        assert_eq!(completed.state, UploadState::Completed);
+        assert_eq!(completed.completed_generation_id.as_ref(), Some(&retry_id));
+        assert_eq!(completed.complete_digest, Some(digest));
+        assert_eq!(parts, original_parts);
+        let (generation, extents) = cat.live_object(&bucket, target.key).await.unwrap().unwrap();
+        assert_eq!(generation.id, retry_id);
+        assert_eq!(
+            extents.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            original_parts
+                .iter()
+                .map(|p| &p.extent_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cat.sql
+                .query("SELECT COUNT(*) FROM generations", &[])
+                .await
+                .unwrap(),
+            vec![vec![SqlValue::Int(1)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_unknown_complete_stays_fenced_and_retry_publishes_once() {
+        complete_after_fence(RusqliteSql::with_schema().unwrap(), false).await;
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_overload_class_after_fencing() {
+        // SQLite supplies the transactional fixture; the first Complete
+        // batch receives the same classified error as the PG adapter.
+        complete_after_fence(RusqliteSql::with_schema().unwrap(), true).await;
     }
 }

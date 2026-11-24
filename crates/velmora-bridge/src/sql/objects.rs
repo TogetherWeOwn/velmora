@@ -11,7 +11,7 @@ use super::intents::publish_intents;
 use super::replay::guard_no_replay;
 use super::uploads::published;
 use super::SqlCatalog;
-use crate::ports::{KeyHead, PublishOutcome, Row, Sql, SqlValue};
+use crate::ports::{Dialect, KeyHead, PublishOutcome, Row, Sql, SqlValue};
 use crate::recovery::Recorded;
 use crate::types::{
     BackboneStatus, BridgeError, BucketId, CommitGeneration, CopyGeneration, ExtentId, ExtentRow,
@@ -126,10 +126,14 @@ impl Cols {
     }
 }
 
-/// How many columns [`GENERATION_COLS`] selects.
+/// How many columns the generation projection selects.
 const GENERATION_WIDTH: usize = 12;
-const GENERATION_COLS: &str = "g.id, g.bucket_id, g.key, g.state, g.size, g.etag, \
-     g.checksum_json, g.content_json, g.user_meta_json, g.extent_count, g.created_at, g.retired_at";
+macro_rules! generation_cols {
+    () => {
+        "g.id, g.bucket_id, g.key, g.state, g.size, g.etag, \
+     g.checksum_json, g.content_json, g.user_meta_json, g.extent_count, g.created_at, g.retired_at"
+    };
+}
 
 fn generation_row(row: Row) -> Result<GenerationRow> {
     let mut c = Cols::new(row);
@@ -151,11 +155,15 @@ fn generation_row(row: Row) -> Result<GenerationRow> {
 
 /// The `extents` columns in schema order, with the place the extent has
 /// in the generation it was first written for.
-pub(super) const EXTENT_COLS: &str =
-    "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
+macro_rules! extent_cols {
+    () => {
+        "id, bucket_id, generation_id, state, seq, plain_offset, plain_size, cipher_size, \
      media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, \
      safety_state, article_count, plan_rev, last_verified_at, release_evidence, released_at, \
-     created_at";
+     created_at"
+    };
+}
+pub(super) use extent_cols;
 
 /// One extent row: the `extents` columns in schema order.
 pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
@@ -205,16 +213,12 @@ pub(super) async fn live_generation_asked<S: Sql>(
     key: &str,
     after_refusal: bool,
 ) -> Result<Option<GenerationRow>> {
-    let sql = format!(
-        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
-         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-         WHERE o.bucket_id = ?1 AND o.key = ?2"
-    );
+    let sql = LIVE_GENERATION;
     let params = [text(bucket.as_str()), text(key)];
     let rows = if after_refusal {
-        c.sql.query_after_refusal(&sql, &params).await?
+        c.sql.query_after_refusal(sql, &params).await?
     } else {
-        c.sql.query(&sql, &params).await?
+        c.sql.query(sql, &params).await?
     };
     rows.into_iter().next().map(generation_row).transpose()
 }
@@ -224,15 +228,10 @@ pub(super) async fn generation_by_id<S: Sql>(
     bucket: &BucketId,
     generation: &GenerationId,
 ) -> Result<Option<(crate::types::Bucket, GenerationRow)>> {
-    let sql = format!(
-        "SELECT {GENERATION_COLS}, b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, \
-           b.disposable, b.created_at \
-         FROM generations g JOIN buckets b ON b.id = g.bucket_id \
-         WHERE g.id = ?1 AND g.bucket_id = ?2"
-    );
+    let sql = GENERATION_BY_ID;
     let rows = c
         .sql
-        .query(&sql, &[text(generation.as_str()), text(bucket.as_str())])
+        .query(sql, &[text(generation.as_str()), text(bucket.as_str())])
         .await?;
     let Some(mut row) = rows.into_iter().next() else {
         return Ok(None);
@@ -250,11 +249,14 @@ pub(super) async fn generation_by_id<S: Sql>(
 /// The select list of an extent as a generation references it: `seq` and
 /// `plain_offset` come from the reference, not from the generation the
 /// extent was first written for.
-const PLACED_EXTENT_COLS: &str =
-    "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
+macro_rules! placed_extent_cols {
+    () => {
+        "e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
      e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
      e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at";
+     e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at"
+    };
+}
 
 /// The last `seq` of generation `?1` whose reference begins at or
 /// before (`$cmp` is `<=`) or before (`<`) the offset `$at`, as a
@@ -275,10 +277,12 @@ const PLACED_EXTENT_COLS: &str =
 /// still holds for a run from the first `seq` on, and a `seq` that has
 /// no reference stands for the next one that has.
 macro_rules! bisect {
-    ($name:literal, $cmp:literal, $at:literal) => {
+    ($name:literal, $cmp:literal, $at:literal, $seed:literal) => {
         concat!(
             $name,
-            "(lo, hi) AS (SELECT -1, COALESCE((SELECT MAX(seq) + 1 FROM generation_extents \
+            "(lo, hi) AS (SELECT ",
+            $seed,
+            ", COALESCE((SELECT MAX(seq) + 1 FROM generation_extents \
                 WHERE generation_id = ?1), 0) \
               UNION ALL \
               SELECT CASE WHEN (SELECT plain_offset FROM generation_extents \
@@ -324,21 +328,11 @@ pub(super) async fn extents_in<S: Sql>(
     let (Ok(start), Ok(end)) = (i64::try_from(start), i64::try_from(end)) else {
         return Err(bad("range offset"));
     };
-    let sql = format!(
-        "WITH RECURSIVE {first}, {last} \
-         SELECT {PLACED_EXTENT_COLS} \
-         FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-         WHERE ge.generation_id = ?1 \
-           AND ge.seq >= (SELECT MAX(lo, 0) FROM first_ref WHERE hi - lo <= 1) \
-           AND ge.seq <= (SELECT lo FROM last_ref WHERE hi - lo <= 1) \
-         ORDER BY ge.seq",
-        first = bisect!("first_ref", "<=", "?2"),
-        last = bisect!("last_ref", "<", "?3"),
-    );
+    let sql = c.sql.dialect().pick(EXTENTS_IN, EXTENTS_IN_PG);
     let rows = c
         .sql
         .query(
-            &sql,
+            sql,
             &[
                 text(generation.as_str()),
                 SqlValue::Int(start),
@@ -362,15 +356,7 @@ pub(super) async fn live_object<S: Sql>(
     // generation the extent was first written for.
     let rows = c
         .sql
-        .query(
-            "SELECT e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
-               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
-               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at \
-             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
-            &[text(generation.id.as_str())],
-        )
+        .query(LIVE_EXTENTS, &[text(generation.id.as_str())])
         .await?;
     let extents = rows.into_iter().map(extent_row).collect::<Result<_>>()?;
     Ok(Some((generation, extents)))
@@ -411,31 +397,25 @@ pub(super) fn retire_live(
     to: GenerationState,
     now: UnixMs,
 ) -> Vec<Stmt> {
+    retire_live_in(Dialect::Sqlite, bucket, key, to, now)
+}
+
+pub(super) fn retire_live_in(
+    dialect: Dialect,
+    bucket: &BucketId,
+    key: &str,
+    to: GenerationState,
+    now: UnixMs,
+) -> Vec<Stmt> {
     let b = || text(bucket.as_str());
     vec![
         (
-            concat!(
-                "INSERT INTO gc(extent_id, action, due_at) \
-                 SELECT x.extent_id, a.action, a.due_at FROM (",
-                retiring!(),
-                ") x JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
-                       UNION ALL SELECT 'delete_safety', ?3 \
-                       UNION ALL SELECT 'shred_key', ?4) a"
-            ),
+            dialect.pick(RETIRE_GC, RETIRE_GC_PG),
             vec![b(), text(key), ms(now), ms(now.plus_ms(SHRED_GRACE_MS))],
         ),
+        (RETIRE_OUTBOX, vec![b(), text(key), ms(now)]),
         (
-            concat!(
-                "UPDATE outbox SET stage = 'cancelled', sent_at = NULL, updated_at = ?3 \
-                 WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN (",
-                retiring!(),
-                ")"
-            ),
-            vec![b(), text(key), ms(now)],
-        ),
-        (
-            "UPDATE generations SET state = ?3, retired_at = ?4 WHERE id = \
-               (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)",
+            RETIRE_GENERATION,
             vec![b(), text(key), text(to.as_str()), ms(now)],
         ),
     ]
@@ -444,9 +424,7 @@ pub(super) fn retire_live(
 /// The row of a new live generation.
 fn generation_insert(g: &GenerationRow) -> Result<Stmt> {
     Ok((
-        "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-           content_json, user_meta_json, extent_count, created_at, retired_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)",
+        INSERT_GENERATION,
         vec![
             text(g.id.as_str()),
             text(g.bucket_id.as_str()),
@@ -466,8 +444,7 @@ fn generation_insert(g: &GenerationRow) -> Result<Stmt> {
 /// Points `(bucket, key)` of `g` at it.
 fn pointer_upsert(g: &GenerationRow) -> Stmt {
     (
-        "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id",
+        UPSERT_POINTER,
         vec![
             text(g.bucket_id.as_str()),
             text(&g.key),
@@ -479,11 +456,7 @@ fn pointer_upsert(g: &GenerationRow) -> Stmt {
 /// Inserts a freshly sealed extent as `committed` in `generation`.
 fn extent_insert(e: &ExtentRow, generation: &GenerationId) -> Result<Stmt> {
     Ok((
-        "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, plain_size, \
-           cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, \
-           cipher_sha256, safety_state, article_count, plan_rev, last_verified_at, \
-           release_evidence, released_at, created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        INSERT_EXTENT,
         vec![
             text(e.id.as_str()),
             text(e.bucket_id.as_str()),
@@ -528,19 +501,21 @@ pub(super) async fn raise_floor<S: Sql>(
     id: &GenerationId,
     generation: bool,
 ) -> Result<u64> {
-    let (sql, params) = raise_floor_stmt(bucket, key, id, generation);
+    let (sql, params) = raise_floor_stmt(c.sql.dialect(), bucket, key, id, generation);
     c.sql.exec(sql, &params).await
 }
 
-fn raise_floor_stmt(bucket: &BucketId, key: &str, id: &GenerationId, generation: bool) -> Stmt {
+fn raise_floor_stmt(
+    dialect: Dialect,
+    bucket: &BucketId,
+    key: &str,
+    id: &GenerationId,
+    generation: bool,
+) -> Stmt {
     (
         // Nothing for a bucket the catalogue does not have (a replay
         // can read a tombstone of one): nothing is published there.
-        "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
-         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
-         ON CONFLICT(bucket_id, key) DO UPDATE SET \
-           floor_id = max(floor_id, excluded.floor_id), \
-           unpublished = max(unpublished, excluded.unpublished)",
+        dialect.pick(RAISE_FLOOR, RAISE_FLOOR_PG),
         vec![
             text(bucket.as_str()),
             text(key),
@@ -559,7 +534,7 @@ pub(super) async fn raise_floors<S: Sql>(
 ) -> Result<bool> {
     let stmts: Vec<Stmt> = ids
         .iter()
-        .map(|(key, id)| raise_floor_stmt(bucket, key, id, false))
+        .map(|(key, id)| raise_floor_stmt(c.sql.dialect(), bucket, key, id, false))
         .collect();
     // One transaction: the bucket is there for every statement or for
     // none, so either every key has its floor or no row was changed.
@@ -582,8 +557,7 @@ pub(super) async fn settle_floor<S: Sql>(
 
 fn settle_floor_stmt(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
     (
-        "UPDATE key_floors SET unpublished = 0 \
-         WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0",
+        SETTLE_FLOOR,
         vec![text(bucket.as_str()), text(key), text(id.as_str())],
     )
 }
@@ -615,11 +589,7 @@ pub(super) async fn key_heads<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT k.key, k.value, o.generation_id, f.floor_id, f.unpublished \
-             FROM json_each(?2) k \
-             LEFT JOIN objects o ON o.bucket_id = ?1 AND o.key = k.value \
-             LEFT JOIN key_floors f ON f.bucket_id = ?1 AND f.key = k.value \
-             ORDER BY k.key",
+            c.sql.dialect().pick(KEY_HEADS, KEY_HEADS_PG),
             &[text(bucket.as_str()), text(&list)],
         )
         .await?;
@@ -664,11 +634,7 @@ pub(super) async fn unpublished_floor<S: Sql>(
 ) -> Result<Option<GenerationId>> {
     let rows = c
         .sql
-        .query(
-            "SELECT floor_id FROM key_floors \
-             WHERE bucket_id = ?1 AND key = ?2 AND unpublished <> 0",
-            &[text(bucket.as_str()), text(key)],
-        )
+        .query(UNPUBLISHED_FLOOR, &[text(bucket.as_str()), text(key)])
         .await?;
     match rows.first().map(Vec::as_slice) {
         Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
@@ -688,10 +654,7 @@ pub(super) async fn unpublished_floor<S: Sql>(
 /// publication's own id, or an id only 64 equal random bits could repeat.
 pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
     (
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
-           WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3) \
-         OR EXISTS (SELECT 1 FROM key_floors \
-           WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)",
+        GUARD_NEWEST,
         vec![text(bucket.as_str()), text(key), text(id.as_str())],
     )
 }
@@ -706,25 +669,12 @@ pub(super) fn guard_newest(bucket: &BucketId, key: &str, id: &GenerationId) -> S
 pub(super) fn guard_precondition(bucket: &BucketId, key: &str, condition: &Precondition) -> Stmt {
     let at = || vec![text(bucket.as_str()), text(key)];
     match condition {
-        Precondition::Absent => (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
-               WHERE bucket_id = ?1 AND key = ?2)",
-            at(),
-        ),
-        Precondition::Exists => (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects \
-               WHERE bucket_id = ?1 AND key = ?2)",
-            at(),
-        ),
+        Precondition::Absent => (GUARD_ABSENT, at()),
+        Precondition::Exists => (GUARD_PRESENT, at()),
         Precondition::Etag(etag) => {
             let mut params = at();
             params.push(text(etag));
-            (
-                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects o \
-                   JOIN generations g ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-                  WHERE o.bucket_id = ?1 AND o.key = ?2 AND g.etag = ?3)",
-                params,
-            )
+            (GUARD_ETAG, params)
         }
     }
 }
@@ -733,7 +683,7 @@ pub(super) fn guard_precondition(bucket: &BucketId, key: &str, condition: &Preco
 /// hold back, the live pointer does it from here.
 pub(super) fn clear_floor(bucket: &BucketId, key: &str, id: &GenerationId) -> Stmt {
     (
-        "DELETE FROM key_floors WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3",
+        CLEAR_FLOOR,
         vec![text(bucket.as_str()), text(key), text(id.as_str())],
     )
 }
@@ -747,13 +697,7 @@ pub(super) async fn newest_id<S: Sql>(
 ) -> Result<Option<GenerationId>> {
     let rows = c
         .sql
-        .query(
-            "SELECT max(id) FROM (SELECT generation_id AS id FROM objects \
-               WHERE bucket_id = ?1 AND key = ?2 \
-             UNION ALL SELECT floor_id FROM key_floors \
-               WHERE bucket_id = ?1 AND key = ?2)",
-            &[text(bucket.as_str()), text(key)],
-        )
+        .query(NEWEST_ID, &[text(bucket.as_str()), text(key)])
         .await?;
     match rows.first().map(Vec::as_slice) {
         Some([SqlValue::Text(id)]) => Ok(Some(GenerationId::new(id.clone()))),
@@ -810,22 +754,28 @@ pub(super) async fn commit_generation<S: Sql>(
         // The reference reads go through. `OR IGNORE`: the migration's
         // trigger records the same row for the insert above.
         stmts.push((
-            "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-             SELECT generation_id, seq, id, plain_offset FROM extents WHERE id = ?1",
+            c.sql
+                .dialect()
+                .pick(INSERT_EXTENT_REFERENCE, INSERT_EXTENT_REFERENCE_PG),
             vec![text(e.id.as_str())],
         ));
         stmts.push((
             // Marked as sent from the start (`sent_at`): the caller
             // sends the post job itself (`Catalog::commit_generation`).
-            "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
-             VALUES (?1, ?2, 'post', ?3, ?3, ?3)",
+            ENQUEUE_POST,
             vec![text(e.id.as_str()), text(g.id.as_str()), ms(commit.now)],
         ));
     }
     if let Some(write) = write {
-        stmts.extend(publish_intents(write, &g.id, commit.extents.len())?);
+        stmts.extend(publish_intents(
+            c.sql.dialect(),
+            write,
+            &g.id,
+            commit.extents.len(),
+        )?);
     }
-    stmts.extend(retire_live(
+    stmts.extend(retire_live_in(
+        c.sql.dialect(),
         &g.bucket_id,
         &g.key,
         GenerationState::Superseded,
@@ -862,11 +812,7 @@ pub(super) async fn copy_generation<S: Sql>(
     let source = || text(copy.source.as_str());
     let mut stmts: Vec<Stmt> = vec![
         (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS ( \
-               SELECT 1 FROM objects o JOIN generations s ON s.id = o.generation_id \
-                WHERE o.bucket_id = ?1 AND o.key = ?2 AND o.generation_id = ?3 \
-                  AND s.bucket_id = ?1 AND s.state = 'live' \
-                  AND s.size = ?4 AND s.etag = ?5 AND s.extent_count = ?6)",
+            GUARD_COPY_SOURCE,
             vec![
                 text(g.bucket_id.as_str()),
                 text(&copy.source_key),
@@ -885,25 +831,20 @@ pub(super) async fn copy_generation<S: Sql>(
         guard_newest(&g.bucket_id, &g.key, &g.id),
         clear_floor(&g.bucket_id, &g.key, &g.id),
         generation_insert(g)?,
-        (
-            "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-             SELECT ?1, seq, extent_id, plain_offset FROM generation_extents \
-              WHERE generation_id = ?2",
-            vec![text(g.id.as_str()), source()],
-        ),
+        (COPY_REFERENCES, vec![text(g.id.as_str()), source()]),
         // The copy has every reference its row claims, as a completed
         // upload is held to: a source with fewer than it claims is never
         // copied into an object that reads short.
         (
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
-               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2",
+            GUARD_REFERENCE_COUNT,
             vec![
                 text(g.id.as_str()),
                 SqlValue::Int(i64::from(g.extent_count)),
             ],
         ),
     ]);
-    stmts.extend(retire_live(
+    stmts.extend(retire_live_in(
+        c.sql.dialect(),
         &g.bucket_id,
         &g.key,
         GenerationState::Superseded,
@@ -916,6 +857,12 @@ pub(super) async fn copy_generation<S: Sql>(
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
+
+/// For NUL-free stored text, being strictly after `abc\0...` is
+/// equivalent to being strictly after `abc` in byte order.
+pub(super) fn before_nul(s: &str) -> &str {
+    s.split_once('\0').map_or(s, |(prefix, _)| prefix)
+}
 
 /// The least string greater than every string that starts with `s`, or
 /// `None` when no such string exists (`s` is empty or all U+10FFFF).
@@ -936,6 +883,16 @@ pub(super) fn successor(s: &str) -> Option<String> {
     None
 }
 
+/// The inclusive lower bound after a skipped prefix. No stored key can
+/// contain NUL, so the first valid extension of its NUL-free head is U+0001.
+pub(super) fn skip_prefix_bound(done: &str) -> Option<String> {
+    if let Some((head, _)) = done.split_once('\0') {
+        Some(format!("{head}\u{1}"))
+    } else {
+        successor(done)
+    }
+}
+
 /// One ListObjectsV2 page. The prefix is a key range (no `LIKE`). With a
 /// delimiter, keys are folded into common prefixes here and the scan
 /// seeks past each emitted prefix. The returned cursor carries the last
@@ -947,28 +904,25 @@ pub(super) async fn list<S: Sql>(
     q: &ListQuery,
 ) -> Result<ListPage> {
     let mut page = ListPage::default();
-    if q.max_keys == 0 {
+    if q.max_keys == 0 || q.prefix.contains('\0') {
         return Ok(page);
     }
-    let delimiter = q.delimiter.as_deref().filter(|d| !d.is_empty());
+    let delimiter = q
+        .delimiter
+        .as_deref()
+        .filter(|d| !d.is_empty() && !d.contains('\0'));
     let upper = successor(&q.prefix);
-    let sql = format!(
-        "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
-         JOIN generations g \
-         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-         WHERE o.bucket_id = ?1 AND o.key >= ?2 AND o.key > ?3 {} ORDER BY o.key LIMIT ?4",
-        if upper.is_some() {
-            "AND o.key < ?5"
-        } else {
-            ""
-        }
-    );
+    let sql = if upper.is_some() {
+        LIST_OBJECTS_BELOW
+    } else {
+        LIST_OBJECTS
+    };
 
     let mut from = q.prefix.clone(); // inclusive lower bound
-    let mut after = q.after.clone().unwrap_or_default(); // exclusive lower bound
+    let mut after = before_nul(q.after.as_deref().unwrap_or_default()).to_owned(); // exclusive lower bound
     let mut skip: Option<String> = None; // common prefix being folded
     if let Some(done) = &q.skip_prefix {
-        match successor(done) {
+        match skip_prefix_bound(done) {
             Some(s) => from = from.max(s),
             None => return Ok(page),
         }
@@ -985,7 +939,7 @@ pub(super) async fn list<S: Sql>(
             SqlValue::Int(i64::from(limit)),
         ];
         params.extend(upper.as_deref().map(text));
-        let rows = c.sql.query(&sql, &params).await?;
+        let rows = c.sql.query(sql, &params).await?;
         let full = u32::try_from(rows.len()).ok() == Some(limit);
 
         for row in rows {
@@ -1065,7 +1019,7 @@ pub(super) async fn list_heads<S: Sql>(
     bucket: &BucketId,
     q: &ListQuery,
 ) -> Result<Vec<ListEntry>> {
-    if q.max_keys == 0 {
+    if q.max_keys == 0 || q.prefix.contains('\0') {
         return Ok(Vec::new());
     }
     // "Fewer rows than asked for" must mean the range is exhausted, so
@@ -1078,16 +1032,16 @@ pub(super) async fn list_heads<S: Sql>(
     // One lower bound: inclusive at `from`, or exclusive at `after`.
     let mut from = q.prefix.clone();
     if let Some(done) = &q.skip_prefix {
-        match successor(done) {
+        match skip_prefix_bound(done) {
             Some(s) => from = from.max(s),
             None => return Ok(Vec::new()),
         }
     }
-    let after = q.after.clone().unwrap_or_default();
-    let (bound, op) = if after >= from {
-        (after, ">")
+    let after = before_nul(q.after.as_deref().unwrap_or_default()).to_owned();
+    let (bound, exclusive) = if after >= from {
+        (after, true)
     } else {
-        (from, ">=")
+        (from, false)
     };
     // The successor of a group is its head up to the delimiter, then the
     // successor of the delimiter. A delimiter that has none (all
@@ -1095,7 +1049,7 @@ pub(super) async fn list_heads<S: Sql>(
     let group = q
         .delimiter
         .as_deref()
-        .filter(|d| !d.is_empty())
+        .filter(|d| !d.is_empty() && !d.contains('\0'))
         .and_then(|d| Some((d, successor(d)?)));
 
     let mut params = vec![
@@ -1106,59 +1060,31 @@ pub(super) async fn list_heads<S: Sql>(
     let sql = match &group {
         None => {
             params.extend(upper.as_deref().map(text));
-            format!(
-                "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
-                 JOIN generations g \
-                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-                 WHERE o.bucket_id = ?1 AND o.key {op} ?2 {} ORDER BY o.key LIMIT ?3",
-                if upper.is_some() {
-                    "AND o.key < ?4"
-                } else {
-                    ""
-                }
-            )
+            match (exclusive, upper.is_some()) {
+                (true, true) => HEADS_EXCLUSIVE_BELOW,
+                (true, false) => HEADS_EXCLUSIVE,
+                (false, true) => HEADS_INCLUSIVE_BELOW,
+                (false, false) => HEADS_INCLUSIVE,
+            }
         }
         Some((delimiter, next)) => {
-            // `CROSS JOIN` fixes the join order (SQLite never reorders
-            // it): each head looks its object up. Left to choose, the
-            // planner walks every object of the bucket and probes the
-            // heads, which reads the groups this scan just stepped over.
-            // `substr` and `instr` count characters, as this does. The
-            // generation is joined `LEFT`: a head without one (which the
-            // foreign key rules out) fails the row decode below, where an
-            // inner join would end the listing early without a word.
+            // SQLite uses CROSS JOIN to seek the object by each head instead
+            // of scanning the bucket. PG uses the C-collated keys and strpos
+            // with character offsets (the bound prefix length is INT8).
             let prefix_chars = i64::try_from(q.prefix.chars().count())
                 .map_err(|_| BridgeError::Invalid("list prefix length"))?;
             params.extend([SqlValue::Int(prefix_chars), text(delimiter), text(next)]);
             params.extend(upper.as_deref().map(text));
-            let below = if upper.is_some() {
-                "AND o.key < ?7"
-            } else {
-                ""
-            };
-            format!(
-                "WITH RECURSIVE scan(n, key) AS ( \
-                   SELECT 1, (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
-                              AND o.key {op} ?2 {below} ORDER BY o.key LIMIT 1) \
-                   UNION ALL \
-                   SELECT n + 1, CASE WHEN instr(substr(key, ?4 + 1), ?5) > 0 \
-                     THEN (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
-                           AND o.key >= substr(scan.key, 1, \
-                                 ?4 + instr(substr(scan.key, ?4 + 1), ?5) - 1) || ?6 \
-                           {below} ORDER BY o.key LIMIT 1) \
-                     ELSE (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
-                           AND o.key > scan.key {below} ORDER BY o.key LIMIT 1) END \
-                   FROM scan WHERE key IS NOT NULL AND n < ?3 \
-                 ) \
-                 SELECT s.key, g.size, g.etag, g.created_at FROM scan s \
-                 CROSS JOIN objects o ON o.bucket_id = ?1 AND o.key = s.key \
-                 LEFT JOIN generations g \
-                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-                 ORDER BY s.n"
-            )
+            let dialect = c.sql.dialect();
+            match (exclusive, upper.is_some()) {
+                (true, true) => dialect.pick(GROUPED_EXCLUSIVE_BELOW, GROUPED_EXCLUSIVE_BELOW_PG),
+                (true, false) => dialect.pick(GROUPED_EXCLUSIVE, GROUPED_EXCLUSIVE_PG),
+                (false, true) => dialect.pick(GROUPED_INCLUSIVE_BELOW, GROUPED_INCLUSIVE_BELOW_PG),
+                (false, false) => dialect.pick(GROUPED_INCLUSIVE, GROUPED_INCLUSIVE_PG),
+            }
         }
     };
-    let rows = c.sql.query(&sql, &params).await?;
+    let rows = c.sql.query(sql, &params).await?;
     let mut heads = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cols = Cols::new(row);
@@ -1181,14 +1107,10 @@ pub(super) async fn object_status<S: Sql>(
     bucket: &BucketId,
     key: &str,
 ) -> Result<Option<ObjectStatus>> {
-    let sql = format!(
-        "SELECT {GENERATION_COLS} FROM objects o JOIN generations g \
-         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
-         WHERE o.bucket_id = ?1 AND o.key = ?2"
-    );
+    let sql = LIVE_GENERATION;
     let rows = c
         .sql
-        .query(&sql, &[text(bucket.as_str()), text(key)])
+        .query(sql, &[text(bucket.as_str()), text(key)])
         .await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
@@ -1196,16 +1118,7 @@ pub(super) async fn object_status<S: Sql>(
     let generation = generation_row(row)?;
     let gid = [text(generation.id.as_str())];
 
-    let rows = c
-        .sql
-        .query(
-            "SELECT e.id, ge.seq, e.safety_state, o.stage, o.attempts, o.last_error \
-             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
-             LEFT JOIN outbox o ON o.extent_id = e.id \
-             WHERE ge.generation_id = ?1 ORDER BY ge.seq",
-            &gid,
-        )
-        .await?;
+    let rows = c.sql.query(STATUS_EXTENTS, &gid).await?;
     let mut extents = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -1224,22 +1137,7 @@ pub(super) async fn object_status<S: Sql>(
     }
 
     // Latest verification per backbone at the extent's current plan_rev.
-    let rows = c
-        .sql
-        .query(
-            "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
-               CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END, \
-               v.articles_total, v.result, v.kind, v.mode, \
-               e.article_count + COALESCE(e.parity_count, 0) \
-             FROM verifications v JOIN extents e ON e.id = v.extent_id \
-             WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
-               AND v.plan_rev = e.plan_rev AND v.verified_at = \
-               (SELECT MAX(n.verified_at) FROM verifications n WHERE n.extent_id = v.extent_id \
-                  AND n.backbone = v.backbone AND n.plan_rev = v.plan_rev) \
-             ORDER BY v.extent_id, v.backbone",
-            &gid,
-        )
-        .await?;
+    let rows = c.sql.query(STATUS_VERIFICATIONS, &gid).await?;
     for row in rows {
         let mut r = Cols::new(row);
         let extent_id = r.text()?;
@@ -1287,8 +1185,7 @@ pub(super) async fn set_safety_state<S: Sql>(
         .exec(
             // Every change of state bumps the eviction fence, so an eviction
             // listed before it is refused.
-            "UPDATE extents SET safety_state = ?3, evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND safety_state = ?2",
+            SAFETY_CAS,
             &[
                 text(extent.as_str()),
                 text(from.as_str()),
@@ -1299,4 +1196,511 @@ pub(super) async fn set_safety_state<S: Sql>(
     // At least one: a usage-counter trigger adds its own row to the
     // count, and only when the extent's row was changed.
     Ok(changed >= 1)
+}
+
+const LIVE_EXTENTS: &str =
+    "SELECT e.id, e.bucket_id, e.generation_id, e.state, ge.seq, ge.plain_offset, \
+               e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
+               e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
+               e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at \
+             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             WHERE ge.generation_id = ?1 ORDER BY ge.seq";
+
+const RETIRE_GENERATION: &str = "UPDATE generations SET state = ?3, retired_at = ?4 WHERE id = \
+               (SELECT generation_id FROM objects WHERE bucket_id = ?1 AND key = ?2)";
+
+const INSERT_GENERATION: &str =
+    "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
+           content_json, user_meta_json, extent_count, created_at, retired_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)";
+
+const UPSERT_POINTER: &str =
+    "INSERT INTO objects(bucket_id, key, generation_id) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET generation_id = excluded.generation_id";
+
+const INSERT_EXTENT: &str =
+    "INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, plain_size, \
+           cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, plain_sha256, \
+           cipher_sha256, safety_state, article_count, plan_rev, last_verified_at, \
+           release_evidence, released_at, created_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)";
+
+const RAISE_FLOOR_PG: &str = "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET \
+           floor_id = GREATEST(key_floors.floor_id, excluded.floor_id), \
+           unpublished = GREATEST(key_floors.unpublished, excluded.unpublished)";
+
+const RAISE_FLOOR: &str = "INSERT INTO key_floors(bucket_id, key, floor_id, unpublished) \
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM buckets WHERE id = ?1) \
+         ON CONFLICT(bucket_id, key) DO UPDATE SET \
+           floor_id = max(floor_id, excluded.floor_id), \
+           unpublished = max(unpublished, excluded.unpublished)";
+
+const SETTLE_FLOOR: &str = "UPDATE key_floors SET unpublished = 0 \
+         WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3 AND unpublished <> 0";
+
+const KEY_HEADS_PG: &str = "SELECT k.ord - 1, k.value, o.generation_id, f.floor_id, f.unpublished \
+             FROM jsonb_array_elements_text(?2::jsonb) WITH ORDINALITY k(value, ord) \
+             LEFT JOIN objects o ON o.bucket_id = ?1 AND o.key = k.value \
+             LEFT JOIN key_floors f ON f.bucket_id = ?1 AND f.key = k.value \
+             ORDER BY k.ord";
+
+const KEY_HEADS: &str = "SELECT k.key, k.value, o.generation_id, f.floor_id, f.unpublished \
+             FROM json_each(?2) k \
+             LEFT JOIN objects o ON o.bucket_id = ?1 AND o.key = k.value \
+             LEFT JOIN key_floors f ON f.bucket_id = ?1 AND f.key = k.value \
+             ORDER BY k.key";
+
+const UNPUBLISHED_FLOOR: &str = "SELECT floor_id FROM key_floors \
+             WHERE bucket_id = ?1 AND key = ?2 AND unpublished <> 0";
+
+const GUARD_NEWEST: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+           WHERE bucket_id = ?1 AND key = ?2 AND generation_id >= ?3) \
+         OR EXISTS (SELECT 1 FROM key_floors \
+           WHERE bucket_id = ?1 AND key = ?2 AND floor_id > ?3)";
+
+const GUARD_ABSENT: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS (SELECT 1 FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2)";
+
+const GUARD_PRESENT: &str =
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2)";
+
+const GUARD_ETAG: &str =
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM objects o \
+                   JOIN generations g ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                  WHERE o.bucket_id = ?1 AND o.key = ?2 AND g.etag = ?3)";
+
+const CLEAR_FLOOR: &str =
+    "DELETE FROM key_floors WHERE bucket_id = ?1 AND key = ?2 AND floor_id <= ?3";
+
+const NEWEST_ID: &str = "SELECT max(id) FROM (SELECT generation_id AS id FROM objects \
+               WHERE bucket_id = ?1 AND key = ?2 \
+             UNION ALL SELECT floor_id FROM key_floors \
+               WHERE bucket_id = ?1 AND key = ?2)";
+
+const INSERT_EXTENT_REFERENCE_PG: &str =
+    "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT generation_id, seq, id, plain_offset FROM extents WHERE id = ?1 \
+          ON CONFLICT (generation_id, seq) DO NOTHING";
+
+const INSERT_EXTENT_REFERENCE: &str =
+    "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT generation_id, seq, id, plain_offset FROM extents WHERE id = ?1";
+
+const ENQUEUE_POST: &str =
+    "INSERT INTO outbox(extent_id, generation_id, stage, next_at, updated_at, sent_at) \
+             VALUES (?1, ?2, 'post', ?3, ?3, ?3)";
+
+const GUARD_COPY_SOURCE: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS ( \
+               SELECT 1 FROM objects o JOIN generations s ON s.id = o.generation_id \
+                WHERE o.bucket_id = ?1 AND o.key = ?2 AND o.generation_id = ?3 \
+                  AND s.bucket_id = ?1 AND s.state = 'live' \
+                  AND s.size = ?4 AND s.etag = ?5 AND s.extent_count = ?6)";
+
+const COPY_REFERENCES: &str =
+    "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+             SELECT ?1, seq, extent_id, plain_offset FROM generation_extents \
+              WHERE generation_id = ?2";
+
+const GUARD_REFERENCE_COUNT: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+               (SELECT COUNT(*) FROM generation_extents WHERE generation_id = ?1) <> ?2";
+
+const STATUS_EXTENTS: &str =
+    "SELECT e.id, ge.seq, e.safety_state, o.stage, o.attempts, o.last_error \
+             FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+             LEFT JOIN outbox o ON o.extent_id = e.id \
+             WHERE ge.generation_id = ?1 ORDER BY ge.seq";
+
+const STATUS_VERIFICATIONS: &str =
+    "SELECT v.extent_id, v.backbone, v.provider_id, v.verified_at, v.plan_rev, \
+               CASE v.kind WHEN 'stat' THEN v.articles_present ELSE v.articles_ok END, \
+               v.articles_total, v.result, v.kind, v.mode, \
+               e.article_count + COALESCE(e.parity_count, 0) \
+             FROM verifications v JOIN extents e ON e.id = v.extent_id \
+             WHERE e.id IN (SELECT extent_id FROM generation_extents WHERE generation_id = ?1) \
+               AND v.plan_rev = e.plan_rev AND v.verified_at = \
+               (SELECT MAX(n.verified_at) FROM verifications n WHERE n.extent_id = v.extent_id \
+                  AND n.backbone = v.backbone AND n.plan_rev = v.plan_rev) \
+             ORDER BY v.extent_id, v.backbone";
+
+const SAFETY_CAS: &str = "UPDATE extents SET safety_state = ?3, evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND safety_state = ?2";
+
+const LIVE_GENERATION: &str = concat!(
+    "SELECT ",
+    generation_cols!(),
+    " FROM objects o JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+         WHERE o.bucket_id = ?1 AND o.key = ?2"
+);
+
+const GENERATION_BY_ID: &str = concat!(
+    "SELECT ",
+    generation_cols!(),
+    ", b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, \
+           b.disposable, b.created_at \
+         FROM generations g JOIN buckets b ON b.id = g.bucket_id \
+         WHERE g.id = ?1 AND g.bucket_id = ?2"
+);
+
+const EXTENTS_IN: &str = concat!(
+    "WITH RECURSIVE ",
+    bisect!("first_ref", "<=", "?2", "-1"),
+    ", ",
+    bisect!("last_ref", "<", "?3", "-1"),
+    " \
+         SELECT ",
+    placed_extent_cols!(),
+    " \
+         FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = ?1 \
+           AND ge.seq >= (SELECT MAX(lo, 0) FROM first_ref WHERE hi - lo <= 1) \
+           AND ge.seq <= (SELECT lo FROM last_ref WHERE hi - lo <= 1) \
+         ORDER BY ge.seq"
+);
+
+const EXTENTS_IN_PG: &str = concat!(
+    "WITH RECURSIVE ",
+    bisect!("first_ref", "<=", "?2", "-1::bigint"),
+    ", ",
+    bisect!("last_ref", "<", "?3", "-1::bigint"),
+    " \
+         SELECT ",
+    placed_extent_cols!(),
+    " \
+         FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
+         WHERE ge.generation_id = ?1 \
+           AND ge.seq >= (SELECT GREATEST(lo, 0) FROM first_ref WHERE hi - lo <= 1) \
+           AND ge.seq <= (SELECT lo FROM last_ref WHERE hi - lo <= 1) \
+         ORDER BY ge.seq"
+);
+
+const RETIRE_OUTBOX: &str = concat!(
+    "UPDATE outbox SET stage = 'cancelled', sent_at = NULL, updated_at = ?3 \
+                 WHERE stage NOT IN ('done', 'cancelled') AND extent_id IN (",
+    retiring!(),
+    ")"
+);
+
+const RETIRE_GC: &str = concat!(
+    "INSERT INTO gc(extent_id, action, due_at) \
+                 SELECT x.extent_id, a.action, a.due_at FROM (",
+    retiring!(),
+    ") x JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
+                       UNION ALL SELECT 'delete_safety', ?3 \
+                       UNION ALL SELECT 'shred_key', ?4) a"
+);
+
+const RETIRE_GC_PG: &str = concat!(
+    "INSERT INTO gc(extent_id, action, due_at) \
+                 SELECT x.extent_id, a.action, a.due_at FROM (",
+    retiring!(),
+    ") x CROSS JOIN (SELECT 'delete_cache' AS action, ?3 AS due_at \
+                       UNION ALL SELECT 'delete_safety', ?3 \
+                       UNION ALL SELECT 'shred_key', ?4) a"
+);
+
+const LIST_OBJECTS: &str = "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
+         JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+         WHERE o.bucket_id = ?1 AND o.key >= ?2 AND o.key > ?3  ORDER BY o.key LIMIT ?4";
+
+const LIST_OBJECTS_BELOW: &str = "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
+         JOIN generations g \
+         ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+         WHERE o.bucket_id = ?1 AND o.key >= ?2 AND o.key > ?3 AND o.key < ?5 ORDER BY o.key LIMIT ?4";
+
+macro_rules! heads_plain {
+    ($op:literal, $below:literal) => {
+        concat!(
+            "SELECT o.key, g.size, g.etag, g.created_at FROM objects o \
+                 JOIN generations g \
+                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                 WHERE o.bucket_id = ?1 AND o.key ",
+            $op,
+            " ?2 ",
+            $below,
+            " ORDER BY o.key LIMIT ?3"
+        )
+    };
+}
+
+macro_rules! heads_grouped {
+    ($op:literal, $below:literal) => {
+        concat!(
+            "WITH RECURSIVE scan(n, key) AS ( \
+                   SELECT 1, (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                              AND o.key ",
+            $op,
+            " ?2 ",
+            $below,
+            " ORDER BY o.key LIMIT 1) \
+                   UNION ALL \
+                   SELECT n + 1, CASE WHEN instr(substr(key, ?4 + 1), ?5) > 0 \
+                     THEN (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key >= substr(scan.key, 1, \
+                                 ?4 + instr(substr(scan.key, ?4 + 1), ?5) - 1) || ?6 \
+                           ",
+            $below,
+            " ORDER BY o.key LIMIT 1) \
+                     ELSE (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key > scan.key ",
+            $below,
+            " ORDER BY o.key LIMIT 1) END \
+                   FROM scan WHERE key IS NOT NULL AND n < ?3 \
+                 ) \
+                 SELECT s.key, g.size, g.etag, g.created_at FROM scan s \
+                 CROSS JOIN objects o ON o.bucket_id = ?1 AND o.key = s.key \
+                 LEFT JOIN generations g \
+                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                 ORDER BY s.n"
+        )
+    };
+}
+
+macro_rules! heads_grouped_pg {
+    ($op:literal, $below:literal) => {
+        concat!(
+    "WITH RECURSIVE scan(n, key) AS ( \
+                   SELECT 1, (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                              AND o.key ",
+    $op,
+    " ?2 ",
+    $below,
+    " ORDER BY o.key LIMIT 1) \
+                   UNION ALL \
+                   SELECT n + 1, CASE WHEN strpos(substr(key, ?4::int + 1), ?5) > 0 \
+                     THEN (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key >= substr(scan.key, 1, \
+                                 ?4::int + strpos(substr(scan.key, ?4::int + 1), ?5) - 1) || ?6 \
+                           ",
+    $below,
+    " ORDER BY o.key LIMIT 1) \
+                     ELSE (SELECT o.key FROM objects o WHERE o.bucket_id = ?1 \
+                           AND o.key > scan.key ",
+    $below,
+    " ORDER BY o.key LIMIT 1) END \
+                   FROM scan WHERE key IS NOT NULL AND n < ?3 \
+                 ) \
+                 SELECT s.key, g.size, g.etag, g.created_at FROM scan s \
+                 JOIN objects o ON o.bucket_id = ?1 AND o.key = s.key \
+                 LEFT JOIN generations g \
+                 ON g.id = o.generation_id AND g.bucket_id = o.bucket_id \
+                 ORDER BY s.n"
+)
+    };
+}
+
+const HEADS_EXCLUSIVE: &str = heads_plain!(">", "");
+
+const GROUPED_EXCLUSIVE: &str = heads_grouped!(">", "");
+
+const GROUPED_EXCLUSIVE_PG: &str = heads_grouped_pg!(">", "");
+
+const HEADS_EXCLUSIVE_BELOW: &str = heads_plain!(">", "AND o.key < ?4");
+
+const GROUPED_EXCLUSIVE_BELOW: &str = heads_grouped!(">", "AND o.key < ?7");
+
+const GROUPED_EXCLUSIVE_BELOW_PG: &str = heads_grouped_pg!(">", "AND o.key < ?7");
+
+const HEADS_INCLUSIVE: &str = heads_plain!(">=", "");
+
+const GROUPED_INCLUSIVE: &str = heads_grouped!(">=", "");
+
+const GROUPED_INCLUSIVE_PG: &str = heads_grouped_pg!(">=", "");
+
+const HEADS_INCLUSIVE_BELOW: &str = heads_plain!(">=", "AND o.key < ?4");
+
+const GROUPED_INCLUSIVE_BELOW: &str = heads_grouped!(">=", "AND o.key < ?7");
+
+const GROUPED_INCLUSIVE_BELOW_PG: &str = heads_grouped_pg!(">=", "AND o.key < ?7");
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<Stmt> {
+    super::pg_manifest(&[
+        (LIVE_EXTENTS, "T"),
+        (RETIRE_GENERATION, "TTTI"),
+        (INSERT_GENERATION, "TTTTITTTTII"),
+        (INSERT_GENERATION, "TTTTITNTTII"),
+        (UPSERT_POINTER, "TTT"),
+        (INSERT_EXTENT, "TTTTIIIIBIBBBBTIIITII"),
+        (INSERT_EXTENT, "TTTTIIIIBIBBBBTNINNNI"),
+        (INSERT_EXTENT, "TTTTNNIIBINBBBTNINNNI"),
+        (RAISE_FLOOR_PG, "TTTI"),
+        (SETTLE_FLOOR, "TTT"),
+        (KEY_HEADS_PG, "TT"),
+        (UNPUBLISHED_FLOOR, "TT"),
+        (GUARD_NEWEST, "TTT"),
+        (GUARD_ABSENT, "TT"),
+        (GUARD_PRESENT, "TT"),
+        (GUARD_ETAG, "TTT"),
+        (CLEAR_FLOOR, "TTT"),
+        (NEWEST_ID, "TT"),
+        (INSERT_EXTENT_REFERENCE_PG, "T"),
+        (ENQUEUE_POST, "TTI"),
+        (GUARD_COPY_SOURCE, "TTTITI"),
+        (COPY_REFERENCES, "TT"),
+        (GUARD_REFERENCE_COUNT, "TI"),
+        (STATUS_EXTENTS, "T"),
+        (STATUS_VERIFICATIONS, "T"),
+        (SAFETY_CAS, "TTT"),
+        (LIVE_GENERATION, "TT"),
+        (GENERATION_BY_ID, "TT"),
+        (EXTENTS_IN_PG, "TII"),
+        (RETIRE_OUTBOX, "TTI"),
+        (RETIRE_GC_PG, "TTII"),
+        (LIST_OBJECTS, "TTTI"),
+        (LIST_OBJECTS_BELOW, "TTTIT"),
+        (HEADS_EXCLUSIVE, "TTI"),
+        (GROUPED_EXCLUSIVE_PG, "TTIITT"),
+        (HEADS_EXCLUSIVE_BELOW, "TTIT"),
+        (GROUPED_EXCLUSIVE_BELOW_PG, "TTIITTT"),
+        (HEADS_INCLUSIVE, "TTI"),
+        (GROUPED_INCLUSIVE_PG, "TTIITT"),
+        (HEADS_INCLUSIVE_BELOW, "TTIT"),
+        (GROUPED_INCLUSIVE_BELOW_PG, "TTIITTT"),
+    ])
+}
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod pg_manifest_tests {
+    use super::*;
+    use crate::ports::{Catalog, Guard};
+    use crate::testkit::RusqliteSql;
+    use std::cell::RefCell;
+
+    fn bind_kinds(params: &[SqlValue]) -> String {
+        params
+            .iter()
+            .map(|v| match v {
+                SqlValue::Text(_) => 'T',
+                SqlValue::Int(_) => 'I',
+                SqlValue::Blob(_) => 'B',
+                SqlValue::Null => 'N',
+            })
+            .collect()
+    }
+
+    struct RecordExtentBinds {
+        db: RusqliteSql,
+        kinds: RefCell<Vec<String>>,
+    }
+
+    impl Sql for RecordExtentBinds {
+        async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+            self.db.query(sql, params).await
+        }
+
+        async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+            self.db.exec(sql, params).await
+        }
+
+        async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<u64>> {
+            let kinds: Vec<_> = stmts
+                .iter()
+                .filter(|(sql, _)| *sql == INSERT_EXTENT)
+                .map(|(_, params)| bind_kinds(params))
+                .collect();
+            let changes = self.db.batch(stmts).await?;
+            self.kinds.borrow_mut().extend(kinds);
+            Ok(changes)
+        }
+    }
+
+    #[tokio::test]
+    async fn extent_inventory_covers_plain_and_sliced_put_binds() {
+        let db = RusqliteSql::with_schema().unwrap();
+        db.apply(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+             VALUES ('b', 'test', 'owner', X'00', 1, 0)",
+        )
+        .unwrap();
+        let cat = SqlCatalog::new(RecordExtentBinds {
+            db,
+            kinds: RefCell::new(Vec::new()),
+        });
+        let manifest: Vec<_> = pg_statements()
+            .into_iter()
+            .filter(|(sql, _)| *sql == INSERT_EXTENT)
+            .map(|(_, params)| bind_kinds(&params))
+            .collect();
+        for (key, extent_count) in [("plain", 1), ("sliced", 2)] {
+            let bucket = BucketId::new("b");
+            let id = GenerationId::new(format!("g_{key}"));
+            let now = UnixMs(1);
+            let commit = CommitGeneration {
+                generation: GenerationRow {
+                    id: id.clone(),
+                    bucket_id: bucket.clone(),
+                    key: key.to_owned(),
+                    state: GenerationState::Live,
+                    size: u64::from(extent_count),
+                    etag: "tag".into(),
+                    checksum_json: None,
+                    content_json: "{}".into(),
+                    user_meta_json: "{}".into(),
+                    extent_count,
+                    created_at: now,
+                    retired_at: None,
+                },
+                extents: (0..extent_count)
+                    .map(|seq| ExtentRow {
+                        id: ExtentId::new(format!("x_{key}_{seq}")),
+                        bucket_id: bucket.clone(),
+                        generation_id: Some(id.clone()),
+                        state: ExtentState::Committed,
+                        seq: Some(seq),
+                        plain_offset: Some(u64::from(seq)),
+                        plain_size: 1,
+                        cipher_size: 65,
+                        media_header: vec![0; 48],
+                        key_mode: 1,
+                        wrapped_file_key: Some(vec![1; 73]),
+                        plain_md5: [0; 16],
+                        plain_sha256: [0; 32],
+                        cipher_sha256: [0; 32],
+                        safety_state: SafetyState::Held,
+                        article_count: None,
+                        plan_rev: 0,
+                        last_verified_at: None,
+                        release_evidence: None,
+                        released_at: None,
+                        created_at: now,
+                    })
+                    .collect(),
+                now,
+            };
+            let record = Recorded::for_test(&id);
+            let outcome = if extent_count == 1 {
+                cat.commit_generation(&commit, None, record).await.unwrap()
+            } else {
+                let write = WriteId::new("w_test");
+                let extents: Vec<_> = commit.extents.iter().map(|e| e.id.clone()).collect();
+                assert!(matches!(
+                    cat.open_intents(&write, &extents, now).await.unwrap(),
+                    Guard::Applied(())
+                ));
+                assert!(matches!(
+                    cat.intents_generation(&write, &id, extents.len())
+                        .await
+                        .unwrap(),
+                    Guard::Applied(())
+                ));
+                cat.commit_sliced(&commit, &write, None, record)
+                    .await
+                    .unwrap()
+            };
+            assert!(matches!(outcome, PublishOutcome::Applied));
+            let actual = cat.sql.kinds.take();
+            assert_eq!(actual.len(), extent_count as usize);
+            for kinds in actual {
+                assert!(
+                    manifest.contains(&kinds),
+                    "{key} PUT bound {kinds}; manifest has {manifest:?}"
+                );
+            }
+        }
+    }
 }
