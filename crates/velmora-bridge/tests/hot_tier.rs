@@ -1012,6 +1012,27 @@ async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn status_preserves_the_cap_from_before_the_last_decision() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    hot.bridge().clock.advance_secs(3600);
+    let (report, _) = hot.dispatch_and_evict().await;
+    let ctl = report.hot_ctl.unwrap();
+    assert_eq!((ctl.cap_before, ctl.cap_after), (100 * GIB, 90 * GIB));
+    let status = hot.admin_status().await;
+    assert_eq!(status["hot"]["cap_bytes"], 90 * GIB);
+    assert_eq!(status["hot"]["ctl"]["cap_before"], 100 * GIB);
+    assert_eq!(status["hot"]["ctl"]["cap_after"], 90 * GIB);
+    assert_eq!(status["hot"]["ctl"]["target_before"], 100 * GIB);
+    assert_eq!(status["hot"]["ctl"]["step"], "shrink");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_unchanged_target_does_not_rewrite_its_cap_rows() {
     use velmora_bridge::config::HotCtlMode;
     let hot = hot_with(|cfg| {

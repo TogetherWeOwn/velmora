@@ -52,8 +52,10 @@ const HOT_CTL_EVERY_MS: i64 = 3_600_000;
 const HOT_CTL_STALE_MS: i64 = 2 * HOT_CTL_EVERY_MS;
 const HOT_CAP_KEYS: [&str; 2] = ["hot_cap_target", "hot_ctl_applied_cap"];
 const HOT_EFFECTIVE_CAP_KEYS: [&str; 3] = [HOT_CAP_KEYS[0], HOT_CAP_KEYS[1], "hot_ctl_at"];
-const HOT_REPORT_KEYS: [&str; 9] = [
+const HOT_REPORT_KEYS: [&str; 11] = [
     "hot_ctl_at",
+    "hot_ctl_cap_before",
+    "hot_ctl_target_before",
     "hot_ctl_reason",
     "hot_ctl_step",
     "hot_ctl_tau",
@@ -943,9 +945,9 @@ where
         };
         HotCtlReport {
             mode,
-            cap_before: cap,
+            cap_before: hot_unsigned(rows, "hot_ctl_cap_before").unwrap_or(cap),
             cap_after: cap,
-            target_before: target,
+            target_before: hot_unsigned(rows, "hot_ctl_target_before").unwrap_or(target),
             target,
             max: self
                 .cfg
@@ -1066,6 +1068,8 @@ where
             },
         );
         let mut report = self.hot_ctl_report(&rows, shape.evictable_bytes);
+        report.cap_before = report.cap_after;
+        report.target_before = cap;
         report.reason = decision.reason.as_str();
         report.step = decision.step.as_str();
         report.cap_reason = cap_reason;
@@ -1073,6 +1077,10 @@ where
             return Some(report);
         }
         let mut entries = hot_encode(&decision, now);
+        entries.extend([
+            ("hot_ctl_cap_before", report.cap_before as i64),
+            ("hot_ctl_target_before", report.target_before as i64),
+        ]);
         let target = decision.target as i64;
         let applied = if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
             target
