@@ -1931,9 +1931,14 @@ With `GRANT_REFUSAL_REASONS=on` (off when unset or set to anything else),
 child grant refusals append `stage=grant err=<Reason> code=<detail>` to
 request logs. `Expired` reports whole seconds past expiry. `EdgeHeader`
 reports only allowlisted header labels joined by `+`, with unlisted
-matches collapsed to `other`. The existing GET 403 points use
-`grant:<Reason>` in `blob6`, without the log detail. The child's 403 and
-the parent's response and telemetry are unchanged.
+matches collapsed to `other`. For the existing GET 403 points, use
+`blob4 = 's3'`, `double1 = 403`, and the `grant:` prefix in `blob6`:
+refused children never acquire the `sub` route label. The point carries
+only `grant:<Reason>`, not the log detail. The child's 403 and the
+parent's response and telemetry are unchanged.
+
+Enable the flag through the managed deployment configuration; a
+Dashboard-only variable does not survive the next CI deploy.
 
 A failed queue wake-up does not produce an `outbox` response stage. The
 write has already committed, and the dispatcher can resend from the
@@ -1969,8 +1974,8 @@ ORDER BY minute DESC, method, stage
 
 The empty-stage filter omits older points. To include 503s (for example,
 byte-budget exhaustion), use `blob3 = '5xx'` instead of `double1 = 500`.
-To inspect failures inside sub-requests, query `blob4 = 'sub'` separately;
-do not add these to public counts. The Worker reports
+To inspect failures inside admitted sub-requests, query `blob4 = 'sub'`
+separately; do not add these to public counts. The Worker reports
 one response point before streaming the body. Failures after that
 point, including later sub-range failures on the front request, do
 not change its HTTP status or that point.
