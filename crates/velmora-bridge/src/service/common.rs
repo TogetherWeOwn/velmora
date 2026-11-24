@@ -23,7 +23,7 @@ use crate::ingress::{
 };
 use crate::metrics::{FailureStage as Stage, RequestObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector, StreamMeta};
-use crate::recovery::{discard_generation, revocation_recorded, valid_key_id, Unpublished};
+use crate::recovery::{discard_generation, revocation_recorded, Unpublished};
 use crate::replay::ReplayProbe;
 use crate::types::{
     Body, Bucket, BucketId, ExtentId, GenerationId, GenerationRow, Job, KeyStatus, OutboxStage,
@@ -447,9 +447,9 @@ where
     // the other kind is looked up as if it did not exist.
     let entry = Entry::of(&req.headers);
     let claimed = claimed_key(&headers, &target);
-    // Check the same key-id format as the issuer before the catalogue sees
-    // client text. In particular a presigned URI can contain a decoded NUL.
-    if claimed.as_deref().is_some_and(|akid| !valid_key_id(akid)) {
+    // A presigned URI can carry a decoded NUL, which a catalogue text
+    // parameter cannot. Leave all other identifiers to the verifier.
+    if claimed.as_deref().is_some_and(|akid| akid.contains('\0')) {
         let code = if headers.get("authorization").is_some() {
             ErrorCode::AuthorizationHeaderMalformed
         } else {

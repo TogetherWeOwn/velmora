@@ -1829,3 +1829,14 @@ async fn nul_in_presigned_access_key_is_rejected_before_lookup() {
     assert_eq!(response.outcome(), "400 AuthorizationQueryParametersError");
     assert!(sql.recorded.borrow_mut().take().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_well_formed_signature_with_an_unknown_access_key_is_forbidden() {
+    let rig = Rig::new().await;
+    for id in ["UnknownKey", "Unknown-Key"] {
+        let response = rig
+            .send(sign(id, Method::Get, "/alpha/key", &[], &[], Vec::new()))
+            .await;
+        assert_eq!(response.outcome(), "403 InvalidAccessKeyId", "{id}");
+    }
+}
