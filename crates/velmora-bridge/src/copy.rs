@@ -122,6 +122,8 @@
 //!   last one at the latest. One of the fresh sweep is tried again by
 //!   the next pass.
 
+mod held;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
@@ -203,8 +205,8 @@ pub const STORE_KEY: &str = "rc/store";
 const TIME_BYTES: usize = 20;
 /// How far the fresh generation records came that are not sent yet: a
 /// JSON object, key of the record to the number of its article plans,
-/// from the first, that are over there. A plan is never changed or
-/// removed over there, so a number that was true stays true.
+/// from the first, that are over there. The opt-in sweep also stores
+/// `h:`-prefixed generation keys with their mint time in Unix seconds.
 pub const SWEEP_KEY: &str = "rc/sweep";
 /// Records at most in [`SWEEP_KEY`], and the bytes read of it.
 pub const SWEEP_RECORDS: usize = 1000;
@@ -373,6 +375,8 @@ impl JobReport {
 /// The parts of a pass, in the order they are done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
+    /// Opt-in retry of recorded holds that have aged out of the fresh window.
+    Held,
     /// Fresh tombstones of the flat layout (`d` in a cursor).
     Tombstones,
     /// Fresh generation records of the flat layout, and whatever sorts
@@ -401,7 +405,8 @@ enum Phase {
 }
 
 /// The phases and their names in a cursor.
-const PHASES: [(Phase, &str); 10] = [
+const PHASES: [(Phase, &str); 11] = [
+    (Phase::Held, "r"),
     (Phase::Tombstones, "d"),
     (Phase::Generations, "g"),
     (Phase::TenantTombstones, "e"),
@@ -428,7 +433,7 @@ impl Phase {
             TenantTombstones | TenantGenerations | TenantLow | TenantHigh | Tail => {
                 Layout::default_tenant()
             }
-            Tombstones | Generations | Low | High | Plan => Layout::flat(),
+            Held | Tombstones | Generations | Low | High | Plan => Layout::flat(),
         }
     }
 
@@ -440,7 +445,7 @@ impl Phase {
         match self {
             Tombstones | TenantTombstones => fresh(&layout.tombstone_prefix(), pass),
             Generations | TenantGenerations => fresh(&layout.generation_prefix(), pass),
-            Low | Plan => String::new(),
+            Held | Low | Plan => String::new(),
             TenantLow => TENANT_DIR.to_string(),
             High | TenantHigh => layout.of_flat(TOMBSTONES_END),
             Tail => layout.of_flat(GENERATIONS_END),
@@ -452,6 +457,7 @@ impl Phase {
     fn then(self) -> Option<Phase> {
         use Phase::*;
         match self {
+            Held => Some(Tombstones),
             Tombstones => Some(Generations),
             Generations => Some(TenantTombstones),
             TenantTombstones => Some(TenantGenerations),
@@ -612,11 +618,14 @@ fn span(phase: Phase, pass: UnixMs) -> Span {
         Phase::High | Phase::TenantHigh => Some(fresh(&layout.generation_prefix(), pass)),
         Phase::Tail => None,
         // No key lies in it: a hint is not a part of a pass.
-        Phase::Plan => Some(String::new()),
+        Phase::Held | Phase::Plan => Some(String::new()),
     };
     Span {
         until,
-        plans: matches!(phase, Phase::Generations | Phase::TenantGenerations),
+        plans: matches!(
+            phase,
+            Phase::Held | Phase::Generations | Phase::TenantGenerations
+        ),
         since: pass.0 - FRESH_MS,
         last: start_after(
             &layout.generation_prefix(),
@@ -646,6 +655,7 @@ fn walk_from(saved: String, pass: UnixMs) -> Place {
 struct Budget<'a> {
     started: UnixMs,
     copies: usize,
+    copy_limit: usize,
     pages: u32,
     timing: &'a mut JobTiming,
 }
@@ -658,6 +668,8 @@ struct Known {
     /// It could not be read: what this job knows is not all, and is
     /// not saved over it.
     unread: bool,
+    walk_requested: bool,
+    mark_failed: bool,
     plans: BTreeMap<String, u32>,
 }
 
@@ -671,6 +683,19 @@ impl Known {
         }
         self.plans.insert(key.to_string(), n as u32);
         self.changed = true;
+    }
+
+    /// A fully checked segmented cursor still has its segments to send.
+    /// Other saved prefixes must leave a final plan to recheck.
+    fn confirmed(&self, place: &Place, key: &str, named: &Named) -> usize {
+        let of = named.extents();
+        let believed = |n: u32| {
+            let n = n as usize;
+            (n < of || (n == of && matches!(named, Named::Segments(_)))).then_some(n)
+        };
+        let counted = believed(place.plans).filter(|_| place.generation == key);
+        let saved = self.plans.get(key).copied().and_then(believed);
+        counted.max(saved).unwrap_or(0)
     }
 
     /// Remember a checked prefix without letting a later attempt skip
@@ -815,6 +840,11 @@ enum Plan {
     Failed,
     Down,
     Refused,
+}
+
+struct ReadChunk<'a> {
+    items: &'a [Item<'a>],
+    records: Vec<(usize, Read)>,
 }
 
 /// What became of the records of a chunk.
@@ -1171,11 +1201,21 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         let mut budget = Budget {
             started: self.clock.now(),
             copies: 0,
+            copy_limit: JOB_COPIES,
             pages: 0,
             timing,
         };
         let mut known = Known::default();
-        let place = Place::parse(cursor).unwrap_or_else(|| Place::start(pass));
+        let parallel = self.remote.parallel_fresh();
+        let place = Place::parse(cursor)
+            .filter(|place| parallel || place.phase != Phase::Held)
+            .unwrap_or_else(|| {
+                if parallel {
+                    Place::first(Phase::Held, pass)
+                } else {
+                    Place::start(pass)
+                }
+            });
         // The time of the sweep is up: the walk has the rest of the pass.
         // A hint is no part of a pass ([`Copier::run_job`] does it).
         let hint = place.phase == Phase::Plan;
@@ -1192,9 +1232,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 break (None, false);
             };
             let phase = span(place.phase, pass);
-            let walked = self
-                .walk(&phase, &mut place, &mut budget, counts, &mut known)
-                .await?;
+            let walked = if place.phase == Phase::Held {
+                self.retry_held(pass, &phase, &mut budget, counts, &mut known)
+                    .await
+            } else {
+                self.walk(&phase, &mut place, &mut budget, counts, &mut known)
+                    .await?
+            };
             if place.walking() {
                 walk = Some(place.key.clone());
             }
@@ -1217,6 +1261,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 (_, None) => None,
             };
         };
+        let mark_failed = known.mark_failed;
         Ok(CopyStep {
             counts: std::mem::take(counts),
             walk,
@@ -1226,7 +1271,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             next,
             outage,
             late,
-            unsaved: !self.save_known(known).await,
+            unsaved: !self.save_known(known).await || mark_failed,
         })
     }
 
@@ -1433,9 +1478,8 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         (JobOutcome::Ack, counts, why)
     }
 
-    /// Reads [`SWEEP_KEY`], once in a job. Anything that is not what a
-    /// job would have written is read as nothing, and a record that is
-    /// not fresh any more is dropped.
+    /// Reads [`SWEEP_KEY`] once in a job. Old prefixes are dropped
+    /// unless they belong to an opt-in hold still awaiting retry.
     async fn load_known(&self, known: &mut Known, span: &Span) {
         if known.loaded {
             return;
@@ -1459,11 +1503,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         let saved: BTreeMap<String, u32> = serde_json::from_slice(&bytes).unwrap_or_default();
         let before = saved.len();
-        known.plans = saved
-            .into_iter()
-            .filter(|(key, _)| minted_ms(key).is_some_and(|ms| ms >= span.since))
-            .take(SWEEP_RECORDS)
-            .collect();
+        known.plans = held::retain(saved, span.since, self.remote.parallel_fresh());
         known.changed = known.plans.len() < before;
     }
 
@@ -1556,7 +1596,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             let mut done = 0;
             let mut outage = false;
             while done < items.len() {
-                let room = CONCURRENCY.min(JOB_COPIES.saturating_sub(budget.copies));
+                let room = CONCURRENCY.min(budget.copy_limit.saturating_sub(budget.copies));
                 let mut to = done;
                 let mut copies = 0;
                 while to < items.len() {
@@ -1647,10 +1687,32 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             // A mixed batch may also include non-generation records.
             budget.timing.generation_ms += self.elapsed_ms(started);
         }
+        let input = ReadChunk {
+            items: chunk,
+            records: read,
+        };
+        self.copy_read_chunk(input, span, place, budget, counts, known)
+            .await
+    }
+
+    async fn copy_read_chunk(
+        &self,
+        input: ReadChunk<'_>,
+        span: &Span,
+        place: &mut Place,
+        budget: &mut Budget<'_>,
+        counts: &mut CopyCounts,
+        known: &mut Known,
+    ) -> Chunk {
+        let ReadChunk {
+            items: chunk,
+            records,
+        } = input;
+        let plans = span.plans;
         let mut result: Vec<Option<Copied>> = vec![None; chunk.len()];
         let mut generations: BTreeMap<usize, (Vec<u8>, Named)> = BTreeMap::new();
         let (mut asked, mut down) = (0, 0);
-        for (i, read) in read {
+        for (i, read) in records {
             budget.timing.generation_writes += u64::from(matches!(read, Read::GenerationWrite(_)));
             match read {
                 Read::Is(copied) | Read::GenerationWrite(copied) => {
@@ -1673,20 +1735,10 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             .iter()
             .map(|(&i, (_, named))| {
                 let key = &chunk[i].entry.key;
-                let of = named.extents();
-                // Trust only the prefix of this record that was confirmed by
-                // an earlier job. A fully checked segmented generation still
-                // has its segments to send; otherwise recheck the last plan.
-                let believed = |n: u32| {
-                    let n = n as usize;
-                    (n < of || (n == of && matches!(named, Named::Segments(_)))).then_some(n)
-                };
-                let counted = believed(place.plans).filter(|_| place.generation == *key);
-                let saved = known.plans.get(key).copied().and_then(believed);
                 let confirmed = if plans {
-                    counted.max(saved).unwrap_or(0)
+                    known.confirmed(place, key, named)
                 } else {
-                    of
+                    named.extents()
                 };
                 (
                     i,
@@ -1715,7 +1767,12 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             if outage {
                 // Do not continue after an outage. A later attempt will
                 // revisit the held generations.
-                counts.plan_blocked += u64::from(scans[&i].stopped);
+                if scans[&i].stopped {
+                    counts.plan_blocked += 1;
+                    if parallel {
+                        self.remember_hold(known, key).await;
+                    }
+                }
                 result[i] = Some(Copied::Held);
                 continue;
             }
@@ -1734,6 +1791,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 // Its head is not sent: finished for this pass.
                 result[i] = Some(copied);
                 continue;
+            }
+            if parallel && stopped {
+                self.remember_hold(known, key).await;
             }
             known.keep(key, n, of);
             let more = if n == of || (!parallel && stopped && !outage && *key <= span.last) {
@@ -1755,6 +1815,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                             Some(copied) => {
                                 if copied == Copied::Done {
                                     known.forget(key);
+                                    if parallel {
+                                        known.forget_hold(key);
+                                    }
                                 }
                                 if copied == Copied::Down {
                                     silent += 1;
@@ -1787,6 +1850,9 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 }
                 if parallel {
                     for (_, later) in scans.range(i + 1..) {
+                        if later.stopped {
+                            self.remember_hold(known, later.key).await;
+                        }
                         known.keep_for_retry(later.key, later.confirmed, later.named.extents());
                     }
                 }
@@ -1812,7 +1878,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         for (i, copied) in sent {
             down += usize::from(copied == Copied::Down);
             if copied == Copied::Done {
-                known.forget(&chunk[i].entry.key);
+                let key = &chunk[i].entry.key;
+                known.forget(key);
+                if parallel {
+                    known.forget_hold(key);
+                }
             }
             result[i] = Some(copied);
         }
@@ -1880,7 +1950,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         silent: &mut usize,
     ) {
         while !scans[&first].done() && *silent < OUTAGE_MIN {
-            let room = CONCURRENCY.min(JOB_COPIES.saturating_sub(budget.copies));
+            let room = CONCURRENCY.min(budget.copy_limit.saturating_sub(budget.copies));
             if room == 0 || self.spent(budget.started) {
                 break;
             }
@@ -2095,7 +2165,7 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         // At most `MAX_SEGMENTS`, which a job that starts at this head
         // has room for (`HEAD_SEGMENTS`).
         let segments = head.segments.len();
-        if JOB_COPIES.saturating_sub(budget.copies) < segments {
+        if budget.copy_limit.saturating_sub(budget.copies) < segments {
             return None;
         }
         budget.copies += segments;

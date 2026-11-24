@@ -5,6 +5,8 @@
 //! The fake store panics on any method but GET, HEAD and PUT, in every
 //! test of this file: nothing here may ever send a DELETE.
 
+#[path = "recovery_copy/held.rs"]
+mod held;
 mod segmented_support;
 
 use std::cell::{Cell, RefCell};
