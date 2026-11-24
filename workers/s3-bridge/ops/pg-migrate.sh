@@ -251,7 +251,7 @@ def predicate(text):
         return token
     text = ' '.join(hide(t) for t in sql_tokens(text))
     # pg_get_expr expands IN to ANY and BETWEEN to two comparisons.
-    text = re.sub(r'\(\s*(-?\d+)\s*\)\s*::\s*bigint\b', r'\1', text, flags=re.I)
+    text = re.sub(r'\(\s*(-?\s*\d+)\s*\)\s*::\s*bigint\b', r'\1', text, flags=re.I)
     text = re.sub(r'::\s*(?:text|bigint)\b', '', text, flags=re.I)
     text = re.sub(r'(=\s*ANY|<>\s*ALL)\s*\(\s*ARRAY\s*\[([^\]]+)\]\s*\)',
                   lambda m: ('IN' if m[1].startswith('=') else 'NOT IN') + f' ({m[2]})', text, flags=re.I)
@@ -502,11 +502,12 @@ SET client_min_messages = error;
             reason = ERRORS.get(state) or (f'SQLSTATE {state}' if state else 'psql connection or client failure')
             die(f'{report or "database operation"}: {reason}')
 
-    begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock({lock}::bigint);\n"
+    # Cast the complete signed literal, including the sign of BIGINT_MIN.
+    begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock('{lock}'::bigint);\n"
     # Never wait for the migration key with an open snapshot: an in-progress
     # concurrent index build could be waiting for that very snapshot to end.
     migrator_session = ("SET lock_timeout = '3s';\n"
-                        f"SELECT pg_try_advisory_lock({migration_lock}::bigint) AS migrator_locked \\gset\n"
+                        f"SELECT pg_try_advisory_lock('{migration_lock}'::bigint) AS migrator_locked \\gset\n"
                         '\\if :migrator_locked\n\\else\n' + check('true', '55P03') + '\\endif\n')
     online_limits = f'''SELECT {USAGE} AS online, current_setting('server_version_num')::int >= 170000 AS pg17 \\gset
 \\if :online
