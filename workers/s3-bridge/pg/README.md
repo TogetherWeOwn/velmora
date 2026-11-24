@@ -78,8 +78,11 @@ DDL; it is not the import activation procedure.
 
 Each numbered PostgreSQL file is applied once and recorded with its SHA-256.
 Do not edit an applied migration. Ordinary files are atomic; leave transaction
-control and psql metacommands to the runner. A `55P03` lock timeout retries up
-to five times after the initial attempt, with backoff. Use `--to NNNN` to stop
+control and psql metacommands to the runner. Use dollar-quoted routine bodies
+and unqualified catalogue object names so the same DDL works in each target
+schema. A `55P03` lock timeout retries up to five times after the initial
+attempt, with backoff. A statement or transaction budget expiry is not retried.
+Use `--to NNNN` to stop
 at a shipped stage. Online migrations (app schema access granted) use a 3 s
 statement timeout and, on PostgreSQL 17+, a 3 s transaction timeout so an
 acquired exclusive lock cannot stall readers indefinitely. Split changes that

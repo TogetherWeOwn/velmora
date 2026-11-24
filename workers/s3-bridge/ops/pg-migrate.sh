@@ -241,6 +241,15 @@ def lint_migration(sql, no_tx, name):
 def predicate(text):
     if not text:
         return None
+    # Hide quoted tokens before rewriting SQL syntax. A literal string that
+    # contains "::text" or "BETWEEN" is data, not a cast or comparison.
+    quoted = []
+    def hide(token):
+        if token.startswith(("'", '"', "E'", "e'")):
+            quoted.append(token)
+            return f'\x01{len(quoted) - 1}\x02'
+        return token
+    text = ' '.join(hide(t) for t in sql_tokens(text))
     # pg_get_expr expands IN to ANY and BETWEEN to two comparisons.
     text = re.sub(r'\(\s*(-?\d+)\s*\)\s*::\s*bigint\b', r'\1', text, flags=re.I)
     text = re.sub(r'::\s*(?:text|bigint)\b', '', text, flags=re.I)
@@ -248,8 +257,8 @@ def predicate(text):
                   lambda m: ('IN' if m[1].startswith('=') else 'NOT IN') + f' ({m[2]})', text, flags=re.I)
     text = re.sub(r'(\w+(?:\s*\(\s*\w+\s*\))?)\s+BETWEEN\s+(\d+)\s+AND\s+(\d+)',
                   r'(\1 >= \2 AND \1 <= \3)', text, flags=re.I)
-    tokens = list(sql_tokens(text))
-    tokens = [t if t.startswith("'") else t.lower() for t in tokens]
+    text = re.sub(r'\x01(\d+)\x02', lambda m: quoted[int(m[1])], text)
+    tokens = [t if t.startswith(("'", '"', "E'", "e'")) else t.lower() for t in sql_tokens(text)]
 
     def parse(parts):
         depth = 0
@@ -390,7 +399,7 @@ def compare(actual, d1, migrations):
     actual_triggers = actual['triggers'] or ()
     actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) for r in actual_triggers}
     expected_bodies = pg_trigger_bodies(migrations)
-    actual_bodies = {r[1]: (r[5], r[6], trigger_condition(list(sql_tokens(r[7])))) for r in actual_triggers}
+    actual_bodies = {r[1]: (r[5], r[6], trigger_condition(list(sql_tokens(r[7])))) for r in actual_triggers if r[8]}
     actual['checks'] = {(t, predicate(expr), valid) for t, expr, valid in (actual['checks'] or ())}
     bad = []
     for kind, entries in expected.items():
