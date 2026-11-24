@@ -72,15 +72,20 @@ struct Slot {
 /// is gone the runtime gives `waitUntil` at most 30 s more: keys not done
 /// by then stay as they are, and a re-send of the request finishes them.
 async fn handle_detached(
-    ctx: &Context,
+    ctx: Rc<Context>,
     bridge: Rc<env::WorkerBridge>,
     req: velmora_bridge::S3Request,
 ) -> (S3Response, RequestObservation) {
     let slot = Rc::new(RefCell::new(Slot::default()));
     let tx = Rc::clone(&slot);
-    ctx.wait_until(async move {
+    let spawn: ingress::Spawner = Rc::new(move |work| ctx.wait_until(work));
+    let flush = (bridge.cfg.hot_ctl.mode != velmora_bridge::config::HotCtlMode::Fixed)
+        .then(|| Rc::clone(&spawn));
+    spawn(Box::pin(async move {
         let mut get = RequestObservation::default();
-        let mut resp = bridge.handle_observed(req, &mut get).await;
+        let mut resp = bridge
+            .handle_observed_with_hit_flush(req, &mut get, flush)
+            .await;
         let work = match &mut resp.body {
             RespBody::Deferred(d) => d.take_work(),
             _ => None,
@@ -95,7 +100,7 @@ async fn handle_detached(
         if let Some(work) = work {
             work.await;
         }
-    });
+    }));
     poll_fn(|cx| {
         let mut s = slot.borrow_mut();
         match s.resp.take() {
@@ -241,8 +246,9 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .is_ok(),
     );
     let got = std::cell::Cell::new(None);
+    let ctx = Rc::new(ctx);
     let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
-        let (resp, get) = handle_detached(&ctx, Rc::clone(&bridge), req).await;
+        let (resp, get) = handle_detached(Rc::clone(&ctx), Rc::clone(&bridge), req).await;
         got.set(Some(get));
         // A deferred document: buffered when it is done soon, else
         // streamed with keepalive whitespace.

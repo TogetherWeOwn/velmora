@@ -1173,6 +1173,21 @@ impl Catalog for MemCatalog {
     async fn evictable_bytes(&self) -> Result<u64> {
         Ok(0)
     }
+    async fn hot_shape(&self) -> Result<velmora_bridge::HotShape> {
+        unused()
+    }
+    async fn hot_ghost(&self, _: &ExtentId, _: UnixMs) -> Result<()> {
+        unused()
+    }
+    async fn hot_counters_add(&self, _: u64) -> Result<()> {
+        unused()
+    }
+    async fn hot_ctl_load(&self, _: &[&str]) -> Result<Vec<Option<i64>>> {
+        unused()
+    }
+    async fn hot_ctl_store(&self, _: &[(&str, i64)]) -> Result<()> {
+        unused()
+    }
     async fn evict_candidates(&self, _: u32) -> Result<Vec<EvictCandidate>> {
         Ok(Vec::new())
     }
@@ -2097,6 +2112,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
+        hot_ctl: Default::default(),
         maintenance: Maintenance::Off,
         server_side_copy: true,
         get_fanout_bytes: None,

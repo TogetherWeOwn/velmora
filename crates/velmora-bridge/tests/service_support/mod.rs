@@ -658,6 +658,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         job_budget_bytes: 48 * 1024 * 1024,
         gc_mode: GcMode::Disposable,
         hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
+        hot_ctl: Default::default(),
         maintenance: Maintenance::Off,
         server_side_copy: true,
         get_fanout_bytes: None,
