@@ -1963,7 +1963,10 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
     let hot = bridge.catalog.hot_stats().await.or_internal()?;
-    let hot_ctl = bridge.hot_ctl_status(hot.evictable_bytes).await;
+    let hot_ctl = bridge
+        .hot_ctl_status(hot.evictable_bytes)
+        .await
+        .or_internal()?;
     let cap = hot_ctl.cap_after;
     let intents = bridge
         .catalog

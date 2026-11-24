@@ -834,6 +834,125 @@ async fn adaptive_caps_fall_back_or_clamp_untrusted_targets() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_adaptive_cap_does_not_evict_at_the_fixed_threshold() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 10 * GIB;
+    })
+    .await;
+    let x = hot.released("cap-read-overloaded").await;
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 53687091200 WHERE id = ?1",
+        &x,
+    );
+    let cat = &hot.bridge().catalog;
+    cat.hot_ctl_store(&[
+        ("hot_cap_target", (200 * GIB) as i64),
+        ("hot_ctl_applied_cap", (200 * GIB) as i64),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
+    *cat.sql.fail_matching.borrow_mut() = Some(("FROM meta WHERE k IN", 0));
+    assert!(
+        hot.bridge().evict_batch(0).await.is_err(),
+        "retry instead of evicting at the fixed cap"
+    );
+    assert!(hot.has_safety(&x));
+    hot.check_due();
+    let dispatch = hot.bridge().dispatch().await.unwrap();
+    assert!(dispatch.evict_failed);
+    assert!(!dispatch.evict_enqueued);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn switching_from_shadow_starts_at_the_real_fixed_threshold() {
+    use velmora_bridge::config::HotCtlMode;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Shadow;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let x = hot.released("shadow-switch").await;
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 53687091200 WHERE id = ?1",
+        &x,
+    );
+    hot.bridge()
+        .catalog
+        .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+        .await
+        .unwrap();
+    let (shadow, _) = hot.dispatch_and_evict().await;
+    assert_eq!(shadow.hot_ctl.unwrap().target, 10 * GIB);
+    hot.cfg_mut().hot_ctl.mode = HotCtlMode::Adaptive;
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 100 * GIB);
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
+    hot.bridge().clock.advance_secs(3600);
+    let (adaptive, _) = hot.dispatch_and_evict().await;
+    let ctl = adaptive.hot_ctl.unwrap();
+    assert_eq!(
+        (ctl.cap_before, ctl.cap_after, ctl.step),
+        (100 * GIB, 90 * GIB, "shrink")
+    );
+    assert!(hot.has_safety(&x));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let cat = &hot.bridge().catalog;
+    cat.hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+        .await
+        .unwrap();
+    *cat.sql.fail_matching.borrow_mut() = Some(("FROM meta WHERE k IN (?1,?2,?3", 0));
+    let status = hot.admin_status().await;
+    assert_eq!(status["hot"]["cap_bytes"], 10 * GIB);
+    assert_eq!(status["hot"]["ctl"]["reason"], "diagnostics_unavailable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unchanged_target_does_not_rewrite_its_cap_rows() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 10 * GIB;
+    })
+    .await;
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    hot.bridge().clock.advance_secs(3600);
+    hot.check_due();
+    let bridge = hot.bridge();
+    bridge
+        .catalog
+        .sql
+        .stall_batch_key
+        .set(Some("hot_cap_target"));
+    let mut run = pin!(bridge.dispatch());
+    let poll = std::future::poll_fn(|cx| {
+        let poll = run.as_mut().poll(cx);
+        if poll.is_ready() || bridge.catalog.sql.stall_batch_key.get().is_none() {
+            Poll::Ready(poll)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let Poll::Ready(report) = poll else {
+        panic!("unchanged cap was rewritten")
+    };
+    let ctl = report.unwrap().hot_ctl.unwrap();
+    assert_eq!((ctl.target, ctl.step), (10 * GIB, "hold"));
+    assert_eq!(ctl.at, Some(bridge.clock.now().0));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_applied_cap_remains_rate_limited_after_the_maximum_is_lowered() {
     use velmora_bridge::config::HotCtlMode;
     let mut hot = hot_with(|cfg| {
@@ -876,17 +995,21 @@ async fn overlapping_controls_from_one_snapshot_apply_one_step() {
         .stall_batch_key
         .set(Some("hot_cap_target"));
     let mut first = pin!(bridge.dispatch());
-    std::future::poll_fn(|cx| {
-        assert!(first.as_mut().poll(cx).is_pending());
-        if bridge.catalog.sql.stall_batch_key.get().is_none() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            if bridge.catalog.sql.stall_batch_key.get().is_none() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("first controller reaches the metadata batch");
     let second = bridge.dispatch().await.unwrap().hot_ctl.unwrap();
-    bridge.catalog.sql.trip.release();
+    bridge.catalog.sql.selected_batch.release();
     let first = first.await.unwrap().hot_ctl.unwrap();
     assert_eq!(first, second);
     assert_eq!((first.target, first.step), (90 * GIB, "shrink"));
