@@ -1103,6 +1103,58 @@ async fn a_cursor_of_an_ended_replay_publishes_nothing() {
     assert_eq!(t.count(objects), 0);
 }
 
+/// The held check of an ended replay pages without writing: its `next`
+/// is not recorded, a page past what the replay reached is refused, and
+/// a rollback found since is answered before any page.
+#[tokio::test(flavor = "current_thread")]
+async fn the_held_pages_of_an_ended_replay_write_nothing() {
+    let mut t = setup().await;
+    t.put("a", b"a").await;
+    t.replay_in_place().await;
+    let run = t.count("SELECT started_at FROM restore_state WHERE id = 1");
+    // More pinned copies than one page of the check holds.
+    let page = ReplayLimits::default().extents;
+    for i in 0..page {
+        t.put(&format!("h{i}"), b"h").await;
+    }
+    let held = t.rig.bridge.catalog.held_extents("", 1000).await.unwrap();
+    assert_eq!(held.len(), page + 1);
+
+    t.maintenance(Maintenance::Restore);
+    t.sql("CREATE TABLE restore_state_before AS SELECT * FROM restore_state;");
+    let unchanged = || {
+        assert_eq!(t.count("SELECT COUNT(*) FROM restore_state"), 1);
+        assert_eq!(
+            t.count(
+                "SELECT COUNT(*) FROM (SELECT * FROM restore_state \
+                 EXCEPT SELECT * FROM restore_state_before)"
+            ),
+            0
+        );
+    };
+    let last = ReplayCursor {
+        phase: ReplayPhase::Held,
+        after: String::new(),
+        extent: 0,
+        run_ms: run,
+        ..ReplayCursor::start(UnixMs(0))
+    };
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["held_checked"], page, "{report}");
+    assert!(!report["next"].is_null(), "{report}");
+    unchanged();
+    // The next page is past what the replay reached.
+    let (status, again) = t.restore_call(&json!({ "cursor": report["next"] })).await;
+    assert_eq!(status, 400, "{again}");
+    unchanged();
+
+    t.sql("UPDATE rollback_stamp SET rolled_back_at = 1 WHERE id = 1;");
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 409, "{report}");
+    unchanged();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_claim_proves_its_row_again() {
     let t = setup().await;
