@@ -16,7 +16,7 @@ fn field(resp: &Resp, tag: &str) -> Option<String> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn harmless_headers_are_accepted_signed_and_change_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     for (i, (name, value)) in [
         ("x-amz-user-agent", "aws-sdk-js/3.600.0, extra/1"),
@@ -110,7 +110,7 @@ async fn harmless_headers_are_accepted_signed_and_change_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_ignored_header_still_has_to_be_signed() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // Added after signing: an `x-amz-*` header outside the signature is
     // refused whether or not its value would be acted on.
@@ -142,7 +142,7 @@ async fn an_ignored_header_still_has_to_be_signed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_header_that_is_not_served_is_refused_by_name() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     for (name, value, status, code, element) in [
         ("x-amz-tagging", "a=b", 501, "NotImplemented", "Header"),
@@ -262,7 +262,7 @@ async fn a_header_that_is_not_served_is_refused_by_name() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_region_aliases_sign_as_well_as_the_configured_region() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     assert_eq!(REGION, "auto");
     for region in ["auto", "us-east-1"] {
@@ -287,7 +287,7 @@ async fn the_region_aliases_sign_as_well_as_the_configured_region() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_wrong_region_is_told_the_region_to_use() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let unknown = Signer::new("AKIDUNKNOWN000000000", secret());
@@ -359,7 +359,7 @@ async fn a_wrong_region_is_told_the_region_to_use() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_wrong_host_is_told_so() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let sign = || signer.sign(rig.now(), Method::Get, &path(BUCKET, "k"), &[], &[], vec![]);
@@ -442,7 +442,7 @@ async fn a_wrong_host_is_told_so() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_a_verified_caller_learns_that_a_bucket_is_missing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     rig.bucket("bkt-other", true).await;
@@ -583,7 +583,7 @@ async fn every_answer_carries_the_request_id() {
     }
 
     // The same holds for an answer of the service itself.
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let req = signer.sign(
         rig.now(),
@@ -606,7 +606,7 @@ async fn every_answer_carries_the_request_id() {
 /// gets the same answers there.
 #[tokio::test(flavor = "current_thread")]
 async fn multipart_calls_answer_the_same_way() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bucket("bkt-other", true).await;
     let east = Signer {

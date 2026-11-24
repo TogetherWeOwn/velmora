@@ -5,6 +5,7 @@
 //! "Snapshot" here is a copy of every catalogue table inside the same
 //! SQLite database; "rollback" puts every table back to it.
 
+mod intent_support;
 mod service_support;
 
 use std::rc::Rc;
@@ -39,13 +40,14 @@ const TABLES: [&str; 16] = [
 ];
 
 fn sql(rig: &Rig, script: &str) {
-    rig.bridge
-        .catalog
-        .sql
-        .with_conn(|c| c.execute_batch(script).unwrap());
+    rig.bridge.catalog.sql.inner.fixture_script(script).unwrap();
 }
 
 fn snapshot(rig: &Rig) {
+    if rig.bridge.catalog.sql.dialect() == Dialect::Postgres {
+        intent_support::snapshot(rig);
+        return;
+    }
     for t in TABLES {
         sql(
             rig,
@@ -57,6 +59,10 @@ fn snapshot(rig: &Rig) {
 /// Every table is as it was at the snapshot: what a Time Travel restore
 /// or an import of an older export does.
 fn rollback(rig: &Rig) {
+    if rig.bridge.catalog.sql.dialect() == Dialect::Postgres {
+        intent_support::rollback(rig);
+        return;
+    }
     sql(rig, "PRAGMA foreign_keys = OFF;");
     for t in TABLES {
         sql(
@@ -179,7 +185,7 @@ async fn restore_with(rig: &Rig, before_step: impl Fn()) -> Value {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_fresh_catalogue_is_not_locked_out() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // No row and no stamp object: nothing to be behind.
     assert!(!rig.bridge.catalogue_rolled_back().await.unwrap());
@@ -207,7 +213,7 @@ async fn a_fresh_catalogue_is_not_locked_out() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_bucket_is_never_ahead_of_the_catalogue() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
 
     // The object cannot be put: the counter has moved, the bucket has
@@ -271,7 +277,7 @@ async fn the_bucket_is_never_ahead_of_the_catalogue() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_closes_writes_and_stops_jobs_until_a_replay_ends() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.dispatch().await.unwrap();
@@ -366,7 +372,7 @@ where
 /// sign of a rollback.
 #[tokio::test(flavor = "current_thread")]
 async fn a_raise_beside_another_raise_is_not_a_rollback() {
-    let rig = rig();
+    let rig = rig_selected();
     let bridge = &rig.bridge;
     bridge.raise_stamp().await.unwrap();
 
@@ -391,7 +397,7 @@ async fn a_raise_beside_another_raise_is_not_a_rollback() {
 /// The same on a catalogue that has no counter yet.
 #[tokio::test(flavor = "current_thread")]
 async fn the_first_raise_beside_a_check_is_not_a_rollback() {
-    let rig = rig();
+    let rig = rig_selected();
     let bridge = &rig.bridge;
     let other = async { bridge.raise_stamp().await.unwrap() };
     assert!(!interleave(&rig, bridge.catalogue_rolled_back(), other)
@@ -399,7 +405,7 @@ async fn the_first_raise_beside_a_check_is_not_a_rollback() {
         .unwrap());
     assert_eq!(row(&rig).await, level(1));
 
-    let rig = self::rig();
+    let rig = self::rig_selected();
     let bridge = &rig.bridge;
     let other = async { bridge.raise_stamp().await.unwrap() };
     interleave(&rig, bridge.raise_stamp(), other).await.unwrap();
@@ -410,7 +416,7 @@ async fn the_first_raise_beside_a_check_is_not_a_rollback() {
 /// found: the counter is what was read, and an object is after it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_beside_a_check_is_found() {
-    let rig = rig();
+    let rig = rig_selected();
     let bridge = &rig.bridge;
     bridge.raise_stamp().await.unwrap();
     snapshot(&rig);
@@ -427,7 +433,7 @@ async fn a_rollback_beside_a_check_is_found() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_raise_on_a_rolled_back_catalogue_does_not_hide_it() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     snapshot(&rig);
     // Exactly one raise is lost with the rollback: a raise that moved
@@ -451,7 +457,7 @@ async fn a_raise_on_a_rolled_back_catalogue_does_not_hide_it() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_catalogue_without_its_counter_is_behind_any_stamp() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bridge.raise_stamp().await.unwrap();
     // A restore from an export that has no counter row.
@@ -472,7 +478,7 @@ async fn a_catalogue_without_its_counter_is_behind_any_stamp() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_check_that_cannot_be_made_ends_the_tick() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.jobs.inner.take();
@@ -490,7 +496,7 @@ async fn a_check_that_cannot_be_made_ends_the_tick() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.raise_stamp().await.unwrap();
@@ -547,7 +553,7 @@ async fn a_replay_that_did_not_end_leaves_the_catalogue_closed() {
 /// catalogue knows; it reads no record. It must not open the catalogue.
 #[tokio::test(flavor = "current_thread")]
 async fn the_last_call_of_an_ended_replay_does_not_clear_a_later_rollback() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     maintenance(&mut rig, Maintenance::Restore);
@@ -593,7 +599,7 @@ async fn the_last_call_of_an_ended_replay_does_not_clear_a_later_rollback() {
 /// the catalogue, and the tick says what happened.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_into_a_replay_is_not_cleared_by_that_replay() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.dispatch().await.unwrap();
@@ -666,7 +672,7 @@ async fn a_rollback_into_a_replay_is_not_cleared_by_that_replay() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
     const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
-    let mut rig = rig();
+    let mut rig = rig_selected();
     maintenance(&mut rig, Maintenance::Restore);
     let rig = &rig;
     let begin = |since_ms: i64| async move {
@@ -699,7 +705,7 @@ async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
 /// ended, must not be opened with what was read before.
 #[tokio::test(flavor = "current_thread")]
 async fn the_end_of_a_replay_holds_the_catalogue_to_the_counter_it_read() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     let catalog = &rig.bridge.catalog;
     let run = catalog
@@ -756,7 +762,7 @@ async fn the_end_of_a_replay_holds_the_catalogue_to_the_counter_it_read() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_end_of_a_replay_never_moves_the_counter_down() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     rig.bridge.raise_stamp().await.unwrap();
     // Two values whose objects could not be put: the newest object is
@@ -797,7 +803,7 @@ async fn the_end_of_a_replay_never_moves_the_counter_down() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_newest_stamp_is_found_over_many_list_pages() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     snapshot(&rig);
     for counter in 2..=1101 {
@@ -818,7 +824,7 @@ async fn the_newest_stamp_is_found_over_many_list_pages() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_tick_whose_check_fails_sends_no_job() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.raise_stamp().await.unwrap();
@@ -850,16 +856,18 @@ async fn a_tick_whose_check_fails_sends_no_job() {
 /// rollback that is recorded in between refuses the batch.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_recorded_after_the_gate_refuses_the_commit() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bridge.raise_stamp().await.unwrap();
 
     let bridge = rig.bridge.clone();
     let hook = move |_: &str| {
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute("UPDATE rollback_stamp SET rolled_back_at = 1", [])
-                .unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script("UPDATE rollback_stamp SET rolled_back_at = 1")
+            .unwrap();
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
     rig.put(&signer, BUCKET, "a", b"a").await.expect(503);
@@ -872,7 +880,7 @@ async fn a_rollback_recorded_after_the_gate_refuses_the_commit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_recorded_rollback_stops_the_counter() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     sql(&rig, "UPDATE rollback_stamp SET rolled_back_at = 1;");
     assert!(!rig
@@ -888,7 +896,7 @@ async fn a_recorded_rollback_stops_the_counter() {
 /// raise. The check was made: the tick goes on, without a raise.
 #[tokio::test(flavor = "current_thread")]
 async fn a_tick_that_loses_its_raise_to_a_write_goes_on() {
-    let rig = rig();
+    let rig = rig_selected();
     let bridge = &rig.bridge;
     bridge.raise_stamp().await.unwrap();
 
@@ -940,7 +948,7 @@ async fn a_tick_that_loses_its_raise_to_a_write_goes_on() {
 /// itself first, whatever the last tick saw.
 #[tokio::test(flavor = "current_thread")]
 async fn gc_and_eviction_check_the_stamp_before_they_delete() {
-    let rig = rig();
+    let rig = rig_selected();
     let bridge = &rig.bridge;
     bridge.raise_stamp().await.unwrap();
     snapshot(&rig);
@@ -966,7 +974,7 @@ async fn gc_and_eviction_check_the_stamp_before_they_delete() {
 /// bucket would look empty and no rollback would ever be found.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stamp_of_another_catalogue_id_is_not_used() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a").await.expect(200);
     rig.bridge.raise_stamp().await.unwrap();
@@ -1025,7 +1033,7 @@ async fn a_stamp_of_another_catalogue_id_is_not_used() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn no_delete_removes_a_stamp_or_a_tenant_key() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bridge.raise_stamp().await.unwrap();
     let stamp = stamp_key("main", 1);
     let tenant_key = format!("{TENANT_KEY_PREFIX}t_0000000000000000/1");

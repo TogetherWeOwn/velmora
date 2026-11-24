@@ -45,6 +45,10 @@ pub fn small_rig() -> Rig {
     rig_with(NoNntp, small_config())
 }
 
+pub fn small_rig_selected() -> Rig {
+    rig_with_selected(NoNntp, small_config())
+}
+
 // ---------------------------------------------------------------------------
 // Body modes
 // ---------------------------------------------------------------------------
@@ -339,26 +343,39 @@ pub async fn get(rig: &Rig, signer: &Signer, key: &str) -> Resp {
 // ---------------------------------------------------------------------------
 
 pub fn sql(rig: &Rig, script: &str) {
-    rig.bridge
-        .catalog
-        .sql
-        .with_conn(|c| c.execute_batch(script).unwrap());
+    rig.bridge.catalog.sql.inner.fixture_script(script).unwrap();
 }
 
 /// The first column of every row of `query`.
 pub fn column(rig: &Rig, query: &str) -> Vec<String> {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c.prepare(query).unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
-    })
-}
-
-pub fn number(rig: &Rig, query: &str) -> i64 {
     rig.bridge
         .catalog
         .sql
-        .with_conn(|c| c.query_row(query, [], |r| r.get(0)).unwrap())
+        .inner
+        .fixture_query_now(query, &[])
+        .unwrap()
+        .into_iter()
+        .map(|mut row| match row.remove(0) {
+            SqlValue::Text(value) => value,
+            _ => panic!("expected fixture text column"),
+        })
+        .collect()
+}
+
+pub fn number(rig: &Rig, query: &str) -> i64 {
+    match rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(query, &[])
+        .unwrap()
+        .remove(0)
+        .remove(0)
+    {
+        SqlValue::Int(value) => value,
+        _ => panic!("expected fixture integer column"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,27 +389,22 @@ pub struct Intent {
 }
 
 pub fn intents(rig: &Rig) -> Vec<Intent> {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare(
-                "SELECT extent_id, write_id, tenant_id, generation_id, state, created_at \
-                 FROM write_intents ORDER BY extent_id",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(Intent {
-                    extent: r.get(0)?,
-                    write: r.get(1)?,
-                    tenant: r.get(2)?,
-                    generation: r.get(3)?,
-                    state: r.get(4)?,
-                    created_at: r.get(5)?,
-                })
-            })
-            .unwrap();
-        rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
-    })
+    rig.bridge.catalog.sql.inner.fixture_query_now(
+        "SELECT extent_id, write_id, tenant_id, generation_id, state, created_at \
+         FROM write_intents ORDER BY extent_id", &[],
+    ).unwrap().into_iter().map(|row| {
+        let [SqlValue::Text(extent), SqlValue::Text(write), SqlValue::Text(tenant), generation,
+             SqlValue::Text(state), SqlValue::Int(created_at)] = row.as_slice() else {
+            panic!("unexpected write intent row shape")
+        };
+        let generation = match generation {
+            SqlValue::Text(id) => Some(id.clone()),
+            SqlValue::Null => None,
+            _ => panic!("expected nullable generation ID"),
+        };
+        Intent { extent: extent.clone(), write: write.clone(), tenant: tenant.clone(), generation,
+                 state: state.clone(), created_at: *created_at }
+    }).collect()
 }
 
 /// The states of the intent rows, one entry per state with its count.
@@ -490,10 +502,25 @@ pub async fn run_until<'a, V>(
     trip: Trip,
 ) -> Ran<'a, V> {
     rig.trip().arm(skip, trip);
-    let mut fut: Running<'a, V> = Box::pin(fut);
-    match std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await {
-        Poll::Ready(v) => Ran::Done(v),
-        Poll::Pending => Ran::Stalled(fut),
+    let fut: Running<'a, V> = Box::pin(fut);
+    wait_for_trip(rig, fut, trip).await
+}
+
+async fn wait_for_trip<'a, V>(rig: &Rig, mut fut: Running<'a, V>, trip: Trip) -> Ran<'a, V> {
+    let wire = rig.trip();
+    // A real PostgreSQL call can yield before reaching the injected fault.
+    // Pending alone cannot tell a normal socket wait from a held tripwire.
+    let trip_or_done = std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+        Poll::Ready(value) => Poll::Ready(Some(value)),
+        Poll::Pending if trip == Trip::Stall && wire.tripped() => Poll::Ready(None),
+        Poll::Pending => Poll::Pending,
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(10), trip_or_done)
+        .await
+        .expect("fixture request never reached its injected fault or completed")
+    {
+        Some(value) => Ran::Done(value),
+        None => Ran::Stalled(fut),
     }
 }
 
@@ -546,11 +573,14 @@ pub fn sweep_job(write: &str) -> Job {
 // ---------------------------------------------------------------------------
 
 fn tables(rig: &Rig) -> Vec<String> {
-    column(
-        rig,
+    let db = &rig.bridge.catalog.sql.inner;
+    column(rig, db.fixture(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'snap\\_%' ESCAPE '\\' \
          AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name <> 'tx_guard' ORDER BY name",
-    )
+        "SELECT table_name::text FROM information_schema.tables WHERE table_schema = current_schema() \
+         AND table_type = 'BASE TABLE' AND left(table_name, 5) <> 'snap_' \
+         AND table_name <> 'tx_guard' ORDER BY table_name",
+    ))
 }
 
 /// Copies every catalogue table aside.
@@ -566,6 +596,10 @@ pub fn snapshot(rig: &Rig) {
 /// Every table is as it was at the snapshot: what a Time Travel restore
 /// or an import of an older export does. The stores keep what they hold.
 pub fn rollback(rig: &Rig) {
+    if rig.bridge.catalog.sql.dialect() == Dialect::Postgres {
+        rollback_postgres(rig);
+        return;
+    }
     sql(rig, "PRAGMA foreign_keys = OFF;");
     for t in tables(rig) {
         sql(
@@ -574,6 +608,66 @@ pub fn rollback(rig: &Rig) {
         );
     }
     sql(rig, "PRAGMA foreign_keys = ON;");
+}
+
+/// Restore only this fixture schema, in FK order, without a privileged trigger bypass.
+fn rollback_postgres(rig: &Rig) {
+    use std::fmt::Write as _;
+    let all = tables(rig);
+    let db = &rig.bridge.catalog.sql.inner;
+    let refs = db
+        .fixture_query_now(
+            "SELECT child.relname::text, parent.relname::text FROM pg_constraint fk \
+         JOIN pg_class child ON child.oid = fk.conrelid \
+         JOIN pg_class parent ON parent.oid = fk.confrelid \
+         JOIN pg_namespace n ON child.relnamespace = n.oid \
+         WHERE fk.contype = 'f' AND n.nspname = current_schema()",
+            &[],
+        )
+        .unwrap();
+    let refs: Vec<_> = refs
+        .iter()
+        .map(|row| {
+            let [SqlValue::Text(child), SqlValue::Text(parent)] = row.as_slice() else {
+                panic!("unexpected foreign key fixture row")
+            };
+            (child.as_str(), parent.as_str())
+        })
+        .collect();
+    let mut pending: Vec<_> = all
+        .iter()
+        .filter(|name| !name.starts_with("usage_"))
+        .collect();
+    let mut order = Vec::new();
+    while !pending.is_empty() {
+        let index = pending
+            .iter()
+            .position(|name| {
+                !refs.iter().any(|(child, parent)| {
+                    *child == name.as_str() && pending.iter().any(|p| p.as_str() == *parent)
+                })
+            })
+            .expect("cyclic fixture foreign keys");
+        order.push(pending.remove(index));
+    }
+    // The counter tables are restored last. With no usage_global row during
+    // the data insert, the usage triggers do not double-count the snapshot.
+    order.extend(all.iter().filter(|name| name.starts_with("usage_")));
+    let mut script = format!("BEGIN; TRUNCATE TABLE {};", all.join(","));
+    for table in order {
+        let conflict = if table == "generation_extents" {
+            " ON CONFLICT DO NOTHING"
+        } else {
+            ""
+        };
+        writeln!(
+            &mut script,
+            "INSERT INTO {table} SELECT * FROM snap_{table}{conflict};"
+        )
+        .unwrap();
+    }
+    script.push_str("COMMIT;");
+    sql(rig, &script);
 }
 
 pub async fn admin(rig: &Rig, method: Method, path: &str, body: &[u8]) -> Resp {
@@ -668,16 +762,13 @@ impl<'a, V> Ran<'a, V> {
 /// after `skip` more.
 pub async fn resume_until<'a, V>(
     rig: &Rig,
-    mut fut: Running<'a, V>,
+    fut: Running<'a, V>,
     skip: u64,
     trip: Trip,
 ) -> Ran<'a, V> {
     rig.trip().arm(skip, trip);
     rig.trip().release();
-    match std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await {
-        Poll::Ready(v) => Ran::Done(v),
-        Poll::Pending => Ran::Stalled(fut),
-    }
+    wait_for_trip(rig, fut, trip).await
 }
 
 /// Runs `fut` one call at a time until `at` holds: it is then stopped

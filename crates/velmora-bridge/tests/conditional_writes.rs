@@ -146,12 +146,20 @@ async fn abort(rig: &Rig, signer: &Signer, key: &str, id: &str) -> Resp {
 }
 
 fn upload_state(rig: &Rig, id: &str) -> String {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row("SELECT state FROM uploads WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap()
-    })
+    let rows = rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(
+            "SELECT state FROM uploads WHERE id = ?1",
+            &[velmora_bridge::SqlValue::Text(id.into())],
+        )
+        .unwrap();
+    let [velmora_bridge::SqlValue::Text(state)] = rows[0].as_slice() else {
+        panic!("expected upload state")
+    };
+    state.clone()
 }
 
 fn tick(rig: &Rig) {

@@ -1,5 +1,5 @@
 //! `SqlCatalog` outbox leases, article plans, verification counting,
-//! release and GC rows over SQLite with the D1 schema.
+//! release and GC rows over the selected catalogue backend.
 //!
 //! Objects are published through the multipart path, so the rows under
 //! test are the ones the catalogue itself writes. Every statement goes
@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 
 use velmora_bridge::jobs::RESEND_SECS;
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
+use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql, TestSql};
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -24,7 +24,7 @@ fn bbs() -> Vec<String> {
 }
 
 /// The database, and every statement the catalogue ran on it.
-struct Probe(RusqliteSql, RefCell<Vec<(String, Vec<SqlValue>)>>);
+struct Probe(TestSql, RefCell<Vec<(String, Vec<SqlValue>)>>);
 
 impl Probe {
     fn log(&self, sql: &str, params: &[SqlValue]) {
@@ -37,6 +37,9 @@ fn check_params(params: &[SqlValue]) {
 }
 
 impl Sql for Probe {
+    fn dialect(&self) -> Dialect {
+        self.0.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
         self.log(sql, params);
@@ -73,11 +76,11 @@ struct Obj {
 
 impl Fx {
     async fn new() -> Fx {
-        Fx::on(RusqliteSql::with_schema().unwrap()).await
+        Fx::on(TestSql::with_schema().unwrap()).await
     }
 
     /// The fixture on the database `db`, which has its schema.
-    async fn on(db: RusqliteSql) -> Fx {
+    async fn on(db: TestSql) -> Fx {
         let fx = Fx {
             cat: SqlCatalog::new(Probe(db, RefCell::new(Vec::new()))),
             seed: Cell::new(1),
@@ -87,8 +90,13 @@ impl Fx {
         for (id, name, disposable) in [(&fx.bucket, "scratch", 1), (&fx.real_bucket, "real", 0)] {
             fx.run(
                 "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
-                 created_at) VALUES (?1, ?2, 'owner', x'07', 1, ?3, 0)",
-                &[text(id.as_str()), text(name), SqlValue::Int(disposable)],
+                 created_at) VALUES (?1, ?2, 'owner', ?4, 1, ?3, 0)",
+                &[
+                    text(id.as_str()),
+                    text(name),
+                    SqlValue::Int(disposable),
+                    SqlValue::Blob(vec![7]),
+                ],
             )
             .await;
         }
@@ -102,11 +110,11 @@ impl Fx {
     }
 
     async fn run(&self, sql: &str, params: &[SqlValue]) -> u64 {
-        self.cat.sql.0.exec(sql, params).await.unwrap()
+        self.cat.sql.0.fixture_exec(sql, params).await.unwrap()
     }
 
     async fn count(&self, sql: &str) -> i64 {
-        match self.cat.sql.0.query(sql, &[]).await.unwrap()[0][0] {
+        match self.cat.sql.0.fixture_query(sql, &[]).await.unwrap()[0][0] {
             SqlValue::Int(n) => n,
             ref other => panic!("not an integer: {other:?}"),
         }
@@ -122,7 +130,7 @@ impl Fx {
             "SELECT id, safety_state, article_count, plan_rev, last_verified_at, \
              release_evidence, released_at, wrapped_file_key FROM extents ORDER BY id",
         ] {
-            out.extend(self.cat.sql.0.query(sql, &[]).await.unwrap());
+            out.extend(self.cat.sql.0.fixture_query(sql, &[]).await.unwrap());
         }
         out
     }
@@ -134,7 +142,7 @@ impl Fx {
             .cat
             .sql
             .0
-            .query(&sql, &[text(o.extent.as_str())])
+            .fixture_query(&sql, &[text(o.extent.as_str())])
             .await
             .unwrap();
         match &rows[0][0] {
@@ -146,12 +154,17 @@ impl Fx {
 
     /// One column of an object's extent row, as text.
     async fn extent(&self, o: &Obj, column: &str) -> String {
-        let sql = format!("SELECT CAST({column} AS TEXT) FROM extents WHERE id = ?1");
+        let expression = if column.contains(" IS ") {
+            format!("CASE WHEN {column} THEN '1' ELSE '0' END")
+        } else {
+            format!("CAST({column} AS TEXT)")
+        };
+        let sql = format!("SELECT {expression} FROM extents WHERE id = ?1");
         let rows = self
             .cat
             .sql
             .0
-            .query(&sql, &[text(o.extent.as_str())])
+            .fixture_query(&sql, &[text(o.extent.as_str())])
             .await
             .unwrap();
         match &rows[0][0] {
@@ -1497,7 +1510,8 @@ async fn verification_kind_defaults_to_body_and_stat_is_not_a_read() {
     let bad = fx
         .cat
         .sql
-        .exec("UPDATE verifications SET kind = 'head'", &[])
+        .0
+        .fixture_exec("UPDATE verifications SET kind = 'head'", &[])
         .await;
     assert!(bad.is_err());
 
@@ -1530,7 +1544,7 @@ async fn read_backs_before_kind(fx: &Fx, o: &Obj, backbone: &str) -> String {
         .cat
         .sql
         .0
-        .query(
+        .fixture_query(
             "SELECT CAST(COUNT(*) AS TEXT) FROM verifications v \
                JOIN extents e ON e.id = v.extent_id \
               WHERE v.extent_id = ?1 AND v.backbone = ?2 AND v.result = 'ok' \
@@ -1957,8 +1971,12 @@ async fn gc_refuses_an_extent_in_service() {
     fx.run(
         "INSERT INTO extents(id, bucket_id, state, plain_size, cipher_size, media_header, \
          wrapped_file_key, plain_md5, plain_sha256, cipher_sha256, safety_state, created_at) \
-         VALUES ('x_part', ?1, 'staged', 1, 1, x'00', x'01', x'00', x'00', x'00', 'held', 0)",
-        &[text(fx.bucket.as_str())],
+         VALUES ('x_part', ?1, 'staged', 1, 1, ?2, ?3, ?2, ?2, ?2, 'held', 0)",
+        &[
+            text(fx.bucket.as_str()),
+            SqlValue::Blob(vec![0]),
+            SqlValue::Blob(vec![1]),
+        ],
     )
     .await;
     fx.run(
@@ -2007,7 +2025,7 @@ async fn stored(fx: &Fx, o: &Obj) -> Vec<(String, UnixMs, String, String, Option
         .cat
         .sql
         .0
-        .query(
+        .fixture_query(
             "SELECT backbone, verified_at, kind, result, lease_token FROM verifications \
              WHERE extent_id = ?1 ORDER BY backbone, verified_at",
             &[text(o.extent.as_str())],
@@ -2379,8 +2397,11 @@ async fn a_release_by_a_verify_job_leaves_the_rows_of_a_release_job() {
         async move {
             let extent = format!("SELECT {extent_columns} FROM extents WHERE id = ?1");
             let outbox = format!("SELECT {outbox_columns} FROM outbox WHERE extent_id = ?1");
-            let mut rows = sql.query(&extent, std::slice::from_ref(&id)).await.unwrap();
-            rows.extend(sql.query(&outbox, &[id]).await.unwrap());
+            let mut rows = sql
+                .fixture_query(&extent, std::slice::from_ref(&id))
+                .await
+                .unwrap();
+            rows.extend(sql.fixture_query(&outbox, &[id]).await.unwrap());
             rows
         }
     };
@@ -3000,7 +3021,13 @@ impl Fx {
         let mut plans = Vec::new();
         for (sql, params) in ran {
             let explain = format!("EXPLAIN QUERY PLAN {sql}");
-            let rows = self.cat.sql.0.query(&explain, &params).await.unwrap();
+            let rows = self
+                .cat
+                .sql
+                .0
+                .fixture_query(&explain, &params)
+                .await
+                .unwrap();
             let lines: Vec<String> = rows
                 .into_iter()
                 .map(|row| match &row[3] {
@@ -3156,7 +3183,7 @@ async fn the_resend_wait_is_per_kind_of_queue() {
             SqlValue::Text(stage.into()),
         ];
         // At least one: the usage-counter trigger adds its own row.
-        assert!(fx.cat.sql.0.exec(sql, &params).await.unwrap() >= 1);
+        assert!(fx.cat.sql.0.fixture_exec(sql, &params).await.unwrap() >= 1);
     }
     assert_eq!(fx.mark(&[&post, &verify, &release], T0).await, 3);
     let due = |now: UnixMs, post_secs: u32, verify_secs: u32| {
@@ -3309,6 +3336,9 @@ async fn every_stage_gets_its_share_of_a_dispatcher_run() {
 /// day of releases in waiting), and the mark finds each row by its id.
 #[tokio::test]
 async fn the_dispatcher_statements_use_an_index() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN output.
+    }
     let fx = Fx::new().await;
     let a = fx.publish(&fx.bucket, "a").await;
     let plans = fx
@@ -3683,7 +3713,7 @@ async fn gc_drops_a_packed_plan_with_the_article_metadata() {
         .cat
         .sql
         .0
-        .exec(
+        .fixture_exec(
             "UPDATE extents SET plan = NULL WHERE id = ?1",
             &[text(live.extent.as_str())],
         )
@@ -3925,7 +3955,7 @@ impl Fx {
             .cat
             .sql
             .0
-            .query(
+            .fixture_query(
                 "SELECT kind, COALESCE(mode, 'NULL') FROM verifications WHERE extent_id = ?1 \
                  ORDER BY verified_at, backbone",
                 &[text(o.extent.as_str())],
@@ -4622,10 +4652,14 @@ async fn redrive_window_steps_over_releasing_extents() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn redrive_and_bury_run_from_the_indexes_that_remain() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: applies SQLite index migration and compares query plans.
+    }
     let fx = Fx::new().await;
     fx.cat
         .sql
         .0
+        .sqlite()
         .apply(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
         .unwrap();
     let mut objs = Vec::new();
@@ -4882,9 +4916,13 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
             "own" => fx.addendum(&o, &blob, 8),
             _ => fx.addendum(&o, &fx.seeded(&o, 2).0, 8),
         };
-        let set_plan = "UPDATE extents SET plan = x'ffffff', article_count = 2, parity = ?2, \
+        let set_plan = "UPDATE extents SET plan = ?3, article_count = 2, parity = ?2, \
                         parity_count = 1 WHERE id = ?1";
-        let params = [text(o.extent.as_str()), SqlValue::Blob(on_row.clone())];
+        let params = [
+            text(o.extent.as_str()),
+            SqlValue::Blob(on_row.clone()),
+            SqlValue::Blob(vec![255; 3]),
+        ];
         assert_eq!(fx.run(set_plan, &params).await, 1);
         // A job holds the row, and a pass of three articles is on record.
         let l = fx.claim(&o, OutboxStage::Post, T0).await.unwrap();
@@ -4909,7 +4947,12 @@ async fn a_replay_keeps_no_addendum_of_another_plan() {
         assert_eq!(stored.packed.as_deref(), Some(&blob[..]), "{key}");
         let kept = key == "own";
         let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
-        let passes = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        let passes = fx
+            .cat
+            .sql
+            .0
+            .fixture_query(sql, &[text(o.extent.as_str())])
+            .await;
         assert_eq!(
             passes.unwrap()[0][0],
             SqlValue::Int(i64::from(kept)),
@@ -4943,10 +4986,13 @@ fn hex_upper(bytes: &[u8]) -> String {
 /// rows is written: parity costs no row and no statement.
 #[tokio::test]
 async fn parity_writes_no_more_rows_and_no_more_statements() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite preupdate-hook billing counts.
+    }
     let fx = Fx::new().await;
     let plain = fx.two_articles("plain").await;
     let with = fx.two_articles("with").await;
-    fx.cat.sql.0.meter_writes().unwrap();
+    fx.cat.sql.0.sqlite().meter_writes().unwrap();
     let mut cost = Vec::new();
     let mut texts = Vec::new();
     // Two providers took articles of each plan.
@@ -4958,7 +5004,7 @@ async fn parity_writes_no_more_rows_and_no_more_statements() {
             true => &[(0, "p1"), (1, "p1"), (2, "p2")],
             false => &[(0, "p1"), (1, "p2")],
         };
-        let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
+        let (rows, at) = (fx.cat.sql.0.sqlite().writes(), fx.statements());
         fx.cat
             .plan_packed(&post, TWO_ARTICLES, &blob, addendum.as_deref())
             .await
@@ -4969,7 +5015,7 @@ async fn parity_writes_no_more_rows_and_no_more_statements() {
             .mark_posted_many(&post, all, T0.plus_secs(1))
             .await
             .unwrap());
-        let wrote = fx.cat.sql.0.writes().since(&rows);
+        let wrote = fx.cat.sql.0.sqlite().writes().since(&rows);
         cost.push((wrote.billed(), wrote.writing_statements));
         let ran = &fx.cat.sql.1.borrow()[at..];
         texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
@@ -5018,8 +5064,15 @@ async fn a_replay_restores_an_addendum_only_beside_its_packed_plan() {
             _ => addendum.clone(),
         };
         if key == "unreadable" {
-            let set_plan = "UPDATE extents SET plan = x'ffffff', article_count = 2 WHERE id = ?1";
-            assert_eq!(fx.run(set_plan, &[text(o.extent.as_str())]).await, 1);
+            let set_plan = "UPDATE extents SET plan = ?2, article_count = 2 WHERE id = ?1";
+            assert_eq!(
+                fx.run(
+                    set_plan,
+                    &[text(o.extent.as_str()), SqlValue::Blob(vec![255; 3])]
+                )
+                .await,
+                1
+            );
         }
         replay.push(ReplayExtent {
             row: extent_rows.remove(0),
@@ -5071,6 +5124,9 @@ async fn a_replay_restores_an_addendum_only_beside_its_packed_plan() {
 /// it is: no parity, read and posted as before.
 #[tokio::test]
 async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: replays historical SQLite migration.
+    }
     use velmora_bridge::testkit::*;
     let db = RusqliteSql::open_in_memory().unwrap();
     for script in [
@@ -5098,7 +5154,7 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     ] {
         db.apply(script).unwrap();
     }
-    let fx = Fx::on(db).await;
+    let fx = Fx::on(TestSql::Sqlite(db)).await;
     // A packed plan, and two extents without a plan.
     let packed = fx.two_articles("packed").await;
     let rows = fx.publish(&fx.bucket, "rows").await;
@@ -5109,12 +5165,15 @@ async fn the_parity_migration_applies_to_a_catalogue_with_plans() {
     assert_eq!(fx.run(set_plan, &params).await, 1);
     let columns = "id, state, cipher_size, article_count, plan_rev, hex(plan), posted_at";
     let extents = format!("SELECT {columns} FROM extents ORDER BY id");
-    let before = fx.cat.sql.0.query(&extents, &[]).await.unwrap();
+    let before = fx.cat.sql.0.fixture_query(&extents, &[]).await.unwrap();
     assert_eq!(before.len(), 3);
 
-    fx.cat.sql.0.apply(MIGRATION_0022).unwrap();
+    fx.cat.sql.0.sqlite().apply(MIGRATION_0022).unwrap();
 
-    assert_eq!(fx.cat.sql.0.query(&extents, &[]).await.unwrap(), before);
+    assert_eq!(
+        fx.cat.sql.0.fixture_query(&extents, &[]).await.unwrap(),
+        before
+    );
     let with = "SELECT COUNT(*) FROM extents WHERE parity IS NOT NULL OR parity_count IS NOT NULL";
     assert_eq!(fx.count(with).await, 0);
     let stored = fx.cat.stored_plan(&packed.extent).await.unwrap();
@@ -5284,6 +5343,9 @@ async fn release_refuses_passes_without_the_parity_articles() {
 /// costs no row.
 #[tokio::test]
 async fn parity_costs_no_row_at_verify_and_release() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite preupdate-hook billing counts.
+    }
     let fx = Fx::new().await;
     // The first release of an hour also opens the hour's row of the usage
     // counters, once. `first` pays for that, and is not compared.
@@ -5291,11 +5353,11 @@ async fn parity_costs_no_row_at_verify_and_release() {
     let plain = fx.posted_packed("plain", false).await;
     let with = fx.posted_packed("with", true).await;
     let counting = labels(&["bb-a", "bb-b"]);
-    fx.cat.sql.0.meter_writes().unwrap();
+    fx.cat.sql.0.sqlite().meter_writes().unwrap();
     let mut cost = Vec::new();
     let mut texts = Vec::new();
     for ((o, l), n) in [(&first, 2), (&plain, 2), (&with, 3)] {
-        let (rows, at) = (fx.cat.sql.0.writes(), fx.statements());
+        let (rows, at) = (fx.cat.sql.0.sqlite().writes(), fx.statements());
         fx.pass_of(l, "bb-a", T0, VerifyKind::Body, n).await;
         fx.pass_of(l, "bb-b", T0, VerifyKind::Stat, n).await;
         fx.cat.backbone_status(&o.extent).await.unwrap();
@@ -5317,7 +5379,7 @@ async fn parity_costs_no_row_at_verify_and_release() {
         assert_eq!(begun.await.unwrap(), Guard::Applied(()));
         assert!(fx.cat.finish_release(&r, later.plus_ms(2)).await.unwrap());
         assert_eq!(fx.extent(o, "safety_state").await, "released");
-        let wrote = fx.cat.sql.0.writes().since(&rows);
+        let wrote = fx.cat.sql.0.sqlite().writes().since(&rows);
         cost.push((wrote.billed(), wrote.writing_statements));
         let ran = &fx.cat.sql.1.borrow()[at..];
         texts.push(ran.iter().map(|(sql, _)| sql.clone()).collect::<Vec<_>>());
@@ -5428,7 +5490,12 @@ async fn a_replay_restores_an_addendum_that_cannot_be_read() {
     assert!(stranded.is_empty(), "{stranded:?}");
     let passes = async |o: &Obj| {
         let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
-        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        let rows = fx
+            .cat
+            .sql
+            .0
+            .fixture_query(sql, &[text(o.extent.as_str())])
+            .await;
         rows.unwrap()[0][0].clone()
     };
     for ((o, addendum), key) in made.iter().zip(keys) {
@@ -5601,6 +5668,9 @@ async fn the_light_guard_refuses_a_full_read_of_the_data_alone() {
 /// goes on, and puts the addendum of the record back with its count.
 #[tokio::test]
 async fn a_replay_survives_a_parity_count_that_is_no_number() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: stores non-integer values in an SQLite INTEGER column.
+    }
     use velmora_bridge::replay::ReplayExtent;
     let fx = Fx::new().await;
     let bucket = fx.cat.bucket_by_name("scratch").await.unwrap().unwrap();
@@ -5661,7 +5731,7 @@ async fn a_replay_survives_a_parity_count_that_is_no_number() {
             .cat
             .sql
             .0
-            .query(sql, &[text(o.extent.as_str())])
+            .fixture_query(sql, &[text(o.extent.as_str())])
             .await
             .unwrap();
         let kept = i64::from(i + 1 == made.len());
@@ -5707,7 +5777,12 @@ async fn a_replay_that_replaces_an_addendum_ends_the_claims_in_flight() {
     };
     let passes = async |o: &Obj| {
         let sql = "SELECT COUNT(*) FROM verifications WHERE extent_id = ?1";
-        let rows = fx.cat.sql.0.query(sql, &[text(o.extent.as_str())]).await;
+        let rows = fx
+            .cat
+            .sql
+            .0
+            .fixture_query(sql, &[text(o.extent.as_str())])
+            .await;
         rows.unwrap()[0][0].clone()
     };
     let pass = |l: &Lease, backbone: &str, at: UnixMs, kind: VerifyKind| VerificationRow {

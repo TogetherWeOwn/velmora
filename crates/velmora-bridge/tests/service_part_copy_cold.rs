@@ -106,7 +106,7 @@ async fn cold_source(budget: u64, parity: bool) -> Source {
     cfg.parity = parity;
     cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
     let budget = ByteBudget::new(cfg.inflight_budget_bytes);
-    let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
+    let rig = rig_with_budget_selected(TcpConnector::default(), cfg, budget);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)

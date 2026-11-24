@@ -2,7 +2,7 @@
 //! before a commit, are never deleted, and rebuild the catalogue.
 //!
 //! "Export" here is a copy of every catalogue table inside the same
-//! SQLite database; "loss" deletes every row.
+//! test database; "loss" deletes every row.
 
 mod service_support;
 
@@ -38,10 +38,36 @@ const TABLES: [&str; 14] = [
 // ---------------------------------------------------------------------------
 
 fn sql(rig: &Rig, script: &str) {
-    rig.bridge
-        .catalog
-        .sql
-        .with_conn(|c| c.execute_batch(script).unwrap());
+    rig.bridge.catalog.sql.inner.fixture_script(script).unwrap();
+}
+
+fn fixture_rows(db: &FailSql, sql: &str, params: &[SqlValue]) -> Vec<Row> {
+    db.inner.fixture_query_now(sql, params).unwrap()
+}
+
+fn fixture_row(db: &FailSql, sql: &str, params: &[SqlValue]) -> Row {
+    fixture_rows(db, sql, params).remove(0)
+}
+
+fn fixture_text(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Text(value) => value.clone(),
+        _ => panic!("expected fixture text"),
+    }
+}
+
+fn fixture_int(value: &SqlValue) -> i64 {
+    match value {
+        SqlValue::Int(value) => *value,
+        _ => panic!("expected fixture integer"),
+    }
+}
+
+fn fixture_texts(rig: &Rig, sql: &str) -> Vec<String> {
+    fixture_rows(&rig.bridge.catalog.sql, sql, &[])
+        .iter()
+        .map(|row| fixture_text(&row[0]))
+        .collect()
 }
 
 /// Copies every table aside (the export).
@@ -68,10 +94,9 @@ fn wipe(rig: &Rig) {
 fn import(rig: &Rig) {
     for t in TABLES.iter().rev() {
         // The `extents` rows have already written their own references.
-        sql(
-            rig,
-            &format!("INSERT OR IGNORE INTO {t} SELECT * FROM bak_{t};"),
-        );
+        let sqlite = format!("INSERT OR IGNORE INTO {t} SELECT * FROM bak_{t};");
+        let pg = format!("INSERT INTO {t} SELECT * FROM bak_{t} ON CONFLICT DO NOTHING;");
+        sql(rig, rig.bridge.catalog.sql.inner.fixture(&sqlite, &pg));
     }
 }
 
@@ -79,20 +104,13 @@ fn import(rig: &Rig) {
 fn dump(rig: &Rig) -> String {
     let mut out = String::new();
     for t in TABLES {
-        rig.bridge.catalog.sql.with_conn(|c| {
-            let mut stmt = c
-                .prepare(&format!("SELECT * FROM {t} ORDER BY 1, 2"))
-                .unwrap();
-            let n = stmt.column_count();
-            let mut rows = stmt.query([]).unwrap();
-            while let Some(row) = rows.next().unwrap() {
-                out.push_str(t);
-                for i in 0..n {
-                    out.push_str(&format!("|{:?}", row.get_ref(i).unwrap()));
-                }
-                out.push('\n');
-            }
-        });
+        for row in fixture_rows(
+            &rig.bridge.catalog.sql,
+            &format!("SELECT * FROM {t} ORDER BY 1, 2"),
+            &[],
+        ) {
+            out.push_str(&format!("{t}|{row:?}\n"));
+        }
     }
     out
 }
@@ -251,7 +269,7 @@ fn tick(rig: &Rig) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manifest_write_failure_commits_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "kept", b"kept").await.expect(200);
     tick(&rig);
@@ -317,7 +335,7 @@ async fn manifest_write_failure_commits_nothing() {
 /// A delete of nothing writes no tombstone.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_of_a_missing_key_writes_no_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     delete(&rig, &signer, "never").await.expect(204);
     assert!(records(&rig).is_empty());
@@ -329,7 +347,7 @@ async fn delete_of_a_missing_key_writes_no_record() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn recovery_records_survive_gc_and_eviction() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"one").await.expect(200);
     tick(&rig);
@@ -414,7 +432,7 @@ async fn recovery_records_survive_gc_and_eviction() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_a_refused_publication_gives_its_record_up() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
     let (live, extents) = rig
@@ -493,7 +511,7 @@ async fn only_a_refused_publication_gives_its_record_up() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn export_plus_replay_restores_later_writes() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a-old").await.expect(200);
     tick(&rig);
@@ -564,7 +582,7 @@ async fn export_plus_replay_restores_later_writes() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn records_alone_rebuild_the_catalogue() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"a-old").await.expect(200);
     tick(&rig);
@@ -632,15 +650,14 @@ async fn records_alone_rebuild_the_catalogue() {
     assert_eq!(rig.count("objects"), 3);
     assert!(rig.count("gc") > 0);
     // Every live extent is back in the pipeline, at its first stage.
-    let posting: i64 = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
+    let posting: i64 = fixture_int(
+        &fixture_row(
+            &rig.bridge.catalog.sql,
             "SELECT COUNT(*) FROM outbox o JOIN objects l ON l.generation_id = o.generation_id \
              WHERE o.stage = 'post'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    });
+            &[],
+        )[0],
+    );
     assert_eq!(posting, 4);
 
     // The same replay again, in one call per phase.
@@ -661,7 +678,7 @@ async fn records_alone_rebuild_the_catalogue() {
 async fn a_real_bucket_stays_real_through_a_replay() {
     // This test describes the open gate; closing it must revisit it.
     const { assert!(REAL_DATA_READY) }
-    let rig = rig();
+    let rig = rig_selected();
     let real = rig.bucket(BUCKET, false).await;
     let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
     rig.grant(AKID, &real, Perm::Rw).await;
@@ -716,10 +733,7 @@ async fn copy(rig: &Rig, signer: &Signer, from: &str, to: &str) -> Resp {
 }
 
 fn count(rig: &Rig, query: &str) -> i64 {
-    rig.bridge
-        .catalog
-        .sql
-        .with_conn(|c| c.query_row(query, [], |r| r.get(0)).unwrap())
+    fixture_int(&fixture_row(&rig.bridge.catalog.sql, query, &[])[0])
 }
 
 /// Open GC rows for an extent a live object references.
@@ -735,7 +749,7 @@ const LIVE_POSTING: &str = "SELECT COUNT(DISTINCT ge.extent_id) FROM generation_
 /// source it was made from is deleted or overwritten.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_outlives_its_source_through_a_replay() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -828,7 +842,7 @@ async fn a_copy_outlives_its_source_through_a_replay() {
 /// when the source's record is gone.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_is_rebuilt_without_the_record_of_its_source() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -860,7 +874,7 @@ async fn a_copy_is_rebuilt_without_the_record_of_its_source() {
 /// extents the catalogue already holds.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_made_after_the_export_is_replayed_onto_it() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -893,7 +907,7 @@ async fn a_copy_made_after_the_export_is_replayed_onto_it() {
 /// extent, back in service and back in the pipeline.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let start = rig.now();
     rig.put(&signer, BUCKET, "src", b"payload")
@@ -940,7 +954,7 @@ async fn a_copy_is_replayed_after_the_record_that_retired_its_source() {
 /// stage, the only one that finishes it, with a fresh lease token.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_takes_up_the_unfinished_release_of_its_extent() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let start = rig.now();
     rig.put(&signer, BUCKET, "src", b"payload")
@@ -991,7 +1005,7 @@ async fn a_copy_takes_up_the_unfinished_release_of_its_extent() {
 /// object it replaced.
 #[tokio::test(flavor = "current_thread")]
 async fn a_copy_stays_over_the_object_it_replaced() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let start = rig.now();
     rig.put(&signer, BUCKET, "src", b"payload")
@@ -1021,7 +1035,7 @@ async fn a_copy_stays_over_the_object_it_replaced() {
 /// over it when the older generation is unknown to the catalogue.
 #[tokio::test(flavor = "current_thread")]
 async fn an_older_record_never_replaces_a_newer_object() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"old").await.expect(200);
     tick(&rig);
@@ -1057,7 +1071,7 @@ async fn an_older_record_never_replaces_a_newer_object() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_lost_extent_and_a_broken_record_are_reported() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "fine", b"fine").await.expect(200);
     tick(&rig);
@@ -1115,7 +1129,7 @@ async fn a_lost_extent_and_a_broken_record_are_reported() {
 /// generation that cannot be read replaces nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_without_its_extents_does_not_replace_a_good_object() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "big", b"good").await.expect(200);
     let (good, _) = rig.live(&bucket, "big").await.unwrap();
@@ -1138,13 +1152,8 @@ async fn a_record_without_its_extents_does_not_replace_a_good_object() {
 
     // The parts are collected before they were posted: no pinned copy,
     // no article plan.
-    let parts: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare("SELECT id FROM extents WHERE generation_id IS NULL")
-            .unwrap();
-        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        ids.map(|id| id.unwrap()).collect()
-    });
+    let parts: Vec<String> =
+        fixture_texts(&rig, "SELECT id FROM extents WHERE generation_id IS NULL");
     assert_eq!(parts.len(), 2);
     for part in &parts {
         let id = velmora_bridge::ExtentId::new(part.clone());
@@ -1192,7 +1201,7 @@ async fn a_record_without_its_extents_does_not_replace_a_good_object() {
 /// after the refused record, also from a clock that runs behind.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
     rig.put(&signer, BUCKET, "j", b"good").await.expect(200);
@@ -1277,7 +1286,7 @@ async fn a_refused_record_stays_refused_after_the_tombstone_before_it() {
 /// an older generation of the key.
 #[tokio::test(flavor = "current_thread")]
 async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "big", b"good").await.expect(200);
     let (good, _) = rig.live(&bucket, "big").await.unwrap();
@@ -1297,13 +1306,10 @@ async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
         .expect(500);
     let lingering = records(&rig).into_iter().max().unwrap()["m/".len()..].to_owned();
     assert!(lingering.as_str() > good.id.as_str());
-    let parts: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare("SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id")
-            .unwrap();
-        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        ids.map(|id| id.unwrap()).collect()
-    });
+    let parts: Vec<String> = fixture_texts(
+        &rig,
+        "SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id",
+    );
     assert_eq!(parts.len(), 2);
     for part in &parts {
         let id = velmora_bridge::ExtentId::new(part.clone());
@@ -1315,11 +1321,15 @@ async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
     // for it.
     wipe(&rig);
     replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    sql(
-        &rig,
-        "UPDATE extents SET plan = x'ff', article_count = 1 WHERE generation_id IS NULL;",
+    let db = &rig.bridge.catalog.sql.inner;
+    sql(&rig, db.fixture(
+        "UPDATE extents SET plan = x'ff', article_count = 1 WHERE generation_id IS NULL",
+        "UPDATE extents SET plan = decode('ff','hex'), article_count = 1 WHERE generation_id IS NULL",
+    ));
+    let stored = db.fixture(
+        "extents WHERE hex(plan) = 'FF' AND safety_state = 'deleted'",
+        "extents WHERE encode(plan,'hex') = 'ff' AND safety_state = 'deleted'",
     );
-    let stored = "extents WHERE hex(plan) = 'FF' AND safety_state = 'deleted'";
     assert_eq!(rig.count(stored), 2);
     let names: Vec<String> = parts.iter().map(|id| format!("m/art/{id}")).collect();
 
@@ -1349,7 +1359,7 @@ async fn an_unreadable_packed_plan_does_not_replace_a_good_object() {
 /// older generation there is nothing to keep in its place.
 #[tokio::test(flavor = "current_thread")]
 async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     // "big": a good object, then a Complete that is refused and leaves
     // its record. The pinned copies of its parts stay.
@@ -1369,13 +1379,10 @@ async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
         .expect(500);
     let lingering = records(&rig).into_iter().max().unwrap()["m/".len()..].to_owned();
     assert!(lingering.as_str() > good.id.as_str());
-    let mut damaged: Vec<String> = rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare("SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id")
-            .unwrap();
-        let ids = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        ids.map(|id| id.unwrap()).collect()
-    });
+    let mut damaged: Vec<String> = fixture_texts(
+        &rig,
+        "SELECT id FROM extents WHERE generation_id IS NULL ORDER BY id",
+    );
     assert_eq!(damaged.len(), 2);
     // "solo": written once, and its pinned copy is lost.
     tick(&rig);
@@ -1393,13 +1400,15 @@ async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    let sqlite = format!("CREATE TRIGGER damage AFTER INSERT ON extents WHEN NEW.id IN ({ids}) BEGIN \
+                          UPDATE extents SET plan = x'ff', article_count = 1 WHERE id = NEW.id; END;");
+    let postgres = format!("CREATE FUNCTION damage_plan() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                            BEGIN NEW.plan := decode('ff','hex'); NEW.article_count := 1; RETURN NEW; END $$; \
+                            CREATE TRIGGER damage BEFORE INSERT ON extents FOR EACH ROW \
+                            WHEN (NEW.id IN ({ids})) EXECUTE FUNCTION damage_plan();");
     sql(
         &rig,
-        &format!(
-            "CREATE TRIGGER damage AFTER INSERT ON extents WHEN NEW.id IN ({ids}) BEGIN \
-               UPDATE extents SET plan = x'ff', article_count = 1 WHERE id = NEW.id; \
-             END;"
-        ),
+        rig.bridge.catalog.sql.inner.fixture(&sqlite, &postgres),
     );
     let mut names: Vec<String> = damaged.iter().map(|id| format!("m/art/{id}")).collect();
     names.sort();
@@ -1435,7 +1444,7 @@ async fn an_unreadable_packed_plan_alone_keeps_no_object_from_its_key() {
 /// pinned copy.
 #[tokio::test(flavor = "current_thread")]
 async fn an_unreadable_article_plan_does_not_stop_the_replay() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
     let (_, extents) = rig.live(&bucket, "one").await.unwrap();
@@ -1475,7 +1484,7 @@ async fn an_unreadable_article_plan_does_not_stop_the_replay() {
 /// read from Usenet.
 #[tokio::test(flavor = "current_thread")]
 async fn a_packed_plan_that_nothing_replaces_is_named() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
     let (_, extents) = rig.live(&bucket, "one").await.unwrap();
@@ -1485,11 +1494,14 @@ async fn a_packed_plan_that_nothing_replaces_is_named() {
     let id = extents[0].id.as_str();
     let record = format!("m/art/{id}");
     assert!(!rig.bridge.safety.inner.contains(&record));
+    let db = &rig.bridge.catalog.sql.inner;
+    let plan = db.fixture("x'ff'", "decode('ff','hex')");
+    let is_bad = db.fixture("hex(plan) = 'FF'", "encode(plan,'hex') = 'ff'");
     sql(
         &rig,
-        &format!("UPDATE extents SET plan = x'ff', article_count = 1 WHERE id = '{id}';"),
+        &format!("UPDATE extents SET plan = {plan}, article_count = 1 WHERE id = '{id}';"),
     );
-    let stored = format!("extents WHERE id = '{id}' AND hex(plan) = 'FF'");
+    let stored = format!("extents WHERE id = '{id}' AND {is_bad}");
     assert_eq!(rig.count(&stored), 1);
     for _ in 0..2 {
         let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
@@ -1525,7 +1537,7 @@ async fn a_packed_plan_that_nothing_replaces_is_named() {
 /// generation.
 #[tokio::test(flavor = "current_thread")]
 async fn a_live_generation_with_an_unreadable_packed_plan_is_not_listed_as_kept_back() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "one", b"old").await.expect(200);
     tick(&rig);
@@ -1533,15 +1545,17 @@ async fn a_live_generation_with_an_unreadable_packed_plan_is_not_listed_as_kept_
     let (live, extents) = rig.live(&bucket, "one").await.unwrap();
     let id = extents[0].id.as_str();
     let record = format!("m/art/{id}");
+    let db = &rig.bridge.catalog.sql.inner;
+    let plan = db.fixture("x'ff'", "decode('ff','hex')");
+    let is_bad = db.fixture("hex(plan) = 'FF'", "encode(plan,'hex') = 'ff'");
     sql(
         &rig,
         &format!(
-            "UPDATE extents SET plan = x'ff', article_count = 1, safety_state = 'deleted' \
+            "UPDATE extents SET plan = {plan}, article_count = 1, safety_state = 'deleted' \
              WHERE id = '{id}';"
         ),
     );
-    let stored =
-        format!("extents WHERE id = '{id}' AND hex(plan) = 'FF' AND safety_state = 'deleted'");
+    let stored = format!("extents WHERE id = '{id}' AND {is_bad} AND safety_state = 'deleted'");
     assert_eq!(rig.count("generations WHERE key = 'one'"), 2);
     for _ in 0..2 {
         let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
@@ -1557,7 +1571,7 @@ async fn a_live_generation_with_an_unreadable_packed_plan_is_not_listed_as_kept_
 /// not open.
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_is_bound_to_its_name() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "one", b"one").await.expect(200);
     tick(&rig);
@@ -1610,37 +1624,30 @@ async fn admin(rig: &Rig, path: &str, body: Value) -> Resp {
 async fn restore_route_refuses_to_replay_an_incomplete_import() {
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let restoring = rig_with(NoNntp, cfg);
-    restoring.bridge.catalog.sql.with_conn(|c| {
-        c.execute_batch(
-            "CREATE TABLE _velmora_import_incomplete (phase TEXT NOT NULL);\n             INSERT INTO _velmora_import_incomplete VALUES ('loading')",
-        )
-        .unwrap();
-    });
+    let restoring = rig_with_selected(NoNntp, cfg);
+    sql(&restoring, "CREATE TABLE _velmora_import_incomplete (phase TEXT NOT NULL); INSERT INTO _velmora_import_incomplete VALUES ('loading')");
     let before = restore_state(&restoring);
     let body = json!({ "since_ms": 0 });
     for phase in ["loading", "verify", "mismatch"] {
-        restoring.bridge.catalog.sql.with_conn(|c| {
-            c.execute("UPDATE _velmora_import_incomplete SET phase = ?1", [phase])
-                .unwrap();
-        });
+        fixture_rows(
+            &restoring.bridge.catalog.sql,
+            "UPDATE _velmora_import_incomplete SET phase = ?1",
+            &[SqlValue::Text(phase.into())],
+        );
         let refused = admin(&restoring, "/restore", body.clone()).await;
         refused.expect(409);
         assert!(refused.text().contains("CatalogueImportIncomplete"));
         assert_eq!(restore_state(&restoring), before);
     }
 
-    restoring.bridge.catalog.sql.with_conn(|c| {
-        c.execute_batch("DROP TABLE _velmora_import_incomplete")
-            .unwrap();
-    });
+    sql(&restoring, "DROP TABLE _velmora_import_incomplete");
     admin(&restoring, "/restore", body).await.expect(200);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn restore_route_runs_only_in_maintenance() {
     // A serving bridge writes two objects and deletes one.
-    let serving = rig();
+    let serving = rig_selected();
     let (_, signer) = serving.standard(BUCKET).await;
     serving.put(&signer, BUCKET, "a", b"a").await.expect(200);
     tick(&serving);
@@ -1655,7 +1662,7 @@ async fn restore_route_runs_only_in_maintenance() {
     // A bridge in maintenance over the same blobs and an empty catalogue.
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let restoring = rig_with(NoNntp, cfg);
+    let restoring = rig_with_selected(NoNntp, cfg);
     for key in serving.bridge.safety.keys() {
         let blob = serving.bridge.safety.stored(&key).unwrap();
         let meta = BlobMeta {
@@ -1780,18 +1787,12 @@ async fn replay_answers_the_same(rig: &Rig, signer: &Signer, keys: &[&str]) {
 }
 
 fn live_ids(rig: &Rig) -> Vec<String> {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare("SELECT generation_id FROM objects ORDER BY key")
-            .unwrap();
-        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-        rows.map(|r| r.unwrap()).collect()
-    })
+    fixture_texts(rig, "SELECT generation_id FROM objects ORDER BY key")
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_overwrite_from_a_slow_clock_stays_on_top_in_a_replay() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
     let v1 = live_ids(&rig).remove(0);
@@ -1815,7 +1816,7 @@ async fn an_overwrite_from_a_slow_clock_stays_on_top_in_a_replay() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_after_a_delete_sorts_after_the_tombstone() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
     rig.bridge.clock.advance_ms(-500);
@@ -1836,7 +1837,7 @@ async fn a_put_after_a_delete_sorts_after_the_tombstone() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn writes_in_one_millisecond_replay_in_commit_order() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // The clock does not move: every id below is minted in the same
     // millisecond, where only random bytes would order them.
@@ -1872,7 +1873,7 @@ async fn writes_in_one_millisecond_replay_in_commit_order() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_complete_from_a_slow_clock_stays_on_top_in_a_replay() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let first = pattern(3, 5 * MIB);
@@ -1904,7 +1905,7 @@ async fn a_complete_from_a_slow_clock_stays_on_top_in_a_replay() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let first = pattern(3, 5 * MIB);
@@ -1940,15 +1941,14 @@ async fn an_abort_after_the_replay_of_its_complete_harms_nothing() {
         b"",
     )
     .await;
-    let collected: i64 = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
+    let collected: i64 = fixture_int(
+        &fixture_row(
+            &rig.bridge.catalog.sql,
             "SELECT COUNT(*) FROM gc WHERE extent_id IN (SELECT e.id FROM extents e \
                JOIN objects o ON o.generation_id = e.generation_id)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    });
+            &[],
+        )[0],
+    );
     assert_eq!(collected, 0);
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
 }
@@ -1982,7 +1982,7 @@ async fn two_parts(rig: &Rig, signer: &Signer, key: &str) -> (String, Vec<String
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_complete_that_is_then_aborted_does_not_come_back() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig);
@@ -2007,16 +2007,19 @@ async fn a_failed_complete_that_is_then_aborted_does_not_come_back() {
     wipe(&rig);
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
     assert_eq!(report.published, 0, "{report:?}");
-    let generations: i64 = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row("SELECT COUNT(*) FROM generations", [], |r| r.get(0))
-            .unwrap()
-    });
+    let generations: i64 = fixture_int(
+        &fixture_row(
+            &rig.bridge.catalog.sql,
+            "SELECT COUNT(*) FROM generations",
+            &[],
+        )[0],
+    );
     assert_eq!(generations, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_record_of_a_failed_complete_is_deleted_again_when_the_store_fails() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig);
@@ -2050,7 +2053,7 @@ async fn the_record_of_a_failed_complete_is_deleted_again_when_the_store_fails()
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_complete_can_be_sent_again() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
     tick(&rig);
@@ -2073,7 +2076,7 @@ async fn a_failed_complete_can_be_sent_again() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_complete_that_applied_without_an_answer_keeps_its_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig).len();
@@ -2097,7 +2100,7 @@ async fn a_complete_that_applied_without_an_answer_keeps_its_record() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn two_records_of_one_object_are_not_reported_as_a_loss() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig).len();
@@ -2136,7 +2139,7 @@ async fn two_records_of_one_object_are_not_reported_as_a_loss() {
 /// the record of the attempt stays and the upload stays open.
 #[tokio::test(flavor = "current_thread")]
 async fn an_overloaded_catalogue_after_a_failed_complete_keeps_the_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig).len();
@@ -2154,12 +2157,8 @@ async fn an_overloaded_catalogue_after_a_failed_complete_keeps_the_record() {
     assert_eq!(records(&rig).len(), before + 1);
     // Nothing is published, and the upload is open as it was.
     get(&rig, &signer, "big").await.expect(404);
-    let (state, revision): (String, i64) = sql.with_conn(|c| {
-        c.query_row("SELECT state, revision FROM uploads", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap()
-    });
+    let row = fixture_row(sql, "SELECT state, revision FROM uploads", &[]);
+    let (state, revision) = (fixture_text(&row[0]), fixture_int(&row[1]));
     assert_eq!((state.as_str(), revision), ("open", 2));
 
     // The same Complete then goes through.
@@ -2186,7 +2185,7 @@ async fn an_overloaded_catalogue_after_a_failed_complete_keeps_the_record() {
 /// under the id. The record goes only on that answer, so here it stays.
 #[tokio::test(flavor = "current_thread")]
 async fn an_overloaded_catalogue_after_a_refused_complete_keeps_the_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, whole) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig).len();
@@ -2203,14 +2202,13 @@ async fn an_overloaded_catalogue_after_a_refused_complete_keeps_the_record() {
     sql.overloaded.set(0);
     assert_eq!(records(&rig).len(), before + 1);
     get(&rig, &signer, "big").await.expect(404);
-    let staged: i64 = sql.with_conn(|c| {
-        c.query_row(
+    let staged: i64 = fixture_int(
+        &fixture_row(
+            sql,
             "SELECT COUNT(*) FROM extents WHERE state = 'staged' AND generation_id IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    });
+            &[],
+        )[0],
+    );
     assert_eq!(staged, 2);
 
     tick(&rig);
@@ -2233,7 +2231,7 @@ async fn an_overloaded_catalogue_after_a_refused_complete_keeps_the_record() {
 /// removed.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_complete_drops_its_record_once_the_catalogue_answers() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
     let before = records(&rig).len();
@@ -2266,7 +2264,7 @@ async fn a_refused_complete_drops_its_record_once_the_catalogue_answers() {
 /// sorts between the two, removes it in a replay.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "big", b"first").await.expect(200);
     tick(&rig);
@@ -2288,10 +2286,13 @@ async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
         .expect(200);
     tick(&rig);
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
-    let live: String = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row("SELECT generation_id FROM objects", [], |r| r.get(0))
-            .unwrap()
-    });
+    let live = fixture_text(
+        &fixture_row(
+            &rig.bridge.catalog.sql,
+            "SELECT generation_id FROM objects",
+            &[],
+        )[0],
+    );
 
     wipe(&rig);
     let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
@@ -2300,15 +2301,8 @@ async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
     assert!(report.unpublishable.is_empty(), "{report:?}");
     let signer = reissue_key(&rig).await;
     assert_eq!(get(&rig, &signer, "big").await.expect(200).body, whole);
-    let (restored, generations): (String, i64) = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
-            "SELECT (SELECT generation_id FROM objects), \
-                    (SELECT COUNT(*) FROM generations WHERE state = 'live')",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap()
-    });
+    let row = fixture_row(&rig.bridge.catalog.sql, "SELECT (SELECT generation_id FROM objects), (SELECT COUNT(*) FROM generations WHERE state = 'live')", &[]);
+    let (restored, generations) = (fixture_text(&row[0]), fixture_int(&row[1]));
     assert_eq!((restored, generations), (live, 1));
 
     // A second replay over the result changes nothing.
@@ -2323,7 +2317,7 @@ async fn a_delete_between_two_records_of_one_object_does_not_remove_it() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
-    let rig = rig();
+    let rig = rig_selected();
     let (old, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
     tick(&rig);
@@ -2360,18 +2354,14 @@ async fn records_of_a_bucket_whose_name_is_taken_are_reported_and_skipped() {
 // ---------------------------------------------------------------------------
 
 fn restore_state(rig: &Rig) -> Vec<String> {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c.prepare("SELECT state FROM restore_state").unwrap();
-        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-        rows.map(|r| r.unwrap()).collect()
-    })
+    fixture_texts(rig, "SELECT state FROM restore_state")
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_unfinished_replay_refuses_writes_without_maintenance() {
     // Maintenance is off in this rig, as after a deploy that came too
     // early.
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
@@ -2415,15 +2405,13 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
         .await
         .expect(503);
     let outbox = || -> (String, String, String, i64) {
-        rig.bridge.catalog.sql.with_conn(|c| {
-            c.query_row(
-                "SELECT extent_id, generation_id, stage, attempts FROM outbox \
-                 ORDER BY extent_id LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap()
-        })
+        let row = fixture_row(&rig.bridge.catalog.sql, "SELECT extent_id, generation_id, stage, attempts FROM outbox ORDER BY extent_id LIMIT 1", &[]);
+        (
+            fixture_text(&row[0]),
+            fixture_text(&row[1]),
+            fixture_text(&row[2]),
+            fixture_int(&row[3]),
+        )
     };
     let row = outbox();
     assert_eq!(row.2, "post");
@@ -2489,14 +2477,15 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
 #[tokio::test(flavor = "current_thread")]
 async fn the_runbook_statement_closes_a_restored_catalogue() {
     const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
     let arm = || {
-        rig.bridge
-            .catalog
-            .sql
-            .with_conn(|c| c.execute_batch(ARM).unwrap())
+        let postgres = "INSERT INTO restore_state(id,state,since_ms,started_at) VALUES (1,'replaying',-1,0) \
+            ON CONFLICT(id) DO UPDATE SET since_ms = CASE WHEN restore_state.state = 'complete' THEN -1 ELSE restore_state.since_ms END, \
+            state = 'replaying', started_at = restore_state.started_at + 1, finished_at = NULL, \
+            reached_phase = NULL, reached_after = NULL, reached_extent = NULL";
+        sql(&rig, rig.bridge.catalog.sql.inner.fixture(ARM, postgres));
     };
     let catalog = &rig.bridge.catalog;
 
@@ -2541,7 +2530,7 @@ async fn the_runbook_statement_closes_a_restored_catalogue() {
 /// to come back.
 #[tokio::test(flavor = "current_thread")]
 async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
     let (id, etags, _) = two_parts(&rig, &signer, "big").await;
@@ -2553,20 +2542,13 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
     let arm = || {
         let bridge = rig.bridge.clone();
         let hook = move |_: &str| {
-            bridge.catalog.sql.with_conn(|c| {
-                let q = "INSERT INTO restore_state(id, state, since_ms, started_at) \
-                         VALUES (1, 'replaying', 0, 1)";
-                c.execute(q, []).unwrap()
-            });
+            bridge.catalog.sql.inner.fixture_script("INSERT INTO restore_state(id,state,since_ms,started_at) VALUES (1,'replaying',0,1)").unwrap();
         };
         rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
     };
     let disarm = || {
         assert_eq!(restore_state(&rig), ["replaying"], "the hook ran");
-        rig.bridge
-            .catalog
-            .sql
-            .with_conn(|c| c.execute("DELETE FROM restore_state", []).unwrap());
+        sql(&rig, "DELETE FROM restore_state");
     };
 
     arm();
@@ -2617,7 +2599,7 @@ async fn a_replay_that_starts_after_the_gate_refuses_the_commit() {
 /// and open the catalogue for writes.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cursor_ahead_of_the_replay_is_refused() {
-    let serving = rig();
+    let serving = rig_selected();
     let (_, signer) = serving.standard(BUCKET).await;
     serving.put(&signer, BUCKET, "a", b"a").await.expect(200);
     tick(&serving);
@@ -2627,7 +2609,7 @@ async fn a_cursor_ahead_of_the_replay_is_refused() {
 
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let restoring = rig_with(NoNntp, cfg);
+    let restoring = rig_with_selected(NoNntp, cfg);
     for key in serving.bridge.safety.keys() {
         let blob = serving.bridge.safety.stored(&key).unwrap();
         let meta = BlobMeta {
@@ -2726,7 +2708,7 @@ async fn a_cursor_ahead_of_the_replay_is_refused() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_pinned_copy_released_after_the_export_is_found() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "old", b"old").await.expect(200);
     let (_, extents) = rig.live(&bucket, "old").await.unwrap();
@@ -2868,7 +2850,7 @@ async fn answers(
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
     for seed in 0..150u64 {
-        let rig = rig();
+        let rig = rig_selected();
         let (_, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
         let mut log = Vec::new();
@@ -2890,7 +2872,7 @@ async fn random_histories_in_one_millisecond_replay_to_the_same_answers() {
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_across_an_export_replay_to_the_same_answers() {
     for seed in 1000..1300u64 {
-        let rig = rig();
+        let rig = rig_selected();
         let (_, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
         let mut log = Vec::new();
@@ -3067,7 +3049,7 @@ async fn random_faulty_write(
 #[tokio::test(flavor = "current_thread")]
 async fn random_histories_with_faults_replay_to_the_same_answers() {
     for seed in 2000..2200u64 {
-        let rig = rig();
+        let rig = rig_selected();
         let (bucket, signer) = rig.standard(BUCKET).await;
         let mut dice = Dice(seed);
         let mut log = Vec::new();
@@ -3107,7 +3089,7 @@ async fn random_histories_with_faults_replay_to_the_same_answers() {
 /// after both tombstones, or a replay applies the second tombstone to it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_sorts_after_a_tombstone_whose_delete_found_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let bucket = bucket.id;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
@@ -3156,7 +3138,7 @@ fn newest_record(rig: &Rig) -> (String, usize) {
 /// publishes the failed write over it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_sorts_after_the_record_of_a_put_whose_commit_failed() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "over", b"v1").await.expect(200);
     rig.bridge.clock.advance_ms(10);
@@ -3172,10 +3154,13 @@ async fn a_put_sorts_after_the_record_of_a_put_whose_commit_failed() {
         // The next writer's clock is half a second behind.
         rig.bridge.clock.advance_ms(-500);
         rig.put(&signer, BUCKET, key, b"v2").await.expect(200);
-        let live = rig.bridge.catalog.sql.with_conn(|c| {
-            let q = "SELECT generation_id FROM objects WHERE key = ?1";
-            c.query_row(q, [key], |r| r.get::<_, String>(0)).unwrap()
-        });
+        let live = fixture_text(
+            &fixture_row(
+                &rig.bridge.catalog.sql,
+                "SELECT generation_id FROM objects WHERE key = ?1",
+                &[SqlValue::Text(key.into())],
+            )[0],
+        );
         assert!(live > failed, "{key}: {live} sorts after {failed}");
         rig.bridge.clock.advance_ms(1000);
     }
@@ -3185,7 +3170,7 @@ async fn a_put_sorts_after_the_record_of_a_put_whose_commit_failed() {
 /// The same for a copy whose batch failed for the database.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_sorts_after_the_record_of_a_copy_whose_commit_failed() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
     rig.bridge.clock.advance_ms(10);
@@ -3208,27 +3193,30 @@ async fn a_put_sorts_after_the_record_of_a_copy_whose_commit_failed() {
 /// after it all the same.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_sorts_after_the_record_a_refused_copy_could_not_remove() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
     rig.bridge.clock.advance_ms(10);
     let (_, before) = newest_record(&rig);
 
     let etag = |rig: &Rig, etag: &str| {
-        rig.bridge.catalog.sql.with_conn(|c| {
-            let q = "UPDATE generations SET etag = ?1 WHERE key = 'src'";
-            c.execute(q, [etag]).unwrap()
-        });
+        fixture_rows(
+            &rig.bridge.catalog.sql,
+            "UPDATE generations SET etag = ?1 WHERE key = 'src'",
+            &[SqlValue::Text(etag.into())],
+        );
     };
     let source = rig.live(&bucket, "src").await.unwrap().0.etag;
     let bridge = rig.bridge.clone();
     let hook = move |key: &str| {
         // The source changes between the read and the batch, and the
         // record written here cannot be removed afterwards.
-        bridge.catalog.sql.with_conn(|c| {
-            let q = "UPDATE generations SET etag = '\"changed\"' WHERE key = 'src'";
-            c.execute(q, []).unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script(r#"UPDATE generations SET etag = '"changed"' WHERE key = 'src'"#)
+            .unwrap();
         *bridge.safety.fail_delete.borrow_mut() = Some(key.to_owned());
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
@@ -3254,7 +3242,7 @@ async fn a_put_sorts_after_the_record_a_refused_copy_could_not_remove() {
 /// slower clock sorts after it all the same.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_sorts_after_the_record_a_refused_complete_could_not_remove() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
@@ -3264,10 +3252,12 @@ async fn a_put_sorts_after_the_record_a_refused_complete_could_not_remove() {
     let hook = move |key: &str| {
         // The upload changes between the read and the batch; the record
         // cannot be removed; and the next read of the upload fails.
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute("UPDATE uploads SET revision = revision + 1", [])
-                .unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script("UPDATE uploads SET revision = revision + 1")
+            .unwrap();
         *bridge.safety.fail_delete.borrow_mut() = Some(key.to_owned());
         let sql = &bridge.catalog.sql;
         sql.fail_matching.replace(Some(("FROM uploads", 0)));
@@ -3295,7 +3285,7 @@ async fn a_put_sorts_after_the_record_a_refused_complete_could_not_remove() {
 /// failed write over the acknowledged delete.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_sorts_after_the_record_of_a_put_whose_commit_failed() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
     rig.bridge.clock.advance_ms(10);
@@ -3328,7 +3318,7 @@ fn tombstones(rig: &Rig) -> Vec<String> {
 /// record, once: a repeated delete of the key records nothing more.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_of_nothing_live_covers_the_record_of_a_failed_put() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // A key that was never written and one that is: no tombstone.
     delete(&rig, &signer, "k").await.expect(204);
@@ -3364,7 +3354,7 @@ async fn a_delete_of_nothing_live_covers_the_record_of_a_failed_put() {
 /// failed write is covered by the next acknowledged delete.
 #[tokio::test(flavor = "current_thread")]
 async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"source").await.expect(200);
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
@@ -3398,7 +3388,7 @@ async fn each_failed_write_on_a_deleted_key_is_covered_by_the_next_delete() {
 /// record, and a replay does not publish the failed write.
 #[tokio::test(flavor = "current_thread")]
 async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"good").await.expect(200);
     tick(&rig);
@@ -3457,7 +3447,7 @@ async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
 /// a replay.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_published_under_the_tombstone_of_such_a_delete_is_deleted() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bridge.catalog.sql.fail_batches.set(1);
     rig.put(&signer, BUCKET, "k", b"failed")
@@ -3470,22 +3460,11 @@ async fn a_put_published_under_the_tombstone_of_such_a_delete_is_deleted() {
     let between = format!("{}ffffffffffffffff", &failed[..15]);
     let bridge = rig.bridge.clone();
     let hook = move |_: &str| {
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute(
-                "INSERT INTO generations(id, bucket_id, key, state, size, etag, checksum_json, \
-                   content_json, user_meta_json, extent_count, created_at) \
-                 SELECT ?1, bucket_id, key, 'live', 0, 'x', '{}', '{}', '{}', 0, 0 \
-                   FROM key_floors WHERE key = 'k'",
-                [&between],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO objects(bucket_id, key, generation_id) \
-                 SELECT bucket_id, key, id FROM generations WHERE key = 'k'",
-                [],
-            )
-            .unwrap()
-        });
+        fixture_rows(&bridge.catalog.sql,
+            "INSERT INTO generations(id,bucket_id,key,state,size,etag,checksum_json,content_json,user_meta_json,extent_count,created_at) \
+             SELECT ?1,bucket_id,key,'live',0,'x','{}','{}','{}',0,0 FROM key_floors WHERE key = 'k'",
+            &[SqlValue::Text(between.clone())]);
+        fixture_rows(&bridge.catalog.sql, "INSERT INTO objects(bucket_id,key,generation_id) SELECT bucket_id,key,id FROM generations WHERE key = 'k'", &[]);
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
     delete(&rig, &signer, "k").await.expect(204);
@@ -3499,7 +3478,7 @@ async fn a_put_published_under_the_tombstone_of_such_a_delete_is_deleted() {
 /// tombstone on record, and a second replay keeps it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_put_after_a_replay_sorts_after_every_tombstone_on_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let bucket = bucket.id;
     rig.put(&signer, BUCKET, "k", b"v1").await.expect(200);
@@ -3544,7 +3523,7 @@ async fn a_put_after_a_replay_sorts_after_every_tombstone_on_record() {
 /// not count as a newer id on the key.
 #[tokio::test(flavor = "current_thread")]
 async fn a_complete_refused_for_its_parts_is_not_taken_for_an_id_race() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
     let etag = upload_part(&rig, &signer, "big", &id, 1, b"part one").await;
@@ -3552,10 +3531,12 @@ async fn a_complete_refused_for_its_parts_is_not_taken_for_an_id_race() {
     let hook = move |_: &str| {
         // The part is no longer what was listed when the batch runs,
         // and the upload itself says nothing of it.
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute("UPDATE extents SET plain_size = plain_size + 1", [])
-                .unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script("UPDATE extents SET plain_size = plain_size + 1")
+            .unwrap();
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
     complete(&rig, &signer, "big", &id, std::slice::from_ref(&etag))
@@ -3615,7 +3596,7 @@ async fn plan_record(
 /// each reposts in the form it was posted in.
 #[tokio::test(flavor = "current_thread")]
 async fn a_replayed_plan_keeps_each_rows_yenc_form() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = vec![7u8; 1_000_000];
     rig.put(&signer, BUCKET, "two-articles", &body)
@@ -3641,7 +3622,7 @@ async fn a_replayed_plan_keeps_each_rows_yenc_form() {
 /// unreadable, not skipped without a word by the replay's insert.
 #[tokio::test(flavor = "current_thread")]
 async fn a_plan_record_with_a_bad_yenc_name_is_unreadable() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = vec![7u8; 1_000_000];
     rig.put(&signer, BUCKET, "two-articles", &body)
@@ -3676,7 +3657,7 @@ async fn a_generation_record_names_the_article_plans_of_its_extents() {
     use velmora_bridge::crypto::open_manifest;
     use velmora_bridge::recovery::{article_key, generation_key, plan_keys};
 
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"some bytes")
         .await
@@ -3745,7 +3726,7 @@ fn by_layout(rig: &Rig) -> (Vec<String>, Vec<String>) {
 async fn the_tenant_layout_puts_every_new_record_under_the_tenant() {
     use velmora_bridge::recovery::{is_protected_key, record_name, RecordKind};
 
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     assert_eq!(rig.bridge.cfg.records, Layout::flat());
     rig.put(&signer, BUCKET, "old", b"old").await.expect(200);
@@ -3895,7 +3876,7 @@ async fn random_histories_in_both_layouts_replay_to_the_same_objects() {
     for seed in 5000..5120u64 {
         let mut had = Vec::new();
         for mixed in [false, true] {
-            let mut rig = rig();
+            let mut rig = rig_selected();
             let (_, signer) = rig.standard(BUCKET).await;
             let mut dice = Dice(seed);
             let mut turn = Dice(seed ^ 0x7e4a);
@@ -3952,7 +3933,7 @@ async fn a_deleted_key_stays_deleted_across_the_layouts() {
         ("k2", flat(), tenant(), Some(flat())),
         ("k3", tenant(), flat(), Some(tenant())),
     ];
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     for (key, written, deleted, again) in &cases {
         write_in(&mut rig, written.clone());
@@ -4007,7 +3988,7 @@ async fn an_article_plan_is_found_in_the_other_layout_than_its_record() {
         (Layout::flat(), Layout::default_tenant()),
         (Layout::default_tenant(), Layout::flat()),
     ] {
-        let mut rig = rig();
+        let mut rig = rig_selected();
         write_in(&mut rig, record.clone());
         let (bucket, signer) = rig.standard(BUCKET).await;
         rig.put(&signer, BUCKET, "k", &vec![7u8; 1_000_000])
@@ -4067,7 +4048,7 @@ async fn a_record_moved_to_the_other_layout_does_not_open() {
         (Layout::flat(), Layout::default_tenant()),
         (Layout::default_tenant(), Layout::flat()),
     ] {
-        let mut rig = rig();
+        let mut rig = rig_selected();
         write_in(&mut rig, from.clone());
         let (bucket, signer) = rig.standard(BUCKET).await;
         rig.put(&signer, BUCKET, "k", b"body").await.expect(200);
@@ -4102,7 +4083,7 @@ async fn a_record_moved_to_the_other_layout_does_not_open() {
 /// name does not open, the other one is replayed: the test below.)
 #[tokio::test(flavor = "current_thread")]
 async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"body").await.expect(200);
     tick(&rig);
@@ -4148,7 +4129,7 @@ async fn one_id_in_both_layouts_is_replayed_once_and_reported() {
 /// delete, and reports both names.
 #[tokio::test(flavor = "current_thread")]
 async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     write_in(&mut rig, Layout::default_tenant());
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "kept", b"body").await.expect(200);
@@ -4213,7 +4194,7 @@ async fn a_flat_name_that_does_not_open_does_not_hide_the_tenant_record() {
 /// the name it was written, in the tenant layout as in the flat one.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_record_of_the_tenant_layout_is_removed_under_its_name() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     write_in(&mut rig, Layout::default_tenant());
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create_upload(&rig, &signer, "big").await;
@@ -4225,10 +4206,12 @@ async fn a_refused_record_of_the_tenant_layout_is_removed_under_its_name() {
     let seen = written.clone();
     let hook = move |key: &str| {
         seen.borrow_mut().push(key.to_owned());
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute("UPDATE extents SET plain_size = plain_size + 1", [])
-                .unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script("UPDATE extents SET plain_size = plain_size + 1")
+            .unwrap();
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
     complete(&rig, &signer, "big", &id, std::slice::from_ref(&etag))

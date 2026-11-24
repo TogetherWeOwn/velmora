@@ -30,7 +30,7 @@ struct Setup {
 }
 
 async fn setup_with(cfg: config::BridgeConfig) -> Setup {
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (bucket, signer) = rig.standard(BUCKET).await;
     let old = pattern(9, 100);
     rig.put(&signer, BUCKET, KEY, &old).await.expect(200);
@@ -437,27 +437,29 @@ async fn a_record_of_the_tenant_layout_keeps_its_slices_from_the_sweep() {
 fn refuse_publishes(s: &Setup, times: u32) -> Rc<Cell<u32>> {
     fn install(bridge: Rc<TestBridge<NoNntp>>, bucket: String, left: Rc<Cell<u32>>) {
         let again = Rc::clone(&bridge);
-        let hook = move |key: &str| {
-            match key.strip_prefix("m/g_") {
-                Some(rest) if left.get() > 0 => {
-                    left.set(left.get() - 1);
-                    let ms = i64::from_str_radix(&rest[..13], 16).unwrap();
-                    let floor = format!("g_{:013x}{}", ms + 1, &rest[13..]);
-                    again.catalog.sql.with_conn(|c| {
-                        c.execute(
-                            "INSERT INTO key_floors(bucket_id, key, floor_id) VALUES (?1, ?2, ?3) \
-                             ON CONFLICT(bucket_id, key) DO UPDATE SET floor_id = excluded.floor_id",
-                            [bucket.as_str(), KEY, floor.as_str()],
-                        )
-                        .unwrap()
-                    });
+        let hook =
+            move |key: &str| {
+                match key.strip_prefix("m/g_") {
+                    Some(rest) if left.get() > 0 => {
+                        left.set(left.get() - 1);
+                        let ms = i64::from_str_radix(&rest[..13], 16).unwrap();
+                        let floor = format!("g_{:013x}{}", ms + 1, &rest[13..]);
+                        again.catalog.sql.inner.fixture_query_now(
+                        "INSERT INTO key_floors(bucket_id, key, floor_id) VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(bucket_id, key) DO UPDATE SET floor_id = excluded.floor_id",
+                        &[
+                            velmora_bridge::SqlValue::Text(bucket.as_str().into()),
+                            velmora_bridge::SqlValue::Text(KEY.into()),
+                            velmora_bridge::SqlValue::Text(floor),
+                        ],
+                    ).unwrap();
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if left.get() > 0 {
-                install(Rc::clone(&again), bucket, left);
-            }
-        };
+                if left.get() > 0 {
+                    install(Rc::clone(&again), bucket, left);
+                }
+            };
         bridge.safety.before_put.replace(Some(Box::new(hook)));
     }
     let left = Rc::new(Cell::new(times));
@@ -1920,7 +1922,7 @@ const KEYS: [&str; 3] = ["a", "b", "c"];
 
 impl World {
     async fn new(seed: u64) -> World {
-        let rig = small_rig();
+        let rig = small_rig_selected();
         let (_, signer) = rig.standard(BUCKET).await;
         World {
             rig,
@@ -2156,9 +2158,13 @@ impl World {
 #[tokio::test(flavor = "current_thread")]
 async fn random_writers_sweeps_rollbacks_and_replays_lose_nothing() {
     let (mut checked, mut swept) = (0, 0);
-    for seed in 0..60 {
+    // PostgreSQL opens sockets per catalogue operation. Preserve the full
+    // SQLite run and use the same invariants with fewer network-backed turns.
+    let postgres = velmora_bridge::testkit::TestSql::postgres_selected();
+    let (seeds, steps) = if postgres { (6, 24) } else { (60, 80) };
+    for seed in 0..seeds {
         let mut world = World::new(seed).await;
-        for step in 0..80 {
+        for step in 0..steps {
             world.rig.bridge.clock.advance_ms(1000);
             let what = format!("seed {seed} step {step}");
             let guard = PanicNote(what);
@@ -2174,8 +2180,11 @@ async fn random_writers_sweeps_rollbacks_and_replays_lose_nothing() {
         swept += s;
     }
     // The run looked at something.
-    assert!(checked > 1000, "{checked} records checked");
-    assert!(swept > 100, "{swept} sweep jobs");
+    assert!(
+        checked > if postgres { 0 } else { 1000 },
+        "{checked} records checked"
+    );
+    assert!(swept > if postgres { 0 } else { 100 }, "{swept} sweep jobs");
 }
 
 /// Says where a failed run was.

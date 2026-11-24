@@ -47,7 +47,7 @@ async fn observed(rig: &Rig, req: Req, method: &str, status: u16, tail: &[&str])
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_failures_report_auth_lookup_r2_budget_and_commit() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let request = || {
         signer.sign(
@@ -105,7 +105,7 @@ async fn a_sliced_put_reports_a_failed_rollback_stamp_separately_from_commit() {
     let mut cfg = config(Vec::new());
     cfg.max_extent_bytes = 4 * 1024;
     cfg.slice_bytes = 2 * 1024;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     let req = signer.sign(
         rig.now(),
@@ -127,7 +127,7 @@ async fn a_sliced_put_reports_a_failed_rollback_stamp_separately_from_commit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn head_failures_stay_bodyless_and_report_stage_and_size() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, KEY, b"payload").await.expect(200);
     let request = || {
@@ -154,13 +154,13 @@ async fn head_failures_stay_bodyless_and_report_stage_and_size() {
             .is_empty()
     );
     sql.fail_matching.borrow_mut().take();
-    sql.with_conn(|conn| {
-        conn.execute(
+    sql.inner
+        .fixture_exec(
             "UPDATE generations SET size = ?1, content_json = 'null'",
-            [1_i64 << 31],
+            &[velmora_bridge::SqlValue::Int(1_i64 << 31)],
         )
-    })
-    .unwrap();
+        .await
+        .unwrap();
     let failed = observed(&rig, request(), "HEAD", 500, &["other", "gt_1gib"]).await;
     assert!(failed.body.is_empty());
     assert!(failed.header("content-type").is_none());
@@ -168,7 +168,7 @@ async fn head_failures_stay_bodyless_and_report_stage_and_size() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn multipart_failures_are_redacted_and_successes_are_unchanged() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let target = path(BUCKET, KEY);
     let created = rig

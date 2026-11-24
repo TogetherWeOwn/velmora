@@ -116,7 +116,7 @@ async fn sources(rig: &Rig, signer: &Signer) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn parts_copied_by_range_read_back_and_outlive_the_source() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let (big, one) = sources(&rig, &signer).await;
     let (_, big_extents) = rig.live(&bucket, "big").await.unwrap();
@@ -156,16 +156,19 @@ async fn parts_copied_by_range_read_back_and_outlive_the_source() {
     assert_eq!(rig.count("extents"), 6);
     // Two rows are the parts the source was uploaded in.
     assert_eq!(rig.count("upload_parts"), 2 + 3);
-    let reused: i64 = rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
+    let reused = rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query(
             "SELECT COUNT(*) FROM upload_parts p JOIN generation_extents g \
-               ON g.extent_id = p.extent_id WHERE p.upload_id = ?1",
-            [id.as_str()],
-            |r| r.get(0),
+         ON g.extent_id = p.extent_id WHERE p.upload_id = ?1",
+            &[velmora_bridge::SqlValue::Text(id.as_str().into())],
         )
-        .unwrap()
-    });
-    assert_eq!(reused, 0);
+        .await
+        .unwrap();
+    assert_eq!(reused, [vec![velmora_bridge::SqlValue::Int(0)]]);
 
     complete(&rig, &signer, "dst", &id, &etags)
         .await
@@ -195,7 +198,7 @@ async fn parts_copied_by_range_read_back_and_outlive_the_source() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_copied_part_can_replace_an_uploaded_one() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let (_, one) = sources(&rig, &signer).await;
     let id = create(&rig, &signer, "dst").await;
@@ -223,7 +226,7 @@ async fn a_copied_part_can_replace_an_uploaded_one() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn requests_the_part_copy_cannot_honour_store_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.bucket("bkt-other", true).await;
     let (big, _) = sources(&rig, &signer).await;
@@ -368,7 +371,7 @@ async fn requests_the_part_copy_cannot_honour_store_nothing() {
 async fn a_range_larger_than_one_extent_is_refused() {
     let mut cfg = config(Vec::new());
     cfg.max_extent_bytes = 6 * MIB as u64;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     let a = pattern(1, 6 * MIB);
     let b = pattern(2, 100);
@@ -442,7 +445,7 @@ async fn a_range_larger_than_one_extent_is_refused() {
 /// only three times.
 #[tokio::test(flavor = "current_thread")]
 async fn a_full_size_extent_is_copied_within_the_byte_budget() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let cap = rig.bridge.cfg.max_extent_bytes;
     assert_eq!(rig.bridge.budget.capacity(), 3 * cap);

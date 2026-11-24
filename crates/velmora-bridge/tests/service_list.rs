@@ -81,7 +81,7 @@ async fn put_all<N: NntpConnector + 'static>(rig: &Rig<N>, signer: &Signer, keys
 
 #[tokio::test(flavor = "current_thread")]
 async fn empty_bucket_lists_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let resp = list(&rig, &signer, BUCKET, &[]).await;
     let p = page(&resp);
@@ -93,7 +93,7 @@ async fn empty_bucket_lists_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn pages_follow_tokens_without_gaps_or_repeats() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut keys: Vec<String> = (0..25).map(|i| format!("key-{i:03}")).collect();
     // Written out of order: the listing sorts.
@@ -125,7 +125,7 @@ async fn pages_follow_tokens_without_gaps_or_repeats() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn prefix_and_start_after_bound_the_listing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let keys: Vec<String> = ["a/1", "a/2", "a%/3", "a_/4", "b/1", "b/2", "c"]
         .iter()
@@ -158,7 +158,7 @@ async fn prefix_and_start_after_bound_the_listing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delimiter_folds_common_prefixes() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let keys: Vec<String> = ["a/1", "a/2", "a/sub/3", "b/1", "c", "d/x/y", "d/x/z", "e"]
         .iter()
@@ -197,7 +197,7 @@ async fn delimiter_folds_common_prefixes() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn listings_larger_than_one_catalogue_batch() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut keys: Vec<String> = (0..1500).map(|i| format!("big/{i:05}")).collect();
     keys.extend((0..700).map(|i| format!("flat-{i:05}")));
@@ -229,7 +229,7 @@ async fn listings_larger_than_one_catalogue_batch() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tokens_are_bound_to_their_listing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket("bkt-other", true).await;
     rig.grant(AKID, &other, Perm::Rw).await;
@@ -290,7 +290,7 @@ async fn tokens_are_bound_to_their_listing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_the_live_generation_is_listed() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "kept", b"one").await.expect(200);
     rig.put(&signer, BUCKET, "kept", b"second")
@@ -315,7 +315,7 @@ async fn only_the_live_generation_is_listed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn reserved_keys_are_listed_verbatim() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut keys: Vec<String> = [
         "with space/and more.txt",
@@ -359,7 +359,7 @@ async fn reserved_keys_are_listed_verbatim() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_list_objects_v1_and_v2_are_served() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // No list-type is V1 (served; see `list_objects_v1_pages_by_marker`).
     rig.call(&signer, Method::Get, "/bkt-list", &[], &[], b"")
@@ -381,7 +381,7 @@ async fn only_list_objects_v1_and_v2_are_served() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_buckets_shows_only_granted_buckets() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard("bkt-zeta").await;
     let alpha = rig.bucket("bkt-alpha", true).await;
     rig.grant(AKID, &alpha, Perm::Ro).await;
@@ -415,7 +415,7 @@ async fn list_buckets_shows_only_granted_buckets() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_objects_v1_pages_by_marker() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let keys = ["a/1", "a/2", "b", "c/x", "c/y", "d e", "z"];
     for k in keys {
@@ -504,7 +504,7 @@ async fn list_objects_v1_pages_by_marker() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_objects_v1_needs_a_grant() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bucket("bkt-hidden", true).await;
     rig.call(&signer, Method::Get, "/bkt-hidden", &[], &[], b"")
@@ -525,7 +525,7 @@ async fn list_objects_v1_needs_a_grant() {
 /// restic (minio-go) lists with exactly this query.
 #[tokio::test(flavor = "current_thread")]
 async fn restic_listing_query_is_served() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "repo/keys/k1", b"x")
         .await
@@ -603,6 +603,7 @@ fn seed_folders<N: NntpConnector + 'static>(
 /// sub-folder.
 #[tokio::test(flavor = "current_thread")]
 async fn a_folder_of_150_subfolders_is_one_catalogue_query() {
+    // sqlite_only: measures SQLite VM and row counts.
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "template", b"abc")
@@ -698,7 +699,7 @@ fn model(
 /// this is what holds that scan to the listing a full scan gives.
 #[tokio::test(flavor = "current_thread")]
 async fn every_page_matches_a_full_scan() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut keys: Vec<String> = [
         "a",
@@ -802,6 +803,7 @@ async fn every_page_matches_a_full_scan() {
 /// query per page whatever `max-keys` is, and rows in step with it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_page_reads_in_step_with_max_keys() {
+    // sqlite_only: measures SQLite VM and row counts.
     let rig = rig();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "template", b"abc")

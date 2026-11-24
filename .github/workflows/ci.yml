@@ -382,6 +382,51 @@ jobs:
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
 
+  # Deliberately outside ci-ok until both sets of catalogue SQL variants land.
+  bridge-postgres:
+    name: bridge PostgreSQL tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          # Disposable service for untrusted PRs; no repository credentials.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: velmora_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd 'pg_isready -U postgres -d velmora_test'
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check D1 baseline migration coverage
+        run: workers/s3-bridge/ops/pg-migrate.sh --check-migrations
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-bridge-postgres
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Exercise the PostgreSQL catalogue and check SQL coverage
+        env:
+          VELMORA_TEST_PG_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/velmora_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          export VELMORA_PG_STATEMENTS_DIR="$(mktemp -d "${RUNNER_TEMP}/velmora-pg-statements.XXXXXX")"
+          suite=0
+          coverage=0
+          cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --tests --no-fail-fast -- --test-threads=4 || suite=$?
+          cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --test pg_statements catalog_statement_coverage -- --ignored --exact || coverage=$?
+          (( suite == 0 && coverage == 0 ))
+
   # The S3 Worker bundle: wasm clippy with the request-target lint
   # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build,
   # Cloudflare's size limit, and a size report against main.

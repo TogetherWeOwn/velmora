@@ -103,7 +103,7 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
     cfg.gc_mode = GcMode::Off;
     cfg.hot_cap_bytes = 0;
     tune(&mut cfg);
-    let rig = rig_with(TcpConnector::default(), cfg);
+    let rig = rig_with_selected(TcpConnector::default(), cfg);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -139,10 +139,12 @@ impl Hot {
 
     /// Makes the dispatcher's hot-tier check due on its next run.
     fn check_due(&self) {
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.execute("DELETE FROM meta WHERE k = 'hot_checked_at'", [])
-                .unwrap()
-        });
+        self.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_script("DELETE FROM meta WHERE k = 'hot_checked_at'")
+            .unwrap();
     }
 
     /// As a release leaves an extent, without posting it.
@@ -287,29 +289,47 @@ impl Hot {
         );
     }
 
+    fn column(&self, extent: &ExtentRow, column: &str) -> SqlValue {
+        self.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_query_now(
+                &format!("SELECT {column} FROM extents WHERE id = ?1"),
+                &[SqlValue::Text(extent.id.as_str().into())],
+            )
+            .unwrap()
+            .remove(0)
+            .remove(0)
+    }
+
     fn num(&self, extent: &ExtentRow, column: &str) -> Option<i64> {
-        let sql = format!("SELECT {column} FROM extents WHERE id = ?1");
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.query_row(&sql, [extent.id.as_str()], |r| r.get(0))
-                .unwrap()
-        })
+        match self.column(extent, column) {
+            SqlValue::Int(n) => Some(n),
+            SqlValue::Null => None,
+            _ => panic!("expected nullable integer for {column}"),
+        }
     }
 
     fn text(&self, extent: &ExtentRow, column: &str) -> String {
-        let sql = format!("SELECT {column} FROM extents WHERE id = ?1");
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.query_row(&sql, [extent.id.as_str()], |r| r.get(0))
-                .unwrap()
-        })
+        let SqlValue::Text(value) = self.column(extent, column) else {
+            panic!("expected text for {column}")
+        };
+        value
     }
 
     fn sql(&self, sql: &str, extent: &ExtentRow) {
-        let n = self
+        let rows = self
             .bridge()
             .catalog
             .sql
-            .with_conn(|c| c.execute(sql, [extent.id.as_str()]).unwrap());
-        assert_eq!(n, 1, "{sql}");
+            .inner
+            .fixture_query_now(
+                &format!("{sql} RETURNING 1"),
+                &[SqlValue::Text(extent.id.as_str().into())],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
     }
 
     fn has_safety(&self, extent: &ExtentRow) -> bool {
@@ -1869,6 +1889,9 @@ async fn garbage_collection_and_admin_evict_end_the_count() {
 /// pinned total may be read from the older, narrower one.
 #[tokio::test(flavor = "current_thread")]
 async fn periodic_statements_read_only_their_index() {
+    if velmora_bridge::testkit::TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN before and after an index migration.
+    }
     let hot = hot().await;
     let plans = || -> Vec<(&str, &str, String)> {
         HOT_INDEX_ONLY

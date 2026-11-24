@@ -112,7 +112,7 @@ fn set_maintenance(rig: &mut Rig, mode: Maintenance) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_objects_deletes_every_named_key_and_no_other() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     for key in ["a", "dir/b & <c>", "c", "keep"] {
         rig.put(&signer, BUCKET, key, key.as_bytes())
@@ -160,7 +160,7 @@ async fn delete_objects_deletes_every_named_key_and_no_other() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_objects_needs_an_integrity_check_that_holds() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let xml = delete_xml(&["k"], false);
@@ -250,7 +250,7 @@ async fn delete_objects_takes_a_document_larger_than_an_extent() {
     cfg.max_extent_bytes = 64 * 1024;
     cfg.max_put_bytes = 64 * 1024;
     cfg.slice_bytes = 64 * 1024;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k0", b"payload").await.expect(200);
 
@@ -281,7 +281,7 @@ async fn delete_objects_takes_a_document_larger_than_an_extent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_objects_refuses_a_document_it_cannot_take() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k0", b"payload").await.expect(200);
 
@@ -349,7 +349,7 @@ async fn delete_objects_refuses_a_document_it_cannot_take() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_objects_answers_for_each_key_on_its_own() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"payload").await.expect(200);
     rig.put(&signer, BUCKET, "b", b"payload").await.expect(200);
@@ -390,7 +390,7 @@ async fn delete_objects_answers_for_each_key_on_its_own() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_objects_is_held_to_the_grants_and_gates_of_a_delete() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket(OTHER, true).await;
     let ro = reader(&rig, &bucket).await;
@@ -470,7 +470,7 @@ const DELETED: [&str; 5] = ["a", "b", "never", "gone", "c"];
 /// `b`, `c` (`c` overwritten once), `keep`, and `gone`, which was
 /// deleted before.
 async fn seeded() -> (Rig, Signer) {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     snapshot(&rig);
     for key in ["a", "b", "c", "c", "keep", "gone"] {
@@ -651,7 +651,7 @@ async fn list_parts(
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_multipart_uploads_lists_the_open_uploads_of_the_bucket() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket(OTHER, true).await;
     rig.grant(AKID, &other, Perm::Rw).await;
@@ -772,7 +772,7 @@ async fn list_multipart_uploads_lists_the_open_uploads_of_the_bucket() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_parts_lists_the_parts_of_one_open_upload() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket(OTHER, true).await;
     rig.grant(AKID, &other, Perm::Rw).await;
@@ -912,7 +912,7 @@ fn bucket_names(rig: &Rig) -> Vec<String> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_bucket_removes_a_bucket_that_never_held_anything() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket(OTHER, true).await;
     rig.grant(AKID, &other, Perm::Rw).await;
@@ -1007,7 +1007,7 @@ async fn delete_bucket_keeps_a_bucket_that_holds_or_held_anything() {
     };
 
     // A live object.
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let before = (rig.bridge.safety.keys(), catalogue_state(&rig));
@@ -1049,7 +1049,7 @@ async fn delete_bucket_keeps_a_bucket_that_holds_or_held_anything() {
     assert_eq!(bucket_names(&rig), [BUCKET]);
 
     // An upload in progress, with and without a part, and after its abort.
-    let rig = self::rig();
+    let rig = self::rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create(&rig, &signer, BUCKET, "big").await;
     not_empty(&delete_bucket(&rig, BUCKET).await);
@@ -1062,7 +1062,7 @@ async fn delete_bucket_keeps_a_bucket_that_holds_or_held_anything() {
 
     // A write that stored its record and was never published: only the
     // floor of the key says so.
-    let rig = self::rig();
+    let rig = self::rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.bridge
         .catalog
@@ -1080,7 +1080,7 @@ async fn delete_bucket_keeps_a_bucket_that_holds_or_held_anything() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_bucket_is_refused_during_a_replay_and_allowed_under_maintenance() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bucket(OTHER, true).await;
 
@@ -1132,7 +1132,7 @@ async fn delete_bucket_is_refused_during_a_replay_and_allowed_under_maintenance(
 /// nothing afterwards: no record, no upload, no blob.
 #[tokio::test(flavor = "current_thread")]
 async fn a_write_that_lost_its_bucket_stores_no_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     // The PUT stops at its first write to the safety store or the
     // catalogue; the bucket goes while it waits.
@@ -1210,7 +1210,7 @@ async fn replay_all(rig: &Rig) -> u64 {
 /// grants, and a client write into it would keep it for good.
 #[tokio::test(flavor = "current_thread")]
 async fn a_rollback_to_before_a_bucket_deletion_is_repaired_by_deleting_it_again() {
-    let mut rig = rig();
+    let mut rig = rig_selected();
     let (stale, signer) = rig.standard(BUCKET).await;
     snapshot(&rig);
 

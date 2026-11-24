@@ -30,6 +30,167 @@ use crate::types::{
     Job, KekBytes, Precondition, Result, UnixMs,
 };
 
+#[cfg(feature = "testkit-pg")]
+#[path = "testkit_pg.rs"]
+mod postgres;
+#[cfg(feature = "testkit-pg")]
+pub use postgres::TestPostgres;
+
+/// Selects the catalogue fixture explicitly requested by the test environment.
+/// A configured PostgreSQL connection that fails never falls back to SQLite.
+pub enum TestSql {
+    Sqlite(RusqliteSql),
+    #[cfg(feature = "testkit-pg")]
+    Postgres(Box<TestPostgres>),
+}
+
+impl TestSql {
+    pub fn postgres_selected() -> bool {
+        std::env::var_os("VELMORA_TEST_PG_URL").is_some()
+    }
+
+    pub fn with_schema() -> Result<Self> {
+        Self::open(true, true)
+    }
+
+    pub fn with_schema_unarmed() -> Result<Self> {
+        Self::open(false, true)
+    }
+
+    /// For port tests that execute synthetic statements, not catalogue paths.
+    pub fn with_schema_unrecorded() -> Result<Self> {
+        Self::open(true, false)
+    }
+
+    fn open(armed: bool, _record: bool) -> Result<Self> {
+        if Self::postgres_selected() {
+            #[cfg(feature = "testkit-pg")]
+            return Ok(Self::Postgres(Box::new(TestPostgres::new(armed, _record)?)));
+            #[cfg(not(feature = "testkit-pg"))]
+            return Err(BridgeError::Sql(
+                "pg testkit: VELMORA_TEST_PG_URL requires --features testkit-pg".into(),
+            ));
+        }
+        if armed {
+            RusqliteSql::with_schema().map(Self::Sqlite)
+        } else {
+            RusqliteSql::with_schema_unarmed().map(Self::Sqlite)
+        }
+    }
+
+    #[cfg(feature = "testkit-pg")]
+    pub fn postgres(&self) -> Option<&TestPostgres> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(pg) => Some(pg),
+        }
+    }
+
+    #[cfg(feature = "testkit-pg")]
+    pub fn postgres_lock_key(&self) -> Option<i64> {
+        self.postgres().map(TestPostgres::lock_key)
+    }
+
+    /// Picks fixture-only SQL without putting either dialect in catalogue metrics.
+    pub fn fixture<'a>(&self, sqlite: &'a str, _postgres: &'a str) -> &'a str {
+        match self {
+            Self::Sqlite(_) => sqlite,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(_) => _postgres,
+        }
+    }
+
+    /// Execute an assertion or fixture query without counting it as production
+    /// catalogue statement coverage.
+    pub async fn fixture_query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        match self {
+            Self::Sqlite(db) => db.query(sql, params).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.fixture_sql.query(sql, params).await,
+        }
+    }
+
+    pub async fn fixture_exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        match self {
+            Self::Sqlite(db) => db.exec(sql, params).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.fixture_sql.exec(sql, params).await,
+        }
+    }
+
+    pub async fn fixture_batch(
+        &self,
+        stmts: Vec<(&'static str, Vec<SqlValue>)>,
+    ) -> Result<Vec<u64>> {
+        match self {
+            Self::Sqlite(db) => db.batch(stmts).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.fixture_sql.batch(stmts).await,
+        }
+    }
+
+    /// Fixture query for a synchronous assertion or test hook.
+    pub fn fixture_query_now(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        match self {
+            Self::Sqlite(db) => db.query_now(sql, params),
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.fixture_query_now(sql, params),
+        }
+    }
+
+    /// Run fixture-only DDL or data setup in the isolated test schema.
+    pub fn fixture_script(&self, script: &str) -> Result<()> {
+        match self {
+            Self::Sqlite(db) => db.apply(script),
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.fixture_script(script),
+        }
+    }
+
+    /// Explicit access for SQLite-only VDBE, metering and migration tests.
+    pub fn sqlite(&self) -> &RusqliteSql {
+        match self {
+            Self::Sqlite(db) => db,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(_) => panic!("SQLite-only fixture used on PostgreSQL"),
+        }
+    }
+}
+
+impl Sql for TestSql {
+    #[cfg(feature = "testkit-pg")]
+    fn dialect(&self) -> crate::ports::Dialect {
+        match self {
+            Self::Sqlite(db) => db.dialect(),
+            Self::Postgres(db) => db.sql.dialect(),
+        }
+    }
+
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        match self {
+            Self::Sqlite(db) => db.query(sql, params).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.sql.query(sql, params).await,
+        }
+    }
+
+    async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        match self {
+            Self::Sqlite(db) => db.exec(sql, params).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.sql.exec(sql, params).await,
+        }
+    }
+
+    async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        match self {
+            Self::Sqlite(db) => db.batch(stmts).await,
+            #[cfg(feature = "testkit-pg")]
+            Self::Postgres(db) => db.sql.batch(stmts).await,
+        }
+    }
+}
+
 /// The D1 schema, applied by [`RusqliteSql::with_schema`].
 pub const MIGRATION_0001: &str =
     include_str!("../../../workers/s3-bridge/migrations/0001_init.sql");
@@ -368,8 +529,8 @@ impl RusqliteSql {
     }
 }
 
-impl Sql for RusqliteSql {
-    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+impl RusqliteSql {
+    fn query_now(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params)?;
         let conn = self.conn.borrow();
         // Whatever a failed statement left behind was rolled back.
@@ -402,6 +563,12 @@ impl Sql for RusqliteSql {
             m.commit(sql, priced);
         }
         Ok(out)
+    }
+}
+
+impl Sql for RusqliteSql {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.query_now(sql, params)
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {

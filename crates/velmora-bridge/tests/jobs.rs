@@ -25,7 +25,7 @@ use velmora_bridge::recovery::{
 };
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
-    FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, RusqliteSql, TestKek,
+    FakeJobs, FixedClock, MemBlobStore, PublishUnrecorded, TestKek, TestSql,
 };
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
@@ -38,9 +38,9 @@ const VERIFY_DELAY_SECS: u32 = 30;
 // Ports
 // ---------------------------------------------------------------------------
 
-/// One SQLite database shared by the bridge and the test.
+/// One isolated catalogue database shared by the bridge and the test.
 struct Shared {
-    db: Rc<RusqliteSql>,
+    db: Rc<TestSql>,
     /// Calls made through this handle. A batch is one call, as on D1.
     calls: Rc<Cell<u32>>,
     /// The dispatcher's mark of sent rows fails.
@@ -48,7 +48,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(db: &Rc<RusqliteSql>) -> Shared {
+    fn new(db: &Rc<TestSql>) -> Shared {
         Shared {
             db: Rc::clone(db),
             calls: Rc::default(),
@@ -61,6 +61,9 @@ impl Shared {
 }
 
 impl Sql for Shared {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.count();
         self.db.query(sql, params).await
@@ -192,7 +195,7 @@ type TestBridge =
 
 struct Fx {
     bridge: TestBridge,
-    sql: Rc<RusqliteSql>,
+    sql: Rc<TestSql>,
     clock: Rc<FixedClock>,
     server: TestNntpServer,
     forbid_io: Rc<Cell<bool>>,
@@ -301,7 +304,7 @@ impl Fx {
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         };
-        let sql = Rc::new(RusqliteSql::with_schema().unwrap());
+        let sql = Rc::new(TestSql::with_schema().unwrap());
         let clock = Rc::new(FixedClock::new(T0));
         let forbid_io = Rc::new(Cell::new(false));
         let blob = || GuardedBlob {
@@ -451,7 +454,7 @@ impl Fx {
 
     /// First column of the first row, as text.
     async fn scalar(&self, sql: &str, params: &[SqlValue]) -> String {
-        let rows = self.sql.query(sql, params).await.unwrap();
+        let rows = self.sql.fixture_query(sql, params).await.unwrap();
         match rows.first().and_then(|r| r.first()) {
             Some(SqlValue::Text(s)) => s.clone(),
             Some(SqlValue::Int(n)) => n.to_string(),
@@ -487,7 +490,7 @@ impl Fx {
              FROM extents ORDER BY id",
             "SELECT * FROM gc ORDER BY id",
         ] {
-            out.extend(self.sql.query(sql, &[]).await.unwrap());
+            out.extend(self.sql.fixture_query(sql, &[]).await.unwrap());
         }
         out
     }
@@ -496,7 +499,7 @@ impl Fx {
     /// changed" checks across a dispatcher run.
     async fn unmark(&self) {
         let sql = "UPDATE outbox SET sent_at = NULL";
-        self.sql.exec(sql, &[]).await.unwrap();
+        self.sql.fixture_exec(sql, &[]).await.unwrap();
     }
 
     fn has_safety(&self, o: &Obj) -> bool {
@@ -723,7 +726,7 @@ impl Fx {
     async fn make_due(&self, o: &Obj) {
         let sql = "UPDATE outbox SET next_at = 0, lease_until = NULL WHERE extent_id = ?1";
         self.sql
-            .exec(sql, &[text(o.extent.as_str())])
+            .fixture_exec(sql, &[text(o.extent.as_str())])
             .await
             .unwrap();
     }
@@ -1139,7 +1142,7 @@ async fn dispatch_is_bounded() {
     // One row has used up its attempts, one is held by a running job.
     let spent = &objects[0];
     fx.sql
-        .exec(
+        .fixture_exec(
             "UPDATE outbox SET attempts = ?2 WHERE extent_id = ?1",
             &[
                 text(spent.extent.as_str()),
@@ -1635,7 +1638,10 @@ async fn dispatch_survives_a_failed_redrive() {
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "k", &plaintext()).await;
     fx.make_due(&o).await;
-    fx.sql.exec("DROP TABLE scan_cursors", &[]).await.unwrap();
+    fx.sql
+        .fixture_exec("DROP TABLE scan_cursors", &[])
+        .await
+        .unwrap();
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert!(report.redrive_failed);
@@ -1668,7 +1674,7 @@ impl Fx {
         assert_eq!(self.outbox(o, "stage").await, "post");
         let sql = "UPDATE outbox SET stage = 'cancelled' WHERE extent_id = ?1";
         self.sql
-            .exec(sql, &[text(o.extent.as_str())])
+            .fixture_exec(sql, &[text(o.extent.as_str())])
             .await
             .unwrap();
     }
@@ -1706,7 +1712,7 @@ async fn dispatch_survives_a_failed_revival() {
     // Only the revival's own write is refused.
     let sql = "CREATE TRIGGER no_revive BEFORE UPDATE OF stage ON outbox \
                WHEN OLD.stage = 'cancelled' BEGIN SELECT RAISE(ABORT, 'down'); END";
-    fx.sql.exec(sql, &[]).await.unwrap();
+    fx.sql.fixture_exec(sql, &[]).await.unwrap();
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert!(report.redrive_failed);
@@ -1956,7 +1962,7 @@ async fn dispatch_keeps_pace_with_5000_due_releases() {
     // minimum age after the post.
     let due = T0.plus_secs(DAY_SECS);
     fx.sql
-        .exec(
+        .fixture_exec(
             "UPDATE outbox SET stage = 'release', next_at = ?1",
             &[SqlValue::Int(due.0)],
         )
@@ -2129,14 +2135,14 @@ fn post_backlog(fx: &Fx, post: Oldest) {
 /// Counts every outbox row written from now on, whatever the write
 /// changes ([`outbox_writes`]).
 async fn count_outbox_writes(fx: &Fx) {
-    for sql in [
-        "CREATE TABLE outbox_writes (n INTEGER NOT NULL)",
-        "INSERT INTO outbox_writes VALUES (0)",
-        "CREATE TRIGGER outbox_written AFTER UPDATE ON outbox \
-         BEGIN UPDATE outbox_writes SET n = n + 1; END",
-    ] {
-        fx.sql.exec(sql, &[]).await.unwrap();
-    }
+    fx.sql.fixture_script(fx.sql.fixture(
+        "CREATE TABLE outbox_writes (n INTEGER NOT NULL); INSERT INTO outbox_writes VALUES (0); \
+         CREATE TRIGGER outbox_written AFTER UPDATE ON outbox BEGIN UPDATE outbox_writes SET n = n + 1; END;",
+        "CREATE TABLE outbox_writes (n BIGINT NOT NULL); INSERT INTO outbox_writes VALUES (0); \
+         CREATE FUNCTION count_outbox_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE outbox_writes SET n = n + 1; RETURN NULL; END $$; \
+         CREATE TRIGGER outbox_written AFTER UPDATE ON outbox FOR EACH ROW EXECUTE FUNCTION count_outbox_write();",
+    )).unwrap();
 }
 
 async fn outbox_writes(fx: &Fx) -> usize {
@@ -2709,17 +2715,20 @@ fn clock_sleeper(clock: &Rc<FixedClock>) -> velmora_bridge::ingress::Sleeper {
 /// Polls `job` until it holds its bytes: it is then in the middle of its
 /// work.
 async fn poll_until_charged<F: std::future::Future + Unpin>(job: &mut F, budget: &ByteBudget) {
-    for _ in 0..10_000 {
-        let once = std::future::poll_fn(|cx| {
-            std::task::Poll::Ready(std::pin::Pin::new(&mut *job).poll(cx).is_pending())
-        });
-        assert!(once.await, "the job ended");
+    let charged = std::future::poll_fn(|cx| {
+        assert!(
+            std::pin::Pin::new(&mut *job).poll(cx).is_pending(),
+            "the job ended"
+        );
         if budget.in_use() > 0 {
-            return;
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
         }
-        tokio::task::yield_now().await;
-    }
-    panic!("the job never charged the budget");
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), charged)
+        .await
+        .expect("the job never charged the budget");
 }
 
 /// A job that is dropped in the middle of its work gives its bytes back:

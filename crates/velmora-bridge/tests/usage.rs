@@ -43,15 +43,56 @@ const STAGES: [&str; 6] = ["post", "verify", "release", "done", "cancelled", "de
 const GEN_STATES: [&str; 3] = ["live", "superseded", "deleted"];
 const BUCKETS: [&str; 3] = ["b_1", "b_2", "b_3"];
 
-fn row(db: &RusqliteSql, sql: &str, n: usize) -> Vec<i64> {
-    db.with_conn(|c| {
-        c.query_row(sql, (), |r| (0..n).map(|i| r.get::<_, i64>(i)).collect())
-            .unwrap()
-    })
+trait UsageFixture {
+    fn fetch(&self, sql: &str) -> Vec<Row>;
+}
+
+impl UsageFixture for RusqliteSql {
+    fn fetch(&self, sql: &str) -> Vec<Row> {
+        self.with_conn(|c| {
+            use rusqlite::types::ValueRef;
+            let mut stmt = c.prepare(sql).unwrap();
+            let n = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    (0..n)
+                        .map(|i| {
+                            Ok(match r.get_ref(i)? {
+                                ValueRef::Integer(x) => SqlValue::Int(x),
+                                ValueRef::Text(x) => {
+                                    SqlValue::Text(std::str::from_utf8(x).unwrap().into())
+                                }
+                                other => panic!("unexpected usage fixture value: {other:?}"),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap();
+            rows.map(|row| row.unwrap()).collect()
+        })
+    }
+}
+
+impl UsageFixture for TestSql {
+    fn fetch(&self, sql: &str) -> Vec<Row> {
+        self.fixture_query_now(sql, &[]).unwrap()
+    }
+}
+
+fn row(db: &impl UsageFixture, sql: &str, n: usize) -> Vec<i64> {
+    let first = db.fetch(sql).remove(0);
+    assert_eq!(first.len(), n);
+    first
+        .into_iter()
+        .map(|value| match value {
+            SqlValue::Int(n) => n,
+            _ => panic!("expected an integer usage value"),
+        })
+        .collect()
 }
 
 /// The level counters of row `id`, in the order of [`TRUTH`].
-fn levels(db: &RusqliteSql, id: i64) -> Vec<i64> {
+fn levels(db: &impl UsageFixture, id: i64) -> Vec<i64> {
     row(
         db,
         &format!(
@@ -78,17 +119,22 @@ const TRUTH: &str = "SELECT \
   (SELECT COUNT(*) FROM outbox WHERE stage = 'cancelled'), \
   (SELECT COUNT(*) FROM outbox WHERE stage = 'dead')";
 
-fn pairs(db: &RusqliteSql, sql: &str) -> Vec<(String, i64, i64)> {
-    db.with_conn(|c| {
-        let mut stmt = c.prepare(sql).unwrap();
-        let rows = stmt.query_map((), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)));
-        rows.unwrap().map(|r| r.unwrap()).collect()
-    })
+fn pairs(db: &impl UsageFixture, sql: &str) -> Vec<(String, i64, i64)> {
+    db.fetch(sql)
+        .into_iter()
+        .map(|row| {
+            let [SqlValue::Text(id), SqlValue::Int(count), SqlValue::Int(size)] = row.as_slice()
+            else {
+                panic!("unexpected bucket usage fixture row")
+            };
+            (id.clone(), *count, *size)
+        })
+        .collect()
 }
 
 /// Live objects per bucket as the counters have them. A row of zeros
 /// is a bucket without live objects.
-fn bucket_counters(db: &RusqliteSql) -> Vec<(String, i64, i64)> {
+fn bucket_counters(db: &impl UsageFixture) -> Vec<(String, i64, i64)> {
     pairs(
         db,
         "SELECT bucket_id, live_objects, live_bytes FROM usage_buckets \
@@ -96,7 +142,7 @@ fn bucket_counters(db: &RusqliteSql) -> Vec<(String, i64, i64)> {
     )
 }
 
-fn bucket_truth(db: &RusqliteSql) -> Vec<(String, i64, i64)> {
+fn bucket_truth(db: &impl UsageFixture) -> Vec<(String, i64, i64)> {
     pairs(
         db,
         "SELECT bucket_id, COUNT(*), SUM(size) FROM generations WHERE state = 'live' \
@@ -104,16 +150,16 @@ fn bucket_truth(db: &RusqliteSql) -> Vec<(String, i64, i64)> {
     )
 }
 
-fn armed(db: &RusqliteSql) -> bool {
+fn armed(db: &impl UsageFixture) -> bool {
     row(
         db,
-        "SELECT all_x AND all_o AND all_g FROM usage_global WHERE id = 1",
+        "SELECT all_x <> 0 AND all_o <> 0 AND all_g <> 0 FROM usage_global WHERE id = 1",
         1,
     )[0] == 1
 }
 
 /// The counters equal the tables. `at` names the place in a failure.
-fn assert_exact(db: &RusqliteSql, at: &str) {
+fn assert_exact(db: &impl UsageFixture, at: &str) {
     assert_eq!(levels(db, 1), row(db, TRUTH, 11), "levels, {at}");
     assert_eq!(bucket_counters(db), bucket_truth(db), "buckets, {at}");
 }
@@ -152,7 +198,7 @@ struct Totals {
     failures: i64,
 }
 
-fn totals(db: &RusqliteSql) -> Totals {
+fn totals(db: &impl UsageFixture) -> Totals {
     let t = row(
         db,
         "SELECT posts_total, verifies_total, releases_total, dead_total, failures_total \
@@ -170,7 +216,7 @@ fn totals(db: &RusqliteSql) -> Totals {
 
 /// The filed hours and the hour under way add up to every event
 /// counted, an `off` in between or not.
-fn hourly_sum(db: &RusqliteSql) -> Totals {
+fn hourly_sum(db: &impl UsageFixture) -> Totals {
     let t = row(
         db,
         "SELECT h_posts + (SELECT COALESCE(SUM(posts), 0) FROM usage_hours), \
@@ -193,11 +239,20 @@ fn hourly_sum(db: &RusqliteSql) -> Totals {
 /// One random sequence. Returns how many recounts ended.
 async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
     let db = if start_armed {
-        RusqliteSql::with_schema().unwrap()
+        TestSql::with_schema().unwrap()
     } else {
-        RusqliteSql::with_schema_unarmed().unwrap()
+        TestSql::with_schema_unarmed().unwrap()
     };
-    add_buckets(&db);
+    let text = |s: &str| SqlValue::Text(s.into());
+    let make_bucket = "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) VALUES (?1,?1 || '-name','o',?2,1,0)";
+    for bucket in BUCKETS {
+        db.fixture_exec(make_bucket, &[text(bucket), SqlValue::Blob(vec![0])])
+            .await
+            .unwrap();
+    }
+    let append_extent = db.fixture(ADD_EXTENT,
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+         VALUES (?1,?2,'committed',?3,?3,decode('00','hex'),decode('00','hex'),decode('00','hex'),decode('00','hex'),?4,0)");
     let catalog = SqlCatalog::new(db);
     let db = &catalog.sql;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -221,54 +276,62 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             0..=17 => {
                 let (id, b, s) = (xid(&mut rng), rng.pick(&BUCKETS), rng.pick(&SAFETY));
                 let size = rng.below(5_000) as i64;
-                let _ = db.with_conn(|c| c.execute(ADD_EXTENT, (id, b, size, s)));
+                let _ = db
+                    .fixture_exec(
+                        append_extent,
+                        &[text(&id), text(b), SqlValue::Int(size), text(s)],
+                    )
+                    .await;
             }
             18..=27 => {
                 let (id, s) = (xid(&mut rng), rng.pick(&SAFETY));
-                let _ = db.with_conn(|c| {
-                    c.execute(
+                let _ = db
+                    .fixture_exec(
                         "UPDATE extents SET safety_state = ?2 WHERE id = ?1",
-                        (id, s),
+                        &[text(&id), text(s)],
                     )
-                });
+                    .await;
             }
             28..=30 => {
                 let (id, size) = (xid(&mut rng), rng.below(5_000) as i64);
-                let _ = db.with_conn(|c| {
-                    c.execute(
+                let _ = db
+                    .fixture_exec(
                         "UPDATE extents SET cipher_size = ?2 WHERE id = ?1",
-                        (id, size),
+                        &[text(&id), SqlValue::Int(size)],
                     )
-                });
+                    .await;
             }
             // Refused by the foreign key while the extent has an outbox row.
             31..=35 => {
                 let id = xid(&mut rng);
-                let _ = db.with_conn(|c| c.execute("DELETE FROM extents WHERE id = ?1", (id,)));
+                let _ = db
+                    .fixture_exec("DELETE FROM extents WHERE id = ?1", &[text(&id)])
+                    .await;
             }
             36..=47 => {
                 let (id, s) = (xid(&mut rng), rng.pick(&STAGES));
-                let _ = db.with_conn(|c| c.execute(ADD_OUTBOX, (id, s, now)));
+                let _ = db
+                    .fixture_exec(ADD_OUTBOX, &[text(&id), text(s), SqlValue::Int(now)])
+                    .await;
             }
             48..=62 => {
                 let (id, new) = (xid(&mut rng), rng.pick(&STAGES));
-                let old: Option<String> = db.with_conn(|c| {
-                    c.query_row(
+                let old = db
+                    .fixture_query(
                         "SELECT stage FROM outbox WHERE extent_id = ?1",
-                        (&id,),
-                        |r| r.get(0),
+                        &[text(&id)],
                     )
-                    .ok()
-                });
-                let n = db
-                    .with_conn(|c| {
-                        c.execute(
-                            "UPDATE outbox SET stage = ?2, updated_at = ?3 WHERE extent_id = ?1",
-                            (&id, new, now),
-                        )
-                    })
+                    .await
                     .unwrap();
-                if let (true, 1, Some(old)) = (on, n, old.as_deref()) {
+                let old = old.first().map(|row| match &row[0] {
+                    SqlValue::Text(stage) => stage.as_str(),
+                    _ => panic!("expected outbox stage"),
+                });
+                let n = db.fixture_query(
+                    "UPDATE outbox SET stage = ?2, updated_at = ?3 WHERE extent_id = ?1 RETURNING extent_id",
+                    &[text(&id), text(new), SqlValue::Int(now)],
+                ).await.unwrap().len();
+                if let (true, 1, Some(old)) = (on, n, old) {
                     if old != new {
                         model.posts += i64::from(old == "post" && new == "verify");
                         since.posts += i64::from(old == "post" && new == "verify");
@@ -286,14 +349,14 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             63..=66 => {
                 let id = xid(&mut rng);
                 let n = db
-                    .with_conn(|c| {
-                        c.execute(
-                            "UPDATE outbox SET last_error = 'e', attempts = attempts + 1, \
-                               updated_at = ?2 WHERE extent_id = ?1",
-                            (&id, now),
-                        )
-                    })
-                    .unwrap();
+                    .fixture_query(
+                        "UPDATE outbox SET last_error = 'e', attempts = attempts + 1, \
+                     updated_at = ?2 WHERE extent_id = ?1 RETURNING extent_id",
+                        &[text(&id), SqlValue::Int(now)],
+                    )
+                    .await
+                    .unwrap()
+                    .len();
                 if on && n == 1 {
                     model.failures += 1;
                     since.failures += 1;
@@ -301,36 +364,50 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             }
             67..=69 => {
                 let id = xid(&mut rng);
-                let _ =
-                    db.with_conn(|c| c.execute("DELETE FROM outbox WHERE extent_id = ?1", (id,)));
+                let _ = db
+                    .fixture_exec("DELETE FROM outbox WHERE extent_id = ?1", &[text(&id)])
+                    .await;
             }
             70..=79 => {
                 let (id, b, s) = (gid(&mut rng), rng.pick(&BUCKETS), rng.pick(&GEN_STATES));
                 let size = rng.below(9_000) as i64;
-                let _ = db.with_conn(|c| c.execute(ADD_GENERATION, (id, b, s, size)));
+                let _ = db
+                    .fixture_exec(
+                        ADD_GENERATION,
+                        &[text(&id), text(b), text(s), SqlValue::Int(size)],
+                    )
+                    .await;
             }
             80..=85 => {
                 let (id, s) = (gid(&mut rng), rng.pick(&GEN_STATES));
-                let _ = db.with_conn(|c| {
-                    c.execute("UPDATE generations SET state = ?2 WHERE id = ?1", (id, s))
-                });
+                let _ = db
+                    .fixture_exec(
+                        "UPDATE generations SET state = ?2 WHERE id = ?1",
+                        &[text(&id), text(s)],
+                    )
+                    .await;
             }
             86..=87 => {
                 let (id, size) = (gid(&mut rng), rng.below(9_000) as i64);
-                let _ = db.with_conn(|c| {
-                    c.execute("UPDATE generations SET size = ?2 WHERE id = ?1", (id, size))
-                });
+                let _ = db
+                    .fixture_exec(
+                        "UPDATE generations SET size = ?2 WHERE id = ?1",
+                        &[text(&id), SqlValue::Int(size)],
+                    )
+                    .await;
             }
             88..=89 => {
                 let id = gid(&mut rng);
-                let _ = db.with_conn(|c| c.execute("DELETE FROM generations WHERE id = ?1", (id,)));
+                let _ = db
+                    .fixture_exec("DELETE FROM generations WHERE id = ?1", &[text(&id)])
+                    .await;
             }
             // A batch whose last statement fails: all of it is undone,
             // the counter changes of its first statements too.
             90..=91 => {
                 let before = (levels(db, 1), levels(db, 2), bucket_counters(db));
                 let failed = db
-                    .batch(vec![
+                    .fixture_batch(vec![
                         (
                             "UPDATE extents SET safety_state = 'released'",
                             Vec::<SqlValue>::new(),
@@ -353,12 +430,10 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
             // A transaction that is rolled back.
             92 => {
                 let before = (levels(db, 1), levels(db, 2), totals(db));
-                db.with_conn(|c| {
-                    c.execute_batch(
-                        "BEGIN; DELETE FROM outbox; UPDATE extents SET safety_state = 'deleted'; \
-                         DELETE FROM generations WHERE state = 'live'; ROLLBACK;",
-                    )
-                })
+                db.fixture_script(
+                    "BEGIN; DELETE FROM outbox; UPDATE extents SET safety_state = 'deleted'; \
+                     DELETE FROM generations WHERE state = 'live'; ROLLBACK;",
+                )
                 .unwrap();
                 assert_eq!(before, (levels(db, 1), levels(db, 2), totals(db)), "{at}");
             }
@@ -425,11 +500,17 @@ async fn run_sequence(seed: u64, start_armed: bool, steps: u32) -> u32 {
 #[tokio::test]
 async fn counters_equal_the_tables_after_any_sequence() {
     let mut ended = 0;
-    for seed in 0..60 {
-        ended += run_sequence(seed, seed % 2 == 0, 500).await;
+    // Preserve SQLite's full randomized model and exercise the same model
+    // on PostgreSQL, where each production SQL call opens a real connection.
+    let (seeds, steps, minimum) = if TestSql::postgres_selected() {
+        (8, 64, 8)
+    } else {
+        (60, 500, 101)
+    };
+    for seed in 0..seeds {
+        ended += run_sequence(seed, seed % 2 == 0, steps).await;
     }
-    // The sequences did end recounts in the middle of the changes.
-    assert!(ended > 100, "{ended}");
+    assert!(ended >= minimum, "{ended}");
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +535,78 @@ fn fill(db: &RusqliteSql, n: u32) {
                 .unwrap();
         }
     });
+}
+
+#[tokio::test]
+async fn recount_on_each_backend_seeds_reports_drift_and_adopts() {
+    let c = SqlCatalog::new(TestSql::with_schema_unarmed().unwrap());
+    let db = &c.sql;
+    let text = |s: &str| SqlValue::Text(s.into());
+    db.fixture_exec(
+        "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) VALUES ('b_1','one','o',?1,1,0)",
+        &[SqlValue::Blob(vec![0])],
+    ).await.unwrap();
+    let extent = db.fixture(ADD_EXTENT,
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+         VALUES (?1,?2,'committed',?3,?3,decode('00','hex'),decode('00','hex'),decode('00','hex'),decode('00','hex'),?4,0)");
+    db.fixture_batch(vec![
+        (
+            ADD_GENERATION,
+            vec![text("g"), text("b_1"), text("live"), SqlValue::Int(7)],
+        ),
+        (
+            extent,
+            vec![text("x_1"), text("b_1"), SqlValue::Int(69), text("held")],
+        ),
+        (
+            ADD_OUTBOX,
+            vec![text("x_1"), text("post"), SqlValue::Int(T0)],
+        ),
+    ])
+    .await
+    .unwrap();
+    let now = UnixMs(T0);
+    assert!(!c.usage_counters().await.unwrap().seeded);
+    assert!(c.usage_recount_step(1, now).await.unwrap().idle);
+    let finish = |adopt| {
+        let c = &c;
+        async move {
+            assert!(c
+                .usage_recount_start(now, adopt, false, false)
+                .await
+                .unwrap());
+            for _ in 0..20 {
+                let progress = c.usage_recount_step(1, now).await.unwrap();
+                assert!(progress.rows <= 1);
+                if let Some(done) = progress.finished {
+                    return done;
+                }
+            }
+            panic!("fixture recount never finished")
+        }
+    };
+    let seeded = finish(false).await;
+    assert_eq!((seeded.drift, seeded.adopted), (0, true));
+    assert!(c.usage_counters().await.unwrap().seeded);
+    let (seeded, buckets) = c.usage_buckets("", 5).await.unwrap();
+    assert!(seeded);
+    assert_eq!(buckets.len(), 1);
+    let _ = c.usage_snapshot(1).await.unwrap();
+    let _ = c.usage_recounts().await.unwrap();
+    db.fixture_exec(
+        "UPDATE usage_global SET ob_post = ob_post + 1 WHERE id = 1",
+        &[],
+    )
+    .await
+    .unwrap();
+    let report = finish(false).await;
+    assert_eq!((report.drift, report.adopted), (1, false));
+    assert!(report.detail.is_some());
+    let adopt = finish(true).await;
+    assert_eq!((adopt.drift, adopt.adopted), (1, true));
+    assert_eq!(finish(false).await.drift, 0);
+    c.usage_off().await.unwrap();
+    assert!(!c.usage_counters().await.unwrap().seeded);
 }
 
 #[tokio::test]

@@ -47,10 +47,7 @@ const TABLES: [&str; 14] = [
 // ---------------------------------------------------------------------------
 
 fn sql(rig: &Rig, script: &str) {
-    rig.bridge
-        .catalog
-        .sql
-        .with_conn(|c| c.execute_batch(script).unwrap());
+    rig.bridge.catalog.sql.inner.fixture_script(script).unwrap();
 }
 
 /// Deletes every catalogue row (the loss).
@@ -64,20 +61,16 @@ fn wipe(rig: &Rig) {
 fn dump(rig: &Rig) -> String {
     let mut out = String::new();
     for t in TABLES {
-        rig.bridge.catalog.sql.with_conn(|c| {
-            let mut stmt = c
-                .prepare(&format!("SELECT * FROM {t} ORDER BY 1, 2"))
-                .unwrap();
-            let n = stmt.column_count();
-            let mut rows = stmt.query([]).unwrap();
-            while let Some(row) = rows.next().unwrap() {
-                out.push_str(t);
-                for i in 0..n {
-                    out.push_str(&format!("|{:?}", row.get_ref(i).unwrap()));
-                }
-                out.push('\n');
-            }
-        });
+        for row in rig
+            .bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_query_now(&format!("SELECT * FROM {t} ORDER BY 1, 2"), &[])
+            .unwrap()
+        {
+            out.push_str(&format!("{t}|{row:?}\n"));
+        }
     }
     out
 }
@@ -110,7 +103,7 @@ fn small_slices(layout: &Layout) -> Rig {
     cfg.slice_bytes = SLICE as u64;
     cfg.max_extent_bytes = SLICE as u64;
     cfg.records = layout.clone();
-    rig_with(NoNntp, cfg)
+    rig_with_selected(NoNntp, cfg)
 }
 
 /// A bucket with a small object, the large one (`big`, [`EXTENTS`]

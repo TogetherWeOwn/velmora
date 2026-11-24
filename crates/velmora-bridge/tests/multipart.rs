@@ -24,7 +24,7 @@ use velmora_bridge::config::BridgeConfig;
 use velmora_bridge::crypto::{open_range, unwrap_bdk, wrap_bdk, wrap_secret, DataKey};
 use velmora_bridge::ingress::ByteBudget;
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek};
+use velmora_bridge::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek, TestSql};
 use velmora_bridge::*;
 
 // None of these values is a secret: they exist only inside this test.
@@ -49,7 +49,7 @@ const KEY: &str = "dir/big file+@.bin";
 type Recorded = (String, Vec<SqlValue>);
 
 struct Probe {
-    db: RusqliteSql,
+    db: TestSql,
     /// When set, every batch first yields to the other request.
     yield_before_batch: Cell<bool>,
     /// When set, every statement is kept here with its parameters.
@@ -81,6 +81,9 @@ impl Probe {
 }
 
 impl Sql for Probe {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.record(sql, params);
         self.fault(sql, params)?;
@@ -412,7 +415,7 @@ impl Rig {
         let cfg = config(maintenance);
         let kek = TestKek::new();
         let catalog = SqlCatalog::new(Probe {
-            db: RusqliteSql::with_schema().expect("schema applies"),
+            db: TestSql::with_schema().expect("schema applies"),
             yield_before_batch: Cell::new(false),
             recorded: RefCell::new(None),
             overload: Cell::new(None),
@@ -551,7 +554,14 @@ impl Rig {
     // -- catalogue and store views --------------------------------------------
 
     async fn count(&self, sql: &str) -> i64 {
-        let rows = self.bridge.catalog.sql.query(sql, &[]).await.unwrap();
+        let rows = self
+            .bridge
+            .catalog
+            .sql
+            .db
+            .fixture_query(sql, &[])
+            .await
+            .unwrap();
         match rows[0][0] {
             SqlValue::Int(n) => n,
             ref other => panic!("{sql}: not a count: {other:?}"),
@@ -1756,6 +1766,9 @@ async fn aws_chunked_refusals_store_nothing() {
 /// with the parts already uploaded.
 #[tokio::test]
 async fn upload_part_reads_no_other_part_of_the_upload() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN output.
+    }
     let rig = Rig::new().await;
     let id = rig.create("alpha", KEY).await;
     for n in 1..=6u8 {
@@ -1772,7 +1785,7 @@ async fn upload_part_reads_no_other_part_of_the_upload() {
         for (q, params) in &ran {
             let plan = sql
                 .db
-                .query(&format!("EXPLAIN QUERY PLAN {q}"), params)
+                .fixture_query(&format!("EXPLAIN QUERY PLAN {q}"), params)
                 .await
                 .unwrap();
             for row in plan {

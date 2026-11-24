@@ -1,5 +1,5 @@
 //! `SqlCatalog` for buckets, access keys, grants, objects and listing,
-//! over SQLite with the D1 schema.
+//! over the selected catalogue backend.
 //!
 //! Every statement goes through [`Probe`], which refuses more than 100
 //! bound parameters (the D1 limit), counts queries, and can make a batch
@@ -8,7 +8,7 @@
 use std::cell::{Cell, RefCell};
 
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
+use velmora_bridge::testkit::{PublishUnrecorded, TestSql};
 use velmora_bridge::*;
 
 /// 2025-11-13T00:00:00.123Z.
@@ -20,7 +20,7 @@ const DAY_MS: i64 = 86_400_000;
 // ---------------------------------------------------------------------------
 
 struct Probe {
-    db: RusqliteSql,
+    db: TestSql,
     /// When set, every batch ends with a failing `tx_guard` insert.
     lose_guard: Cell<bool>,
     queries: Cell<u32>,
@@ -43,6 +43,9 @@ fn check_params(params: &[SqlValue]) {
 }
 
 impl Sql for Probe {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
         self.queries.set(self.queries.get() + 1);
@@ -65,6 +68,7 @@ impl Sql for Probe {
         *self.last_batch.borrow_mut() = stmts.iter().map(|(sql, _)| *sql).collect();
         if self.lose_guard.get() {
             stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
+            return self.db.fixture_batch(stmts).await;
         }
         self.db.batch(stmts).await
     }
@@ -79,7 +83,7 @@ impl Fx {
     fn new() -> Fx {
         Fx {
             cat: SqlCatalog::new(Probe {
-                db: RusqliteSql::with_schema().unwrap(),
+                db: TestSql::with_schema().unwrap(),
                 lose_guard: Cell::new(false),
                 queries: Cell::new(0),
                 execs: Cell::new(0),
@@ -175,18 +179,27 @@ impl Fx {
     }
 
     fn int(&self, sql: &str) -> i64 {
-        self.cat
-            .sql
-            .db
-            .with_conn(|c| c.query_row(sql, [], |r| r.get(0)).unwrap())
+        let rows = self.cat.sql.db.fixture_query_now(sql, &[]).unwrap();
+        let [SqlValue::Int(n)] = rows[0].as_slice() else {
+            panic!("expected an integer")
+        };
+        *n
     }
 
     fn strings(&self, sql: &str) -> Vec<String> {
-        self.cat.sql.db.with_conn(|c| {
-            let mut stmt = c.prepare(sql).unwrap();
-            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        })
+        self.cat
+            .sql
+            .db
+            .fixture_query_now(sql, &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let [SqlValue::Text(text)] = row.as_slice() else {
+                    panic!("expected text")
+                };
+                text.clone()
+            })
+            .collect()
     }
 
     /// `(batch, exec)` calls since the last reading.
@@ -195,7 +208,7 @@ impl Fx {
     }
 
     fn run(&self, sql: &str) {
-        self.cat.sql.db.apply(sql).unwrap();
+        self.cat.sql.db.fixture_script(sql).unwrap();
     }
 
     /// Row counts of every table a publication or deletion writes.
@@ -240,6 +253,54 @@ async fn page_all(
         }
     }
     panic!("listing did not terminate");
+}
+
+#[tokio::test]
+async fn listing_normalizes_nul_bounds_and_pages_multibyte_prefixes() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    for key in [
+        "foo",
+        "foo0",
+        "foo/bar",
+        "葉🙂/a",
+        "葉🙂/b/x",
+        "葉🙂/b/y",
+        "葉🙂/c",
+        "葉/other",
+    ] {
+        fx.put(&b.id, key, T0).await;
+    }
+    let page = fx
+        .cat
+        .list(&b.id, &query("foo\0bar", Some("/"), 1))
+        .await
+        .unwrap();
+    assert!(page.entries.is_empty() && page.common_prefixes.is_empty() && page.next.is_none());
+
+    let mut q = query("foo", Some("\0"), 1);
+    q.after = Some("foo\0bar".into());
+    let (keys, prefixes, _) = page_all(&fx, &b.id, q).await;
+    assert_eq!(keys, ["foo/bar", "foo0"]);
+    assert!(prefixes.is_empty());
+
+    let (keys, prefixes, pages) = page_all(&fx, &b.id, query("葉🙂/", Some("/"), 1)).await;
+    assert_eq!(keys, ["葉🙂/a", "葉🙂/c"]);
+    assert_eq!(prefixes, ["葉🙂/b/"]);
+    assert_eq!(pages, [1, 1, 1]);
+
+    // The service uses the SQL group seek, not `list`'s Rust folding.
+    for key in ["葉🙂/m§a", "葉🙂/m§b", "葉🙂/n§a", "葉🙂/n§b", "葉🙂/o"] {
+        fx.put(&b.id, key, T0).await;
+    }
+    let mut grouped = query("葉🙂/", Some("§"), 1);
+    grouped.after = Some("葉🙂/m".into());
+    let first = fx.cat.list_heads(&b.id, &grouped).await.unwrap();
+    assert_eq!(first[0].key, "葉🙂/m§a");
+    grouped.after = Some(first[0].key.clone());
+    grouped.skip_prefix = Some("葉🙂/m§".into());
+    let second = fx.cat.list_heads(&b.id, &grouped).await.unwrap();
+    assert_eq!(second[0].key, "葉🙂/n§a");
 }
 
 /// What S3 says a complete listing holds: keys under the prefix in byte
@@ -403,7 +464,7 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     let before = fx.footprint();
     let rows = |fx: &Fx| {
         fx.strings(
-            "SELECT 'g:' || id || ':' || state || ':' || COALESCE(retired_at, '') FROM generations \
+            "SELECT 'g:' || id || ':' || state || ':' || COALESCE(CAST(retired_at AS TEXT), '') FROM generations \
              UNION ALL SELECT 'x:' || id || ':' || generation_id FROM extents \
              UNION ALL SELECT 'o:' || extent_id || ':' || stage || ':' || updated_at FROM outbox \
              UNION ALL SELECT 'p:' || key || ':' || generation_id FROM objects \
@@ -412,11 +473,15 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     };
     let snapshot = rows(&fx);
 
-    fx.run(
+    fx.run(fx.cat.sql.db.fixture(
         "CREATE TRIGGER fail_ins BEFORE INSERT ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;
          CREATE TRIGGER fail_upd BEFORE UPDATE ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;
          CREATE TRIGGER fail_del BEFORE DELETE ON objects BEGIN SELECT RAISE(ABORT, 'x'); END;",
-    );
+        "CREATE FUNCTION fail_pointer() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'fixture pointer refused' USING ERRCODE = 'VL001'; END $$; \
+         CREATE TRIGGER fail_pointer BEFORE INSERT OR UPDATE OR DELETE ON objects \
+         FOR EACH ROW EXECUTE FUNCTION fail_pointer();",
+    ));
     fx.writes();
     // New key: the pointer insert fails.
     let fresh = fx.commit(&b.id, "fresh", 2, T0.plus_ms(10));
@@ -454,7 +519,10 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
     assert!(fx.cat.live_object(&b.id, "fresh").await.unwrap().is_none());
 
     // With the triggers gone the same writes go through.
-    fx.run("DROP TRIGGER fail_ins; DROP TRIGGER fail_upd; DROP TRIGGER fail_del;");
+    fx.run(fx.cat.sql.db.fixture(
+        "DROP TRIGGER fail_ins; DROP TRIGGER fail_upd; DROP TRIGGER fail_del;",
+        "DROP TRIGGER fail_pointer ON objects; DROP FUNCTION fail_pointer();",
+    ));
     fx.cat.publish(&fresh).await.unwrap();
     fx.cat.publish(&over).await.unwrap();
     fx.cat
@@ -467,6 +535,9 @@ async fn failure_on_the_last_statement_rolls_back_the_whole_batch() {
 /// the stage index it would visit every cancelled row on every pass.
 #[tokio::test(flavor = "current_thread")]
 async fn revival_reads_only_its_window_of_the_outbox() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: checks SQLite rowid index and EXPLAIN output.
+    }
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
     fx.put(&b.id, "k", T0).await;
@@ -477,7 +548,7 @@ async fn revival_reads_only_its_window_of_the_outbox() {
         .filter(|s| s.starts_with("UPDATE outbox SET stage"))
         .collect();
     assert_eq!(revive.len(), 1, "{ran:?}");
-    let plan = fx.cat.sql.db.with_conn(|c| {
+    let plan = fx.cat.sql.db.sqlite().with_conn(|c| {
         let mut stmt = c
             .prepare(&format!("EXPLAIN QUERY PLAN {}", revive[0]))
             .unwrap();
@@ -502,6 +573,9 @@ async fn revival_reads_only_its_window_of_the_outbox() {
 /// driven from the live pointer through indexed lookups.
 #[tokio::test(flavor = "current_thread")]
 async fn outbox_cancel_does_not_scan_the_outbox() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN output.
+    }
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
     fx.put(&b.id, "k", T0).await;
@@ -513,7 +587,7 @@ async fn outbox_cancel_does_not_scan_the_outbox() {
 
     // Unbound parameters plan the same way as bound ones.
     let explain = |sql: &str| {
-        fx.cat.sql.db.with_conn(|c| {
+        fx.cat.sql.db.sqlite().with_conn(|c| {
             let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let mut rows = stmt.raw_query();
             let mut lines = vec![];
@@ -1825,7 +1899,7 @@ fn delete_like_an_older_worker(fx: &Fx, id: &GenerationId, now: UnixMs) {
         id.as_str(),
         id.as_str()
     );
-    fx.cat.sql.db.apply(&sql).unwrap();
+    fx.cat.sql.db.fixture_script(&sql).unwrap();
 }
 
 /// A catalogue from before `key_floors`: its deletes are known only
@@ -1834,6 +1908,9 @@ fn delete_like_an_older_worker(fx: &Fx, id: &GenerationId, now: UnixMs) {
 /// behind still sorts after the old tombstone.
 #[tokio::test]
 async fn the_migration_fences_keys_deleted_before_it() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: replays the historical SQLite migration.
+    }
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
     fx.put(&b.id, "kept", T0).await;
@@ -1847,8 +1924,9 @@ async fn the_migration_fences_keys_deleted_before_it() {
 
     // Back to the schema before the migration, then the migration.
     let db = &fx.cat.sql.db;
-    db.apply(BEFORE_0007).unwrap();
-    db.apply(velmora_bridge::testkit::MIGRATION_0007).unwrap();
+    db.fixture_script(BEFORE_0007).unwrap();
+    db.fixture_script(velmora_bridge::testkit::MIGRATION_0007)
+        .unwrap();
 
     assert_eq!(fx.int("SELECT COUNT(*) FROM key_floors"), 1);
     assert!(fx.cat.newest_id(&b.id, "kept").await.unwrap().is_some());
@@ -1911,6 +1989,9 @@ async fn a_delete_that_writes_no_tombstone_row_is_fenced() {
 /// above their tombstones too, not only above its own time.
 #[tokio::test(flavor = "current_thread")]
 async fn the_migration_fences_deletes_with_ids_far_ahead() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: replays the historical SQLite migration.
+    }
     let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1918,7 +1999,7 @@ async fn the_migration_fences_deletes_with_ids_far_ahead() {
     let wall = UnixMs(i64::try_from(wall).unwrap());
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
-    fx.cat.sql.db.apply(BEFORE_0007).unwrap();
+    fx.cat.sql.db.fixture_script(BEFORE_0007).unwrap();
 
     // One hour ahead of this machine when the generation was minted.
     let ahead = fx.commit(&b.id, "ahead", 1, wall.plus_ms(3_600_000));
@@ -1941,12 +2022,12 @@ async fn the_migration_fences_deletes_with_ids_far_ahead() {
             T0.0,
             now.0
         );
-        fx.cat.sql.db.apply(&sql).unwrap();
+        fx.cat.sql.db.fixture_script(&sql).unwrap();
     }
     fx.cat
         .sql
         .db
-        .apply(velmora_bridge::testkit::MIGRATION_0007)
+        .fixture_script(velmora_bridge::testkit::MIGRATION_0007)
         .unwrap();
 
     for (key, tombstone) in ["ahead", "plain"].into_iter().zip(tombstones) {
@@ -2275,17 +2356,26 @@ impl Fx {
         c.generation
     }
 
-    fn by_walk(&self, generation: &GenerationId, start: u64, end: u64) -> Vec<u32> {
-        self.cat.sql.db.with_conn(|c| {
-            let mut stmt = c.prepare_cached(EXTENTS_IN_BY_WALK).unwrap();
-            let rows = stmt
-                .query_map(
-                    rusqlite::params![generation.as_str(), start as i64, end as i64],
-                    |r| r.get::<_, u32>(0),
-                )
-                .unwrap();
-            rows.map(|r| r.unwrap()).collect()
-        })
+    async fn by_walk(&self, generation: &GenerationId, start: u64, end: u64) -> Vec<u32> {
+        let params = [
+            SqlValue::Text(generation.as_str().into()),
+            SqlValue::Int(start as i64),
+            SqlValue::Int(end as i64),
+        ];
+        self.cat
+            .sql
+            .db
+            .fixture_query(EXTENTS_IN_BY_WALK, &params)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let [SqlValue::Int(seq)] = row.as_slice() else {
+                    panic!("expected an extent sequence")
+                };
+                u32::try_from(*seq).unwrap()
+            })
+            .collect()
     }
 
     /// Asks for a range both ways and holds the answers to each other
@@ -2293,7 +2383,7 @@ impl Fx {
     async fn same_run(&self, g: &GenerationRow, sizes: &[u64], start: u64, end: u64) {
         let got = self.cat.extents_in(&g.id, start, end).await.unwrap();
         let seqs: Vec<u32> = got.iter().map(|e| e.seq.unwrap()).collect();
-        let walked = self.by_walk(&g.id, start, end);
+        let walked = self.by_walk(&g.id, start, end).await;
         assert_eq!(seqs, walked, "range {start}..{end} of {sizes:?}");
         let mut offset = 0;
         let placed: Vec<(u64, u64)> = sizes
@@ -2407,7 +2497,7 @@ async fn extents_in_matches_the_statement_it_replaced() {
     }
     let unknown = GenerationId::mint(T0, [0xEE; 8]);
     assert!(fx.cat.extents_in(&unknown, 0, 10).await.unwrap().is_empty());
-    assert!(fx.by_walk(&unknown, 0, 10).is_empty());
+    assert!(fx.by_walk(&unknown, 0, 10).await.is_empty());
 }
 
 /// Writers number the references of a generation from 0 without a gap,
@@ -2430,23 +2520,28 @@ async fn extents_in_matches_the_walk_where_numbers_are_missing() {
                 gone.push(seq);
             }
         }
-        fx.cat.sql.db.with_conn(|c| {
-            for seq in &gone {
-                let n = c
-                    .execute(
-                        "DELETE FROM generation_extents WHERE generation_id = ?1 AND seq = ?2",
-                        rusqlite::params![g.id.as_str(), *seq as i64],
-                    )
-                    .unwrap();
-                assert_eq!(n, 1);
-            }
-        });
+        for seq in &gone {
+            let n = fx
+                .cat
+                .sql
+                .db
+                .fixture_exec(
+                    "DELETE FROM generation_extents WHERE generation_id = ?1 AND seq = ?2",
+                    &[
+                        SqlValue::Text(g.id.as_str().into()),
+                        SqlValue::Int(*seq as i64),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(n, 1);
+        }
         let size = g.size;
         for start in 0..size + 2 {
             for end in [start, start + 1, start + 7, size, size + 3] {
                 let got = fx.cat.extents_in(&g.id, start, end).await.unwrap();
                 let seqs: Vec<u32> = got.iter().map(|e| e.seq.unwrap()).collect();
-                let walked = fx.by_walk(&g.id, start, end);
+                let walked = fx.by_walk(&g.id, start, end).await;
                 assert_eq!(seqs, walked, "{start}..{end} of {count} without {gone:?}");
             }
         }
@@ -2458,6 +2553,9 @@ async fn extents_in_matches_the_walk_where_numbers_are_missing() {
 /// of the object, whatever their number.
 #[tokio::test(flavor = "current_thread")]
 async fn extents_in_only_searches_the_primary_key() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN output.
+    }
     let fx = Fx::new();
     let b = fx.bucket("alpha").await;
     let g = fx.uneven(&b.id, "k", &[5; 40]).await;
@@ -2470,7 +2568,7 @@ async fn extents_in_only_searches_the_primary_key() {
     );
     assert_eq!(fx.cat.sql.queries.get() - before, 1);
     let asked = fx.cat.sql.asked.borrow().clone();
-    let plan: Vec<String> = fx.cat.sql.db.with_conn(|c| {
+    let plan: Vec<String> = fx.cat.sql.db.sqlite().with_conn(|c| {
         let mut stmt = c
             .prepare(&format!("EXPLAIN QUERY PLAN {}", asked[0]))
             .unwrap();

@@ -87,11 +87,9 @@ async fn multipart(rig: &Rig, signer: &Signer, key: &str, parts: &[&[u8]]) {
 /// has the trigger that writes the reference for a worker older than
 /// the table; the second statement is for when it is gone.)
 fn grow(rig: &Rig, generation: &GenerationRow, to: u32) {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        let id = generation.id.as_str();
-        let (from, size) = (generation.extent_count, generation.size as i64);
-        c.execute(
-            "WITH RECURSIVE n(i) AS (SELECT ?2 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?3) \
+    let db = &rig.bridge.catalog.sql.inner;
+    let fill = db.fixture(
+        "WITH RECURSIVE n(i) AS (SELECT ?2 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?3) \
              INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
                plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
                plain_sha256, cipher_sha256, safety_state, created_at) \
@@ -99,22 +97,41 @@ fn grow(rig: &Rig, generation: &GenerationRow, to: u32) {
                0, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, e.plain_md5, \
                e.plain_sha256, e.cipher_sha256, e.safety_state, e.created_at \
              FROM n, extents e WHERE e.generation_id = ?1 AND e.seq = 0",
-            rusqlite::params![id, from, to, size],
-        )
+        "WITH RECURSIVE n(i) AS (SELECT ?2 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < ?3) \
+             INSERT INTO extents(id, bucket_id, generation_id, state, seq, plain_offset, \
+               plain_size, cipher_size, media_header, key_mode, wrapped_file_key, plain_md5, \
+               plain_sha256, cipher_sha256, safety_state, created_at) \
+             SELECT 'x_' || lpad(to_hex(n.i), 26, '0'), e.bucket_id, e.generation_id, e.state, n.i, ?4, \
+               0, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, e.plain_md5, \
+               e.plain_sha256, e.cipher_sha256, e.safety_state, e.created_at \
+             FROM n, extents e WHERE e.generation_id = ?1 AND e.seq = 0",
+    );
+    let id = SqlValue::Text(generation.id.as_str().into());
+    let start = SqlValue::Int(i64::from(generation.extent_count));
+    let stop = SqlValue::Int(i64::from(to));
+    db.fixture_query_now(
+        fill,
+        &[
+            id.clone(),
+            start.clone(),
+            stop.clone(),
+            SqlValue::Int(generation.size as i64),
+        ],
+    )
+    .unwrap();
+    let reference = db.fixture(
+        "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT ?1, seq, id, plain_offset FROM extents WHERE generation_id = ?1 AND seq >= ?2",
+        "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+         SELECT ?1, seq, id, plain_offset FROM extents WHERE generation_id = ?1 AND seq >= ?2 ON CONFLICT DO NOTHING",
+    );
+    db.fixture_query_now(reference, &[id.clone(), start])
         .unwrap();
-        c.execute(
-            "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
-             SELECT ?1, seq, id, plain_offset FROM extents \
-             WHERE generation_id = ?1 AND seq >= ?2",
-            rusqlite::params![id, from],
-        )
-        .unwrap();
-        c.execute(
-            "UPDATE generations SET extent_count = ?2 WHERE id = ?1",
-            rusqlite::params![id, to],
-        )
-        .unwrap();
-    });
+    db.fixture_query_now(
+        "UPDATE generations SET extent_count = ?2 WHERE id = ?1",
+        &[id, stop],
+    )
+    .unwrap();
 }
 
 /// DeleteObject and the conditions of a write are decided on the
@@ -122,7 +139,7 @@ fn grow(rig: &Rig, generation: &GenerationRow, to: u32) {
 /// answer, and answer the same.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_and_write_conditions_load_no_extent_row() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let (a, b) = (pattern(1, 5 * MIB), pattern(2, 70_000));
     multipart(&rig, &signer, "big", &[&a, &b]).await;
@@ -194,7 +211,7 @@ async fn delete_and_write_conditions_load_no_extent_row() {
 /// out, before any extent row is read and with nothing stored.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_of_a_source_above_the_single_record_limit_is_refused() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(3, 50_000);
     rig.put(&signer, BUCKET, "src", &body).await.expect(200);
@@ -265,7 +282,7 @@ async fn copy_of_a_source_above_the_single_record_limit_is_refused() {
 /// first.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_judges_its_conditions_on_the_source_it_loaded() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", &pattern(4, 9_000))
         .await
@@ -321,7 +338,7 @@ async fn copy_judges_its_conditions_on_the_source_it_loaded() {
 /// is the way to copy a source too large for CopyObject.
 #[tokio::test(flavor = "current_thread")]
 async fn part_copy_reads_the_extents_of_its_range_from_a_source_of_any_size() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let (a, b) = (pattern(4, 5 * MIB), pattern(5, 70_000));
     multipart(&rig, &signer, "big", &[&a, &b]).await;
@@ -364,19 +381,25 @@ async fn part_copy_reads_the_extents_of_its_range_from_a_source_of_any_size() {
     }
     allow(&rig);
 
-    let parts: Vec<(i64, Vec<u8>)> = rig.bridge.catalog.sql.with_conn(|c| {
-        let mut stmt = c
-            .prepare(
-                "SELECT e.plain_size, e.plain_md5 FROM upload_parts p \
-                   JOIN extents e ON e.id = p.extent_id \
-                 WHERE p.upload_id = ?1 ORDER BY p.part_number",
-            )
-            .unwrap();
-        let rows = stmt
-            .query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap();
-        rows.map(|r| r.unwrap()).collect()
-    });
+    let parts = rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(
+            "SELECT e.plain_size, e.plain_md5 FROM upload_parts p \
+          JOIN extents e ON e.id = p.extent_id WHERE p.upload_id = ?1 ORDER BY p.part_number",
+            &[SqlValue::Text(id.as_str().into())],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let [SqlValue::Int(size), SqlValue::Blob(md5)] = row.as_slice() else {
+                panic!("unexpected fixture part")
+            };
+            (*size, md5.clone())
+        })
+        .collect::<Vec<_>>();
     let expected = [&whole[start..end], &whole[100..200]];
     assert_eq!(parts.len(), 2);
     for ((size, md5), bytes) in parts.iter().zip(expected) {
