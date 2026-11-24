@@ -14,7 +14,9 @@ already created disposable schema. This bootstrap removes default PUBLIC
 schema access and refuses to run after app access has been explicitly granted.
 The migration login owns the schema
 and its objects. The app role gets DML, sequence access, and trigger function
-access, but cannot reach the schema until activation. The read-only login has
+access, but cannot reach the schema until activation. Its sessions default to
+read-only transactions so writes cannot autocommit if a proxy rejects `BEGIN`.
+The adapter uses `BEGIN READ WRITE` and takes W1 before any write. The read-only login has
 `pg_read_all_data` and is for trusted host tooling, not application traffic.
 
 Pass the path of a regular, caller-owned `0600` file to `ops/pg-migrate.sh`.

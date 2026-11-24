@@ -74,6 +74,12 @@ SELECT json_build_object(
             AND NOT pg_has_role('kofra_app', 'kofra_migrate', 'MEMBER'),
         'import marker blocks app', NOT has_schema_privilege('kofra_app', current_schema(), 'USAGE')
             OR to_regclass(format('%I._velmora_import_incomplete', current_schema())) IS NULL,
+        'app transactions default read only', (SELECT 'default_transaction_read_only=on' = ANY(rolconfig)
+            AND NOT EXISTS (SELECT FROM pg_db_role_setting s JOIN pg_database d ON d.oid = s.setdatabase,
+                LATERAL unnest(s.setconfig) AS c(setting)
+                WHERE s.setrole = app.oid AND d.datname = current_database()
+                  AND split_part(c.setting, '=', 1) = 'default_transaction_read_only'
+                  AND c.setting <> 'default_transaction_read_only=on') FROM app),
         'app role timeouts', (SELECT 'idle_in_transaction_session_timeout=5s' = ANY(rolconfig)
             AND (current_setting('server_version_num')::int < 170000
                  OR 'transaction_timeout=30s' = ANY(rolconfig)) FROM app),

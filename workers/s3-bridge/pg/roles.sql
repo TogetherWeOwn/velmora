@@ -24,6 +24,9 @@ SELECT has_schema_privilege('kofra_app', :'schema', 'USAGE,CREATE') AS app_has_s
 \endif
 GRANT pg_read_all_data TO kofra_ro;
 
+-- If the proxy drops BEGIN, following statements must not autocommit writes.
+-- The adapter must opt into READ WRITE before taking W1.
+ALTER ROLE kofra_app SET default_transaction_read_only = on;
 ALTER ROLE kofra_app SET idle_in_transaction_session_timeout = '5s';
 SELECT current_setting('server_version_num')::int >= 170000 AS pg17 \gset
 \if :pg17
