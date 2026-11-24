@@ -695,6 +695,266 @@ async fn pinned_extents_are_never_evicted_however_far_over_the_cap() {
     );
 }
 
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn adaptive_wiring_does_not_change_eviction_candidates_fences_or_watermark() {
+    use sha2::{Digest, Sha256};
+    let sql = include_str!("../src/sql/hot.rs");
+    let jobs = include_str!("../src/jobs.rs");
+    for (source, start, end, expected) in [
+        (
+            sql,
+            "macro_rules! pinned {",
+            "\n}\n",
+            "4c5b000da5c92c69afca08faabf8b8488b9bbd86c1ad7be34ee94edbe5e5eae7",
+        ),
+        (
+            sql,
+            "macro_rules! evictable {",
+            "\n}\n",
+            "a041385a0d471640465da980882b67ad852a9f5d427990f230f38482929d5dee",
+        ),
+        (
+            sql,
+            "macro_rules! evictable_bytes {",
+            "\n}\n",
+            "6028f43c7e6f390bd32516aab1ed775d69d802b18165338aa5c4c1ab6276185f",
+        ),
+        (
+            sql,
+            "const CANDIDATES:",
+            "\n);",
+            "532917be75e3e85fc2a2c7ce9b3149f4e4d72102c63fe9a2fb8b86148853d356",
+        ),
+        (
+            sql,
+            "pub(super) async fn begin_evict",
+            "\n}\n",
+            "aaa72d021a381da6563d4599a6a2387a1600d2e43ee74b9fdffb8f0d3cc7854d",
+        ),
+        (
+            sql,
+            "pub(super) async fn finish_evict",
+            "\n}\n",
+            "79da077229615a72875cb3455a679873d68ad323a354dda93775e54071fb189a",
+        ),
+        (
+            jobs,
+            "pub fn low_watermark",
+            "\n}\n",
+            "9d8badd84704be9fdc9780d660c8318a08b21febdc3a1812d1b3f8320c4c77c5",
+        ),
+    ] {
+        let body = source
+            .split_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0;
+        assert_eq!(hex(&Sha256::digest(body)), expected, "{start}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fixed_and_shadow_keep_the_fixed_cap_in_the_check_and_first_batch() {
+    use velmora_bridge::config::HotCtlMode;
+    for mode in [HotCtlMode::Fixed, HotCtlMode::Shadow] {
+        let hot = hot_with(|cfg| {
+            cfg.hot_ctl.mode = mode;
+            cfg.hot_cap_bytes = 100 * GIB;
+        })
+        .await;
+        let x = hot.released("below-fixed-cap").await;
+        hot.sql(
+            "UPDATE extents SET hot_safety_bytes = 12884901888 WHERE id = ?1",
+            &x,
+        );
+        hot.bridge()
+            .catalog
+            .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+            .await
+            .unwrap();
+        assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
+        let (report, ran) = hot.dispatch_and_evict().await;
+        assert!(!report.evict_enqueued);
+        assert_eq!(ran, 0);
+        assert!(hot.has_safety(&x));
+        let status = hot.admin_status().await;
+        assert_eq!(status["hot"]["cap_bytes"], 100 * GIB);
+        if mode == HotCtlMode::Shadow {
+            assert_eq!(report.hot_ctl.unwrap().target, 10 * GIB);
+            assert_eq!(status["hot"]["ctl"]["mode"], "shadow");
+        } else {
+            assert!(report.hot_ctl.is_none());
+            assert_eq!(status["hot"]["ctl"]["mode"], "fixed");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn adaptive_caps_fall_back_or_clamp_untrusted_targets() {
+    use velmora_bridge::config::HotCtlMode;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+        cfg.hot_ctl.max_bytes = Some(150 * GIB);
+    })
+    .await;
+    let status = hot.admin_status().await;
+    assert_eq!(status["hot"]["cap_bytes"], 100 * GIB);
+    assert_eq!(status["hot"]["ctl"]["cap_reason"], "fixed_fallback");
+    for (value, expected, reason) in [
+        (-1, 100 * GIB, "fixed_fallback"),
+        (1, 10 * GIB, "clamped_min"),
+        ((300 * GIB) as i64, 150 * GIB, "clamped_max"),
+    ] {
+        hot.bridge()
+            .catalog
+            .hot_ctl_store(&[("hot_cap_target", value)])
+            .await
+            .unwrap();
+        let status = hot.admin_status().await;
+        assert_eq!(status["hot"]["cap_bytes"], expected);
+        assert_eq!(status["hot"]["ctl"]["cap_reason"], reason);
+    }
+    hot.cfg_mut().hot_ctl.max_bytes = None;
+    hot.bridge()
+        .catalog
+        .hot_ctl_store(&[
+            ("hot_cap_target", (2048 * GIB) as i64),
+            ("hot_ctl_applied_cap", (2048 * GIB) as i64),
+        ])
+        .await
+        .unwrap();
+    let status = hot.admin_status().await;
+    assert_eq!(status["hot"]["cap_bytes"], 1024 * GIB);
+    assert_eq!(status["hot"]["ctl"]["max"], "none");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_applied_cap_remains_rate_limited_after_the_maximum_is_lowered() {
+    use velmora_bridge::config::HotCtlMode;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let (baseline, _) = hot.dispatch_and_evict().await;
+    assert_eq!(baseline.hot_ctl.unwrap().target, 100 * GIB);
+    hot.cfg_mut().hot_ctl.max_bytes = Some(70 * GIB);
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 100 * GIB);
+    hot.bridge().clock.advance_secs(3600);
+    let (stepped, _) = hot.dispatch_and_evict().await;
+    let ctl = stepped.hot_ctl.unwrap();
+    assert_eq!(
+        (ctl.target, ctl.step, ctl.reason),
+        (90 * GIB, "shrink", "max_lowered")
+    );
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 90 * GIB);
+    hot.bridge().clock.advance_secs(1800);
+    let (too_soon, _) = hot.dispatch_and_evict().await;
+    assert!(too_soon.hot_ctl.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn overlapping_controls_from_one_snapshot_apply_one_step() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    hot.bridge().clock.advance_secs(3600);
+    hot.check_due();
+    let bridge = hot.bridge();
+    bridge
+        .catalog
+        .sql
+        .stall_batch_key
+        .set(Some("hot_cap_target"));
+    let mut first = pin!(bridge.dispatch());
+    std::future::poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending());
+        if bridge.catalog.sql.stall_batch_key.get().is_none() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let second = bridge.dispatch().await.unwrap().hot_ctl.unwrap();
+    bridge.catalog.sql.trip.release();
+    let first = first.await.unwrap().hot_ctl.unwrap();
+    assert_eq!(first, second);
+    assert_eq!((first.target, first.step), (90 * GIB, "shrink"));
+    assert_eq!(
+        bridge
+            .catalog
+            .hot_ctl_load(&["hot_cap_target"])
+            .await
+            .unwrap(),
+        vec![Some((90 * GIB) as i64)]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn adaptive_ten_gib_minimum_drains_then_reads_back_byte_exact_from_fake_nntp() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let x = hot.released("p3-roundtrip").await;
+    hot.get_ok("p3-roundtrip").await;
+    let pinned = hot.put("p3-pinned").await;
+    // Fake the tier's occupancy, not the payload. The original bytes and
+    // the subsequent cold fill still go through the in-process NNTP server.
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 12884901888 WHERE id = ?1",
+        &x,
+    );
+    hot.bridge()
+        .catalog
+        .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+        .await
+        .unwrap();
+    let (report, ran) = hot.dispatch_and_evict().await;
+    assert!(report.evict_enqueued);
+    assert_eq!(ran, 1);
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(json["hot_ctl"]["mode"], "adaptive");
+    assert_eq!(json["hot_ctl"]["target"], 10 * GIB);
+    assert_eq!(json["hot_ctl"]["actual_evictable_bytes"], 12 * GIB);
+    assert!(!hot.has_safety(&x) && !hot.has_cache(&x));
+    assert!(hot.has_safety(&pinned));
+    let connects = hot.bridge().nntp.connects();
+    hot.get_ok("p3-roundtrip").await;
+    assert!(hot.bridge().nntp.connects() > connects);
+    assert!(hot.has_cache(&x));
+
+    hot.bridge().clock.advance_secs(3600);
+    let (measured, _) = hot.dispatch_and_evict().await;
+    let line = measured.hot_ctl.unwrap().log_line().unwrap();
+    assert_eq!(line.lines().count(), 1);
+    let log: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let ctl = &log["hot_ctl"];
+    assert_eq!(ctl["mode"], "adaptive");
+    assert_eq!(ctl["cap_before"], 10 * GIB);
+    assert_eq!(ctl["cap_after"], 10 * GIB);
+    assert_eq!(ctl["step"], "hold");
+    assert_eq!(ctl["reason"], "idle");
+    assert_eq!(ctl["hit_floor_breached"], true);
+    assert_eq!(ctl["input_rates"]["hit_bytes_day"], 0.0);
+    assert_eq!(
+        ctl["input_rates"]["miss_bytes_day"][0],
+        24.0 * x.cipher_size as f64
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn an_evicted_extent_is_read_cold_and_the_cache_refill_is_evictable() {
     let hot = hot().await;

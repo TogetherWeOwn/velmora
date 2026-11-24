@@ -642,6 +642,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     }
     match bridge.dispatch().await {
         Ok(report) => {
+            if let Some(line) = report.hot_ctl.as_ref().and_then(|ctl| ctl.log_line().ok()) {
+                console_log!("{line}");
+            }
             if report.rolled_back {
                 console_error!(
                     "dispatch: the catalogue is behind its rollback stamp; writes are refused until a replay has ended"

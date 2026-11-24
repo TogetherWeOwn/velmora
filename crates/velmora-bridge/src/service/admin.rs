@@ -1963,6 +1963,8 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
         outbox.insert(stage.as_str().to_string(), json!(n));
     }
     let hot = bridge.catalog.hot_stats().await.or_internal()?;
+    let hot_ctl = bridge.hot_ctl_status(hot.evictable_bytes).await;
+    let cap = hot_ctl.cap_after;
     let intents = bridge
         .catalog
         .intent_stats(crate::intents::open_before(now))
@@ -1991,8 +1993,9 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
             "pinned_extents": hot.pinned_extents,
             "evictable_bytes": hot.evictable_bytes,
             "evictable_extents": hot.evictable_extents,
-            "cap_bytes": cfg.hot_cap_bytes,
-            "low_watermark_bytes": crate::jobs::low_watermark(cfg.hot_cap_bytes),
+            "cap_bytes": cap,
+            "low_watermark_bytes": crate::jobs::low_watermark(cap),
+            "ctl": hot_ctl,
         },
         "environment": if cfg.is_dev() { "dev" } else { "prod" },
         "maintenance": match cfg.maintenance {
