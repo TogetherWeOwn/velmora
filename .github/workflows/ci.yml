@@ -156,6 +156,7 @@ jobs:
       # Scalar core (no transport features) and the Workers transport build.
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features
       - run: cargo check --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      - run: cargo check --locked -p velmora-pg-load --target wasm32-unknown-unknown
       - run: cargo clippy --locked -p velmora --target wasm32-unknown-unknown --no-default-features --features worker-transport -- -D warnings
       # The simd128 yEnc fast path must keep compiling (Workers run V8 with
       # Wasm SIMD; workers/s3-bridge/bundle.sh builds with this RUSTFLAGS).
