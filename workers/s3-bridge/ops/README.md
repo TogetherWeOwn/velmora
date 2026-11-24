@@ -1937,8 +1937,8 @@ refused children never acquire the `sub` route label. The point carries
 only `grant:<Reason>`, not the log detail. The child's 403 and the
 parent's response and telemetry are unchanged.
 
-Enable the flag through the managed deployment configuration; a
-Dashboard-only variable does not survive the next CI deploy.
+Production sets it in the `[vars]` table of `workers/s3-bridge/wrangler.toml`;
+a Dashboard-only variable does not survive the next CI deploy.
 
 A failed queue wake-up does not produce an `outbox` response stage. The
 write has already committed, and the dispatcher can resend from the
