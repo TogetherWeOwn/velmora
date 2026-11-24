@@ -796,6 +796,16 @@ async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_w
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
+    stalled_ghost_write(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_ghost_timeout_serves_verified_bytes_without_refilling_or_stamping() {
+    stalled_ghost_write(true).await;
+}
+
+async fn stalled_ghost_write(time_out: bool) {
+    use std::time::Duration;
     use velmora_bridge::ingress::ByteBudget;
     let mut hot = hot_with(|cfg| {
         cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
@@ -827,6 +837,7 @@ async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
     hot.bridge().evict_batch(0).await.unwrap();
     assert!(!hot.has_cache(&xs[0]) && !hot.has_safety(&xs[0]));
     let cat = &hot.bridge().catalog;
+    cat.sql.trip.jitter(42);
     cat.sql
         .stall_exec_matching
         .set(Some("INSERT INTO meta(k, v) SELECT CASE"));
@@ -842,15 +853,20 @@ async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
         )
         .into_request();
     let mut handle = pin!(Rc::clone(&hot.rig.bridge).handle(req));
-    let at_miss = std::future::poll_fn(|cx| {
-        let response = handle.as_mut().poll(cx);
-        if response.is_ready() || cat.sql.stall_exec_matching.get().is_none() {
-            Poll::Ready(response)
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
+    let before = hot.num(&xs[0], "last_read_at");
+    let at_miss = tokio::time::timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            let response = handle.as_mut().poll(cx);
+            if response.is_ready() || cat.sql.stall_exec_matching.get().is_none() {
+                Poll::Ready(response)
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("GET reached the selected ghost write");
     assert!(
         at_miss.is_pending(),
         "a served miss must not depend on the body continuing to drive its cache refill"
@@ -877,13 +893,29 @@ async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
         !hot.has_cache(&xs[0]),
         "refill must not race the ghost write"
     );
-    cat.sql.trip.release();
-    // A caller can abandon the body as soon as its first piece has arrived.
-    assert_eq!(handle.await.status, 200);
-    assert_eq!(
-        cat.hot_ctl_load(&["hotg_1h"]).await.unwrap(),
-        vec![Some(xs[0].cipher_size as i64)]
-    );
+    if time_out {
+        hot.bridge()
+            .clock
+            .advance_ms(i64::from(velmora_bridge::fetch::COLD_WAIT_MS));
+        let resp = tokio::time::timeout(Duration::from_secs(5), async {
+            Resp::collect(handle.await).await
+        })
+        .await
+        .expect("verified GET completes while ghost is still stalled");
+        resp.expect(200);
+        assert!(resp.body == Hot::body("cold-drop"));
+        assert!(!hot.has_cache(&xs[0]));
+        assert_eq!(hot.num(&xs[0], "last_read_at"), before);
+        assert_eq!(hot.bridge().nntp.live(), 0);
+    } else {
+        cat.sql.selected_exec.release();
+        // A caller can abandon the body as soon as its first piece has arrived.
+        assert_eq!(handle.await.status, 200);
+        assert_eq!(
+            cat.hot_ctl_load(&["hotg_1h"]).await.unwrap(),
+            vec![Some(xs[0].cipher_size as i64)]
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

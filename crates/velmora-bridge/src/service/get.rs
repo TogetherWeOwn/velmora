@@ -840,6 +840,7 @@ async fn relay<C, B, N, J, K, T>(
     for (at, piece) in todo.iter().enumerate() {
         // A piece taken back after a client stall is still the same read.
         let mut first_eligible_at = None;
+        let mut read_from_usenet = false;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -851,7 +852,10 @@ async fn relay<C, B, N, J, K, T>(
             let first = *first_eligible_at.get_or_insert_with(|| bridge.clock.now());
             let item = cold.piece(&bucket, piece, first).await;
             let failed = item.is_err();
-            let hit_bytes = if measure && !failed && cold.from_r2 {
+            // An abandoned cold attempt still cost a verified fetch. A
+            // warm retry of this same piece is not a separate customer hit.
+            read_from_usenet |= !failed && !cold.from_r2;
+            let hit_bytes = if measure && !failed && !read_from_usenet {
                 piece.extent.cipher_size
             } else {
                 0
@@ -1072,9 +1076,9 @@ where
 }
 
 /// A verified miss is recorded whether or not there is room for a refill.
-/// The refill is returned to the caller unpolled so it cannot overwrite
-/// the recency timestamp while the miss is being recorded.
-async fn prepare_verified_fill<F: Future<Output = ()>, O: Future<Output = ()>>(
+/// The refill is returned unpolled so it cannot overwrite the stamp
+/// before observation settles, or is dropped if observation timed out.
+async fn prepare_verified_fill<F: Future<Output = ()>, O: Future<Output = bool>>(
     room: &ByteBudget,
     cipher: Vec<u8>,
     measure: bool,
@@ -1084,8 +1088,8 @@ async fn prepare_verified_fill<F: Future<Output = ()>, O: Future<Output = ()>>(
     let put = room
         .try_charge(cipher.len() as u64)
         .map(|copy| write(cipher, copy));
-    if measure {
-        observe().await;
+    if measure && !observe().await {
+        return None;
     }
     put
 }
@@ -1243,6 +1247,30 @@ where
             self.hang_up().await;
         }
         beside(&mut self.put, f).await
+    }
+
+    /// Observe a verified customer miss before its optional refill. A
+    /// timed-out D1 request can still land after its Rust future is
+    /// dropped, so don't start any fill or stamp for this attempt then.
+    async fn observe_miss(&mut self, extent: &ExtentId) -> bool {
+        let bridge = self.bridge;
+        let ghost = bridge.catalog.hot_ghost(extent, bridge.clock.now());
+        let Some(sleep) = bridge.budget.sleeper() else {
+            // Hosts without timers may take an immediate observation,
+            // but must not await a new unbounded write on the GET path.
+            return ghost.now_or_never().is_some();
+        };
+        let completed = matches!(
+            self.wait(select(core::pin::pin!(ghost), sleep(COLD_WAIT_MS)))
+                .await,
+            Either::Left(_)
+        );
+        if !completed {
+            // If both deadlines were ready on the same poll, the ghost
+            // deadline may have won before `wait` closed the sessions.
+            self.hang_up().await;
+        }
+        completed
     }
 
     /// Lets the cache write end, with the connections watched as in
@@ -1502,13 +1530,7 @@ where
                             }
                             .boxed_local()
                         },
-                        || async {
-                            // The refill is not in self.put yet, so wait
-                            // can watch providers without racing the stamp.
-                            let _ = self
-                                .wait(bridge.catalog.hot_ghost(&extent.id, bridge.clock.now()))
-                                .await;
-                        },
+                        || self.observe_miss(&extent.id),
                     )
                     .await;
                     return Ok((plain, held));
@@ -1668,6 +1690,7 @@ mod tests {
             },
             || async {
                 catalog.hot_ghost(&extent, UnixMs(1)).await.unwrap();
+                true
             },
         )
         .await;
