@@ -1666,30 +1666,36 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 What::Copy(copy) => Some((i, item.entry, copy)),
                 _ => None,
             });
-        let started = self.clock.now();
-        let read: Vec<(usize, Read)> = stream::iter(work)
+        let read: Vec<_> = stream::iter(work)
             .map(|(i, entry, copy)| async move {
                 if generation(&entry.key) {
-                    (i, self.read_generation(&entry.key, copy, plans).await)
+                    let start = self.clock.now().0;
+                    let record = self.read_generation(&entry.key, copy, plans).await;
+                    (i, record, Some((start, self.clock.now().0)))
                 } else {
-                    (i, Read::Is(self.copy_one(&entry.key, copy).await))
+                    (i, Read::Is(self.copy_one(&entry.key, copy).await), None)
                 }
             })
             .buffer_unordered(CONCURRENCY)
             .collect()
             .await;
-        let reads = read
+        // Measure the union of the generation intervals. Another kind
+        // of record in the same batch contributes no time on its own.
+        let mut intervals: Vec<_> = read
             .iter()
-            .filter(|(i, _)| generation(&chunk[*i].entry.key))
-            .count();
-        if reads != 0 {
-            budget.timing.generation_reads += reads as u64;
-            // A mixed batch may also include non-generation records.
-            budget.timing.generation_ms += self.elapsed_ms(started);
+            .filter_map(|(_, _, interval)| *interval)
+            .collect();
+        intervals.sort_unstable();
+        budget.timing.generation_reads += intervals.len() as u64;
+        let mut through = i64::MIN;
+        for (start, end) in intervals {
+            let from = start.max(through);
+            budget.timing.generation_ms += end.saturating_sub(from).max(0) as u64;
+            through = from.max(end);
         }
         let input = ReadChunk {
             items: chunk,
-            records: read,
+            records: read.into_iter().map(|(i, read, _)| (i, read)).collect(),
         };
         self.copy_read_chunk(input, span, place, budget, counts, known)
             .await

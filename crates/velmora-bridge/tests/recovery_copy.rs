@@ -1221,6 +1221,30 @@ async fn fresh_job_reports_where_its_budget_went() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn recovery_generation_timing_excludes_other_records_in_the_same_batch() {
+    let w = World::new();
+    w.e2.timed.set(true);
+    w.generation(&generation(2 * MIN_AGE_MS, "_timed"), &[])
+        .await;
+    w.record("m/rk/other", b"an unrelated recovery record")
+        .await;
+    let (_, report) = w
+        .copier()
+        .run_job_report(&w.jobs, UnixMs(NOW), &sweep("m/g_"))
+        .await;
+    assert_eq!(report.counts.unwrap().copied, 2);
+    assert_eq!(
+        (
+            report.timing.generation_reads,
+            report.timing.generation_writes
+        ),
+        (1, 1)
+    );
+    // Source reads are instantaneous; only the generation PUT and its HEAD take time.
+    assert_eq!(report.timing.generation_ms, 80);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn parallel_fresh_doubles_records_at_the_same_job_budget() {
     let mut records = [0; 2];
     for (i, parallel) in [false, true].into_iter().enumerate() {
