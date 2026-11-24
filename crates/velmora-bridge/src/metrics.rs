@@ -293,26 +293,6 @@ fn blob_code(text: &str) -> ProviderCode {
     ProviderCode::R2 { op, class, code }
 }
 
-/// Whether a failed R2 put is eligible for replay of a complete seal.
-/// A numeric code takes precedence over a broad text class, except that
-/// a stream fault is never eligible even with a retryable code.
-pub fn transient_put(error: &crate::types::BridgeError) -> bool {
-    let crate::types::BridgeError::Blob(text) = error else {
-        return false;
-    };
-    match blob_code(text) {
-        ProviderCode::R2 {
-            op: "put",
-            class,
-            code,
-        } if class != Some("stream") => match code {
-            Some(code) => matches!(code, 10001 | 10043 | 10058),
-            None => matches!(class, Some("network_lost" | "internal" | "timeout")),
-        },
-        _ => false,
-    }
-}
-
 fn nntp_code(e: &velmora::Error) -> ProviderCode {
     use std::io::ErrorKind;
     match e {
@@ -377,7 +357,6 @@ pub struct RequestObservation {
     fault: Option<Fault>,
     size: SizeClass,
     complete_multipart: bool,
-    put_retries: u8,
 }
 
 // The GET and fan-out paths use this same observation and stage vocabulary.
@@ -445,31 +424,15 @@ impl RequestObservation {
         self.fault
     }
 
-    pub(crate) fn record_put_retry(&mut self) {
-        self.put_retries = self.put_retries.saturating_add(1);
-    }
-
-    /// Additional attempts for the streamed safety put, if it replayed.
-    pub fn put_retries(&self) -> u8 {
-        self.put_retries
-    }
-
     /// `stage=<stage> err=<variant> code=<provider code>` for the request
-    /// log line of a `5xx`; `-` for what is not known. A streamed safety
-    /// put that retried also gives `retries=<number>`.
+    /// log line of a `5xx`; `-` for what is not known.
     pub fn log_fields(&self) -> String {
-        use std::fmt::Write as _;
-
-        let mut fields = format!(
+        format!(
             "stage={} err={} code={}",
             self.stage.map_or("-", FailureStage::code),
             self.fault.map_or("-", |f| f.variant),
             self.fault.map_or_else(|| "-".to_string(), |f| f.code()),
-        );
-        if self.put_retries != 0 {
-            let _ = write!(fields, " retries={}", self.put_retries);
-        }
-        fields
+        )
     }
 
     pub(crate) fn mark_complete_multipart(&mut self) {
@@ -737,43 +700,6 @@ mod tests {
         assert!(kept.iter().all(|w| *w == 10));
         // The same request is always decided the same way.
         assert_eq!(weight(200, 10, "ray-7"), weight(200, 10, "ray-7"));
-    }
-
-    #[test]
-    fn transient_put_uses_only_r2_put_classes_and_codes() {
-        use crate::types::BridgeError;
-
-        let cases = [
-            ("r2: put failed: network lost", true),
-            ("r2: put failed: internal", true),
-            ("r2: put failed: timeout", true),
-            ("r2: put failed: internal (10001)", true),
-            ("r2: put failed (10001)", true),
-            ("r2: put failed (10043)", true),
-            ("r2: put failed (10058)", true),
-            ("r2: put failed: stream", false),
-            ("r2: put failed: stream (10058)", false),
-            ("r2: put failed (10054)", false),
-            ("r2: put failed: internal (10054)", false),
-            ("r2: put failed: timeout (10014)", false),
-            ("r2: put failed (10014)", false),
-            ("r2: put failed", false),
-            ("r2: put returned no object", false),
-            ("r2: put returned no md5", false),
-            ("r2: get failed: network lost", false),
-            ("r2: get body failed (10043)", false),
-            ("store down", false),
-        ];
-        for (message, want) in cases {
-            assert_eq!(
-                transient_put(&BridgeError::Blob(message.into())),
-                want,
-                "{message}"
-            );
-        }
-        assert!(!transient_put(&BridgeError::Sql(
-            "r2: put failed (10001)".into()
-        )));
     }
 
     #[test]

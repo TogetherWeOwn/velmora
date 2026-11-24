@@ -462,9 +462,6 @@ pub struct BridgeConfig {
     /// Record bounded child grant refusal diagnostics (`GRANT_REFUSAL_REASONS=on`).
     /// Does not affect admission.
     pub grant_refusal_reasons: bool,
-    /// Replay complete streamed safety puts after transient R2 errors
-    /// when the copy fits immediately (`R2_PUT_RETRY=on`; off by default).
-    pub r2_put_retry: bool,
     /// Accept `http://` as if it were HTTPS (`wrangler dev` only).
     pub dev_trust_http: bool,
     pub providers: Vec<ProviderConfig>,
@@ -1219,7 +1216,6 @@ impl BridgeConfig {
             server_side_copy,
             get_fanout_bytes,
             grant_refusal_reasons: get("GRANT_REFUSAL_REASONS").as_deref() == Some("on"),
-            r2_put_retry: get("R2_PUT_RETRY").as_deref() == Some("on"),
             dev_trust_http,
             providers,
             admin_token: Secret::new(admin_token),

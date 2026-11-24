@@ -140,10 +140,8 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     // only if the validator accepted the body, and it is durable before
     // the catalogue names it. If the commit below fails, the blob is an
     // unreferenced orphan, never a catalogue row without bytes.
-    let replay_budget = bridge.cfg.r2_put_retry.then(|| bridge.budget.for_request());
-    let charge = replay_budget
-        .as_ref()
-        .unwrap_or(&bridge.budget)
+    let charge = bridge
+        .budget
         .charge_stream(len)
         .await
         .inspect_err(observed.on_error(Stage::Budget))
@@ -159,8 +157,6 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
             extent: &extent_id,
         },
         &charge,
-        replay_budget.as_ref(),
-        &bridge.clock,
         observed,
     )
     .await
