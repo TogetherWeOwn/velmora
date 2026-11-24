@@ -20,6 +20,9 @@ use velmora_bridge::{
 use velmora_kit::Entry;
 
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
+const MANIFEST: &str = "manifest.json";
+const SHA256_HEX_LEN: usize = 64;
+const MAX_MANIFEST_CHECKSUM: u64 = (SHA256_HEX_LEN + 2 + MANIFEST.len() + 1) as u64;
 const INVALID: &str = "invalid recovery kit manifest";
 const CHANGED: &str = "kit file size or SHA-256 mismatch";
 const INDEX: &str = "index.vki";
@@ -60,13 +63,9 @@ impl Kit {
         if !fs::symlink_metadata(root).map_err(|_| INVALID)?.is_dir() {
             return Err(INVALID);
         }
-        let bytes = read("manifest.json", MAX_MANIFEST)?;
-        let digest = read("manifest.json.sha256", 66)?;
-        let digest = digest
-            .strip_suffix(b"\r\n")
-            .or_else(|| digest.strip_suffix(b"\n"))
-            .unwrap_or(&digest);
-        let expected = decode_hex::<32>(digest).ok_or(INVALID)?;
+        let bytes = read(MANIFEST, MAX_MANIFEST)?;
+        let digest = read("manifest.json.sha256", MAX_MANIFEST_CHECKSUM)?;
+        let expected = manifest_checksum(&digest).ok_or(INVALID)?;
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
             return Err("kit manifest SHA-256 mismatch");
         }
@@ -175,6 +174,25 @@ impl Kit {
             .map_err(|_| "kit record pack does not match authenticated index")?;
         Ok(())
     }
+}
+
+fn manifest_checksum(input: &[u8]) -> Option<[u8; 32]> {
+    let (hex, suffix) = input.split_at_checked(SHA256_HEX_LEN)?;
+    // A legacy bare digest may end in LF or CRLF. A sha256sum line must
+    // contain the mode marker, the exact manifest basename, and a final LF.
+    if !matches!(suffix, b"" | b"\n" | b"\r\n") {
+        let filename = suffix
+            .strip_prefix(b"  ")
+            .or_else(|| suffix.strip_prefix(b" *"))?
+            .strip_suffix(b"\n")?;
+        if filename != MANIFEST.as_bytes() {
+            return None;
+        }
+    }
+    if hex.iter().any(u8::is_ascii_uppercase) {
+        return None;
+    }
+    decode_hex(hex)
 }
 
 fn record_pack_path(path: &str) -> bool {
