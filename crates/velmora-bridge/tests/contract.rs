@@ -688,6 +688,15 @@ fn missing_secret_fails_closed() {
             }
             continue;
         }
+        // Grant refusal reasons: absent or blank is off. Logging only;
+        // no value of it changes an admission decision.
+        if name == "GRANT_REFUSAL_REASONS" {
+            for _ in 0..2 {
+                assert!(!load(&vars).unwrap().grant_refusal_reasons);
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
         // Where permits come from: absent or blank is the catalogue's
         // slot rows, as before the switch existed. The Worker reads it,
         // not this configuration.
