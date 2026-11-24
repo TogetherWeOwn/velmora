@@ -57,8 +57,8 @@ fn wipe(rig: &Rig) {
     }
 }
 
-/// Everything the catalogue says.
-fn dump(rig: &Rig) -> String {
+/// Catalogue rows for comparing two independent fresh replays.
+fn fresh_replay_rows(rig: &Rig) -> String {
     let mut out = String::new();
     for t in TABLES {
         // A fresh replay allocates a new internal scan identity (SQLite
@@ -81,6 +81,14 @@ fn dump(rig: &Rig) -> String {
         }
     }
     out
+}
+
+fn outbox_identities(rig: &Rig) -> Option<Vec<Row>> {
+    let db = &rig.bridge.catalog.sql.inner;
+    (db.dialect() == Dialect::Postgres).then(|| {
+        db.fixture_query_now("SELECT extent_id, seq FROM outbox ORDER BY extent_id", &[])
+            .unwrap()
+    })
 }
 
 /// Replays to the end. Returns what was published, which records were
@@ -393,7 +401,7 @@ async fn a_segmented_record_replays_to_what_the_single_record_replays_to() {
         wipe(&rig);
         let (single, _) = replay(&rig, ReplayLimits::default()).await;
         assert_eq!((single.published, single.unreadable.len()), (3, 0));
-        let rows = dump(&rig);
+        let rows = fresh_replay_rows(&rig);
         assert_eq!(rig.live(&bucket, "big").await.unwrap(), live_before);
 
         for (per, records, extents) in [
@@ -429,13 +437,19 @@ async fn a_segmented_record_replays_to_what_the_single_record_replays_to() {
                 // A call for each extent: every place was a cursor.
                 assert!(calls as usize > EXTENTS, "{at}: {calls} calls");
             }
-            assert_eq!(dump(&rig), rows, "{at}");
+            assert_eq!(fresh_replay_rows(&rig), rows, "{at}");
             assert_eq!(rig.live(&bucket, "big").await.unwrap(), live_before, "{at}");
 
-            // Again: nothing changes.
+            // A repeat replay is a no-op, including the internal outbox
+            // identities. Unlike independent replays, it must not reinsert.
+            let before_repeat = outbox_identities(&rig);
             let (again, _) = replay(&rig, ReplayLimits { records, extents }).await;
             assert_eq!((again.published, again.present), (0, 3), "{at}");
-            assert_eq!(dump(&rig), rows, "{at}");
+            assert_eq!(fresh_replay_rows(&rig), rows, "{at}");
+            assert!(
+                outbox_identities(&rig) == before_repeat,
+                "outbox (extent_id, seq) changed after a no-op replay: {at}"
+            );
         }
 
         let signer = reissue_key(&rig).await;

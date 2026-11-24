@@ -12,6 +12,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Duration;
+
+use tokio::sync::oneshot;
 
 use base64::Engine as _;
 use futures_util::future::join;
@@ -48,10 +51,70 @@ const KEY: &str = "dir/big file+@.bin";
 /// One statement and its parameters.
 type Recorded = (String, Vec<SqlValue>);
 
+// Pause only the terminal mutation. Both requests can validate the open
+// upload and reach their actual write before either starts a transaction.
+#[derive(Clone, Copy)]
+enum RaceWrite {
+    Complete,
+    Abort,
+    UploadPart,
+}
+
+impl RaceWrite {
+    fn matches(self, sql: &str) -> bool {
+        let prefix = match self {
+            Self::Complete => "UPDATE uploads SET state = 'completed',",
+            Self::Abort => "UPDATE uploads SET state = 'aborted',",
+            Self::UploadPart => "UPDATE uploads SET revision = revision + 1",
+        };
+        sql.starts_with(prefix)
+    }
+}
+
+struct BatchPause {
+    arrived: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+    finished: oneshot::Sender<()>,
+}
+
+struct RaceBatch {
+    write: RaceWrite,
+    pause: RefCell<Option<BatchPause>>,
+}
+
+tokio::task_local! {
+    static RACE_BATCH: RaceBatch;
+}
+
+struct BatchControl {
+    arrived: oneshot::Receiver<()>,
+    release: oneshot::Sender<()>,
+    finished: oneshot::Receiver<()>,
+}
+
+fn batch_gate(write: RaceWrite) -> (RaceBatch, BatchControl) {
+    let (arrived, ready) = oneshot::channel();
+    let (allow, release) = oneshot::channel();
+    let (finished, done) = oneshot::channel();
+    (
+        RaceBatch {
+            write,
+            pause: RefCell::new(Some(BatchPause {
+                arrived,
+                release,
+                finished,
+            })),
+        },
+        BatchControl {
+            arrived: ready,
+            release: allow,
+            finished: done,
+        },
+    )
+}
+
 struct Probe {
     db: TestSql,
-    /// When set, every batch first yields to the other request.
-    yield_before_batch: Cell<bool>,
     /// When set, every statement is kept here with its parameters.
     recorded: RefCell<Option<Vec<Recorded>>>,
     /// One synthetic PostgreSQL overload at a selected SQL boundary.
@@ -99,10 +162,32 @@ impl Sql for Probe {
             self.record(q, p);
             self.fault(q, p)?;
         }
-        if self.yield_before_batch.get() {
-            tokio::task::yield_now().await;
+        let pause = RACE_BATCH
+            .try_with(|gate| {
+                if stmts.iter().any(|(sql, _)| gate.write.matches(sql)) {
+                    gate.pause.borrow_mut().take()
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some(BatchPause {
+            arrived,
+            release,
+            finished,
+        }) = pause
+        {
+            arrived.send(()).expect("race controller watches arrivals");
+            release.await.expect("race controller releases the batch");
+            let result = self.db.batch(stmts).await;
+            finished
+                .send(())
+                .expect("race controller watches database results");
+            result
+        } else {
+            self.db.batch(stmts).await
         }
-        self.db.batch(stmts).await
     }
 }
 
@@ -416,7 +501,6 @@ impl Rig {
         let kek = TestKek::new();
         let catalog = SqlCatalog::new(Probe {
             db: TestSql::with_schema().expect("schema applies"),
-            yield_before_batch: Cell::new(false),
             recorded: RefCell::new(None),
             overload: Cell::new(None),
         });
@@ -622,11 +706,37 @@ impl Rig {
 
     /// Runs two requests with every catalogue batch yielding first, so
     /// both reach their write before either commits; `first` commits first.
-    async fn race(&self, first: Req, second: Req) -> (Resp, Resp) {
-        self.bridge.catalog.sql.yield_before_batch.set(true);
-        let out = join(self.send(first), self.send(second)).await;
-        self.bridge.catalog.sql.yield_before_batch.set(false);
-        out
+    async fn race(&self, first: (RaceWrite, Req), second: (RaceWrite, Req)) -> (Resp, Resp) {
+        let (first_gate, first_control) = batch_gate(first.0);
+        let (second_gate, second_control) = batch_gate(second.0);
+        let requests = join(
+            RACE_BATCH.scope(first_gate, self.send(first.1)),
+            RACE_BATCH.scope(second_gate, self.send(second.1)),
+        );
+        let order = async {
+            let (ready_first, ready_second) =
+                join(first_control.arrived, second_control.arrived).await;
+            ready_first.expect("first request reached its write batch");
+            ready_second.expect("second request reached its write batch");
+            first_control
+                .release
+                .send(())
+                .expect("first batch is waiting");
+            first_control.finished.await.expect("first batch finished");
+            second_control
+                .release
+                .send(())
+                .expect("second batch is waiting");
+            second_control
+                .finished
+                .await
+                .expect("second batch finished");
+        };
+        // A missing or changed SQL batch must fail, not leave the test hung.
+        tokio::time::timeout(Duration::from_secs(20), join(requests, order))
+            .await
+            .expect("multipart requests did not reach and finish their gated batches")
+            .0
     }
 }
 
@@ -867,19 +977,17 @@ async fn complete_vs_abort_race() {
         let complete = complete_req(RW_KEY, "alpha", KEY, &id, &[(1, &etag)], &[]);
         let abort = abort_req(RW_KEY, "alpha", KEY, &id);
         let (completed, aborted) = if complete_first {
-            rig.race(complete, abort).await
+            rig.race((RaceWrite::Complete, complete), (RaceWrite::Abort, abort))
+                .await
         } else {
-            let (a, c) = rig.race(abort, complete).await;
+            let (a, c) = rig
+                .race((RaceWrite::Abort, abort), (RaceWrite::Complete, complete))
+                .await;
             (c, a)
         };
         let object = rig.object(&rig.alpha, KEY).await;
         let state = rig.upload_state(&rig.alpha, KEY, &id).await;
-        let complete_won = if TestSql::postgres_selected() {
-            completed.outcome() == "200"
-        } else {
-            complete_first
-        };
-        if complete_won {
+        if complete_first {
             assert_eq!(completed.outcome(), "200", "{}", completed.body);
             assert_eq!(aborted.outcome(), "404 NoSuchUpload");
             assert_eq!(state, Some(UploadState::Completed));
@@ -912,19 +1020,23 @@ async fn complete_vs_upload_part_race() {
         let complete = complete_req(RW_KEY, "alpha", KEY, &id, &[(1, &old_etag)], &[]);
         let part = part_req(RW_KEY, "alpha", KEY, &id, 1, &new);
         let (complete, part) = if complete_first {
-            rig.race(complete, part).await
+            rig.race(
+                (RaceWrite::Complete, complete),
+                (RaceWrite::UploadPart, part),
+            )
+            .await
         } else {
-            let (part, complete) = rig.race(part, complete).await;
+            let (part, complete) = rig
+                .race(
+                    (RaceWrite::UploadPart, part),
+                    (RaceWrite::Complete, complete),
+                )
+                .await;
             (complete, part)
         };
         // Yielding first orders these tiny in-memory calls, but on real
         // sockets either request can finish its reads and commit first.
-        let complete_won = if TestSql::postgres_selected() {
-            complete.outcome() == "200"
-        } else {
-            complete_first
-        };
-        if complete_won {
+        if complete_first {
             assert_eq!(complete.outcome(), "200", "{}", complete.body);
             assert_eq!(part.outcome(), "404 NoSuchUpload");
             assert_eq!(
@@ -934,15 +1046,10 @@ async fn complete_vs_upload_part_race() {
             assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == old);
             assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 1);
             assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 1);
-            // A part that reached its upload before the close can leave one
-            // orphan blob, but it never acquires a catalogue row.
+            // Both requests reached their batch, so the losing UploadPart
+            // wrote its safety blob but never acquired a catalogue row.
             let pinned = rig.bridge.safety.keys();
-            let blobs = pinned.iter().filter(|k| k.starts_with("x/")).count();
-            if TestSql::postgres_selected() {
-                assert!((1..=2).contains(&blobs));
-            } else {
-                assert_eq!(blobs, 2);
-            }
+            assert_eq!(pinned.iter().filter(|k| k.starts_with("x/")).count(), 2);
         } else {
             assert_eq!(part.outcome(), "200", "{}", part.body);
             assert_eq!(complete.outcome(), "400 InvalidPart");

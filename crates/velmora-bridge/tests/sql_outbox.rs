@@ -3710,23 +3710,35 @@ async fn gc_drops_a_packed_plan_with_the_article_metadata() {
     );
     assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
     assert_eq!(fx.cat.articles(&live.extent).await.unwrap().len(), 1);
-    // The schema keeps it too, whatever statement asks.
-    let err = fx
-        .cat
-        .sql
-        .0
-        .fixture_exec(
-            "UPDATE extents SET plan = NULL WHERE id = ?1",
-            &[text(live.extent.as_str())],
-        )
-        .await
-        .unwrap_err();
-    let expected = fx
-        .cat
-        .sql
-        .0
-        .fixture("extent is in service", "pg: constraint violation");
-    assert!(err.to_string().contains(expected), "{err}");
+    // The schema keeps it too, whatever statement asks. The raw fixture
+    // session preserves the SQLSTATE that the production port redacts.
+    let db = &fx.cat.sql.0;
+    match db {
+        #[cfg(feature = "testkit-pg")]
+        TestSql::Postgres(pg) => {
+            let err = pg
+                .client()
+                .await
+                .unwrap()
+                .execute(
+                    "UPDATE extents SET plan = NULL WHERE id = $1",
+                    &[&live.extent.as_str()],
+                )
+                .await
+                .expect_err("PostgreSQL trigger must refuse removing the live plan");
+            assert_eq!(err.code().map(|code| code.code()), Some("VL001"));
+        }
+        TestSql::Sqlite(_) => {
+            let err = db
+                .fixture_exec(
+                    "UPDATE extents SET plan = NULL WHERE id = ?1",
+                    &[text(live.extent.as_str())],
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("extent is in service"), "{err}");
+        }
+    }
     assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
 }
 
