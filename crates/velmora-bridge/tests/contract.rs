@@ -415,6 +415,12 @@ fn config_loads_from_documented_vars() {
         assert_eq!(load(&sized).unwrap().grant_refusal_reasons, value == "on");
     }
     sized.remove("GRANT_REFUSAL_REASONS");
+    assert!(!load(&sized).unwrap().r2_put_retry);
+    for value in ["on", "off", "", "ON", " on", "typo"] {
+        sized.insert("R2_PUT_RETRY".into(), value.into());
+        assert_eq!(load(&sized).unwrap().r2_put_retry, value == "on");
+    }
+    sized.remove("R2_PUT_RETRY");
     // A cold read uses four connections unless told otherwise, from one
     // to eight, and never more than fit the byte budget beside one extent
     // and its copy: 48 MiB less 32 MiB leaves room for ten more.

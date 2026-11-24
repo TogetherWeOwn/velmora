@@ -265,7 +265,8 @@ pub trait BlobStore {
     ///   bytes against before it has them, so the caller compares the
     ///   answer with what it sent and does not name the blob anywhere
     ///   unless they agree.
-    /// - One attempt: a stream cannot be read twice.
+    /// - One attempt per stream: it cannot be read twice. The streamed
+    ///   upload handler may put a complete buffered copy under the same key.
     ///
     /// This default holds the whole body and hands it to
     /// [`BlobStore::put`] ([`put_stream_whole`]); an adapter that can
