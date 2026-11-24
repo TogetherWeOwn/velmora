@@ -19,6 +19,7 @@ import time
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
 W1 = 7413000001
+MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
             'PGSSLMODE', 'PGSSLROOTCERT', 'PGCONNECT_TIMEOUT'}
 ERRORS = {
@@ -30,6 +31,7 @@ ERRORS = {
     'VL015': 'catalogue contains an invalid index; repair it before retrying',
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
+    '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
 }
 MARKER = "to_regclass(format('%I._velmora_import_incomplete', current_schema()))"
 USAGE = "has_schema_privilege('kofra_app', current_schema(), 'USAGE')"
@@ -42,6 +44,19 @@ LEDGER = '''CREATE TABLE schema_migrations (
     applied_at BIGINT NOT NULL
 );
 REVOKE ALL ON TABLE schema_migrations FROM kofra_app;'''
+RESTART_IDENTITIES = '''
+DO $$
+DECLARE next_id bigint;
+BEGIN
+    SELECT greatest(coalesce(max(id), 0) + 1, 1) INTO next_id FROM gc;
+    EXECUTE format('ALTER TABLE gc ALTER COLUMN id RESTART WITH %s', next_id);
+    SELECT greatest(coalesce(max(id), 0) + 1, 1) INTO next_id FROM usage_recounts;
+    EXECUTE format('ALTER TABLE usage_recounts ALTER COLUMN id RESTART WITH %s', next_id);
+    SELECT greatest(coalesce(max(seq), 0) + 1, 1) INTO next_id FROM outbox;
+    EXECUTE format('ALTER TABLE outbox ALTER COLUMN seq RESTART WITH %s', next_id);
+END;
+$$;
+'''
 
 
 def die(message):
@@ -101,6 +116,12 @@ def coverage(files, d1):
     print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
 
 
+def lock_key(raw, setting):
+    if not re.fullmatch(r'-?[0-9]{1,19}', raw) or not -(2**63) <= int(raw) < 2**63:
+        die(f'{setting} must be a signed bigint (PGLOCKKEY is required for a lane schema)')
+    return int(raw)
+
+
 def connection(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
@@ -118,18 +139,19 @@ def connection(path):
         if not line.strip() or line.lstrip().startswith('#'):
             continue
         key, sep, value = line.partition('=')
-        if not sep or key not in DATA_ENV | {'PGSCHEMA', 'PGLOCKKEY'} or key in values or '\r' in value:
+        if not sep or key not in DATA_ENV | {'PGSCHEMA', 'PGLOCKKEY', 'PGMIGRATELOCKKEY'} or key in values or '\r' in value:
             die(f'invalid or duplicate connection entry on line {n}')
         values[key] = value
     schema = values.pop('PGSCHEMA', 'public')
     raw_lock = values.pop('PGLOCKKEY', str(W1) if schema == 'public' else '')
     if not re.fullmatch(r'[a-z][a-z0-9_]{0,62}', schema) or schema.startswith('pg_') or schema == 'information_schema':
         die('invalid PGSCHEMA')
-    if not re.fullmatch(r'-?[0-9]{1,19}', raw_lock) or not -(2**63) <= int(raw_lock) < 2**63:
-        die('PGLOCKKEY must be a signed bigint (required for a lane schema)')
-    lock = int(raw_lock)
-    if (schema == 'public') != (lock == W1):
-        die('public must use the production W1 key; lane schemas must use a different key')
+    lock = lock_key(raw_lock, 'PGLOCKKEY')
+    migration_lock = lock_key(values.pop('PGMIGRATELOCKKEY', str(MIGRATOR if schema == 'public' else lock ^ (1 << 62))),
+                              'PGMIGRATELOCKKEY')
+    if (schema == 'public' and (lock, migration_lock) != (W1, MIGRATOR)) or (
+            schema != 'public' and ({lock, migration_lock} & {W1, MIGRATOR} or lock == migration_lock)):
+        die('public must use the fixed W1 and migrator keys; lane keys must be distinct and non-production')
     if values.get('PGUSER') != 'kofra_migrate' or not values.get('PGHOST') or not values.get('PGDATABASE'):
         die('PGHOST, PGDATABASE and PGUSER=kofra_migrate are required')
     host = values['PGHOST']
@@ -141,21 +163,85 @@ def connection(path):
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(PGAPPNAME='velmora-pg-migrate', PGCONNECT_TIMEOUT='5', PGCLIENTENCODING='UTF8', LC_ALL='C')
     env.update(values)
-    return env, schema, lock
+    return env, schema, lock, migration_lock
 
 
 def check(condition, code):
     return f"DO $$ BEGIN IF ({condition}) THEN RAISE EXCEPTION USING ERRCODE = '{code}'; END IF; END $$;\n"
 
 
+SQL_TOKEN = re.compile(r'''\s+|--[^\n]*|/\*|\$(?:[A-Za-z_]\w*)?\$|
+    [eE]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'|"(?:""|[^"])*"|
+    [\w$]+|<>|!=|>=|<=|!~|.''', re.X | re.S)
+
+
+def sql_tokens(sql):
+    """Keep literals and dollar bodies intact; omit line and nested block comments."""
+    i = 0
+    while i < len(sql):
+        token = SQL_TOKEN.match(sql, i).group()
+        i += len(token)
+        if token.isspace() or token.startswith('--'):
+            continue
+        if token == '/*':
+            depth = 1
+            while depth:
+                boundary = re.search(r'/\*|\*/', sql[i:])
+                if boundary is None:
+                    raise ValueError('unterminated block comment')
+                i += boundary.end()
+                depth += 1 if boundary.group() == '/*' else -1
+            continue
+        if re.fullmatch(r'\$(?:[A-Za-z_]\w*)?\$', token):
+            end = sql.find(token, i)
+            if end < 0:
+                raise ValueError('unterminated dollar quote')
+            end += len(token)
+            token += sql[i:end]
+            i = end
+        elif token in {"'", '"'}:
+            raise ValueError('unterminated quoted value')
+        elif token == '\\':
+            raise ValueError('psql metacommands are not allowed')
+        yield token
+
+
+def lint_migration(sql, no_tx, name):
+    statements, pending = [], []
+    try:
+        for token in sql_tokens(sql):
+            if token == ';':
+                if pending:
+                    statements.append(pending)
+                pending = []
+            else:
+                pending.append(token.upper())
+    except ValueError as e:
+        die(f'{name}: {e}')
+    if pending or not statements:
+        die(f'{name}: migration must contain terminated SQL statements')
+    for statement in statements:
+        if statement[0] in {'ABORT', 'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'START'} or statement[:2] == ['PREPARE', 'TRANSACTION']:
+            die(f'{name}: transaction control belongs to the migration runner')
+        if no_tx:
+            head = statement[:]
+            if head[:2] == ['CREATE', 'UNIQUE']:
+                del head[1]
+            if head[:6] != ['CREATE', 'INDEX', 'CONCURRENTLY', 'IF', 'NOT', 'EXISTS']:
+                die(f'{name}: only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed')
+
+
 def predicate(text):
     if not text:
         return None
-    # pg_get_expr expands IN to ANY and type annotates string literals.
+    # pg_get_expr expands IN to ANY and BETWEEN to two comparisons.
+    text = re.sub(r'\((-?\d+)\)::bigint\b', r'\1', text, flags=re.I)
     text = re.sub(r'::(?:text|bigint)\b', '', text, flags=re.I)
     text = re.sub(r'(=\s*ANY|<>\s*ALL)\s*\(ARRAY\[([^\]]+)\]\)',
                   lambda m: ('IN' if m[1].startswith('=') else 'NOT IN') + f' ({m[2]})', text, flags=re.I)
-    tokens = re.findall(r"'(?:[^']|'')*'|[\w]+|<>|!=|>=|<=|[^\s]", text)
+    text = re.sub(r'(\w+(?:\s*\(\s*\w+\s*\))?)\s+BETWEEN\s+(\d+)\s+AND\s+(\d+)',
+                  r'(\1 >= \2 AND \1 <= \3)', text, flags=re.I)
+    tokens = list(sql_tokens(text))
     tokens = [t if t.startswith("'") else t.lower() for t in tokens]
 
     def parse(parts):
@@ -180,6 +266,19 @@ def predicate(text):
     return parse(tokens)
 
 
+def sqlite_checks(ddl):
+    tokens = list(sql_tokens(ddl))
+    for start, token in enumerate(tokens[:-1]):
+        if token.upper() != 'CHECK' or tokens[start + 1] != '(':
+            continue
+        depth = 1
+        end = start + 2
+        while depth:
+            depth += (tokens[end] == '(') - (tokens[end] == ')')
+            end += 1
+        yield ' '.join(tokens[start + 2:end - 1])
+
+
 def compare(actual, d1):
     expected = defaultdict(set)
     types = {'INTEGER': 'bigint', 'TEXT': 'text', 'BLOB': 'bytea'}
@@ -197,6 +296,10 @@ def compare(actual, d1):
                 ident = 'd' if (table, col) in {('gc', 'id'), ('usage_recounts', 'id')} else ''
                 expected['columns'].add((table, col, types[kind], bool(required or pk), ident,
                                          'C' if kind == 'TEXT' else None, default))
+            for expr in sqlite_checks(sql):
+                if table == 'articles':
+                    expr = expr.replace("NOT GLOB '*[^0-9a-z]*'", "!~ '[^0-9a-z]'")
+                expected['checks'].add((table, predicate(expr), True))
             pkcols = tuple((c[1], False, False) for c in sorted(cols, key=lambda c: c[5]) if c[5])
             if pkcols:
                 expected['indexes'].add((table, '<pk>', True, True, True, 'btree', pkcols, None))
@@ -247,14 +350,18 @@ def compare(actual, d1):
     actual['foreign_keys'] = {tuple(r[:2]) + (tuple(r[2]), tuple(r[3])) + tuple(r[4:])
                               for r in (actual['foreign_keys'] or ())}
     actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) for r in (actual['triggers'] or ())}
+    actual['checks'] = {(t, predicate(expr), valid) for t, expr, valid in (actual['checks'] or ())}
     bad = []
     for kind, entries in expected.items():
         for label, delta in [('missing/changed', entries - actual[kind]), ('unexpected/changed', actual[kind] - entries)]:
             if delta:
-                names = {r if isinstance(r, str) else '.'.join(r[:2]) for r in delta}
+                names = {r if isinstance(r, str) else r[0] if kind == 'checks'
+                         else '.'.join(r[:2]) for r in delta}
                 bad.append(f'{kind} {label}: {", ".join(sorted(names))}')
     if not actual['tx_guard']:
         bad.append('missing or incorrect tx_guard_ok CHECK')
+    if not actual['identities_ready']:
+        bad.append('identity sequence positions must be above copied keys and within bigint range')
     bad.extend(f'privilege check failed: {name}' for name, ok in actual['privileges'].items() if ok is not True)
     if bad:
         die('\n'.join(bad))
@@ -299,6 +406,14 @@ def main():
     args = p.parse_args(sys.argv[2:])
     files = sql_files(PG)
     d1 = sql_files(D1)
+    migrations = {}
+    for version, (name, body) in files.items():
+        sql = body.decode()
+        no_tx = sql.splitlines()[:1] == ['-- velmora: no-transaction']
+        if no_tx and version in {'0001', '0002'}:
+            die('baseline stages must be transactional')
+        lint_migration(sql, no_tx, name)
+        migrations[version] = sql, no_tx
     if args.check_migrations:
         if args.env_file or args.activate or args.import_mode:
             p.error('--check-migrations does not take a connection file or other flags')
@@ -310,10 +425,11 @@ def main():
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
     coverage(files, d1)
-    env, schema, lock = connection(args.env_file)
-    print(f'Catalogue schema: {schema}', flush=True)
+    env, schema, lock, migration_lock = connection(args.env_file)
+    print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
     prefix = f'''SET search_path TO "{schema}", pg_temp;
-'''+ check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
+SET standard_conforming_strings = on;
+''' + check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
 
     def run(sql, *, retry=False, report=None):
         for attempt in range(6):
@@ -323,7 +439,7 @@ def main():
             if result.returncode == 0:
                 return result.stdout.strip()
             # Do not forward libpq messages, SQL, or row contents from a live database.
-            match = re.search(r'\bERROR: +([0-9A-Z]{5})(?:\s|$)', result.stderr)
+            match = re.search(r'\b(?:ERROR|FATAL): +([0-9A-Z]{5})(?:\s|$)', result.stderr)
             state = match.group(1) if match else None
             if state == '55P03' and retry and attempt < 5:
                 print(f'{report}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
@@ -333,7 +449,16 @@ def main():
             die(f'{report or "database operation"}: {reason}')
 
     begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock({lock}::bigint);\n"
-    sessions = f"SET lock_timeout = '3s';\nSELECT pg_advisory_lock({lock}::bigint);\nBEGIN;\n"
+    migrator_session = f"SET lock_timeout = '3s';\nSELECT pg_advisory_lock({migration_lock}::bigint);\n"
+    online_limits = f'''SELECT {USAGE} AS online, current_setting('server_version_num')::int >= 170000 AS pg17 \\gset
+\\if :online
+    SET LOCAL statement_timeout = '3s';
+    \\if :pg17
+        SET LOCAL transaction_timeout = '3s';
+    \\endif
+\\endif
+'''
+    migration_tx = begin + ('' if args.import_mode else online_limits)
     ledger_exists = "to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL"
     fingerprints = ', '.join(f"('{v}', '{digest(body)}')" for v, (_, body) in files.items())
     history = check(f'''EXISTS (SELECT FROM schema_migrations m WHERE NOT EXISTS (
@@ -365,19 +490,8 @@ $$;
     for version, (name, body) in files.items():
         if version > target:
             break
-        sql = body.decode()
-        no_tx = sql.splitlines()[0] == '-- velmora: no-transaction'
-        if re.search(r'^\s*\\', sql, re.M):
-            die(f'psql metacommands are not allowed in {name}')
-        if no_tx:
-            # Only the documented idempotent concurrent-index form is supported.
-            statements = re.sub(r'(?m)^\s*--[^\n]*', '', sql).split(';')
-            if statements[-1].strip() or not any(s.strip() for s in statements):
-                die(f'unterminated or empty no-transaction file: {name}')
-            if any(not re.match(r'^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\b', s, re.I)
-                   for s in statements if s.strip()):
-                die(f'only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed in {name}')
-        batch = sessions if no_tx else begin
+        sql, no_tx = migrations[version]
+        batch = migrator_session + migration_tx
         batch += f'SELECT {ledger_exists} AS ledger_exists \\gset\n\\if :ledger_exists\n\\else\n'
         batch += LEDGER + '\n\\endif\n' if version == '0001' else check('true', 'VL017') + '\\endif\n'
         batch += history
@@ -395,10 +509,14 @@ $$;
         if version == '0002' and not args.import_mode:
             batch += check(f'{MARKER} IS NOT NULL OR NOT ({SEEDS})', 'VL014')
         if no_tx:
+            # Release W1 before CIC may wait for old snapshots; keep only the
+            # session migrator lock until the ledger transaction commits.
             batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
         batch += sql + '\n'
         if no_tx:
-            batch += 'BEGIN;\n' + check(BAD_INDEX, 'VL015')
+            batch += migration_tx + check(BAD_INDEX, 'VL015')
+        if version == '0002' and args.import_mode:
+            batch += RESTART_IDENTITIES
         if version == '0001':
             batch += import_pre if args.import_mode else ''
             if not args.import_mode:
@@ -406,12 +524,13 @@ $$;
         batch += (f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
                   f"(extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
                   '\\echo applied\n\\endif\nCOMMIT;\n')
-        # Closing the psql session releases a no-transaction file's session W1 lock.
-        status_out = run(batch, retry=True, report=name)
-        print(f'{name}: {status_out}', flush=True)
+        output = run(batch, retry=True, report=name).splitlines()
+        if not output or output[-1] not in {'applied', 'already applied'}:
+            die(f'{name}: no migration status returned')
+        print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
         compare(json.loads(run(verify_sql, report='pre-activation verification')), d1)
-        run(begin + history + complete + check(f'{MARKER} IS NOT NULL', 'VL016')
+        run(migrator_session + migration_tx + history + complete + check(f'{MARKER} IS NOT NULL', 'VL016')
             + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True, report='activation')
         print('App schema USAGE granted')
 

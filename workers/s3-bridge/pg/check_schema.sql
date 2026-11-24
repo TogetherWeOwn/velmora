@@ -40,6 +40,19 @@ SELECT json_build_object(
         c.convalidated AND NOT c.condeferrable AND r.relnamespace = t.relnamespace))
         FROM tbl t JOIN pg_constraint c ON c.conrelid = t.oid AND c.contype = 'f'
         JOIN pg_class r ON r.oid = c.confrelid),
+    'checks', (SELECT json_agg(json_build_array(t.relname, pg_get_expr(c.conbin, c.conrelid), c.convalidated))
+        FROM tbl t JOIN pg_constraint c ON c.conrelid = t.oid AND c.contype = 'c'),
+    'identities_ready', (SELECT bool_and(next_value > max_key AND next_value <= 9223372036854775807)
+        FROM (
+            SELECT last_value::numeric + is_called::int AS next_value, (SELECT coalesce(max(id), 0) FROM gc) AS max_key
+            FROM gc_id_seq
+            UNION ALL
+            SELECT last_value::numeric + is_called::int, (SELECT coalesce(max(id), 0) FROM usage_recounts)
+            FROM usage_recounts_id_seq
+            UNION ALL
+            SELECT last_value::numeric + is_called::int, (SELECT coalesce(max(seq), 0) FROM outbox)
+            FROM outbox_seq_seq
+        ) s),
     'triggers', (SELECT json_agg(json_build_array(r.relname, t.tgname, t.tgenabled,
         t.tgtype, ARRAY(SELECT a.attname FROM unnest(t.tgattr) WITH ORDINALITY k(attnum, ord)
                         JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum ORDER BY k.ord)))

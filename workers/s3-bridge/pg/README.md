@@ -25,10 +25,14 @@ Optional libpq keys are `PGPORT`, `PGPASSWORD`, `PGSSLMODE`, `PGSSLROOTCERT`,
 and `PGCONNECT_TIMEOUT`. Remote connections require `PGSSLMODE=verify-full`.
 No value is passed in command-line arguments. Keep the file outside the repo.
 
-`PGSCHEMA` defaults to `public` and uses the catalogue writer lock `7413000001`.
-For an isolated lane, set `PGSCHEMA` and a separate `PGLOCKKEY` (signed bigint)
-and use the same pair in every writer. To apply the SQL directly in standalone
-tests, set `search_path` to the test schema followed by `pg_temp` before
+`PGSCHEMA` defaults to `public`. The fixed public writer key (`PGLOCKKEY`, W1)
+is `7413000001`; the migrator-only session key (`PGMIGRATELOCKKEY`) is
+`7413000002`. For an isolated lane, set `PGSCHEMA` and a unique `PGLOCKKEY`
+(signed bigint); the default migration key is the writer key XOR `2^62`.
+If overriding a lane's migrator key, keep it distinct from all writer and
+other lane keys. Use the same schema and W1 key in every catalogue writer.
+To apply the SQL directly in standalone tests, set `search_path` to the test
+schema followed by `pg_temp` before
 applying the baseline. Seed `usage_global(id)` with `1, 2` only for fresh tests.
 
 ## Fresh test databases
@@ -59,12 +63,13 @@ DDL; it is not the import activation procedure.
    live, secondary indexes and triggers are not.
 3. Run `ops/pg-migrate.sh "$CONNECTION_FILE" --import-mode` after COPY has
    committed. The post-stage requires the marker, both usage rows and an
-   inaccessible app schema. Restart the `gc.id`, `usage_recounts.id` and
-   `outbox.seq` identities above the copied values before opening the app.
+   inaccessible app schema. It restarts the `gc.id`, `usage_recounts.id` and
+   `outbox.seq` identities above the copied values in the same transaction.
 4. Verify source data counts and digests outside this tool. `--verify` also
    works while the verifier holds the writer lock on another connection; it
-   does not acquire that lock or activate the app. The import verifier removes
-   the marker and grants the app schema `USAGE` in one locked transaction.
+   checks identity positions without acquiring either advisory lock or
+   activating the app. The import verifier removes the marker and grants the
+   app schema `USAGE` in one locked transaction.
 
 ## Adding migrations
 
@@ -72,11 +77,19 @@ Each numbered PostgreSQL file is applied once and recorded with its SHA-256.
 Do not edit an applied migration. Ordinary files are atomic; leave transaction
 control and psql metacommands to the runner. A `55P03` lock timeout retries up
 to five times after the initial attempt, with backoff. Use `--to NNNN` to stop
-at a shipped stage. A file whose first line is `-- velmora: no-transaction`
-may contain only idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS`
-statements. It holds the session writer lock across statements. A failed
-concurrent index build can leave an invalid index: the tool refuses to record
-the file, and an operator must inspect and repair the index before retrying.
+at a shipped stage. Online migrations (app schema access granted) use a 3 s
+statement timeout and, on PostgreSQL 17+, a 3 s transaction timeout so an
+acquired exclusive lock cannot stall readers indefinitely. Split changes that
+cannot fit the budget, or run them with the app offline. Inactive/import
+migrations are not subject to the 3 s execution budget.
+
+A file whose first line is `-- velmora: no-transaction` may contain only
+idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
+Only the migrator session lock is held through the index statements; short
+precheck and ledger transactions use W1. A failed concurrent index build
+can leave an invalid index (including after a lock timeout). The tool refuses
+to record the file or skip the invalid index on retry. Inspect and repair the
+index before rerunning.
 
 `ops/pg-migrate.sh --check-migrations` is offline. The baseline marker covers
 exact historical D1 versions (not gaps). Its fingerprint is the SHA-256 of
