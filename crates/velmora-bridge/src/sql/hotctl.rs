@@ -39,6 +39,8 @@ const COUNTER_ADD: &str = "INSERT INTO meta(k, v) VALUES (?1, ?2) \
     ON CONFLICT(k) DO UPDATE SET v = meta.v + excluded.v";
 // An absent row is a valid initial version. Check it inside the same
 // transaction as all state writes, including the new version timestamp.
+// On PostgreSQL this relies on the global writer advisory lock in PgSql::write:
+// without it, two stores can both check the same version and both commit.
 const STORE_GUARD: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
     (SELECT v FROM meta WHERE k = 'hot_ctl_at') IS DISTINCT FROM ?1";
 const STORE: &str = "INSERT INTO meta(k, v) VALUES (?1, ?2) \

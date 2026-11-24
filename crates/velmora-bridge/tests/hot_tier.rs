@@ -1378,8 +1378,9 @@ async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
     );
 }
 
-/// Count actual changed meta rows on either backend. SQLite has a native
-/// preupdate hook; PostgreSQL uses a row trigger in the isolated fixture.
+/// Count meta-row writes on either backend. SQLite uses its committed-write
+/// meter. The PostgreSQL fixture's row trigger advances a sequence, so a
+/// subsequent rollback cannot hide that a statement wrote a row.
 struct MetaWrites<'a>(&'a TestSql);
 
 impl<'a> MetaWrites<'a> {
@@ -1388,10 +1389,9 @@ impl<'a> MetaWrites<'a> {
             db.sqlite().meter_writes().unwrap();
         } else {
             db.fixture_script(
-                "CREATE TABLE hot_meta_writes (n BIGINT NOT NULL); \
-                 INSERT INTO hot_meta_writes VALUES (0); \
+                "CREATE SEQUENCE hot_meta_writes; \
                  CREATE FUNCTION count_hot_meta_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
-                     BEGIN UPDATE hot_meta_writes SET n = n + 1; RETURN NULL; END $$; \
+                     BEGIN PERFORM nextval('hot_meta_writes'); RETURN NULL; END $$; \
                  CREATE TRIGGER count_hot_meta_write AFTER INSERT OR UPDATE OR DELETE ON meta \
                      FOR EACH ROW EXECUTE FUNCTION count_hot_meta_write()",
             )
@@ -1406,7 +1406,10 @@ impl<'a> MetaWrites<'a> {
         }
         let rows = self
             .0
-            .fixture_query("SELECT n FROM hot_meta_writes", &[])
+            .fixture_query(
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM hot_meta_writes",
+                &[],
+            )
             .await
             .unwrap();
         let [SqlValue::Int(n)] = rows[0].as_slice() else {
@@ -1414,6 +1417,34 @@ impl<'a> MetaWrites<'a> {
         };
         u64::try_from(*n).unwrap()
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn meta_write_meter_preserves_postgres_rollback_counts() {
+    let db = TestSql::with_schema().unwrap();
+    let writes = MetaWrites::start(&db);
+    assert_eq!(writes.count().await, 0);
+    let result = db
+        .fixture_batch(vec![
+            (
+                "INSERT INTO meta(k, v) VALUES ('meter_rollback', 1)",
+                vec![],
+            ),
+            ("INSERT INTO tx_guard(ok) VALUES (0)", vec![]),
+        ])
+        .await;
+    assert!(
+        matches!(result, Err(BridgeError::GuardFailed)),
+        "{result:?}"
+    );
+    assert!(db
+        .fixture_query("SELECT v FROM meta WHERE k = 'meter_rollback'", &[])
+        .await
+        .unwrap()
+        .is_empty());
+    // The shared SQLite meter intentionally discards rolled-back writes.
+    let expected = u64::from(db.dialect() == Dialect::Postgres);
+    assert_eq!(writes.count().await, expected, "rollback write count");
 }
 
 #[tokio::test(flavor = "current_thread")]

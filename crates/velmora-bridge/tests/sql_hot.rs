@@ -58,7 +58,7 @@ async fn hot_ctl_store_refuses_missing_expected_version_after_first_write() {
         .hot_ctl_store(None, &[(CAP, BYTES), (AT, at.0)])
         .await
         .unwrap());
-    for expected in [None, Some(next)] {
+    for expected in [None, Some(next), Some(UnixMs(at.0 - 1))] {
         assert!(
             !c.hot_ctl_store(expected, &[(CAP, 9), (AT, next.0)])
                 .await
@@ -170,7 +170,14 @@ async fn hot_eviction_keeps_pinned_safety_and_fences_stale_claims() {
             oldest_read_at: Some(UnixMs(100)),
         }
     );
-    assert_eq!(c.evict_candidates(1).await.unwrap()[0].extent, pinned);
+    let limited = c.evict_candidates(1).await.unwrap();
+    let [only] = limited.as_slice() else {
+        panic!(
+            "expected exactly one eviction candidate, got {}",
+            limited.len()
+        );
+    };
+    assert_eq!((&only.extent, only.pinned), (&pinned, true));
     let candidates = c.evict_candidates(2).await.unwrap();
     let (p, r) = (&candidates[0], &candidates[1]);
     assert_eq!(
