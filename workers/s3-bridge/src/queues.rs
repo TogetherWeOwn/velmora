@@ -700,6 +700,45 @@ mod tests {
     }
 
     #[test]
+    fn post_jobs_and_wakeups_reach_all_eight_bound_shards() {
+        let names = [
+            "POST_Q", "POST_Q2", "POST_Q3", "POST_Q4", "POST_Q5", "POST_Q6", "POST_Q7", "POST_Q8",
+        ];
+        let post = bound_queues("POST_Q", |name| names.contains(&name)).unwrap();
+        assert_eq!(post, 8);
+        let shards = Shards {
+            post,
+            verify: 4,
+            aux: true,
+        };
+        let mut visited = [false; 8];
+        for n in 0..128 {
+            let extent = ExtentId::new(format!("e_{n:x}"));
+            let generation = GenerationId::new("g_1");
+            let job = Job::Extent {
+                v: JOB_VERSION,
+                extent: extent.clone(),
+                generation: generation.clone(),
+                stage: OutboxStage::Post,
+            };
+            let wake = Job::Wake {
+                v: JOB_VERSION,
+                extent,
+                generation,
+                stage: OutboxStage::Post,
+                at: velmora_bridge::UnixMs(1),
+            };
+            let target = lane(&job, shards);
+            assert_eq!(lane(&wake, shards), target);
+            let Lane::Post(shard) = target else {
+                panic!("post job routed to {target:?}");
+            };
+            visited[shard] = true;
+        }
+        assert_eq!(visited, [true; 8]);
+    }
+
+    #[test]
     fn a_batch_is_split_by_queue_and_no_job_is_left_out() {
         let shards = Shards {
             post: 3,
