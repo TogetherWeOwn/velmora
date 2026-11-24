@@ -700,9 +700,14 @@ pub(super) async fn complete_upload<S: Sql>(
     open_at.push(int(revision)?);
     let fence = vec![(GUARD_REVISION, open_at.clone()), (FENCE_REVISION, open_at)];
     match c.sql.batch(fence).await {
-        Ok(_) => Ok(PublishOutcome::Fenced(
-            record.refused(super::GuardRefused(())),
-        )),
+        Ok(_) => {
+            let unpublished = record.refused(super::GuardRefused(()));
+            if failed.is_pg_overloaded() {
+                Ok(PublishOutcome::FencedOverloaded(unpublished))
+            } else {
+                Ok(PublishOutcome::Fenced(unpublished))
+            }
+        }
         // Still unknown, or it had applied: the record stays.
         Err(_) => Err(failed),
     }
@@ -934,4 +939,247 @@ pub(super) fn pg_statements() -> Vec<Stmt> {
         (GUARD_ADOPTED_LAYOUT_PG, "TII"),
         (POST_ADOPTED_PG, "TI"),
     ])
+}
+
+#[cfg(test)]
+mod complete_fence_tests {
+    use super::*;
+    use crate::ports::Catalog;
+    use crate::testkit::RusqliteSql;
+    use crate::types::{Bucket, ExtentPlacement, GenerationRow, SafetyState};
+    use std::cell::Cell;
+
+    struct FailOnce<S> {
+        inner: S,
+        error: Cell<Option<BridgeError>>,
+    }
+
+    impl<S: Sql> Sql for FailOnce<S> {
+        fn dialect(&self) -> Dialect {
+            self.inner.dialect()
+        }
+
+        async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+            self.inner.query(sql, params).await
+        }
+
+        async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+            self.inner.exec(sql, params).await
+        }
+
+        async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<u64>> {
+            if let Some(error) = self.error.take() {
+                return Err(error);
+            }
+            self.inner.batch(stmts).await
+        }
+    }
+
+    async fn complete_after_fence<S: Sql>(sql: S, overloaded: bool) {
+        let cat = SqlCatalog::new(FailOnce {
+            inner: sql,
+            error: Cell::new(None),
+        });
+        let now = UnixMs(1);
+        let bucket = BucketId::new("b_fixture");
+        let upload = UploadId::new("u_fixture");
+        let target = UploadTarget {
+            bucket: &bucket,
+            key: "fixture",
+            id: &upload,
+        };
+        assert!(matches!(
+            cat.create_bucket(&Bucket {
+                id: bucket.clone(),
+                name: "fence-test".into(),
+                owner: "fixture".into(),
+                bdk_wrapped: vec![0; 73],
+                kek_version: 1,
+                disposable: false,
+                created_at: now,
+            })
+            .await
+            .unwrap(),
+            Guard::Applied(())
+        ));
+        cat.create_upload(&UploadRow {
+            id: upload.clone(),
+            bucket_id: bucket.clone(),
+            key: target.key.into(),
+            content_json: "{}".into(),
+            user_meta_json: "{}".into(),
+            state: UploadState::Open,
+            revision: 0,
+            completed_generation_id: None,
+            complete_digest: None,
+            result_etag: None,
+            initiated_at: now,
+        })
+        .await
+        .unwrap();
+
+        let mut placements = Vec::new();
+        for part_number in 1..=2 {
+            let extent = ExtentRow {
+                id: ExtentId::new(format!("x_fixture_{part_number}")),
+                bucket_id: bucket.clone(),
+                generation_id: None,
+                state: ExtentState::Staged,
+                seq: None,
+                plain_offset: None,
+                plain_size: 1,
+                cipher_size: 65,
+                media_header: vec![0; 48],
+                key_mode: 1,
+                wrapped_file_key: Some(vec![1; 73]),
+                plain_md5: [0; 16],
+                plain_sha256: [0; 32],
+                cipher_sha256: [0; 32],
+                safety_state: SafetyState::Held,
+                article_count: None,
+                plan_rev: 0,
+                last_verified_at: None,
+                release_evidence: None,
+                released_at: None,
+                created_at: now,
+            };
+            let part = UploadPartRow {
+                upload_id: upload.clone(),
+                part_number,
+                extent_id: extent.id.clone(),
+                size: 1,
+                etag: format!("part-{part_number}"),
+                uploaded_at: now,
+            };
+            assert!(matches!(
+                cat.put_upload_part(&target, &part, &extent, now)
+                    .await
+                    .unwrap(),
+                Guard::Applied(())
+            ));
+            placements.push(ExtentPlacement {
+                extent_id: extent.id,
+                seq: u32::from(part_number - 1),
+                plain_offset: u64::from(part_number - 1),
+            });
+        }
+        let (before, original_parts) = cat.upload(&target).await.unwrap().unwrap();
+        let id = GenerationId::new("g_before_fence");
+        let digest = [7; 32];
+        let completion = CompleteUpload {
+            generation: GenerationRow {
+                id: id.clone(),
+                bucket_id: bucket.clone(),
+                key: target.key.into(),
+                state: GenerationState::Live,
+                size: 2,
+                etag: "result".into(),
+                checksum_json: None,
+                content_json: "{}".into(),
+                user_meta_json: "{}".into(),
+                extent_count: 2,
+                created_at: now,
+                retired_at: None,
+            },
+            placements,
+            now,
+        };
+        cat.sql.error.set(Some(BridgeError::Sql(
+            if overloaded {
+                "pg: overloaded"
+            } else {
+                "fixture: unknown commit"
+            }
+            .into(),
+        )));
+        let result = cat
+            .complete_upload(
+                &target,
+                before.revision,
+                &digest,
+                &completion,
+                None,
+                Recorded::for_test(&id),
+            )
+            .await
+            .unwrap();
+        let record = match result {
+            PublishOutcome::FencedOverloaded(record) if overloaded => record,
+            PublishOutcome::Fenced(record) if !overloaded => record,
+            PublishOutcome::Fenced(_) => {
+                panic!("Complete returned ordinary Fenced after PostgreSQL overload")
+            }
+            _ => panic!("Complete did not return the expected fenced outcome"),
+        };
+        assert_eq!(record.generation(), &id);
+        let (fenced, retained_parts) = cat.upload(&target).await.unwrap().unwrap();
+        assert_eq!(fenced.state, UploadState::Open);
+        assert_eq!(fenced.revision, before.revision + 1);
+        assert_eq!(retained_parts, original_parts);
+        assert!(matches!(
+            cat.complete_upload(
+                &target,
+                before.revision,
+                &digest,
+                &completion,
+                None,
+                Recorded::for_test(&id)
+            )
+            .await
+            .unwrap(),
+            PublishOutcome::Refused(_)
+        ));
+
+        // The next Complete request retains the upload, digest and parts,
+        // but publishes a fresh generation at the new upload revision.
+        let mut retry = completion;
+        let retry_id = GenerationId::new("g_retry");
+        retry.generation.id = retry_id.clone();
+        assert!(matches!(
+            cat.complete_upload(
+                &target,
+                fenced.revision,
+                &digest,
+                &retry,
+                None,
+                Recorded::for_test(&retry_id)
+            )
+            .await
+            .unwrap(),
+            PublishOutcome::Applied
+        ));
+        let (completed, parts) = cat.upload(&target).await.unwrap().unwrap();
+        assert_eq!(completed.state, UploadState::Completed);
+        assert_eq!(completed.completed_generation_id.as_ref(), Some(&retry_id));
+        assert_eq!(completed.complete_digest, Some(digest));
+        assert_eq!(parts, original_parts);
+        let (generation, extents) = cat.live_object(&bucket, target.key).await.unwrap().unwrap();
+        assert_eq!(generation.id, retry_id);
+        assert_eq!(
+            extents.iter().map(|e| &e.id).collect::<Vec<_>>(),
+            original_parts
+                .iter()
+                .map(|p| &p.extent_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cat.sql
+                .query("SELECT COUNT(*) FROM generations", &[])
+                .await
+                .unwrap(),
+            vec![vec![SqlValue::Int(1)]]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_unknown_complete_stays_fenced_and_retry_publishes_once() {
+        complete_after_fence(RusqliteSql::with_schema().unwrap(), false).await;
+    }
+
+    #[tokio::test]
+    async fn complete_preserves_overload_class_after_fencing() {
+        // SQLite supplies the transactional fixture; the first Complete
+        // batch receives the same classified error as the PG adapter.
+        complete_after_fence(RusqliteSql::with_schema().unwrap(), true).await;
+    }
 }
