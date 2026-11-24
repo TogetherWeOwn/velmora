@@ -207,6 +207,15 @@ pub(super) fn adopt_in(
     stmts
 }
 
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<Stmt> {
+    super::pg_manifest(&[
+        (ADOPT_RECORD_PG, "TTT"),
+        (ADOPT_UPLOAD_PG, "TTTT"),
+        (REFERENCE_SHARED_PG, "TTT"),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,13 +379,4 @@ mod tests {
             assert_eq!((pair[0].0, pair[1].0), (ADOPT_RECORD, REFERENCE_SHARED));
         }
     }
-}
-
-#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
-pub(super) fn pg_statements() -> Vec<Stmt> {
-    super::pg_manifest(&[
-        (ADOPT_RECORD_PG, "TTT"),
-        (ADOPT_UPLOAD_PG, "TTTT"),
-        (REFERENCE_SHARED_PG, "TTT"),
-    ])
 }

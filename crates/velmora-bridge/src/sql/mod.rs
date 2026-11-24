@@ -1116,3 +1116,27 @@ pub fn pg_datapath_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
     .flatten()
     .collect()
 }
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod pg_manifest_tests {
+    use super::pg_datapath_statements;
+
+    #[test]
+    fn declared_binds_cover_every_statement_position() {
+        for (sql, params) in pg_datapath_statements() {
+            // A typed PREPARE alone may infer missing trailing types. Check
+            // arity explicitly, ignoring markers inside quoted SQL literals.
+            let highest = sql
+                .split('\'')
+                .step_by(2)
+                .flat_map(|code| code.split('?').skip(1))
+                .filter_map(|tail| {
+                    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+                    tail[..digits].parse::<usize>().ok()
+                })
+                .max()
+                .unwrap_or(0);
+            assert_eq!(params.len(), highest, "inventory bind count: {sql}");
+        }
+    }
+}

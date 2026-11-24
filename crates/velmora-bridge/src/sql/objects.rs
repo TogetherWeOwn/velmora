@@ -1539,7 +1539,7 @@ pub(super) fn pg_statements() -> Vec<Stmt> {
         (NEWEST_ID, "TT"),
         (INSERT_EXTENT_REFERENCE_PG, "T"),
         (ENQUEUE_POST, "TTI"),
-        (GUARD_COPY_SOURCE, "TTT"),
+        (GUARD_COPY_SOURCE, "TTTITI"),
         (COPY_REFERENCES, "TT"),
         (GUARD_REFERENCE_COUNT, "TI"),
         (STATUS_EXTENTS, "T"),
