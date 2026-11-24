@@ -148,6 +148,17 @@ fn frozen_d1_comment_handling_matches_sqlite() {
 }
 
 #[test]
+fn frozen_d1_refuses_named_binds_in_a_single_read() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    let sql = "SELECT :arg(--)";
+    let stmt = db.prepare(sql).unwrap();
+    assert!(stmt.readonly());
+    assert_eq!(stmt.parameter_count(), 1);
+    assert!(!super::is_read_only(sql));
+    assert!(super::is_read_only("SELECT ?1"));
+}
+
+#[test]
 fn bound_values_are_validated_before_connection() {
     use crate::{SqlValue, MAX_SQL_INT, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES};
     for v in [MAX_SQL_INT, -MAX_SQL_INT] {
