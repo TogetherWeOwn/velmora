@@ -704,6 +704,39 @@ class OlderSwitchesTest(GeneratorCase):
         self.refused({"VELMORA_D1_DATABASE_ID": "not-a-uuid"}, "VELMORA_D1_DATABASE_ID is missing")
 
 
+class RecoveryCopyParallelFreshTest(GeneratorCase):
+    switch = "RECOVERY_COPY_PARALLEL_FRESH"
+
+    def test_the_step_uses_the_production_variable(self):
+        self.assertEqual(self.step.env.get(self.switch), f"vars.{self.switch}")
+
+    def test_unset_empty_and_off_preserve_the_shipped_default(self):
+        for value in (None, "", "off"):
+            with self.subTest(value=value):
+                _, written = self.ok({self.switch: value})
+                self.assertEqual(written, without_switches(self.shipped))
+                self.assertNotIn(self.switch, tomllib.loads(written.decode("utf-8"))["vars"])
+
+    def test_on_adds_only_the_prod_vars_binding(self):
+        for copy in ("off", "on"):
+            with self.subTest(copy=copy):
+                older = {"VELMORA_RECOVERY_COPY": copy, "VELMORA_RECOVERY_PREFIX": PREFIX}
+                _, written = self.ok({**older, self.switch: "on"})
+                before = tomllib.loads(with_older(self.shipped, older).decode("utf-8"))
+                after = tomllib.loads(written.decode("utf-8"))
+                self.assertEqual(after["vars"].pop(self.switch, None), "on")
+                self.assertEqual(after, before)
+
+    def test_other_values_are_refused_without_writing(self):
+        for value in ("ON", "true", " on", "on\n"):
+            with self.subTest(value=value):
+                self.refused({self.switch: value}, f"{self.switch} must be unset, off or on")
+
+    def test_a_shipped_binding_cannot_enable_the_switch_by_default(self):
+        doctored = add_after(self.shipped, 'RECOVERY_COPY = "off"', f'"{self.switch}" = "on"')
+        self.refused({}, f"the generated config does not carry the {self.switch} setting that was asked for", doctored)
+
+
 class ReleaseAtVerifyTest(GeneratorCase):
     switch = "VELMORA_RELEASE_AT_VERIFY"
     shipped_line = 'RELEASE_AT_VERIFY = "off"'

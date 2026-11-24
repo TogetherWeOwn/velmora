@@ -840,6 +840,9 @@ jobs:
       # name no prefix, whatever the switch says. The store's endpoint,
       # region, bucket and keys are Worker secrets: this job writes none
       # of them, and a plain var set outside it is gone after a deploy.
+      # RECOVERY_COPY_PARALLEL_FRESH adds its binding to prod [vars]
+      # only for "on". Unset, empty or "off" leaves it absent; any
+      # other value fails this step before Wrangler runs.
       # The verify stage is switched the same way: VELMORA_VERIFY_MODE
       # (unset, empty or "body": the shipped "body" stays; "light"). Any
       # other value fails this step and nothing is deployed. The shipped
@@ -895,6 +898,7 @@ jobs:
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
+          RECOVERY_COPY_PARALLEL_FRESH: ${{ vars.RECOVERY_COPY_PARALLEL_FRESH }}
           VELMORA_VERIFY_MODE: ${{ vars.VELMORA_VERIFY_MODE }}
           VELMORA_RECORD_LAYOUT: ${{ vars.VELMORA_RECORD_LAYOUT }}
           VELMORA_RELEASE_AT_VERIFY: ${{ vars.VELMORA_RELEASE_AT_VERIFY }}
@@ -923,6 +927,9 @@ jobs:
               sys.exit("VELMORA_RECOVERY_PREFIX is not lowercase segments that each end with a slash")
           if copy == "on" and not prefix_ok:
               sys.exit("VELMORA_RECOVERY_COPY is on and VELMORA_RECOVERY_PREFIX is missing")
+          parallel_fresh = os.environ.get("RECOVERY_COPY_PARALLEL_FRESH", "") or "off"
+          if parallel_fresh not in ("off", "on"):
+              sys.exit("RECOVERY_COPY_PARALLEL_FRESH must be unset, off or on")
           mode = os.environ.get("VELMORA_VERIFY_MODE", "") or "body"
           if mode not in ("body", "light"):
               sys.exit("VELMORA_VERIFY_MODE must be unset, body or light")
@@ -970,11 +977,13 @@ jobs:
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
           ]
-          # One line in, two lines out with "on": the switch and its
-          # prefix. Checked also when the switch is off.
+          # Keep the recovery copy setting and its optional prefix and
+          # parallel-fresh opt-in together in the prod [vars] table.
           shipped = 'RECOVERY_COPY = "off"'
-          subs.append((shipped, f'RECOVERY_COPY = "on"\nRECOVERY_PREFIX = "{prefix}"'
-                       if copy == "on" else shipped))
+          copy_vars = f'RECOVERY_COPY = "on"\nRECOVERY_PREFIX = "{prefix}"' if copy == "on" else shipped
+          if parallel_fresh == "on":
+              copy_vars += '\nRECOVERY_COPY_PARALLEL_FRESH = "on"'
+          subs.append((shipped, copy_vars))
           switch = [i for i in range(end) if lines[i].strip() == shipped]
           tables = [lines[i].strip() for i in range(switch[0] if switch else 0)
                     if header.match(lines[i])]
@@ -1047,6 +1056,8 @@ jobs:
               sys.exit("the generated config does not carry the record layout that was asked for")
           if prod_vars.get("RELEASE_AT_VERIFY") != release:
               sys.exit("the generated config does not carry the release-at-verify setting that was asked for")
+          if prod_vars.get("RECOVERY_COPY_PARALLEL_FRESH") != ("on" if parallel_fresh == "on" else None):
+              sys.exit("the generated config does not carry the RECOVERY_COPY_PARALLEL_FRESH setting that was asked for")
           # The segment writer is on when one object may have more
           # extents than one record holds. Its records must not get
           # flat names. Absent or empty is the Worker's default, which
