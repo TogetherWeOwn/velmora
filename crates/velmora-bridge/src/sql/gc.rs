@@ -278,11 +278,7 @@ pub(super) async fn gc_due<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT gc.id, gc.extent_id, gc.action, gc.due_at FROM gc \
-             WHERE gc.done_at IS NULL AND gc.due_at <= ?1 \
-               AND (?2 = 0 OR EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
-                    WHERE e.id = gc.extent_id AND b.disposable = 1)) \
-             ORDER BY gc.due_at, gc.id LIMIT ?3",
+            GC_DUE,
             &[
                 ms(now),
                 SqlValue::Int(i64::from(disposable_only)),
@@ -319,19 +315,10 @@ pub(super) async fn gc_begin<S: Sql>(
             text(row.action.as_str()),
         ]
     };
-    let close: Stmt = (
-        "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND done_at IS NULL",
-        vec![SqlValue::Int(row.id), ms(now)],
-    );
+    let close: Stmt = (MARK_KEY_GC_DONE, vec![SqlValue::Int(row.id), ms(now)]);
     let free = match row.action {
         GcAction::DeleteCache | GcAction::DeleteSafety => {
-            let rows = c
-                .sql
-                .query(
-                    concat!("SELECT ", open_row!(), " AND NOT ", in_use!()),
-                    &ident(),
-                )
-                .await?;
+            let rows = c.sql.query(GC_OPEN_QUERY, &ident()).await?;
             let free = match rows.into_iter().next() {
                 Some(r) => Cols::new(r).num::<i64>()? != 0,
                 None => false,
@@ -346,37 +333,24 @@ pub(super) async fn gc_begin<S: Sql>(
                 // the next eviction.) The sequence is bumped only so that
                 // every change to the counts ends outstanding listings.
                 c.sql
-                    .exec(
-                        "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
-                         WHERE id = ?1 AND hot_cache_bytes > 0",
-                        &[text(row.extent_id.as_str())],
-                    )
+                    .exec(CLEAR_DELETED_CACHE, &[text(row.extent_id.as_str())])
                     .await?;
             }
             free
         }
         GcAction::ShredKey | GcAction::DropArticlesMeta => {
             let apply = if row.action == GcAction::ShredKey {
-                "UPDATE extents SET wrapped_file_key = NULL WHERE id = ?1"
+                SHRED_KEY
             } else {
-                "DELETE FROM articles WHERE extent_id = ?1"
+                DROP_ARTICLES
             };
             let stmts = vec![
-                (
-                    concat!(
-                        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
-                        open_row!(),
-                        " OR ",
-                        in_use!()
-                    ),
-                    ident(),
-                ),
+                (GUARD_GC_OPEN, ident()),
                 (apply, vec![text(row.extent_id.as_str())]),
                 // The article metadata of a packed plan is the plan, and
                 // the parity addendum beside it.
                 (
-                    "UPDATE extents SET plan = NULL, parity = NULL, parity_count = NULL \
-                     WHERE id = ?1 AND ?2 = 'drop_articles_meta'",
+                    DROP_PLAN,
                     vec![text(row.extent_id.as_str()), text(row.action.as_str())],
                 ),
                 close,
@@ -390,8 +364,7 @@ pub(super) async fn gc_begin<S: Sql>(
     if !free {
         c.sql
             .exec(
-                "UPDATE gc SET due_at = ?4 WHERE id = ?2 AND extent_id = ?1 AND action = ?3 \
-                   AND done_at IS NULL",
+                DEFER_GC,
                 &[ident(), vec![ms(now.plus_ms(SKIP_RETRY_MS))]].concat(),
             )
             .await?;
@@ -415,17 +388,8 @@ pub(super) async fn gc_begin<S: Sql>(
 pub(super) async fn gc_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
         .batch(vec![
-            (
-                "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
-                   evict_seq = evict_seq + 1 \
-                 WHERE id = (SELECT extent_id FROM gc \
-                 WHERE id = ?1 AND action = 'delete_safety' AND done_at IS NULL)",
-                vec![SqlValue::Int(id)],
-            ),
-            (
-                "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND done_at IS NULL",
-                vec![SqlValue::Int(id), ms(now)],
-            ),
+            (DELETE_GC_SAFETY, vec![SqlValue::Int(id)]),
+            (MARK_SAFETY_GC_DONE, vec![SqlValue::Int(id), ms(now)]),
         ])
         .await?;
     Ok(())
@@ -475,10 +439,7 @@ impl OrphanCursor {
 }
 
 async fn orphan_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<OrphanCursor> {
-    let rows = c
-        .sql
-        .query("SELECT v FROM scan_cursors WHERE k = 'orphans'", &[])
-        .await?;
+    let rows = c.sql.query(GC_ORPHAN_CURSOR, &[]).await?;
     Ok(match rows.into_iter().next() {
         Some(row) => OrphanCursor::parse(&Cols::new(row).text()?),
         None => OrphanCursor::START,
@@ -514,21 +475,7 @@ pub(super) async fn gc_orphans<S: Sql>(
     let rows = c
         .sql
         .query(
-            concat!(
-                "SELECT w.id, w.extent_id, w.due_at, \
-                   (w.action = 'delete_safety' AND ",
-                orphan!("w.extent_id"),
-                ") FROM (SELECT id, extent_id, action, due_at FROM \
-                   (SELECT id, extent_id, action, due_at FROM gc \
-                     WHERE done_at IS NULL AND due_at = ?2 AND id > ?3 AND due_at <= ?1 \
-                     ORDER BY id LIMIT ?4) \
-                  UNION ALL SELECT id, extent_id, action, due_at FROM \
-                   (SELECT id, extent_id, action, due_at FROM gc \
-                     WHERE done_at IS NULL AND due_at > ?2 AND due_at <= ?1 \
-                     ORDER BY due_at, id LIMIT ?4) \
-                  ORDER BY due_at, id LIMIT ?4) w \
-                 ORDER BY w.due_at, w.id"
-            ),
+            c.sql.dialect().pick(GC_ORPHAN_WINDOW, GC_ORPHAN_WINDOW_PG),
             &[
                 ms(cutoff),
                 SqlValue::Int(due),
@@ -564,11 +511,7 @@ pub(super) async fn gc_orphans<S: Sql>(
         }
     }
     c.sql
-        .exec(
-            "INSERT INTO scan_cursors(k, v) VALUES ('orphans', ?1) \
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            &[text(&next.encode())],
-        )
+        .exec(SET_GC_ORPHAN_CURSOR, &[text(&next.encode())])
         .await?;
     Ok(out)
 }
@@ -659,10 +602,9 @@ async fn orphan_claims<S: Sql>(
     let found = c
         .sql
         .query(
-            "SELECT e.id, e.bucket_id, \
-               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id), \
-               (SELECT v FROM scan_cursors WHERE k = 'orphans:bucket:' || e.bucket_id) \
-             FROM extents e WHERE e.id IN (SELECT value FROM json_each(?1))",
+            c.sql
+                .dialect()
+                .pick(ORPHAN_CLAIM_INPUTS, ORPHAN_CLAIM_INPUTS_PG),
             &[text(&ids)],
         )
         .await?;
@@ -726,7 +668,9 @@ async fn orphan_claims<S: Sql>(
                 }
             }
             stmts.push((
-                GUARD_BUCKET_FOUND_CLEAN,
+                c.sql
+                    .dialect()
+                    .pick(GUARD_BUCKET_FOUND_CLEAN, GUARD_BUCKET_FOUND_CLEAN_PG),
                 vec![text(&row), SqlValue::Int(fresh)],
             ));
         }
@@ -776,13 +720,243 @@ async fn orphan_claims<S: Sql>(
 /// pass claims it once more, which sets the state and the usage right.
 pub(super) async fn gc_orphan_done<S: Sql>(c: &SqlCatalog<S>, id: i64, now: UnixMs) -> Result<()> {
     c.sql
-        .exec(
-            "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND action = 'delete_safety' \
-               AND done_at IS NULL AND EXISTS \
-               (SELECT 1 FROM extents de WHERE de.id = gc.extent_id \
-                  AND de.safety_state = 'deleted')",
-            &[SqlValue::Int(id), ms(now)],
-        )
+        .exec(MARK_ORPHAN_DONE, &[SqlValue::Int(id), ms(now)])
         .await?;
     Ok(())
+}
+
+// Match SQLite's integer cast: take the decimal prefix, discard leading
+// zeroes before the overflow check, and saturate positive overflow.
+const GUARD_BUCKET_FOUND_CLEAN_PG: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS \
+       (SELECT 1 FROM scan_cursors \
+          CROSS JOIN LATERAL (SELECT ltrim(substring(v from '^clean:([0-9]+)'), '0') AS digits) d \
+          WHERE k = ?1 AND v ~ '^clean:[0-9]' AND CASE \
+            WHEN d.digits = '' THEN 0 \
+            WHEN length(d.digits) > 19 OR (length(d.digits) = 19 \
+              AND d.digits COLLATE \"C\" > '9223372036854775807') THEN 9223372036854775807 \
+            ELSE d.digits::bigint END > ?2)";
+
+const GC_DUE: &str = "SELECT gc.id, gc.extent_id, gc.action, gc.due_at FROM gc \
+             WHERE gc.done_at IS NULL AND gc.due_at <= ?1 \
+               AND (?2 = 0 OR EXISTS (SELECT 1 FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+                    WHERE e.id = gc.extent_id AND b.disposable = 1)) \
+             ORDER BY gc.due_at, gc.id LIMIT ?3";
+
+const MARK_KEY_GC_DONE: &str = "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND done_at IS NULL";
+
+const GC_OPEN_QUERY: &str = concat!("SELECT ", open_row!(), " AND NOT ", in_use!());
+
+const CLEAR_DELETED_CACHE: &str =
+    "UPDATE extents SET hot_cache_bytes = 0, evict_seq = evict_seq + 1 \
+                         WHERE id = ?1 AND hot_cache_bytes > 0";
+
+const SHRED_KEY: &str = "UPDATE extents SET wrapped_file_key = NULL WHERE id = ?1";
+
+const DROP_ARTICLES: &str = "DELETE FROM articles WHERE extent_id = ?1";
+
+const GUARD_GC_OPEN: &str = concat!(
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
+    open_row!(),
+    " OR ",
+    in_use!()
+);
+
+const DROP_PLAN: &str = "UPDATE extents SET plan = NULL, parity = NULL, parity_count = NULL \
+                     WHERE id = ?1 AND ?2 = 'drop_articles_meta'";
+
+const DEFER_GC: &str =
+    "UPDATE gc SET due_at = ?4 WHERE id = ?2 AND extent_id = ?1 AND action = ?3 \
+                   AND done_at IS NULL";
+
+const DELETE_GC_SAFETY: &str =
+    "UPDATE extents SET safety_state = 'deleted', hot_safety_bytes = 0, \
+                   evict_seq = evict_seq + 1 \
+                 WHERE id = (SELECT extent_id FROM gc \
+                 WHERE id = ?1 AND action = 'delete_safety' AND done_at IS NULL)";
+
+const MARK_SAFETY_GC_DONE: &str = "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND done_at IS NULL";
+
+const GC_ORPHAN_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'orphans'";
+
+macro_rules! gc_orphan_window {
+    ($orphan:expr) => {
+        concat!(
+            "SELECT w.id, w.extent_id, w.due_at, \
+                   (w.action = 'delete_safety' AND ",
+            $orphan,
+            ") FROM (SELECT id, extent_id, action, due_at FROM \
+                   (SELECT id, extent_id, action, due_at FROM gc \
+                     WHERE done_at IS NULL AND due_at = ?2 AND id > ?3 AND due_at <= ?1 \
+                     ORDER BY id LIMIT ?4) \
+                  UNION ALL SELECT id, extent_id, action, due_at FROM \
+                   (SELECT id, extent_id, action, due_at FROM gc \
+                     WHERE done_at IS NULL AND due_at > ?2 AND due_at <= ?1 \
+                     ORDER BY due_at, id LIMIT ?4) \
+                  ORDER BY due_at, id LIMIT ?4) w \
+                 ORDER BY w.due_at, w.id"
+        )
+    };
+}
+
+const GC_ORPHAN_WINDOW: &str = gc_orphan_window!(orphan!("w.extent_id"));
+
+// Projected EXISTS checks can become hashed subplans over every reference
+// in the catalogue. Scalar, correlated one-row probes only consult the
+// current candidate. The claim batch still rechecks the original guards.
+pub(super) const GC_ORPHAN_WINDOW_PG: &str = gc_orphan_window!(
+    "((SELECT 1 FROM extents oe WHERE oe.id = w.extent_id \
+      AND oe.state = 'staged' AND oe.generation_id IS NULL \
+      AND oe.safety_state IN ('held', 'deleted')) IS NOT NULL \
+      AND (SELECT 1 FROM generation_extents og WHERE og.extent_id = w.extent_id LIMIT 1) IS NULL \
+      AND (SELECT 1 FROM upload_parts pr JOIN uploads pu ON pu.id = pr.upload_id \
+           WHERE pr.extent_id = w.extent_id AND pu.state = 'open' LIMIT 1) IS NULL \
+      AND (SELECT 1 FROM upload_part_extents px JOIN uploads pu ON pu.id = px.upload_id \
+           WHERE px.extent_id = w.extent_id AND pu.state = 'open' LIMIT 1) IS NULL)"
+);
+
+const SET_GC_ORPHAN_CURSOR: &str = "INSERT INTO scan_cursors(k, v) VALUES ('orphans', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+
+const MARK_ORPHAN_DONE: &str =
+    "UPDATE gc SET done_at = ?2 WHERE id = ?1 AND action = 'delete_safety' \
+               AND done_at IS NULL AND EXISTS \
+               (SELECT 1 FROM extents de WHERE de.id = gc.extent_id \
+                  AND de.safety_state = 'deleted')";
+
+const ORPHAN_CLAIM_INPUTS: &str = "SELECT e.id, e.bucket_id, \
+               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id), \
+               (SELECT v FROM scan_cursors WHERE k = 'orphans:bucket:' || e.bucket_id) \
+             FROM extents e WHERE e.id IN (SELECT value FROM json_each(?1))";
+
+const ORPHAN_CLAIM_INPUTS_PG: &str = "SELECT e.id, e.bucket_id, \
+               EXISTS (SELECT 1 FROM upload_parts kp WHERE kp.extent_id = e.id), \
+               (SELECT v FROM scan_cursors WHERE k = 'orphans:bucket:' || e.bucket_id) \
+             FROM extents e WHERE e.id IN (SELECT value FROM jsonb_array_elements_text(?1::jsonb) AS j(value))";
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (BUCKET_VERDICT.to_owned(), vec![T, T, T, T]),
+        (GUARD_NO_REPLAY_SINCE.to_owned(), vec![I]),
+        (CLAIM_OF_UPLOAD.to_owned(), vec![T, I, I]),
+        (CLAIM_IN_BUCKET.to_owned(), vec![T, I, I, T]),
+        (GUARD_BUCKET_FOUND_CLEAN_PG.to_owned(), vec![T, I]),
+        (GC_DUE.to_owned(), vec![I, I, I]),
+        (MARK_KEY_GC_DONE.to_owned(), vec![I, I]),
+        (GC_OPEN_QUERY.to_owned(), vec![T, I, T]),
+        (CLEAR_DELETED_CACHE.to_owned(), vec![T]),
+        (SHRED_KEY.to_owned(), vec![T]),
+        (DROP_ARTICLES.to_owned(), vec![T]),
+        (GUARD_GC_OPEN.to_owned(), vec![T, I, T]),
+        (DROP_PLAN.to_owned(), vec![T, T]),
+        (DEFER_GC.to_owned(), vec![T, I, T, I]),
+        (DELETE_GC_SAFETY.to_owned(), vec![I]),
+        (MARK_SAFETY_GC_DONE.to_owned(), vec![I, I]),
+        (GC_ORPHAN_CURSOR.to_owned(), vec![]),
+        (GC_ORPHAN_WINDOW_PG.to_owned(), vec![I, I, I, I]),
+        (SET_GC_ORPHAN_CURSOR.to_owned(), vec![T]),
+        (MARK_ORPHAN_DONE.to_owned(), vec![I, I]),
+        (ORPHAN_CLAIM_INPUTS_PG.to_owned(), vec![T]),
+    ]
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::GUARD_BUCKET_FOUND_CLEAN;
+    use rusqlite::{params, Connection};
+
+    #[test]
+    fn bucket_verdict_uses_strict_saturating_decimal_prefix() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE scan_cursors (k TEXT PRIMARY KEY, v TEXT NOT NULL);\
+             CREATE TABLE tx_guard (ok INTEGER NOT NULL CHECK (ok = 1));",
+        )
+        .unwrap();
+        for (value, cutoff, allowed) in verdict_cases() {
+            db.execute(
+                "INSERT OR REPLACE INTO scan_cursors VALUES ('bucket', ?1)",
+                [value],
+            )
+            .unwrap();
+            let result = db.execute(GUARD_BUCKET_FOUND_CLEAN, params!["bucket", cutoff]);
+            if allowed {
+                assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ConstraintViolation),
+                    "{value} at {cutoff}"
+                );
+            }
+        }
+    }
+
+    fn verdict_cases() -> impl Iterator<Item = (&'static str, i64, bool)> {
+        [
+            ("clean:123", Some(123)),
+            ("clean:123x", Some(123)),
+            ("clean:", None),
+            ("clean:0000000000000000001", Some(1)),
+            ("clean:00000000000000000001", Some(1)),
+            ("clean:000000000000000000000123", Some(123)),
+            (
+                "clean:00000000000000000000009223372036854775807",
+                Some(i64::MAX),
+            ),
+            ("clean:9223372036854775808", Some(i64::MAX)),
+            ("clean:99999999999999999999", Some(i64::MAX)),
+            ("dirty", None),
+            ("clean:0", Some(0)),
+            ("clean:-5", None),
+            ("clean: 5", None),
+            ("clean:+5", None),
+            ("clean:12.9", Some(12)),
+            ("clean:1e5", Some(1)),
+            ("CLEAN:5", None),
+            ("clean:١", None),
+            ("clean:0000x", Some(0)),
+        ]
+        .into_iter()
+        .flat_map(|(value, parsed)| {
+            [-1, 0, 1, 11, 122, 123, i64::MAX - 1, i64::MAX]
+                .into_iter()
+                .map(move |cutoff| (value, cutoff, parsed.is_some_and(|time| time > cutoff)))
+        })
+    }
+
+    #[cfg(feature = "pg-test-record")]
+    #[tokio::test]
+    async fn postgres_bucket_verdict_matches_sqlite_cases() {
+        use crate::gate::pg_background_fixture as pg;
+        let Some(mut db) = pg::connect().await else {
+            return;
+        };
+        let mut tx = pg::transaction(&mut db).await;
+        let guard = pg::sql(super::GUARD_BUCKET_FOUND_CLEAN_PG);
+        for (value, cutoff, allowed) in verdict_cases() {
+            let case = tx.transaction().await.unwrap();
+            case.execute("INSERT INTO scan_cursors VALUES ('bucket', $1)", &[&value])
+                .await
+                .unwrap();
+            let result = case.execute(&guard, &[&"bucket", &cutoff]).await;
+            if allowed {
+                assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
+            } else {
+                let Err(error) = result else {
+                    panic!("{value} at {cutoff} should be refused");
+                };
+                assert_eq!(
+                    error.as_db_error().and_then(|e| e.constraint()),
+                    Some("tx_guard_ok"),
+                    "{value} at {cutoff}: {error:?}"
+                );
+            }
+            case.rollback().await.unwrap();
+        }
+        tx.rollback().await.unwrap();
+    }
 }
