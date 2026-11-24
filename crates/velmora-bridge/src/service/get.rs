@@ -29,7 +29,7 @@ use crate::fetch::{
     ColdFetch, ColdReader, COLD_WAIT_MS,
 };
 use crate::ingress::{ByteBudget, Charge, Spawner, CHARGE_WAIT_MS};
-use crate::metrics::{GetFailureStage as Stage, GetObservation};
+use crate::metrics::{Fault, GetFailureStage as Stage, GetObservation};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::types::{
     BridgeError, Bucket, ByteSpan, ExtentId, ExtentRow, GenerationId, RespBody, Result, S3Request,
@@ -177,23 +177,33 @@ enum ReadFail {
     Busy(Stage),
     /// No source holds the extent intact: `503 ServiceUnavailable`.
     Unavailable(Stage),
-    Internal(Stage),
+    /// With the port error behind it, when there was one.
+    Internal(Stage, Option<Fault>),
 }
 
 impl ReadFail {
     fn cold_error(error: BridgeError) -> Self {
-        Self::Internal(match error {
+        let stage = match error {
             BridgeError::Sql(_) | BridgeError::GuardFailed => Stage::Lookup,
             BridgeError::Blob(_) => Stage::R2,
             BridgeError::Nntp(_) => Stage::Nntp,
             BridgeError::Crypto(_) => Stage::Decrypt,
             _ => Stage::Other,
-        })
+        };
+        Self::Internal(stage, Some(Fault::of(&error)))
+    }
+
+    /// Marks this failure on `observed`: its stage, and its error if known.
+    fn mark(&self, observed: &mut GetObservation) {
+        match *self {
+            Self::Internal(stage, Some(fault)) => observed.mark_fault(stage, fault),
+            _ => observed.mark_stage(self.stage()),
+        }
     }
 
     fn stage(&self) -> Stage {
         match *self {
-            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage) => stage,
+            Self::Busy(stage) | Self::Unavailable(stage) | Self::Internal(stage, _) => stage,
         }
     }
 
@@ -201,7 +211,7 @@ impl ReadFail {
         match self {
             ReadFail::Busy(_) => s3_error(ErrorCode::SlowDown),
             ReadFail::Unavailable(_) => unavailable(),
-            ReadFail::Internal(_) => internal(),
+            ReadFail::Internal(..) => internal(),
         }
     }
 
@@ -212,7 +222,7 @@ impl ReadFail {
             ReadFail::Unavailable(_) => {
                 BridgeError::Invalid("read interrupted: extent unavailable")
             }
-            ReadFail::Internal(_) => BridgeError::Invalid("read interrupted"),
+            ReadFail::Internal(..) => BridgeError::Invalid("read interrupted"),
         }
     }
 }
@@ -681,7 +691,7 @@ async fn body<
     let first = match items.next().await {
         Some((Ok(held), hit_bytes)) => (Ok(held), hit_bytes),
         Some((Err(fail), _)) => {
-            observed.mark_stage(fail.stage());
+            fail.mark(observed);
             return Err(fail.response());
         }
         None => {
@@ -1072,7 +1082,7 @@ where
                 )
                 .await
                 .map_err(|fail| {
-                    observed.mark_stage(fail.stage());
+                    fail.mark(observed);
                     fail.response()
                 })?,
             );
@@ -1086,7 +1096,7 @@ where
             read_piece(bridge, bucket, piece, first_eligible_at)
                 .await
                 .map_err(|fail| {
-                    observed.mark_stage(fail.stage());
+                    fail.mark(observed);
                     fail.response()
                 })?,
         );
@@ -1498,7 +1508,8 @@ where
                     break;
                 };
                 drop(src);
-                let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
+                let held =
+                    retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget, None))?;
                 if !self.no_cold_fill {
                     self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
                 }
@@ -1515,7 +1526,7 @@ where
         self.until = None;
         self.from_r2 = false;
         let span = cipher_span(extent.plain_size, piece.off, piece.len)
-            .ok_or(ReadFail::Internal(Stage::Plan))?;
+            .ok_or(ReadFail::Internal(Stage::Plan, None))?;
         match self.warm(bucket, piece, span).await {
             Err(ReadFail::Unavailable(_)) => {}
             found => {
@@ -1624,7 +1635,7 @@ where
                     drop(work);
                     let held = room
                         .try_charge(plain.len() as u64)
-                        .ok_or(ReadFail::Internal(Stage::Budget))?;
+                        .ok_or(ReadFail::Internal(Stage::Budget, None))?;
                     let spent = Rc::clone(&self.spent);
                     self.put = prepare_verified_fill(
                         &room,

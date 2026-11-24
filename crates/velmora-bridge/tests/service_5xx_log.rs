@@ -105,6 +105,21 @@ async fn a_put_that_fails_logs_its_stage_variant_and_code() {
     assert_eq!(fields(&line), "stage=budget err=SlowDown code=-");
     drop(held);
 
+    // The live-object read of a conditional PUT.
+    *sql.fail_matching.borrow_mut() = Some(("FROM objects o JOIN generations", 0));
+    let conditional = signer.sign(
+        rig.now(),
+        Method::Put,
+        &path(BUCKET, KEY),
+        &[],
+        &[("if-none-match", "*")],
+        b"payload".to_vec(),
+    );
+    let (resp, line) = logged(&rig, conditional).await;
+    resp.expect_error(500, "InternalError");
+    assert_eq!(fields(&line), "stage=lookup err=Sql code=sql_other");
+    sql.fail_matching.borrow_mut().take();
+
     // A PUT that went through logs no fields.
     let (resp, line) = logged(&rig, put()).await;
     resp.expect(200);

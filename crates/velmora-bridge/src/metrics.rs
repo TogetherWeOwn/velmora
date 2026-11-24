@@ -216,11 +216,11 @@ impl Fault {
 fn sql_class(class: &str) -> &'static str {
     match class {
         "d1: overloaded" => "d1_overloaded",
-        "d1: network lost" => "d1_network_lost",
-        "d1: storage reset" => "d1_storage_reset",
-        "d1: timeout" => "d1_timeout",
-        "d1: transient" => "d1_transient",
-        "d1: client disconnected" => "d1_client_disconnected",
+        "d1: network lost: statement failed" => "d1_network_lost",
+        "d1: storage reset: statement failed" => "d1_storage_reset",
+        "d1: timeout: statement failed" => "d1_timeout",
+        "d1: transient: statement failed" => "d1_transient",
+        "d1: client disconnected: statement failed" => "d1_client_disconnected",
         "d1: constraint violation" => "d1_constraint",
         "d1: statement failed" => "d1_statement",
         "d1: bind failed" => "d1_bind",
@@ -682,11 +682,11 @@ mod tests {
                 "err=Sql code=d1_overloaded",
             ),
             (
-                BridgeError::Sql("d1: network lost".into()),
+                BridgeError::Sql("d1: network lost: statement failed".into()),
                 "err=Sql code=d1_network_lost",
             ),
             (
-                BridgeError::Sql("d1: storage reset".into()),
+                BridgeError::Sql("d1: storage reset: statement failed".into()),
                 "err=Sql code=d1_storage_reset",
             ),
             (

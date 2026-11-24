@@ -30,9 +30,10 @@ use velmora_s3_proto::mutation::{CommitResult, UploadMetadata};
 use velmora_s3_proto::{ErrorCode, StoredChecksum, UploadValidator};
 
 use super::common::{
-    authenticate_observed, catalog_error, check_precondition, checksum_json, conditional_gate,
-    discard_before_retry, from_proto, hold_precondition, internal, local_error, local_fault,
-    metadata_json, restore_gate_observed, s3_error, send_post_jobs, store_streamed, writes_refused,
+    authenticate_observed, catalog_error, check_precondition_observed, checksum_json,
+    conditional_gate, discard_before_retry, from_proto, hold_precondition, internal, local_error,
+    local_fault, metadata_json, restore_gate_observed, s3_error, send_post_jobs, store_streamed,
+    writes_refused,
 };
 use super::slices::{store_slices, SliceError, SliceSink};
 use crate::crypto::unwrap_bdk;
@@ -99,9 +100,7 @@ async fn put<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: 
     // read. One that holds now proves nothing yet: it is judged again
     // where the write is published.
     if let Some(condition) = &condition {
-        check_precondition(bridge, &bucket.id, key, condition)
-            .await
-            .inspect_err(observed.on_error(Stage::Lookup))?;
+        check_precondition_observed(bridge, &bucket.id, key, condition, observed).await?;
     }
     let metadata = UploadMetadata::from_headers(&authed.headers).map_err(s3_error)?;
     // For aws-chunked bodies every length below is the decoded one.

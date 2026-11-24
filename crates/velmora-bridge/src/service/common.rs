@@ -477,7 +477,7 @@ where
 
 /// The answer to a port error during authentication, which is kept in
 /// `fault`.
-fn noted(fault: &Cell<Option<Fault>>, error: BridgeError) -> S3Response {
+pub(super) fn noted(fault: &Cell<Option<Fault>>, error: BridgeError) -> S3Response {
     fault.set(Some(Fault::of(&error)));
     catalog_error(error)
 }
@@ -695,6 +695,48 @@ pub(super) async fn check_precondition<
         .map_err(precondition_error)
 }
 
+/// Marks a refusal at `stage` on `observed`, with the port error kept in
+/// `fault` (by [`noted`]) when there was one.
+pub(super) fn mark_noted(
+    observed: &mut RequestObservation,
+    stage: Stage,
+    fault: &Cell<Option<Fault>>,
+) {
+    match fault.get() {
+        Some(fault) => observed.mark_fault(stage, fault),
+        None => observed.mark_stage(stage),
+    }
+}
+
+/// [`check_precondition`] for a request that is observed: any refusal
+/// marks the lookup stage, with the catalogue error when it was one.
+pub(super) async fn check_precondition_observed<
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+>(
+    bridge: &Bridge<C, B, N, J, K, T>,
+    bucket: &BucketId,
+    key: &str,
+    condition: &Precondition,
+    observed: &mut RequestObservation,
+) -> Result<(), S3Response> {
+    let live = match bridge.catalog.live_generation(bucket, key).await {
+        Ok(live) => live,
+        Err(error) => {
+            observed.mark_error(Stage::Lookup, &error);
+            return Err(catalog_error(error));
+        }
+    };
+    condition
+        .check(live.as_ref().map(|g| g.etag.as_str()))
+        .map_err(precondition_error)
+        .inspect_err(observed.on_error(Stage::Lookup))
+}
+
 /// The step of a conditional write between choosing the id `id` and
 /// storing the recovery record under it: raises the floor of the key to
 /// `id`, then judges the condition. Nothing for an unconditional write.
@@ -736,9 +778,7 @@ pub(super) async fn hold_precondition<
         .await
         .inspect_err(observed.on_error(Stage::Commit))
         .map_err(catalog_error)?;
-    check_precondition(bridge, bucket, key, condition)
-        .await
-        .inspect_err(observed.on_error(Stage::Lookup))
+    check_precondition_observed(bridge, bucket, key, condition, observed).await
 }
 
 /// [`mutation_gate`] for the requests that can be conditional

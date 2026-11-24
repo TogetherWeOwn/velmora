@@ -66,9 +66,10 @@ use crate::ports::{
 };
 use crate::recovery::{id_after, write_generation};
 use crate::service::common::{
-    auth_refused, check_precondition, discard_failure, discard_refused, discard_unless_present,
-    header_refused, hold_precondition, host_refused, precondition, restore_gate_observed,
-    send_post_jobs, signed_host, store_streamed, writes_refused, REGION_ALIASES,
+    auth_refused, check_precondition_observed, discard_failure, discard_refused,
+    discard_unless_present, header_refused, hold_precondition, host_refused, precondition,
+    restore_gate_observed, send_post_jobs, signed_host, store_streamed, writes_refused,
+    REGION_ALIASES,
 };
 use crate::service::slices::{store_slices, SliceError, SliceSink};
 use crate::types::{
@@ -1091,12 +1092,12 @@ where
             }
             .into());
         }
-        Err(_) => {
+        Err(error) => {
             // Unknown whether the batch applied. If it did, the rows
             // are gone and this changes nothing; if not, it cannot
             // apply any more.
             give_up().await;
-            observed.mark_stage(Stage::Commit);
+            observed.mark_error(Stage::Commit, &error);
             return Err(Fail::Internal);
         }
     }
@@ -1169,9 +1170,10 @@ where
         return Err(ErrorCode::InvalidRequest.into());
     }
     let key = super::copy::source_key(&a.headers, &a.policy, &a.bucket)?;
-    let source = super::copy::source_generation(bridge, &a.headers, &a.bucket, &key)
+    let fault = std::cell::Cell::new(None);
+    let source = super::copy::source_generation(bridge, &a.headers, &a.bucket, &key, &fault)
         .await
-        .inspect_err(observed.on_error(Stage::Lookup))?;
+        .inspect_err(|_| super::common::mark_noted(observed, Stage::Lookup, &fault))?;
     let (start, len) = match a.headers.get("x-amz-copy-source-range") {
         Some(range) => copy_range(range, source.size)?,
         None => (0, source.size),
@@ -1470,9 +1472,8 @@ where
         // A condition that does not hold now is answered before anything
         // is written for this attempt, the floor of the key included.
         if let Some(condition) = &condition {
-            if let Err(refusal) = check_precondition(bridge, &a.bucket.id, &a.key, condition)
-                .await
-                .inspect_err(observed.on_error(Stage::Lookup))
+            if let Err(refusal) =
+                check_precondition_observed(bridge, &a.bucket.id, &a.key, condition, observed).await
             {
                 return refused_unless_completed(bridge, &target, &digest, &a, refusal, observed)
                     .await;
@@ -1656,10 +1657,14 @@ where
                     // the condition fails now, that is the answer, so
                     // the upload is not blamed below for what the key
                     // did.
-                    if let Err(refusal) =
-                        check_precondition(bridge, &a.bucket.id, &a.key, condition)
-                            .await
-                            .inspect_err(observed.on_error(Stage::Lookup))
+                    if let Err(refusal) = check_precondition_observed(
+                        bridge,
+                        &a.bucket.id,
+                        &a.key,
+                        condition,
+                        observed,
+                    )
+                    .await
                     {
                         return refused_unless_completed(
                             bridge, &target, &digest, &a, refusal, observed,

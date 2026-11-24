@@ -275,7 +275,9 @@ fn map_err(e: JsValue) -> BridgeError {
 
 /// The shared guard rule, then a class-only error. The classes after
 /// "overloaded" only name D1's transient failures apart for the request
-/// log (`velmora_bridge::metrics::Fault`); nothing branches on them.
+/// log (`velmora_bridge::metrics::Fault`). Each still ends with
+/// `: statement failed`, which is what callers that retry an unanswered
+/// catalogue match (`catalogue_unanswered` in the admin drill).
 fn classify(text: &str) -> BridgeError {
     let class = if is_tx_guard_violation(text) {
         return BridgeError::GuardFailed;
@@ -284,15 +286,15 @@ fn classify(text: &str) -> BridgeError {
     } else if text.contains("D1 DB is overloaded") {
         OVERLOADED
     } else if text.contains("Network connection lost") {
-        "d1: network lost"
+        "d1: network lost: statement failed"
     } else if text.contains("client disconnected") {
-        "d1: client disconnected"
+        "d1: client disconnected: statement failed"
     } else if text.contains("transient issue") {
-        "d1: transient"
+        "d1: transient: statement failed"
     } else if text.contains("was reset") || text.contains("to be reset") {
-        "d1: storage reset"
+        "d1: storage reset: statement failed"
     } else if text.contains("timed out") || text.contains("timeout") {
-        "d1: timeout"
+        "d1: timeout: statement failed"
     } else {
         "d1: statement failed"
     };
@@ -338,23 +340,26 @@ mod tests {
                 "d1: statement failed",
             ),
             // D1's transient failures, as its documentation lists them.
-            ("D1_ERROR: Network connection lost.", "d1: network lost"),
+            (
+                "D1_ERROR: Network connection lost.",
+                "d1: network lost: statement failed",
+            ),
             (
                 "D1_ERROR: D1 DB storage operation exceeded timeout which caused object \
                  to be reset.",
-                "d1: storage reset",
+                "d1: storage reset: statement failed",
             ),
             (
                 "D1_ERROR: D1 DB's isolate exceeded its memory limit and was reset.",
-                "d1: storage reset",
+                "d1: storage reset: statement failed",
             ),
             (
                 "D1_ERROR: Cannot resolve D1 DB due to transient issue on remote node.",
-                "d1: transient",
+                "d1: transient: statement failed",
             ),
             (
                 "D1_ERROR: Can't read from request stream because client disconnected.",
-                "d1: client disconnected",
+                "d1: client disconnected: statement failed",
             ),
             // As D1 answered the first read after a refused batch of
             // 65,536 extents.
@@ -368,6 +373,11 @@ mod tests {
                 matches!(classify(text), BridgeError::Sql(m) if m == class),
                 "{text}"
             );
+            // A catalogue that did not answer stays one: the admin drill
+            // retries on this suffix.
+            if !class.contains("constraint") && class != OVERLOADED {
+                assert!(class.ends_with(": statement failed"), "{class}");
+            }
         }
     }
 
