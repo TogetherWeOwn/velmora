@@ -31,6 +31,7 @@ pub(super) fn retain(
     saved: BTreeMap<String, u32>,
     since: i64,
     parallel: bool,
+    trust_prefixes: bool,
 ) -> BTreeMap<String, u32> {
     let holds: BTreeSet<String> = if parallel {
         saved
@@ -53,13 +54,17 @@ pub(super) fn retain(
             (entry, stamp)
         })
         .collect();
-    let room = SWEEP_RECORDS - result.len();
-    result.extend(
-        saved
-            .into_iter()
-            .filter(|(key, _)| minted_ms(key).is_some_and(|ms| ms >= since) || holds.contains(key))
-            .take(room),
-    );
+    if trust_prefixes {
+        let room = SWEEP_RECORDS - result.len();
+        result.extend(
+            saved
+                .into_iter()
+                .filter(|(key, _)| {
+                    minted_ms(key).is_some_and(|ms| ms >= since) || holds.contains(key)
+                })
+                .take(room),
+        );
+    }
     result
 }
 

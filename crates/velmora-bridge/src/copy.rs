@@ -473,8 +473,8 @@ impl Phase {
 /// Where a pass stands: the cursor of a job, as a JSON object. An
 /// empty cursor, or one that does not parse, is the start of a pass.
 ///
-/// The members: `p` the phase and `k` the key, both required; `g`, `n`
-/// and `t`, each left out when empty or zero. A member of another name
+/// The members: `p` the phase and `k` the key, both required; `g`, `n`,
+/// `d` (destination) and `t`, each left out when empty or zero. A member of another name
 /// is passed over; one of another type is no cursor, and neither is
 /// an object that is not plain JSON of small depth.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,6 +488,8 @@ struct Place {
     /// them (`g` and `n`).
     generation: String,
     plans: u32,
+    /// Destination that confirmed these plans for the opt-in sweep (`d`).
+    destination: String,
     /// When a hint was made ([`Phase::Plan`]; `t`).
     made: i64,
 }
@@ -504,6 +506,7 @@ impl Place {
             key,
             generation: String::new(),
             plans: 0,
+            destination: String::new(),
             made: 0,
         }
     }
@@ -533,6 +536,11 @@ impl Place {
             key,
             generation,
             plans,
+            destination: object
+                .get("d")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             made,
         })
     }
@@ -549,6 +557,10 @@ impl Place {
             if number != 0 {
                 out.push_str(&format!(",\"{name}\":{number}"));
             }
+        }
+        if !self.destination.is_empty() {
+            out.push_str(",\"d\":");
+            out.push_str(&quoted(&self.destination));
         }
         out.push('}');
         out
@@ -670,10 +682,18 @@ struct Known {
     unread: bool,
     walk_requested: bool,
     mark_failed: bool,
+    /// Current destination digest in the opt-in sweep, even if the marker is unreadable.
+    destination: Option<String>,
     plans: BTreeMap<String, u32>,
 }
 
 impl Known {
+    fn destination_tag(&self) -> Option<String> {
+        self.destination
+            .as_ref()
+            .map(|digest| format!("d:{digest}"))
+    }
+
     /// Keeps that `n` of the `of` plans of the record at `key` are over
     /// there. Only a part is kept: a record with all of them is sent.
     fn keep(&mut self, key: &str, n: usize, of: usize) {
@@ -693,7 +713,11 @@ impl Known {
             let n = n as usize;
             (n < of || (n == of && matches!(named, Named::Segments(_)))).then_some(n)
         };
-        let counted = believed(place.plans).filter(|_| place.generation == key);
+        let belongs = self
+            .destination
+            .as_ref()
+            .is_none_or(|digest| *digest == place.destination);
+        let counted = believed(place.plans).filter(|_| belongs && place.generation == key);
         let saved = self.plans.get(key).copied().and_then(believed);
         counted.max(saved).unwrap_or(0)
     }
@@ -1485,36 +1509,45 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             return;
         }
         known.loaded = true;
+        let parallel = self.remote.parallel_fresh();
+        known.destination = parallel.then(|| self.remote.place());
         // Its size first: something else may have written it.
         let bytes = match self.safety.head(SWEEP_KEY).await {
-            Ok(None) => return,
+            Ok(None) => Ok(None),
             Ok(Some(size)) if size > SWEEP_BYTES as u64 => return,
             Ok(Some(_)) => self.safety.get(SWEEP_KEY, None).await,
             Err(e) => Err(e),
         };
-        let bytes = match bytes {
+        let mut saved: BTreeMap<String, u32> = match bytes {
             Ok(Some(bytes)) if bytes.len() > SWEEP_BYTES => return,
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return,
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Ok(None) => BTreeMap::new(),
             Err(_) => {
                 known.unread = true;
                 return;
             }
         };
-        let saved: BTreeMap<String, u32> = serde_json::from_slice(&bytes).unwrap_or_default();
+        // Held entries are obligations, not proof that a plan is present.
+        let matches = known
+            .destination_tag()
+            .is_none_or(|tag| saved.remove(&tag) == Some(0));
         let before = saved.len();
-        known.plans = held::retain(saved, span.since, self.remote.parallel_fresh());
-        known.changed = known.plans.len() < before;
+        known.plans = held::retain(saved, span.since, parallel, matches);
+        known.changed = !matches || known.plans.len() < before;
     }
 
     /// Writes [`SWEEP_KEY`] when the job changed it. False when it
     /// could not be written.
-    async fn save_known(&self, known: Known) -> bool {
+    async fn save_known(&self, mut known: Known) -> bool {
         if !known.changed {
             return true;
         }
         if known.unread {
             return false;
+        }
+        // This metadata does not count against the budget for generation entries.
+        if let Some(tag) = known.destination_tag() {
+            known.plans.insert(tag, 0);
         }
         // Serializing strings and integers cannot fail.
         let body = serde_json::to_vec(&known.plans).unwrap_or_default();
@@ -1853,6 +1886,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 if plans {
                     place.generation = key.clone();
                     place.plans = n as u32;
+                    place.destination = if n > 0 {
+                        known.destination.clone().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                 }
                 if parallel {
                     for (_, later) in scans.range(i + 1..) {

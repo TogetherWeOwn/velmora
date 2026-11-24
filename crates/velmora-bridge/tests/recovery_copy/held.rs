@@ -82,6 +82,94 @@ async fn held_generation_is_retried_next_pass_after_leaving_the_fresh_window() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn destination_change_rechecks_held_prefix_before_publishing() {
+    for other_tag in [false, true] {
+        let w = World::with_parallel_fresh(true);
+        let key = generation(FRESH_MS - PASS_INTERVAL_MS + 1, "_destination");
+        let first = "m/art/x_bound_a";
+        let second = "m/art/x_bound_b";
+        w.generation(&key, &["x_bound_a", "x_bound_b"]).await;
+        w.record(first, b"first plan").await;
+        let now = UnixMs(NOW);
+        rest(&w, now).await;
+        pass(&w, now).await;
+        assert!(w.e2.get(first).is_some() && w.e2.get(&key).is_none());
+        let mut previous = held_map(&w).await;
+        assert_eq!(previous.get(&key), Some(&1));
+        assert!(previous.contains_key(&held(&key).0));
+
+        // Simulate a new empty destination with progress saved at a different
+        // destination (or by a binary that never tagged its progress).
+        previous.retain(|entry, _| !entry.starts_with("d:"));
+        if other_tag {
+            previous.insert("d:0000000000000000".into(), 0);
+        }
+        save_held(&w, previous).await;
+        w.e2.objects.borrow_mut().remove(first);
+        w.e2.log.borrow_mut().clear();
+        w.record(second, b"second plan").await;
+        let next = UnixMs(NOW + PASS_INTERVAL_MS);
+        w.clock.set(next);
+        pass(&w, next).await;
+        let published = put_at(w.e2, &key).expect("held generation was retried");
+        assert!(put_at(w.e2, first).is_some_and(|at| at < published));
+        assert!(put_at(w.e2, second).is_some_and(|at| at < published));
+        let marker = held_map(&w).await;
+        assert_eq!(
+            marker,
+            BTreeMap::from([(format!("d:{}", w.remote.place()), 0)])
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn destination_cursor_prefix_is_trusted_only_at_its_destination_in_strict_mode() {
+    for (parallel, tagged, resume) in [
+        (true, None, false),
+        (true, Some(false), false),
+        (true, Some(true), true),
+        (false, Some(false), true), // The legacy path ignores the optional field.
+    ] {
+        let w = World::with_parallel_fresh(parallel);
+        let key = generation(600_000, "_queued");
+        let first = "m/art/x_first";
+        let bytes = w.record(first, b"first plan").await;
+        w.record("m/art/x_last", b"last plan").await;
+        w.generation(&key, &["x_first", "x_last"]).await;
+        if resume {
+            w.e2.set(first, &bytes);
+        }
+        let now = UnixMs(NOW);
+        rest(&w, now).await;
+        // Matching queue progress must work even when rc/sweep is unreadable.
+        w.raw(SWEEP_KEY, b"{}".to_vec()).await;
+        let copier = Copier {
+            safety: &NoRead(&w.safety, SWEEP_KEY, false),
+            kek: &w.kek,
+            clock: &w.clock,
+            remote: &w.remote,
+            maintenance: Maintenance::Off,
+        };
+        let mut cursor = serde_json::json!({"p": "g", "k": "m/g_", "g": key, "n": 1});
+        if let Some(matching) = tagged {
+            cursor["d"] = if matching {
+                w.remote.place()
+            } else {
+                "0000000000000000".into()
+            }
+            .into();
+        }
+        copier.step(now, &cursor.to_string()).await.unwrap();
+        assert!(w.e2.get(&key).is_some());
+        assert!(
+            w.e2.get(first).is_some(),
+            "published without a prefix plan: parallel={parallel}, tagged={tagged:?}"
+        );
+        assert_eq!(asked_for(w.e2, "HEAD", first), if resume { 0 } else { 2 });
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn held_expiry_drops_a_key_only_after_requesting_the_walk() {
     for fail in [true, false] {
         let w = World::with_parallel_fresh(true);
@@ -127,7 +215,11 @@ async fn held_entries_take_cap_slots_and_overflow_requests_the_walk() {
     rest(&w, now).await;
     pass(&w, now).await;
     let saved = held_map(&w).await;
-    assert_eq!(saved.len(), SWEEP_RECORDS);
+    assert_eq!(saved.len(), SWEEP_RECORDS + 1, "one destination tag");
+    assert_eq!(
+        saved.keys().filter(|key| key.starts_with("h:")).count(),
+        SWEEP_RECORDS
+    );
     assert!(!saved.contains_key(&held(&key).0));
     assert_eq!(time_at(&w, WANT_KEY).await, Some(NOW.to_string()));
     assert!(w.e2.get(&key).is_none());

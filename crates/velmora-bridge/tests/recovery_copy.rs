@@ -3244,11 +3244,32 @@ async fn check_generation_plan_resume(parallel: bool) {
     let after = generation(500_000, "_next");
     w.generation(&after, &[]).await;
     let start = format!("m/g_{:013x}", NOW - FRESH_MS);
-    let at = |n: u32| format!("{{\"p\":\"g\",\"k\":\"{start}\",\"g\":\"{key}\",\"n\":{n}}}");
+    let digest = if parallel {
+        format!(",\"d\":\"{}\"", w.remote.place())
+    } else {
+        String::new()
+    };
+    let at =
+        |n: u32| format!("{{\"p\":\"g\",\"k\":\"{start}\",\"g\":\"{key}\",\"n\":{n}{digest}}}");
 
     // The two records take two of the 250.
     let first = w.copier().step(UnixMs(NOW), "").await.unwrap();
     assert_eq!(first.next, Some(at(248)));
+    if parallel {
+        // The older cursor reader accepts these known fields and ignores d.
+        #[derive(serde::Deserialize)]
+        struct PreviousProgress {
+            p: String,
+            k: String,
+            g: String,
+            n: u32,
+        }
+        let old: PreviousProgress = serde_json::from_str(first.next.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (old.p.as_str(), old.k.as_str(), old.g.as_str(), old.n),
+            ("g", start.as_str(), key.as_str(), 248)
+        );
+    }
     assert_eq!((first.counts.copied, first.counts.records), (248, 0));
     assert_eq!(first.walk, None);
     let second = w.copier().step(UnixMs(NOW), &at(248)).await.unwrap();
