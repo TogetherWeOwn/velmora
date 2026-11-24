@@ -5,7 +5,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
@@ -18,6 +18,7 @@ const INSERT: &str = "INSERT INTO wp1_fault_marker VALUES (?1)";
 enum Fault {
     ChunkReplies,
     DropCommitReply,
+    RejectStartup,
     RejectPrelude,
 }
 
@@ -71,6 +72,21 @@ async fn frame(input: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+async fn fault_reply(
+    output: &mut (impl AsyncWrite + Unpin),
+    code: &str,
+    ready: bool,
+) -> io::Result<()> {
+    let fields = format!("SERROR\0C{code}\0Mfixture proxy fault\0\0");
+    output.write_u8(b'E').await?;
+    output.write_u32((4 + fields.len()) as u32).await?;
+    output.write_all(fields.as_bytes()).await?;
+    if ready {
+        output.write_all(b"Z\0\0\0\x05I").await?;
+    }
+    Ok(())
+}
+
 async fn proxy(listener: TcpListener, port: u16, fault: Fault, trace: Trace) -> io::Result<()> {
     let (downstream, _) = listener.accept().await?;
     let mut upstream = TcpStream::connect(("127.0.0.1", port)).await?;
@@ -83,6 +99,9 @@ async fn proxy(listener: TcpListener, port: u16, fault: Fault, trace: Trace) -> 
     }
     let mut buf = vec![0; startup as usize - 4];
     reader.read_exact(&mut buf).await?;
+    if matches!(fault, Fault::RejectStartup) {
+        return fault_reply(&mut *writer.lock().await, "58000", false).await;
+    }
     upstream.write_u32(startup).await?;
     upstream.write_all(&buf).await?;
     let (mut pg_read, mut pg_write) = upstream.into_split();
@@ -97,12 +116,7 @@ async fn proxy(listener: TcpListener, port: u16, fault: Fault, trace: Trace) -> 
                 if matches!(fault, Fault::RejectPrelude) {
                     // Reject only this Q. Keep forwarding subsequent independent
                     // Parse/Bind/Execute/Sync requests to the real server.
-                    let err = b"SERROR\0C53300\0Mfixture proxy refused prelude\0\0";
-                    let mut downstream = writer.lock().await;
-                    downstream.write_u8(b'E').await?;
-                    downstream.write_u32((4 + err.len()) as u32).await?;
-                    downstream.write_all(err).await?;
-                    downstream.write_all(b"Z\0\0\0\x05I").await?;
+                    fault_reply(&mut *writer.lock().await, "58000", true).await?;
                     continue;
                 }
             }
@@ -208,6 +222,30 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
             .get(0)
     }
     let insert = |v| (INSERT, vec![SqlValue::Int(v)]);
+    let (res, trace) = through_proxy(port, Fault::RejectStartup, vec![insert(10)]).await;
+    assert!(
+        matches!(res, Err(error) if error.is_pg_overloaded()),
+        "startup must classify 58000 as overload"
+    );
+    assert!(trace.is_empty());
+    let (res, trace) = through_proxy(port, Fault::RejectPrelude, vec![insert(11)]).await;
+    assert!(
+        matches!(res, Err(error) if error.is_pg_overloaded()),
+        "BEGIN must classify 58000 as overload when no statement succeeds"
+    );
+    assert!(trace.contains(&Wire::ReadOnly));
+    assert_eq!(stored(&root).await, 0);
+
+    root.batch_execute("CREATE OR REPLACE FUNCTION wp1_fault_58000() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RAISE SQLSTATE '58000'; END; $$").await.unwrap();
+    let (res, _) = through_proxy(
+        port,
+        Fault::ChunkReplies,
+        vec![insert(12), ("SELECT wp1_fault_58000()", vec![])],
+    )
+    .await;
+    assert!(matches!(res,Err(BridgeError::Sql(s)) if s=="pg: statement failed"));
+    assert_eq!(stored(&root).await, 0);
+
     let (res, trace) = through_proxy(
         port,
         Fault::RejectPrelude,
@@ -282,8 +320,10 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
         );
     }
     assert_eq!(stored(&root).await, 4);
-    root.batch_execute("DROP TABLE wp1_fault_marker; DROP ROLE wp1_fault_writer;")
-        .await
-        .unwrap();
+    root.batch_execute(
+        "DROP FUNCTION wp1_fault_58000(); DROP TABLE wp1_fault_marker; DROP ROLE wp1_fault_writer;",
+    )
+    .await
+    .unwrap();
     driver.abort();
 }

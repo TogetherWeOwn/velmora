@@ -153,7 +153,13 @@ pub(super) async fn transaction(
     record: bool,
 ) -> Result<Vec<Reply>> {
     let start = prelude(lock_key);
-    let begin = control(client, &start);
+    let begin = async {
+        client
+            .simple_query(&start)
+            .await
+            .map(|_| ())
+            .map_err(error::before_catalogue)
+    };
     let stmts = prepared.iter().map(|s| s.run(client, collect_rows, record));
     let finish = |commit| control(client, if commit { "COMMIT" } else { "ROLLBACK" });
     if pipelined {

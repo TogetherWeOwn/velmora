@@ -4,6 +4,21 @@ pub(super) fn statement_failed() -> BridgeError {
     BridgeError::Sql("pg: statement failed".into())
 }
 
+fn overloaded() -> BridgeError {
+    BridgeError::Sql("pg: overloaded".into())
+}
+
+/// Hyperdrive's measured pool-wait failure is 58000. Only classify it as
+/// overload at startup or BEGIN, before catalogue statements can execute.
+/// A later statement success still overrides the prelude's classification.
+pub(super) fn before_catalogue(error: tokio_postgres::Error) -> BridgeError {
+    if error.code().is_some_and(|code| code.code() == "58000") {
+        overloaded()
+    } else {
+        without_guard(from_driver(error))
+    }
+}
+
 pub(super) fn shape() -> BridgeError {
     BridgeError::Sql("pg: unexpected result shape".into())
 }
@@ -21,9 +36,7 @@ pub(super) fn classify(code: &str, constraint: Option<&str>) -> BridgeError {
         "23514" if constraint == Some("tx_guard_ok") => BridgeError::GuardFailed,
         "VL001" => BridgeError::Sql("pg: constraint violation".into()),
         c if c.starts_with("23") => BridgeError::Sql("pg: constraint violation".into()),
-        "55P03" | "57014" | "53300" | "53400" | "40001" | "40P01" => {
-            BridgeError::Sql("pg: overloaded".into())
-        }
+        "55P03" | "57014" | "53300" | "53400" | "40001" | "40P01" => overloaded(),
         _ => statement_failed(),
     }
 }

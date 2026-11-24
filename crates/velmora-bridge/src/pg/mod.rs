@@ -32,7 +32,7 @@ pub fn is_postgres_read_only(sql: &str) -> bool {
 
 /// Redact connection failures before they leave a runtime connector.
 pub fn classify_connect_error(error: tokio_postgres::Error) -> crate::BridgeError {
-    error::without_guard(error::from_driver(error))
+    error::before_catalogue(error)
 }
 
 /// Canonical SQL used by PostgreSQL, also used to compare coverage entries.
