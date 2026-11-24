@@ -621,6 +621,15 @@ pub(crate) async fn claim_target(client: &Client, run_id: &str) -> Result<(), St
         .batch_execute("BEGIN READ WRITE")
         .await
         .map_err(|e| fixture::sql_error("begin marker claim", e))?;
+    let result = finish_claim(client, run_id).await;
+    if result.is_err() {
+        // Keep the original failure; the caller closes a broken connection.
+        let _ = client.batch_execute("ROLLBACK").await;
+    }
+    result
+}
+
+async fn finish_claim(client: &Client, run_id: &str) -> Result<(), String> {
     let claimed = client
         .execute_typed(
             "UPDATE meta SET v=2 WHERE k=$1 AND v=1",
@@ -913,8 +922,10 @@ mod tests {
         else {
             panic!("the stalled sampler must finish at the deadline");
         };
-        assert_eq!(sampler_coverage(&samples, 10_000), (true, 1_250.0));
-        assert!(1_250 > MAX_SAMPLE_GAP_MS);
+        let (enough_ticks, gap) = sampler_coverage(&samples, 10_000);
+        assert!(enough_ticks);
+        assert_eq!(gap, 1_250.0);
+        assert!(gap > MAX_SAMPLE_GAP_MS as f64);
         assert!(error.is_none(), "the tail gap records this timeout");
     }
 

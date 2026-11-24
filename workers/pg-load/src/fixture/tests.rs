@@ -229,3 +229,37 @@ fn a_second_native_sampler_cannot_lock_the_same_database() {
         );
     });
 }
+
+#[test]
+#[ignore = "requires a disposable local PostgreSQL server"]
+fn a_failed_run_marker_insert_rolls_back_the_arm_update() {
+    local_test(async {
+        use crate::run::claim_target;
+        let schema = "velmora_pg_load_test_claim_rollback";
+        let local = local_for("PG_LOAD_TEST_SOCKET_DIR", schema);
+        let conn = create_catalogue(&local, schema).await;
+        let db = conn.client();
+        db.batch_execute(
+            "INSERT INTO meta(k,v) VALUES ('pg_load_fixture_v1',1), \
+            ('pg_load_run_00112233445566778899aabbccddeeff',1)",
+        )
+        .await
+        .unwrap();
+        let claim = claim_target(db, "00112233445566778899aabbccddeeff").await;
+        let arm = db
+            .query_one("SELECT v FROM meta WHERE k='pg_load_fixture_v1'", &[])
+            .await;
+        if arm.is_err() {
+            db.batch_execute("ROLLBACK").await.unwrap(); // cleanup if the regression fires
+        }
+        db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert!(claim.is_err(), "the duplicate run key must abort the claim");
+        assert_eq!(
+            arm.expect("transaction must already be rolled back")
+                .get::<_, i64>(0),
+            1
+        );
+    });
+}
