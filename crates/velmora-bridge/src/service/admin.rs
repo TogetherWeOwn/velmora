@@ -72,7 +72,7 @@ use crate::ports::{
 use crate::recovery::{
     delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
 };
-use crate::replay::ReplayCursor;
+use crate::replay::{ReplayCursor, ReplayReport};
 use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
     AccessKeyRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow, KeyStatus, Method,
@@ -752,7 +752,18 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
         _ => return Err(bad()),
     };
     let run = crate::types::UnixMs(cursor.run_ms);
-    let report = bridge.replay_step(cursor).await.or_internal()?;
+    // A cursor of a replay that has ended takes no step: with nothing
+    // pending, writes and orphan claims are no longer refused
+    // (`guard_no_replay`), and a step would publish beside them. It goes
+    // straight to the end, as the last call sent again always did. A
+    // replay that another call ends after this read is still covered:
+    // claims wait out `ORPHAN_GRACE_MS` after any replay ends, in the
+    // batch that claims.
+    let report = if bridge.catalog.restore_pending().await.or_internal()? {
+        bridge.replay_step(cursor).await.or_internal()?
+    } else {
+        ReplayReport::default()
+    };
     match &report.next {
         // Recorded before the caller gets it: the next call may start
         // from here and no further.

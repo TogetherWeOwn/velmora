@@ -381,19 +381,8 @@ impl T {
         let started = self.now();
         let mut body = json!({ "since_ms": 0 });
         loop {
-            let mut req = Req {
-                method: Method::Post,
-                target: "/_admin/restore".to_string(),
-                headers: Vec::new(),
-                body: body.to_string().into_bytes(),
-            };
-            req.set_header("host", HOST);
-            req.set_header("content-length", &req.body.len().to_string());
-            let token = self.rig.bridge.cfg.admin_token.expose().to_string();
-            req.set_header("authorization", &format!("Bearer {token}"));
-            let r = self.rig.send(req).await;
-            assert_eq!(r.status, 200, "{}", r.text());
-            let report: Value = serde_json::from_slice(&r.body).unwrap();
+            let (status, report) = self.restore_call(&body).await;
+            assert_eq!(status, 200, "{report}");
             if report["next"].is_null() {
                 break;
             }
@@ -408,6 +397,23 @@ impl T {
             took
         );
         self.maintenance(Maintenance::Off);
+    }
+
+    /// One call of the restore route.
+    async fn restore_call(&self, body: &Value) -> (u16, Value) {
+        let mut req = Req {
+            method: Method::Post,
+            target: "/_admin/restore".to_string(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("host", HOST);
+        req.set_header("content-length", &req.body.len().to_string());
+        let token = self.rig.bridge.cfg.admin_token.expose().to_string();
+        req.set_header("authorization", &format!("Bearer {token}"));
+        let r = self.rig.send(req).await;
+        let report = serde_json::from_slice(&r.body).unwrap_or_else(|_| json!(r.text()));
+        (r.status, report)
     }
 
     fn maintenance(&mut self, mode: Maintenance) {
@@ -1034,6 +1040,40 @@ async fn a_delete_of_the_key_covers_the_lingering_record() {
     assert!(t.blobs().is_empty());
     let report = t.restore().await;
     assert_eq!(report.damaged_total, 0, "{report:?}");
+    assert_eq!(t.status("k").await, 404);
+}
+
+/// A cursor of a replay that has ended publishes nothing. The catalogue
+/// no longer refuses claims for that replay, so a step taken now would
+/// publish beside a claim that deletes the parts it adopts.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cursor_of_an_ended_replay_publishes_nothing() {
+    let mut t = setup().await;
+    t.put("a", b"a").await;
+    t.replay_in_place().await;
+    let run = t.count("SELECT started_at FROM restore_state WHERE id = 1");
+
+    // After the replay, a completion is lost: its record lingers.
+    let id = t.create("k").await;
+    let one = t.part("k", &id, 1, &pattern(1, 3000)).await;
+    t.complete_lost("k", &id, &[(1, &one)]).await;
+
+    // The first cursor of that replay, sent again: it is behind what
+    // the replay reached, so the route takes it as one of that replay.
+    t.maintenance(Maintenance::Restore);
+    let cursor = ReplayCursor {
+        run_ms: run,
+        ..ReplayCursor::start(UnixMs(0))
+    };
+    let (status, report) = t.restore_call(&json!({ "cursor": cursor })).await;
+    assert_eq!(status, 200, "{report}");
+    assert!(report["next"].is_null(), "{report}");
+    assert_eq!(report["published"], 0, "{report}");
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'"),
+        0
+    );
+    t.maintenance(Maintenance::Off);
     assert_eq!(t.status("k").await, 404);
 }
 
