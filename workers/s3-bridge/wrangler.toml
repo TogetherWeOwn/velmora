@@ -284,6 +284,16 @@ dataset = "velmora_requests"
 binding = "SELF"
 service = "velmora-s3"
 
+# The production deploy fills these IDs from the production environment.
+# Binding the pools does not select PostgreSQL; CATALOG_BACKEND remains unset.
+[[hyperdrive]]
+binding = "CATALOG_PG_W"
+id = "<write Hyperdrive config ID>"
+
+[[hyperdrive]]
+binding = "CATALOG_PG_R"
+id = "<read Hyperdrive config ID>"
+
 # The permit gate (src/gate.rs, class PermitGate) is declared and bound
 # here, and this Worker takes its permits from it (PERMITS = "do" above,
 # deploy 4 below, shipped in a deploy of its own).
