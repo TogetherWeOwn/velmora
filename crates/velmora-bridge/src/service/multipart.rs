@@ -803,10 +803,8 @@ where
         // Nothing of the body is read before this charge is held. The
         // body is sealed and stored while it arrives, and the stored
         // copy is whole only if the validator accepted the body.
-        let replay_budget = bridge.cfg.r2_put_retry.then(|| bridge.budget.for_request());
-        let charge = replay_budget
-            .as_ref()
-            .unwrap_or(&bridge.budget)
+        let charge = bridge
+            .budget
             .charge_stream(lengths.decoded)
             .await
             .inspect_err(observed.on_error(Stage::Budget))?;
@@ -821,8 +819,6 @@ where
                 extent: &extent_id,
             },
             &charge,
-            replay_budget.as_ref(),
-            &bridge.clock,
             observed,
         )
         .await?;

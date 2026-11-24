@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use futures_util::stream::{self, StreamExt};
@@ -272,20 +272,8 @@ pub struct Blobs {
     /// A stream put fails once the store took this many pieces, without
     /// reading further.
     pub stop_stream_after: Cell<Option<usize>>,
-    /// Error to return instead of `store down` on an early stop.
-    pub stop_stream_error: Cell<Option<&'static str>>,
-    /// Scripted errors after consuming a whole stream, in attempt order.
-    pub fail_puts: RefCell<VecDeque<(FailMode, &'static str)>>,
-    /// Complete bodies from the scripted failures.
-    pub failed_stream_bytes: RefCell<Vec<Vec<u8>>>,
     /// What a stream put answers in place of the true receipt.
     pub false_receipt: Cell<Option<ReceiptLie>>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FailMode {
-    ReadAllThenFail,
-    StoreThenFail,
 }
 
 /// Told the length of a piece of a stream.
@@ -413,8 +401,7 @@ impl BlobStore for Blobs {
         loop {
             let taken = self.streams.borrow()[at].pieces.len();
             if self.stop_stream_after.get().is_some_and(|n| taken >= n) {
-                let error = self.stop_stream_error.get().unwrap_or("store down");
-                return Err(BridgeError::Blob(error.into()));
+                return Err(BridgeError::Blob("store down".into()));
             }
             match body.next().await {
                 None => {
@@ -436,18 +423,8 @@ impl BlobStore for Blobs {
             }
         }
         drop(body);
-        let failure = self.fail_puts.borrow_mut().pop_front();
-        if let Some((mode, error)) = failure {
-            self.failed_stream_bytes.borrow_mut().push(bytes.clone());
-            if mode == FailMode::ReadAllThenFail {
-                return Err(BridgeError::Blob(error.into()));
-            }
-        }
         let whole = futures_util::stream::iter([Ok(bytes)]).boxed_local();
         let receipt = put_stream_whole(self, key, len, whole, meta).await?;
-        if let Some((FailMode::StoreThenFail, error)) = failure {
-            return Err(BridgeError::Blob(error.into()));
-        }
         self.streams.borrow_mut()[at].stored = true;
         Ok(match self.false_receipt.get() {
             Some(lie) => lie(receipt),
@@ -792,7 +769,6 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         server_side_copy: true,
         get_fanout_bytes: None,
         grant_refusal_reasons: false,
-        r2_put_retry: false,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         verify: Default::default(),

@@ -267,9 +267,6 @@ GET_FANOUT_BYTES = "1073741824"
 # and every admission decision are unchanged). See GRANT_REFUSAL_REASONS
 # under "S3 failure stages" in ops/README.md.
 GRANT_REFUSAL_REASONS = "on"
-# Replay a safety write after a transient R2 error. See R2_PUT_RETRY
-# under "S3 failure stages" in ops/README.md.
-R2_PUT_RETRY = "on"
 
 # Request metrics: one request in METRICS_SAMPLE (default 10) and every
 # 5xx is a data point with method, status, latency, bytes and colo; a

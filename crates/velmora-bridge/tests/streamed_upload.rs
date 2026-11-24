@@ -3,8 +3,6 @@
 //! a body that is refused, and only a window of the body is charged.
 
 mod intent_support;
-#[path = "streamed_upload/r2_retry.rs"]
-mod r2_retry;
 mod service_support;
 
 use std::cell::{Cell, RefCell};
