@@ -565,53 +565,122 @@ async fn bucket_delete_and_put_cannot_both_succeed() {
     }
 }
 
-#[tokio::test]
-async fn orphan_claim_cannot_delete_a_concurrently_published_extent() {
-    use velmora_bridge::replay::{ReplayExtent, ReplayPublish};
+async fn stage_replay_orphan(c: &SqlCatalog<TestSql>, b: &Bucket) -> (ExtentId, GcRow) {
+    use velmora_bridge::replay::ReplayExtent;
+    let source = extent(b, 200);
+    let stranded = c
+        .replay_extents(
+            b,
+            &[ReplayExtent {
+                row: source.clone(),
+                plan: None,
+                packed: None,
+                parity: None,
+                safety_present: true,
+            }],
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(stranded.is_empty());
+    let inserted = rows(
+        c,
+        "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'delete_safety', ?2) RETURNING id",
+        &[
+            SqlValue::Text(source.id.as_str().into()),
+            SqlValue::Int(NOW.0),
+        ],
+    )
+    .await;
+    let [SqlValue::Int(id)] = inserted[0].as_slice() else {
+        panic!("expected GC row ID")
+    };
+    let gc = GcRow {
+        id: *id,
+        extent_id: source.id.clone(),
+        action: GcAction::DeleteSafety,
+        due_at: NOW,
+        done_at: None,
+    };
+    (source.id, gc)
+}
 
+#[tokio::test]
+async fn replay_marker_refuses_orphan_claims_in_both_orders() {
+    use velmora_bridge::replay::ReplayPublish;
+    for replay_first in [false, true] {
+        let Some(c) = catalogue() else { return };
+        let b = bucket(&c, 4).await;
+        let (extent_id, gc) = stage_replay_orphan(&c, &b).await;
+        let now = NOW.plus_ms(32 * 86_400_000);
+        // This is the same catalogue marker normally installed by restore.
+        c.restore_begin(NOW, now)
+            .await
+            .unwrap()
+            .expect("restore starts");
+        assert!(c.restore_pending().await.unwrap());
+        let gen = generation(&b, "replay", 200);
+        let placements = [ExtentPlacement {
+            extent_id: extent_id.clone(),
+            seq: 0,
+            plain_offset: 0,
+        }];
+        let gc = [gc];
+        let claim = || c.gc_orphan_claim(&gc, now, NOW.plus_ms(1));
+        let replay = || c.replay_publish(&gen, &placements, now);
+        // The writer lock serializes these transactions. Exercise both
+        // serial orders explicitly, rather than relying on wake order.
+        let ((claimed, status), published) = if replay_first {
+            let published = replay().await;
+            (claim().await, published)
+        } else {
+            let claimed = claim().await;
+            (claimed, replay().await)
+        };
+        status.unwrap();
+        assert_eq!(claimed, [false], "replay_first={replay_first}");
+        assert_eq!(
+            published.unwrap(),
+            ReplayPublish::Published,
+            "replay_first={replay_first}"
+        );
+        let (head, extents) = c.live_object(&b.id, &gen.key).await.unwrap().unwrap();
+        assert_eq!(head.id, gen.id);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].id, extent_id);
+        assert_eq!(extents[0].safety_state, SafetyState::Held);
+    }
+}
+
+/// When there is no earlier generation, replay can publish a damaged
+/// object. This is why restore must set the marker before replay starts.
+#[tokio::test]
+async fn without_the_replay_marker_an_earlier_claim_can_leave_a_damaged_object() {
+    use velmora_bridge::replay::ReplayPublish;
     let Some(c) = catalogue() else { return };
     let b = bucket(&c, 4).await;
+    let (extent_id, gc) = stage_replay_orphan(&c, &b).await;
+    assert!(!c.restore_pending().await.unwrap());
     let now = NOW.plus_ms(32 * 86_400_000);
-    // Four pairs put eight requests in flight against the same schema.
-    join_all((0..C / 2).map(|i| {
-        let c = &c;
-        let b = &b;
-        async move {
-            let source = extent(b, 200 + i);
-            let taken = c.replay_extents(b, &[ReplayExtent {
-                row: source.clone(), plan: None, packed: None, parity: None, safety_present: true,
-            }], NOW).await.unwrap();
-            assert!(taken.is_empty());
-            let inserted = rows(c,
-                "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'delete_safety', ?2) RETURNING id",
-                &[SqlValue::Text(source.id.as_str().into()), SqlValue::Int(NOW.0)],
-            ).await;
-            let [SqlValue::Int(id)] = inserted[0].as_slice() else { panic!("expected GC row ID") };
-            let gc = [GcRow { id: *id, extent_id: source.id.clone(), action: GcAction::DeleteSafety, due_at: NOW, done_at: None }];
-            let key = format!("replay-{i}");
-            let gen = generation(b, &key, 200 + i);
-            let placements = [ExtentPlacement { extent_id: source.id.clone(), seq: 0, plain_offset: 0 }];
-            let (published, (claim, status)) = tokio::join!(
-                c.replay_publish(&gen, &placements, now),
-                c.gc_orphan_claim(&gc, now, NOW.plus_ms(1)),
-            );
-            status.unwrap();
-            let live = c.live_object(&b.id, &key).await.unwrap();
-            match published.unwrap() {
-                ReplayPublish::Published => {
-                    assert_eq!(claim, [false]);
-                    let (head, extents) = live.unwrap();
-                    assert_eq!(head.id, gen.id);
-                    assert_eq!(extents[0].safety_state, SafetyState::Held);
-                }
-                ReplayPublish::Damaged => {
-                    assert_eq!(claim, [true]);
-                    assert!(live.is_none());
-                }
-                other => panic!("unexpected replay result: {other:?}"),
-            }
-        }
-    })).await;
+    let (claimed, status) = c.gc_orphan_claim(&[gc], now, NOW.plus_ms(1)).await;
+    status.unwrap();
+    assert_eq!(claimed, [true]);
+    let gen = generation(&b, "replay", 200);
+    let placements = [ExtentPlacement {
+        extent_id: extent_id.clone(),
+        seq: 0,
+        plain_offset: 0,
+    }];
+    assert_eq!(
+        c.replay_publish(&gen, &placements, now).await.unwrap(),
+        ReplayPublish::Published
+    );
+    let (head, extents) = c.live_object(&b.id, &gen.key).await.unwrap().unwrap();
+    assert_eq!(head.id, gen.id);
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].id, extent_id);
+    assert_eq!(extents[0].safety_state, SafetyState::Deleted);
+    assert_eq!(c.replay_damaged(10).await.unwrap(), (1, vec![gen.id]));
 }
 
 #[tokio::test]
