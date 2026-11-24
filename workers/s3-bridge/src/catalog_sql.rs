@@ -138,6 +138,10 @@ impl CatalogSql {
 }
 
 impl Sql for CatalogSql {
+    fn is_frozen(&self) -> bool {
+        matches!(self, Self::D1Frozen(_) | Self::PgFrozen(_))
+    }
+
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.reject_mutation(Some(sql))?;
         match self {

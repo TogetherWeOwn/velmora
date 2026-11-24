@@ -80,6 +80,9 @@ pub(super) fn record_hit<C, B, N, J, K, T>(
     K: Kek + 'static,
     T: Clock + 'static,
 {
+    if bridge.catalog.is_frozen() {
+        return;
+    }
     let flush = HOT_HITS.with(|slot| {
         let mut pending = slot.get();
         let flush = pending.record(bytes, bridge.clock.now());
@@ -131,6 +134,9 @@ async fn stamp_read<C, B, N, J, K, T>(
     K: Kek,
     T: Clock,
 {
+    if bridge.catalog.is_frozen() {
+        return;
+    }
     let now = bridge.clock.now();
     let recent = STAMPED.with(|memo| {
         memo.borrow()
@@ -413,8 +419,13 @@ async fn read<
 
     // A body above the fan-out size is not read here: the runtime asks
     // for it in sub-ranges, each from an invocation of its own, all
-    // pinned to this generation.
-    if let Some(chunk) = bridge.cfg.get_fanout_bytes {
+    // pinned to this generation. During a freeze, preflight the whole
+    // requested range here rather than starting a possibly partial fanout.
+    if let Some(chunk) = bridge
+        .cfg
+        .get_fanout_bytes
+        .filter(|_| !bridge.catalog.is_frozen())
+    {
         if range.length() > chunk {
             let mint = {
                 let bridge = Rc::clone(bridge);
@@ -563,6 +574,37 @@ async fn body<
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
     if todo.is_empty() {
         return Err(internal());
+    }
+    // A later miss on a frozen catalogue must not become a truncated 200.
+    // Check local availability before headers, with bounded R2 concurrency.
+    // The normal read still authenticates each returned piece.
+    if bridge.catalog.is_frozen() && todo.len() > 1 {
+        let missing = stream::iter(&todo)
+            .map(|piece| async {
+                let extent = &piece.extent;
+                let size = Some(extent.cipher_size);
+                bridge
+                    .cache
+                    .head(&extent.id.cache_key())
+                    .await
+                    .ok()
+                    .flatten()
+                    != size
+                    && bridge
+                        .safety
+                        .head(&extent.id.safety_key())
+                        .await
+                        .ok()
+                        .flatten()
+                        != size
+            })
+            .buffer_unordered(4)
+            .any(futures_util::future::ready)
+            .await;
+        if missing {
+            observed.mark_stage(Stage::R2);
+            return Err(unavailable());
+        }
     }
     // One item per extent, also for a single extent: the plaintext that
     // is waiting to be pulled stays charged to the byte budget, and the
@@ -1418,6 +1460,12 @@ where
                 self.hang_up().await;
                 return found;
             }
+        }
+
+        // A cold fill needs provider permits and catalogue writes, both
+        // unavailable during the freeze. Refuse before opening a session.
+        if bridge.catalog.is_frozen() {
+            return Err(ReadFail::Unavailable(Stage::R2));
         }
 
         // Cold: the whole extent comes back verified against the

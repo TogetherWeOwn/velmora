@@ -183,6 +183,10 @@ impl<S: Sql> SqlCatalog<S> {
 }
 
 impl<S: Sql> Catalog for SqlCatalog<S> {
+    fn is_frozen(&self) -> bool {
+        self.sql.is_frozen()
+    }
+
     // admin + auth
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>> {
         auth::create_bucket(self, b).await

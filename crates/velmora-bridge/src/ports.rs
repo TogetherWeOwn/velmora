@@ -103,6 +103,10 @@ pub trait Sql {
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
     }
+    /// This backend refuses mutations for the duration of a cutover freeze.
+    fn is_frozen(&self) -> bool {
+        false
+    }
 }
 
 // The limits of the database behind [`Sql`] live here and nowhere else:
@@ -706,6 +710,12 @@ pub struct KeyHead {
 
 /// The catalogue, implemented once: `sql::SqlCatalog<S: Sql>`.
 pub trait Catalog {
+    /// This catalogue is frozen. Check before starting operations whose
+    /// side effects must not outlive a refused catalogue mutation.
+    fn is_frozen(&self) -> bool {
+        false
+    }
+
     // admin + auth
     /// `Lost` = name taken.
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
