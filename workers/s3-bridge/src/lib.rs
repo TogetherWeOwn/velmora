@@ -550,11 +550,8 @@ async fn persist_copy_job(
     report: velmora_bridge::copy::JobReport,
     problems: u64,
 ) {
-    let wrote = match env.d1("CATALOG") {
-        Ok(db) => log
-            .job(&d1::D1Sql::new(db), &report, problems)
-            .await
-            .is_ok(),
+    let wrote = match catalog_sql::CatalogSql::recovery_log_from_env(&env) {
+        Ok(db) => log.job(&db, &report, problems).await.is_ok(),
         Err(_) => false,
     };
     if !wrote {
@@ -588,7 +585,7 @@ async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     if velmora_bridge::copy::pass_due(scheduled) {
         let env = env.clone();
         ctx.wait_until(async move {
-            let ok = match env.d1("CATALOG").map(d1::D1Sql::new) {
+            let ok = match catalog_sql::CatalogSql::recovery_log_from_env(&env) {
                 Ok(db) => recovery_log::prune_tick(
                     &db,
                     scheduled,

@@ -42,6 +42,14 @@ enum Backend {
 }
 
 impl Backend {
+    fn from_env(env: &Env) -> core::result::Result<Self, &'static str> {
+        Self::parse(optional_text(env, "CATALOG_BACKEND", "invalid CATALOG_BACKEND")?.as_deref())
+    }
+
+    fn is_frozen(self) -> bool {
+        matches!(self, Self::D1Frozen | Self::PgFrozen)
+    }
+
     fn parse(value: Option<&str>) -> core::result::Result<Self, &'static str> {
         match value {
             None | Some("d1") => Ok(Self::D1),
@@ -86,18 +94,9 @@ pub enum CatalogSql {
 
 impl CatalogSql {
     pub fn from_env(env: &Env) -> core::result::Result<Self, &'static str> {
-        let backend = Backend::parse(
-            optional_text(env, "CATALOG_BACKEND", "invalid CATALOG_BACKEND")?.as_deref(),
-        )?;
+        let backend = Backend::from_env(env)?;
         match backend {
-            Backend::D1 | Backend::D1Frozen => {
-                let d1 = D1Sql::new(env.d1("CATALOG").map_err(|_| "missing binding CATALOG")?);
-                Ok(if backend == Backend::D1 {
-                    Self::D1(d1)
-                } else {
-                    Self::D1Frozen(d1)
-                })
-            }
+            Backend::D1 | Backend::D1Frozen => Self::d1_from_env(env, backend.is_frozen()),
             Backend::Pg | Backend::PgFrozen => {
                 let config = PgConfig {
                     pipeline: pipeline(
@@ -114,13 +113,28 @@ impl CatalogSql {
                         .map_err(|_| "missing binding CATALOG_PG_R")?,
                 );
                 let pg = PgSql::new(writer, reader, config);
-                Ok(if backend == Backend::Pg {
-                    Self::Pg(pg)
-                } else {
+                Ok(if backend.is_frozen() {
                     Self::PgFrozen(pg)
+                } else {
+                    Self::Pg(pg)
                 })
             }
         }
+    }
+
+    /// Recovery telemetry still uses D1's SQL and binding, regardless of the
+    /// primary catalogue backend. Apply the same freeze policy to it.
+    pub fn recovery_log_from_env(env: &Env) -> core::result::Result<Self, &'static str> {
+        Self::d1_from_env(env, Backend::from_env(env)?.is_frozen())
+    }
+
+    fn d1_from_env(env: &Env, frozen: bool) -> core::result::Result<Self, &'static str> {
+        let db = D1Sql::new(env.d1("CATALOG").map_err(|_| "missing binding CATALOG")?);
+        Ok(if frozen {
+            Self::D1Frozen(db)
+        } else {
+            Self::D1(db)
+        })
     }
 
     fn reject_mutation(&self, query: Option<&str>) -> Result<()> {
@@ -202,6 +216,19 @@ mod tests {
         assert_eq!(pipeline(None), Ok(true));
         assert_eq!(pipeline(Some("0")), Ok(false));
         assert_eq!(pipeline(Some("false")), Err("invalid PG_PIPELINE"));
+    }
+
+    #[test]
+    fn only_frozen_backends_freeze_recovery_telemetry() {
+        for (backend, frozen) in [
+            (None, false),
+            (Some("d1"), false),
+            (Some("d1-frozen"), true),
+            (Some("pg"), false),
+            (Some("pg-frozen"), true),
+        ] {
+            assert_eq!(Backend::parse(backend).unwrap().is_frozen(), frozen);
+        }
     }
 
     #[test]
