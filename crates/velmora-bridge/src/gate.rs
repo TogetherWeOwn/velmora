@@ -1051,7 +1051,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         self.sql
             .batch(vec![
                 (
-                    SEED,
+                    self.sql.dialect().pick(SEED, SEED_PG),
                     vec![text(&p.id), SqlValue::Int(i64::from(p.max_conns))],
                 ),
                 (WAKE, vec![text(&idle), text(&holder)]),
@@ -2167,5 +2167,182 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
             }
             first_error
         })
+    }
+}
+
+const SEED_PG: &str = "INSERT INTO provider_permits(provider_id, slot) \
+     WITH RECURSIVE s(n) AS (SELECT 0::bigint UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
+     SELECT ?1, n FROM s WHERE n < ?2 ON CONFLICT DO NOTHING";
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(crate) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (SEED_PG.to_owned(), vec![T, I]),
+        (SEIZE.to_owned(), vec![T, T, I, I, T, I, I]),
+        (WAKE.to_owned(), vec![T, T]),
+        (OWNED.to_owned(), vec![T, T, I, I, I, T, T]),
+        (HAND_BACK.to_owned(), vec![T, T]),
+    ]
+}
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(crate) mod pg_background_fixture {
+    use std::path::{Path, PathBuf};
+    use tokio_postgres::{Client, NoTls, Transaction};
+
+    pub(crate) async fn connect() -> Option<Client> {
+        let url = std::env::var("VELMORA_TEST_PG_URL").ok()?;
+        let (db, driver) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("connect to the Postgres test database");
+        tokio::spawn(driver);
+        Some(db)
+    }
+
+    pub(crate) async fn transaction(db: &mut Client) -> Transaction<'_> {
+        transaction_seeded(db, "").await
+    }
+
+    pub(crate) async fn transaction_seeded<'a>(db: &'a mut Client, seed: &str) -> Transaction<'a> {
+        let migrations = std::env::var_os("VELMORA_TEST_PG_BASELINE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/s3-bridge/pg")
+            });
+        let tx = db.transaction().await.unwrap();
+        let pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let schema = format!("background_fixture_{pid}");
+        tx.batch_execute(&format!(
+            "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}, pg_temp"
+        ))
+        .await
+        .unwrap();
+        let migration = |name: &str| std::fs::read_to_string(migrations.join(name)).unwrap();
+        tx.batch_execute(&migration("0001_baseline_pre.sql"))
+            .await
+            .unwrap();
+        tx.batch_execute("INSERT INTO usage_global(id) VALUES (1), (2)")
+            .await
+            .unwrap();
+        if !seed.is_empty() {
+            tx.batch_execute(seed).await.unwrap();
+        }
+        tx.batch_execute(&migration("0002_baseline_post.sql"))
+            .await
+            .unwrap();
+        tx
+    }
+
+    pub(crate) fn sql(statement: &str) -> String {
+        statement.replace('?', "$")
+    }
+}
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod postgres_tests {
+    use super::{pg_background_fixture as pg, HAND_BACK, IDLE, OWNED, SEED, SEED_PG, SEIZE, WAKE};
+    use crate::testkit::RusqliteSql;
+    use rusqlite::params;
+
+    #[tokio::test]
+    async fn gate_sql_matches_sqlite_and_postgres() {
+        const ACTIVE: &str = "active:é:";
+        const RETIRED: &str = "retired:é:";
+        const HOLDER: &str = "active:é:a";
+        const SIBLING: &str = "active:é:b";
+        const IDLE_A: &str = "retired:é:a";
+        const IDLE_B: &str = "retired:é:b";
+        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
+        sqlite.with_conn(|db| {
+            assert_eq!(db.execute(SEED, params!["p", 4]).unwrap(), 4);
+            for (shard, holder) in [(0_i64, HOLDER), (1, SIBLING)] {
+                assert_eq!(
+                    db.execute(SEIZE, params!["p", holder, 100, 10, "shared", 2, shard])
+                        .unwrap(),
+                    2
+                );
+            }
+            let cols = db
+                .query_row(
+                    OWNED,
+                    params!["p", HOLDER, 11, 2, 0, ACTIVE, RETIRED],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(cols, (2, 2, 4, 4));
+            assert_eq!(db.execute(IDLE, params![HOLDER, IDLE_A]).unwrap(), 2);
+            assert_eq!(db.execute(HAND_BACK, params![RETIRED, ACTIVE]).unwrap(), 0);
+            assert_eq!(db.execute(WAKE, params![IDLE_A, HOLDER]).unwrap(), 2);
+            assert_eq!(db.execute(IDLE, params![HOLDER, IDLE_A]).unwrap(), 2);
+            assert_eq!(db.execute(IDLE, params![SIBLING, IDLE_B]).unwrap(), 2);
+            assert_eq!(db.execute(HAND_BACK, params![RETIRED, ACTIVE]).unwrap(), 4);
+        });
+        let Some(mut db) = pg::connect().await else {
+            return;
+        };
+        let tx = pg::transaction(&mut db).await;
+        assert_eq!(
+            tx.execute(&pg::sql(SEED_PG), &[&"p", &4_i64])
+                .await
+                .unwrap(),
+            4
+        );
+        for (shard, holder) in [(0_i64, HOLDER), (1, SIBLING)] {
+            assert_eq!(
+                tx.execute(
+                    &pg::sql(SEIZE),
+                    &[&"p", &holder, &100_i64, &10_i64, &"shared", &2_i64, &shard]
+                )
+                .await
+                .unwrap(),
+                2
+            );
+        }
+        let owned = format!("SELECT mine::bigint,held::bigint,total,gate::bigint FROM ({}) AS owned(mine,held,total,gate)", pg::sql(OWNED));
+        let row = tx
+            .query_one(
+                &owned,
+                &[&"p", &HOLDER, &11_i64, &2_i64, &0_i64, &ACTIVE, &RETIRED],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (0..4).map(|i| row.get::<_, i64>(i)).collect::<Vec<_>>(),
+            [2, 2, 4, 4]
+        );
+        let idle = pg::sql(IDLE);
+        let hand_back = pg::sql(HAND_BACK);
+        assert_eq!(tx.execute(&idle, &[&HOLDER, &IDLE_A]).await.unwrap(), 2);
+        assert_eq!(
+            tx.execute(&hand_back, &[&RETIRED, &ACTIVE]).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            tx.execute(&pg::sql(WAKE), &[&IDLE_A, &HOLDER])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(tx.execute(&idle, &[&HOLDER, &IDLE_A]).await.unwrap(), 2);
+        assert_eq!(tx.execute(&idle, &[&SIBLING, &IDLE_B]).await.unwrap(), 2);
+        assert_eq!(
+            tx.execute(&hand_back, &[&RETIRED, &ACTIVE]).await.unwrap(),
+            4
+        );
+        tx.rollback().await.unwrap();
     }
 }
