@@ -85,16 +85,22 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             b if b.is_ascii_whitespace() => i += 1,
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                // SQLite ends line comments at LF or EOF, not a bare CR.
+                while i < bytes.len() && bytes[i] != b'\n' && (!postgres || bytes[i] != b'\r') {
                     i += 1;
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
+                // SQLite's tokenizer does not recognize a bare `/*` at EOF.
+                if !postgres && i == bytes.len() {
+                    return Err(untranslated());
+                }
+                // Only PostgreSQL nests block comments and requires a closer.
                 let mut nesting = 1;
                 while nesting != 0 {
                     match bytes.get(i..i + 2) {
-                        Some(b"/*") => {
+                        Some(b"/*") if postgres => {
                             nesting += 1;
                             i += 2;
                         }
@@ -103,6 +109,7 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                             i += 2;
                         }
                         _ if i < bytes.len() => i += 1,
+                        _ if !postgres => break,
                         _ => return Err(untranslated()),
                     }
                 }
@@ -117,6 +124,20 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 let token = sql[start + 1..i - 1].to_ascii_uppercase();
                 writes |= writes_or_locks(&token);
                 previous = token;
+            }
+            b'`' if !postgres => {
+                i = quoted(bytes, i)?;
+                previous.clear();
+            }
+            b'[' if !postgres => {
+                // Unlike the other quotes, `]` is not escaped by doubling it.
+                i += sql[i + 1..].find(']').ok_or_else(untranslated)? + 2;
+                previous.clear();
+            }
+            b'$' | b':' | b'@' | b'#' if !postgres => {
+                // Catalogue SQL uses positional `?` binds. Refuse SQLite named
+                // binds: their parenthesized suffix can contain comment markers.
+                return Err(untranslated());
             }
             b';' => {
                 ended = true;
