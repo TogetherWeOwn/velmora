@@ -1988,3 +1988,42 @@ async fn pg_overload_during_delete_many_preserves_other_key_results() {
         resp.body
     );
 }
+
+#[tokio::test]
+async fn pg_overload_during_write_preflight_is_consistent() {
+    let rig = Rig::new().await;
+    assert_eq!(rig.send(plain_put("source")).await.outcome(), "200");
+    let sql = &rig.bridge.catalog.sql;
+    let preflight = [
+        (
+            "FROM access_keys WHERE access_key_id",
+            plain_put("preflight"),
+        ),
+        ("FROM buckets WHERE name", plain_put("preflight")),
+        ("SELECT g.perm FROM grants", plain_put("preflight")),
+        (
+            "SELECT max(id) FROM",
+            sign(
+                RW_KEY,
+                Method::Put,
+                "/alpha/dest",
+                &[],
+                &[("x-amz-copy-source", "/alpha/source")],
+                Vec::new(),
+            ),
+        ),
+    ];
+    for (needle, request) in preflight {
+        sql.overload.set(Some((needle, None)));
+        let response = rig.send(request).await;
+        assert!(sql.overload.get().is_none(), "fault not reached: {needle}");
+        assert_eq!(response.outcome(), "503 SlowDown", "{needle}");
+        let retry: Vec<_> = response
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(retry, ["1"], "{needle}");
+    }
+}

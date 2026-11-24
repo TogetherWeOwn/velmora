@@ -292,7 +292,7 @@ where
             .newest_id(&bucket.id, key)
             .await
             .inspect_err(observed.on_error(Stage::Lookup))
-            .map_err(|_| internal())?;
+            .map_err(catalog_error)?;
         let now = bridge.clock.now();
         let mut rand = [0u8; 8];
         SystemRng.fill_bytes(&mut rand).map_err(|_| internal())?;

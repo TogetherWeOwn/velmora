@@ -514,14 +514,14 @@ where
                     .catalog
                     .bucket_by_name(&target.bucket)
                     .await
-                    .map_err(|_| internal())?;
+                    .map_err(catalog_error)?;
             }
             if let Some(b) = &bucket {
                 authority.perm = bridge
                     .catalog
                     .grant(&authority.akid, &b.id)
                     .await
-                    .map_err(|_| internal())?;
+                    .map_err(catalog_error)?;
             }
         }
     }
