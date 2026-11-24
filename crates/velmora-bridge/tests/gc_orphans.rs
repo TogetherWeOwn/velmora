@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_support::*;
 use velmora_bridge::config::{BridgeConfig, GcMode, Maintenance, ORPHAN_GRACE_MS};
 use velmora_bridge::jobs::{ORPHAN_BATCH, ORPHAN_SCAN};
-use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayPhase, ReplayReport};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES;
 use velmora_bridge::*;
@@ -381,19 +381,8 @@ impl T {
         let started = self.now();
         let mut body = json!({ "since_ms": 0 });
         loop {
-            let mut req = Req {
-                method: Method::Post,
-                target: "/_admin/restore".to_string(),
-                headers: Vec::new(),
-                body: body.to_string().into_bytes(),
-            };
-            req.set_header("host", HOST);
-            req.set_header("content-length", &req.body.len().to_string());
-            let token = self.rig.bridge.cfg.admin_token.expose().to_string();
-            req.set_header("authorization", &format!("Bearer {token}"));
-            let r = self.rig.send(req).await;
-            assert_eq!(r.status, 200, "{}", r.text());
-            let report: Value = serde_json::from_slice(&r.body).unwrap();
+            let (status, report) = self.restore_call(&body).await;
+            assert_eq!(status, 200, "{report}");
             if report["next"].is_null() {
                 break;
             }
@@ -408,6 +397,23 @@ impl T {
             took
         );
         self.maintenance(Maintenance::Off);
+    }
+
+    /// One call of the restore route.
+    async fn restore_call(&self, body: &Value) -> (u16, Value) {
+        let mut req = Req {
+            method: Method::Post,
+            target: "/_admin/restore".to_string(),
+            headers: Vec::new(),
+            body: body.to_string().into_bytes(),
+        };
+        req.set_header("host", HOST);
+        req.set_header("content-length", &req.body.len().to_string());
+        let token = self.rig.bridge.cfg.admin_token.expose().to_string();
+        req.set_header("authorization", &format!("Bearer {token}"));
+        let r = self.rig.send(req).await;
+        let report = serde_json::from_slice(&r.body).unwrap_or_else(|_| json!(r.text()));
+        (r.status, report)
     }
 
     fn maintenance(&mut self, mode: Maintenance) {
@@ -1035,6 +1041,118 @@ async fn a_delete_of_the_key_covers_the_lingering_record() {
     let report = t.restore().await;
     assert_eq!(report.damaged_total, 0, "{report:?}");
     assert_eq!(t.status("k").await, 404);
+}
+
+/// A cursor of a replay that has ended publishes nothing. The catalogue
+/// no longer refuses claims for that replay, so a step taken now would
+/// publish beside a claim that deletes the parts it adopts. The check of
+/// the held extents only reads, and is still answered.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cursor_of_an_ended_replay_publishes_nothing() {
+    let mut t = setup().await;
+    t.put("a", b"a").await;
+    t.replay_in_place().await;
+    let run = t.count("SELECT started_at FROM restore_state WHERE id = 1");
+    let objects = "SELECT COUNT(*) FROM objects WHERE key = 'k'";
+
+    // After the replay, the pinned copy of "a" goes missing, and a
+    // completion is lost: its record lingers.
+    let held = t.rig.bridge.catalog.held_extents("", 10).await.unwrap();
+    assert_eq!(held.len(), 1);
+    t.rig
+        .bridge
+        .safety
+        .delete(&held[0].safety_key())
+        .await
+        .unwrap();
+    let id = t.create("k").await;
+    let one = t.part("k", &id, 1, &pattern(1, 3000)).await;
+    t.complete_lost("k", &id, &[(1, &one)]).await;
+
+    // Cursors of that replay, sent again: each is behind what the
+    // replay reached, so the route takes it as one of that replay.
+    t.maintenance(Maintenance::Restore);
+    let first = ReplayCursor {
+        run_ms: run,
+        ..ReplayCursor::start(UnixMs(0))
+    };
+    let last = ReplayCursor {
+        phase: ReplayPhase::Held,
+        after: String::new(),
+        extent: 0,
+        ..first.clone()
+    };
+    let (status, report) = t.restore_call(&json!({ "cursor": first })).await;
+    assert_eq!(status, 200, "{report}");
+    assert!(report["next"].is_null(), "{report}");
+    assert_eq!(report["published"], 0, "{report}");
+    assert_eq!(t.count(objects), 0);
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["held_missing_total"], 1, "{report}");
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'"),
+        0
+    );
+
+    // A rollback found since does not make the ended replay one under
+    // way again.
+    t.sql("UPDATE rollback_stamp SET rolled_back_at = 1 WHERE id = 1;");
+    let (status, report) = t.restore_call(&json!({ "cursor": first })).await;
+    assert_eq!(status, 409, "{report}");
+    assert_eq!(t.count(objects), 0);
+}
+
+/// The held check of an ended replay pages without writing: its `next`
+/// is not recorded, a page past what the replay reached is refused, and
+/// a rollback found since is answered before any page.
+#[tokio::test(flavor = "current_thread")]
+async fn the_held_pages_of_an_ended_replay_write_nothing() {
+    let mut t = setup().await;
+    t.put("a", b"a").await;
+    t.replay_in_place().await;
+    let run = t.count("SELECT started_at FROM restore_state WHERE id = 1");
+    // More pinned copies than one page of the check holds.
+    let page = ReplayLimits::default().extents;
+    for i in 0..page {
+        t.put(&format!("h{i}"), b"h").await;
+    }
+    let held = t.rig.bridge.catalog.held_extents("", 1000).await.unwrap();
+    assert_eq!(held.len(), page + 1);
+
+    t.maintenance(Maintenance::Restore);
+    t.sql("CREATE TABLE restore_state_before AS SELECT * FROM restore_state;");
+    let unchanged = || {
+        assert_eq!(t.count("SELECT COUNT(*) FROM restore_state"), 1);
+        assert_eq!(
+            t.count(
+                "SELECT COUNT(*) FROM (SELECT * FROM restore_state \
+                 EXCEPT SELECT * FROM restore_state_before)"
+            ),
+            0
+        );
+    };
+    let last = ReplayCursor {
+        phase: ReplayPhase::Held,
+        after: String::new(),
+        extent: 0,
+        run_ms: run,
+        ..ReplayCursor::start(UnixMs(0))
+    };
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["held_checked"], page, "{report}");
+    assert!(!report["next"].is_null(), "{report}");
+    unchanged();
+    // The next page is past what the replay reached.
+    let (status, again) = t.restore_call(&json!({ "cursor": report["next"] })).await;
+    assert_eq!(status, 400, "{again}");
+    unchanged();
+
+    t.sql("UPDATE rollback_stamp SET rolled_back_at = 1 WHERE id = 1;");
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 409, "{report}");
+    unchanged();
 }
 
 #[tokio::test(flavor = "current_thread")]

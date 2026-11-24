@@ -72,7 +72,7 @@ use crate::ports::{
 use crate::recovery::{
     delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
 };
-use crate::replay::ReplayCursor;
+use crate::replay::{ReplayCursor, ReplayPhase, ReplayReport};
 use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
     AccessKeyRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow, KeyStatus, Method,
@@ -696,7 +696,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             "This cursor is of an earlier replay. The replay that was started last is not finished.",
         )
     };
-    let cursor = match (body.cursor, body.since_ms) {
+    let (cursor, ended) = match (body.cursor, body.since_ms) {
         (Some(cursor), None) if body.margin_ms.is_none() => {
             // The catalogue knows how far the replay has come. A cursor
             // that is ahead of it (made up, or of another restore
@@ -714,7 +714,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                     "This cursor is ahead of the replay. Send `next` of the last response.",
                 ));
             }
-            cursor
+            (cursor, progress.ended)
         }
         (None, Some(since)) if since >= 0 => {
             let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
@@ -744,14 +744,56 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                         }),
                     )
                 })?;
-            ReplayCursor {
-                run_ms: run.0,
-                ..ReplayCursor::start(from)
-            }
+            (
+                ReplayCursor {
+                    run_ms: run.0,
+                    ..ReplayCursor::start(from)
+                },
+                false,
+            )
         }
         _ => return Err(bad()),
     };
     let run = crate::types::UnixMs(cursor.run_ms);
+    let rolled_back = || {
+        fail(
+            409,
+            "OperationAborted",
+            "The catalogue was rolled back after this replay started. Start a new replay with since_ms.",
+        )
+    };
+    if ended {
+        // A cursor of a replay that has ended publishes nothing and
+        // writes nothing: the catalogue no longer refuses writes or
+        // orphan claims for it (`guard_no_replay`), and a manifest or
+        // tombstone step would publish beside them. Its `restore_state`
+        // row stays as the end left it. The held-extent check only
+        // reads, so the last call sent again still reports what is
+        // missing; its `next` is not recorded, and a page past what the
+        // replay reached is refused by `follows` when it is sent. A
+        // replay that another call ends after the read above is still
+        // covered: claims wait out `ORPHAN_GRACE_MS` after any replay
+        // ends, in the batch that claims.
+        //
+        // First, as at the end of a replay: if the catalogue was rolled
+        // back since, that replay does not cover it.
+        bridge
+            .stamp_level(run)
+            .await
+            .or_internal()?
+            .ok_or_else(rolled_back)?;
+        if bridge.stamp_row().await.or_internal()?.rolled_back {
+            return Err(rolled_back());
+        }
+        let report = if cursor.phase == ReplayPhase::Held {
+            bridge.replay_step(cursor).await.or_internal()?
+        } else {
+            ReplayReport::default()
+        };
+        let value = serde_json::to_value(&report)
+            .map_err(|_| fail(500, "InternalError", "The report could not be encoded."))?;
+        return Ok(ok(&value));
+    }
     let report = bridge.replay_step(cursor).await.or_internal()?;
     match &report.next {
         // Recorded before the caller gets it: the next call may start
@@ -765,13 +807,6 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
         // last step of an older cursor must not open the catalogue for
         // writes while a replay that was started after it still runs.
         None => {
-            let rolled_back = || {
-                fail(
-                    409,
-                    "OperationAborted",
-                    "The catalogue was rolled back after this replay started. Start a new replay with since_ms.",
-                )
-            };
             // Not if the catalogue is behind a stamp that was raised
             // after this replay started: it was rolled back since, and
             // this replay does not hold what was written before that.
@@ -796,9 +831,9 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             {
                 return Err(earlier());
             }
-            // The last step of a replay that had ended before, sent
-            // again: it changed nothing. If the catalogue was rolled
-            // back since, that replay does not cover it.
+            // The run ended between the read of its progress and here
+            // (another call ended it): if the catalogue was rolled back
+            // since, that replay does not cover it.
             if bridge.stamp_row().await.or_internal()?.rolled_back {
                 return Err(rolled_back());
             }

@@ -170,6 +170,9 @@ pub struct RestoreProgress {
     pub since: UnixMs,
     /// Where the next step starts. `None` = no step has finished.
     pub reached: Option<ReplayMark>,
+    /// The replay has ended: the catalogue no longer refuses writes or
+    /// orphan claims for it.
+    pub ended: bool,
 }
 
 impl ReplayCursor {
