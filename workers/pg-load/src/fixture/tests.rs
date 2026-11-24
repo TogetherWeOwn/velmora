@@ -36,7 +36,7 @@ async fn fixture(schema: &str, families: &[Family]) -> (PgConnection, Cat<Local>
     config
         .host_path(socket)
         .dbname("postgres")
-        .user(&env::var("USER").expect("local PostgreSQL role"))
+        .user(env::var("USER").expect("local PostgreSQL role"))
         .options(format!("-c search_path={schema},pg_catalog,pg_temp"));
     let local = Local(config);
     let conn = local.connect().await.unwrap();
