@@ -1526,6 +1526,7 @@ pub(super) fn pg_statements() -> Vec<Stmt> {
         (INSERT_GENERATION, "TTTTITNTTII"),
         (UPSERT_POINTER, "TTT"),
         (INSERT_EXTENT, "TTTTIIIIBIBBBBTIIITII"),
+        (INSERT_EXTENT, "TTTTIIIIBIBBBBTNINNNI"),
         (INSERT_EXTENT, "TTTTNNIIBINBBBTNINNNI"),
         (RAISE_FLOOR_PG, "TTTI"),
         (SETTLE_FLOOR, "TTT"),
@@ -1561,4 +1562,145 @@ pub(super) fn pg_statements() -> Vec<Stmt> {
         (HEADS_INCLUSIVE_BELOW, "TTIT"),
         (GROUPED_INCLUSIVE_BELOW_PG, "TTIITTT"),
     ])
+}
+
+#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+mod pg_manifest_tests {
+    use super::*;
+    use crate::ports::{Catalog, Guard};
+    use crate::testkit::RusqliteSql;
+    use std::cell::RefCell;
+
+    fn bind_kinds(params: &[SqlValue]) -> String {
+        params
+            .iter()
+            .map(|v| match v {
+                SqlValue::Text(_) => 'T',
+                SqlValue::Int(_) => 'I',
+                SqlValue::Blob(_) => 'B',
+                SqlValue::Null => 'N',
+            })
+            .collect()
+    }
+
+    struct RecordExtentBinds {
+        db: RusqliteSql,
+        kinds: RefCell<Vec<String>>,
+    }
+
+    impl Sql for RecordExtentBinds {
+        async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+            self.db.query(sql, params).await
+        }
+
+        async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+            self.db.exec(sql, params).await
+        }
+
+        async fn batch(&self, stmts: Vec<Stmt>) -> Result<Vec<u64>> {
+            let kinds: Vec<_> = stmts
+                .iter()
+                .filter(|(sql, _)| *sql == INSERT_EXTENT)
+                .map(|(_, params)| bind_kinds(params))
+                .collect();
+            let changes = self.db.batch(stmts).await?;
+            self.kinds.borrow_mut().extend(kinds);
+            Ok(changes)
+        }
+    }
+
+    #[tokio::test]
+    async fn extent_inventory_covers_plain_and_sliced_put_binds() {
+        let db = RusqliteSql::with_schema().unwrap();
+        db.apply(
+            "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, created_at) \
+             VALUES ('b', 'test', 'owner', X'00', 1, 0)",
+        )
+        .unwrap();
+        let cat = SqlCatalog::new(RecordExtentBinds {
+            db,
+            kinds: RefCell::new(Vec::new()),
+        });
+        let manifest: Vec<_> = pg_statements()
+            .into_iter()
+            .filter(|(sql, _)| *sql == INSERT_EXTENT)
+            .map(|(_, params)| bind_kinds(&params))
+            .collect();
+        for (key, extent_count) in [("plain", 1), ("sliced", 2)] {
+            let bucket = BucketId::new("b");
+            let id = GenerationId::new(format!("g_{key}"));
+            let now = UnixMs(1);
+            let commit = CommitGeneration {
+                generation: GenerationRow {
+                    id: id.clone(),
+                    bucket_id: bucket.clone(),
+                    key: key.to_owned(),
+                    state: GenerationState::Live,
+                    size: u64::from(extent_count),
+                    etag: "tag".into(),
+                    checksum_json: None,
+                    content_json: "{}".into(),
+                    user_meta_json: "{}".into(),
+                    extent_count,
+                    created_at: now,
+                    retired_at: None,
+                },
+                extents: (0..extent_count)
+                    .map(|seq| ExtentRow {
+                        id: ExtentId::new(format!("x_{key}_{seq}")),
+                        bucket_id: bucket.clone(),
+                        generation_id: Some(id.clone()),
+                        state: ExtentState::Committed,
+                        seq: Some(seq),
+                        plain_offset: Some(u64::from(seq)),
+                        plain_size: 1,
+                        cipher_size: 65,
+                        media_header: vec![0; 48],
+                        key_mode: 1,
+                        wrapped_file_key: Some(vec![1; 73]),
+                        plain_md5: [0; 16],
+                        plain_sha256: [0; 32],
+                        cipher_sha256: [0; 32],
+                        safety_state: SafetyState::Held,
+                        article_count: None,
+                        plan_rev: 0,
+                        last_verified_at: None,
+                        release_evidence: None,
+                        released_at: None,
+                        created_at: now,
+                    })
+                    .collect(),
+                now,
+            };
+            let record = Recorded::for_test(&id);
+            let outcome = if extent_count == 1 {
+                cat.commit_generation(&commit, None, record).await.unwrap()
+            } else {
+                let write = WriteId::new("w_test");
+                let extents: Vec<_> = commit.extents.iter().map(|e| e.id.clone()).collect();
+                assert!(matches!(
+                    cat.open_intents(&write, &extents, now).await.unwrap(),
+                    Guard::Applied(())
+                ));
+                assert!(matches!(
+                    cat.intents_generation(&write, &id, extents.len())
+                        .await
+                        .unwrap(),
+                    Guard::Applied(())
+                ));
+                cat.commit_sliced(&commit, &write, None, record)
+                    .await
+                    .unwrap()
+            };
+            assert!(matches!(outcome, PublishOutcome::Applied));
+            let actual = cat.sql.kinds.take();
+            assert_eq!(actual.len(), extent_count as usize);
+            for kinds in actual {
+                assert!(
+                    manifest.contains(&kinds),
+                    "{key} PUT bound {kinds}; manifest has {manifest:?}"
+                );
+            }
+        }
+    }
 }
