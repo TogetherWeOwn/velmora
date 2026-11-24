@@ -48,6 +48,20 @@ fn invalid_and_unbounded_runs_are_refused() {
 }
 
 #[test]
+fn refuses_impossible_read_coverage_before_a_run_starts() {
+    let config = |rate| {
+        format!(
+            r#"{{"batches_per_minute":300,"minutes":5,"reads_per_minute":{rate},"unloaded_seconds":30,"mix":{{"gc":1}}}}"#
+        )
+    };
+    assert!(parse_config(&config(1200)).is_ok());
+    assert_eq!(
+        parse_config(&config(1199)).unwrap_err(),
+        "load configuration cannot schedule minimum reads per type in both phases"
+    );
+}
+
+#[test]
 fn nearest_rank_percentile_does_not_impute_missing_observations() {
     assert_eq!(percentile(&mut [], 99), None);
     assert_eq!(percentile(&mut [10., 5., 8., 1.], 95), Some(10.));

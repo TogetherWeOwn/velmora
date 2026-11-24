@@ -1,5 +1,5 @@
 use crate::fixture::{self, OpError, Read};
-use crate::{percentile, probe, Config, DrillConnect, Family, Job};
+use crate::{percentile, probe, Config, DrillConnect, Family, Job, MIN_READ_SAMPLES};
 use futures_util::{
     future::{join3, select, Either},
     pin_mut,
@@ -21,8 +21,9 @@ use velmora_bridge::{
 const WRITE_POOL_SLOTS: usize = 5;
 const MAX_LOGICAL_WRITES: usize = 64;
 const SAMPLE_MS: u64 = 250;
+// At most one missed nominal tick between reported samples.
+const MAX_SAMPLE_GAP_MS: u64 = 2 * SAMPLE_MS;
 const READ_SLOTS: usize = 3;
-const MIN_READ_SAMPLES: usize = 200;
 const READ_TIMEOUT_MS: f64 = 20_000.0;
 const ARM_KEY: &str = "pg_load_fixture_v1";
 
@@ -85,6 +86,7 @@ struct Coverage {
     status: &'static str,
     minimum_samples_per_read_and_phase: usize,
     at_least_ninety_percent_advisory_ticks: bool,
+    advisory_gap_within_tolerance: bool,
     unloaded_read_coverage: bool,
     loaded_read_coverage: bool,
 }
@@ -111,6 +113,9 @@ pub struct Report {
     advisory_sampling_ticks: u64,
     advisory_expected_ticks: u64,
     advisory_missed_ticks: u64,
+    advisory_sample_offsets_ms: Vec<f64>,
+    advisory_max_gap_ms: f64,
+    advisory_gap_tolerance_ms: u64,
     advisory_wait_samples: usize,
     sampled_lock_wait_p99_ms: Option<f64>,
     advisory_error: Option<String>,
@@ -442,10 +447,10 @@ async fn advisory(
     start: f64,
     duration: u64,
     lock: i64,
-) -> (u64, Vec<f64>, Option<String>) {
+) -> (Vec<f64>, Vec<f64>, Option<String>) {
     let mut waits = Vec::new();
     let mut error = None;
-    let mut ticks = 0;
+    let mut samples = Vec::new();
     let mut next_tick = 0;
     while next_tick < duration / SAMPLE_MS {
         let elapsed = (runtime.monotonic_ms() - start).max(0.0) as u64;
@@ -461,16 +466,34 @@ async fn advisory(
              AND l.classid::bigint=($1::bigint >> 32) AND l.objid::bigint=($1::bigint & 4294967295)", &[(&lock, Type::INT8)])
             .await;
         match result {
-            Ok(rows) => waits.extend(rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0))),
+            Ok(rows) => {
+                let receipt = (runtime.monotonic_ms() - start).max(0.0);
+                if receipt <= duration as f64 {
+                    samples.push(receipt);
+                    waits.extend(rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0)));
+                }
+            }
             Err(e) => {
                 error = Some(fixture::sql_error("sample advisory waits", e));
                 break;
             }
         }
-        ticks += 1;
         next_tick = tick + 1;
     }
-    (ticks, waits, error)
+    (samples, waits, error)
+}
+
+fn sampler_coverage(samples: &[f64], duration: u64) -> (bool, f64) {
+    let mut previous = 0.0_f64;
+    let mut max_gap = 0.0_f64;
+    for sample in samples.iter().copied().chain([duration as f64]) {
+        max_gap = max_gap.max(sample - previous);
+        previous = previous.max(sample);
+    }
+    (
+        samples.len() as u64 * 10 >= (duration / SAMPLE_MS) * 9,
+        max_gap,
+    )
 }
 
 async fn target(client: &Client) -> Result<(String, String, String), String> {
@@ -594,7 +617,8 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     )
     .await;
     drop(rd);
-    let (ticks, mut waits, advisory_error) = sampled;
+    let (sample_offsets, mut waits, advisory_error) = sampled;
+    let ticks = sample_offsets.len() as u64;
     let WritesResult {
         family,
         minutes: completed,
@@ -602,16 +626,23 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     } = write_result;
     let target = config.batches_per_minute;
     let expected_ticks = duration / SAMPLE_MS;
-    let enough_ticks = ticks * 10 >= expected_ticks * 9 && advisory_error.is_none();
+    let (enough_ticks, max_gap) = sampler_coverage(&sample_offsets, duration);
+    let gap_covered = max_gap <= MAX_SAMPLE_GAP_MS as f64;
     let (unloaded_covered, loaded_covered) = (unloaded.covered(), loaded.covered());
     let r3a_coverage = Coverage {
-        status: if enough_ticks && unloaded_covered && loaded_covered {
+        status: if enough_ticks
+            && gap_covered
+            && advisory_error.is_none()
+            && unloaded_covered
+            && loaded_covered
+        {
             "SUFFICIENT"
         } else {
             "INCONCLUSIVE"
         },
         minimum_samples_per_read_and_phase: MIN_READ_SAMPLES,
         at_least_ninety_percent_advisory_ticks: enough_ticks,
+        advisory_gap_within_tolerance: gap_covered,
         unloaded_read_coverage: unloaded_covered,
         loaded_read_coverage: loaded_covered,
     };
@@ -630,6 +661,9 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
         advisory_sampling_ticks: ticks,
         advisory_expected_ticks: expected_ticks,
         advisory_missed_ticks: expected_ticks.saturating_sub(ticks),
+        advisory_sample_offsets_ms: sample_offsets,
+        advisory_max_gap_ms: max_gap,
+        advisory_gap_tolerance_ms: MAX_SAMPLE_GAP_MS,
         advisory_wait_samples: waits.len(),
         sampled_lock_wait_p99_ms: percentile(&mut waits, 99),
         advisory_error,
@@ -642,6 +676,20 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptable_tick_count_cannot_hide_a_contiguous_gap() {
+        let timestamps: Vec<_> = (0..40)
+            .filter(|i| !(10..=12).contains(i))
+            .map(|i| f64::from(i * 250))
+            .collect();
+        let (enough_ticks, gap) = sampler_coverage(&timestamps, 10_000);
+        assert!(enough_ticks);
+        assert_eq!(gap, 1_000.0);
+        assert!(gap > MAX_SAMPLE_GAP_MS as f64);
+        assert_eq!(sampler_coverage(&[800.0, 950.0], 1_000).1, 800.0);
+        assert_eq!(sampler_coverage(&[0.0, 150.0], 1_000).1, 850.0);
+    }
 
     #[test]
     fn late_results_contribute_to_both_percentiles() {

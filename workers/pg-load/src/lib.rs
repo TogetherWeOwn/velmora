@@ -61,6 +61,8 @@ pub struct Config {
     mix: BTreeMap<Family, u32>,
 }
 
+pub(crate) const MIN_READ_SAMPLES: usize = 200;
+
 fn read_rate() -> u32 {
     1500
 }
@@ -82,6 +84,12 @@ pub fn parse_config(json: &str) -> Result<Config, &'static str> {
             .any(|f| f.batches() <= cfg.batches_per_minute * cfg.minutes)
     {
         return Err("load configuration outside supported bounds");
+    }
+    let read_samples = |seconds: u32| (u64::from(seconds) * u64::from(cfg.reads_per_minute)) / 180;
+    if read_samples(cfg.unloaded_seconds) < MIN_READ_SAMPLES as u64
+        || read_samples(cfg.minutes * 60) < MIN_READ_SAMPLES as u64
+    {
+        return Err("load configuration cannot schedule minimum reads per type in both phases");
     }
     Ok(cfg)
 }
