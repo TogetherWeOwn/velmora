@@ -692,8 +692,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         let outcome = self
             .sql
             .batch(vec![
-                ("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, 1)", key()),
-                ("INSERT INTO tx_guard(ok) SELECT 0", vec![]),
+                (
+                    self.sql.dialect().pick(SELFTEST_MARKER, SELFTEST_MARKER_PG),
+                    key(),
+                ),
+                (SELFTEST_FAIL, vec![]),
             ])
             .await;
         let guard_fired = match outcome {
@@ -701,15 +704,10 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
             Ok(_) => false,
             Err(e) => return Err(e),
         };
-        let marker = self
-            .sql
-            .query("SELECT 1 FROM meta WHERE k = ?1", &key())
-            .await?;
+        let marker = self.sql.query(SELFTEST_READ, &key()).await?;
         if !marker.is_empty() {
             // Atomicity is broken; leave no residue for the next run.
-            self.sql
-                .exec("DELETE FROM meta WHERE k = ?1", &key())
-                .await?;
+            self.sql.exec(SELFTEST_CLEAN, &key()).await?;
         }
         Ok(guard_fired && marker.is_empty())
     }
@@ -801,7 +799,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         let rows = self
             .sql
             .query(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete'",
+                self.sql
+                    .dialect()
+                    .pick(IMPORT_INCOMPLETE, IMPORT_INCOMPLETE_PG),
                 &[],
             )
             .await?;
@@ -1047,4 +1047,72 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<bool> {
         hot::hot_forget(self, extent, seq, safety, cache).await
     }
+}
+
+const SELFTEST_MARKER_PG: &str = "INSERT INTO meta(k, v) VALUES (?1, 1) \
+                  ON CONFLICT (k) DO UPDATE SET v = excluded.v";
+
+const SELFTEST_MARKER: &str = "INSERT OR REPLACE INTO meta(k, v) VALUES (?1, 1)";
+
+const SELFTEST_FAIL: &str = "INSERT INTO tx_guard(ok) SELECT 0";
+
+const SELFTEST_READ: &str = "SELECT 1 FROM meta WHERE k = ?1";
+
+const SELFTEST_CLEAN: &str = "DELETE FROM meta WHERE k = ?1";
+
+const IMPORT_INCOMPLETE_PG: &str = "SELECT 1 FROM pg_catalog.pg_class c \
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE n.nspname = current_schema() \
+                    AND c.relname = '_velmora_import_incomplete' AND c.relkind = 'r'";
+
+const IMPORT_INCOMPLETE: &str =
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_velmora_import_incomplete'";
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+fn pg_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
+    self::pg_manifest(&[
+        (SELFTEST_MARKER_PG, "T"),
+        (SELFTEST_FAIL, ""),
+        (SELFTEST_READ, "T"),
+        (SELFTEST_CLEAN, "T"),
+        (IMPORT_INCOMPLETE_PG, ""),
+    ])
+}
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+fn pg_manifest(statements: &[(&'static str, &str)]) -> Vec<(&'static str, Vec<SqlValue>)> {
+    statements
+        .iter()
+        .map(|&(sql, kinds)| {
+            let params = kinds
+                .bytes()
+                .map(|kind| match kind {
+                    b'T' => SqlValue::Text(String::new()),
+                    b'I' => SqlValue::Int(0),
+                    b'B' => SqlValue::Blob(Vec::new()),
+                    b'N' => SqlValue::Null,
+                    _ => unreachable!("unknown PG statement parameter kind"),
+                })
+                .collect();
+            (sql, params)
+        })
+        .collect()
+}
+
+/// Test inventory of the complete data-path statement texts and their bind types.
+#[doc(hidden)]
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub fn pg_datapath_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
+    [
+        pg_statements(),
+        auth::pg_statements(),
+        intents::pg_statements(),
+        objects::pg_statements(),
+        publish::pg_statements(),
+        recovery::pg_statements(),
+        uploads::pg_statements(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }

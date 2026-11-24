@@ -9,9 +9,7 @@
 //! Everything else in the batch is unchanged: its guards, in their
 //! order, decide whether what was adopted is the object.
 //!
-//! The statements are plain SQLite (`json_each`, `UPDATE ... FROM`).
-//!
-//! Join order and the unary `+` are part of the statement, not style.
+//! Join order and the unary `+` are part of the SQLite statements, not style.
 //! The values are the outer loop (`CROSS JOIN`, and `FROM m` in the
 //! update), and the `+` keeps the filters on `extents` from being used
 //! as an index: the planner must find each extent by its primary key.
@@ -20,7 +18,7 @@
 //! value once per extent row. `tests/sql_publish.rs` asserts the plan.
 
 use super::objects::{text, Stmt};
-use crate::ports::{SqlLimits, SqlValue};
+use crate::ports::{Dialect, SqlLimits, SqlValue};
 use crate::types::{BridgeError, BucketId, ExtentPlacement, GenerationId, Result, UploadId};
 
 /// The placements of one statement as `m(extent_id, seq, off)`, read
@@ -50,14 +48,39 @@ macro_rules! adopt {
 /// names: its extents were put there, staged, from the same record.
 const ADOPT_RECORD: &str = adopt!();
 
-/// A Complete adopts an extent only if a part of upload `?4` names it.
-const ADOPT_UPLOAD: &str = concat!(
-    adopt!(),
-    " AND (EXISTS (SELECT 1 FROM upload_parts \
+macro_rules! upload_source {
+    () => {
+        " AND (EXISTS (SELECT 1 FROM upload_parts \
                     WHERE extent_id = m.extent_id AND upload_id = ?4) \
            OR EXISTS (SELECT 1 FROM upload_part_extents \
                        WHERE extent_id = m.extent_id AND upload_id = ?4))"
-);
+    };
+}
+
+/// A Complete adopts an extent only if a part of upload `?4` names it.
+const ADOPT_UPLOAD: &str = concat!(adopt!(), upload_source!());
+
+macro_rules! placed_pg {
+    () => {
+        "WITH m(extent_id, seq, off) AS (SELECT j->>0, (j->>1)::bigint, (j->>2)::bigint \
+           FROM jsonb_array_elements(?2::jsonb) j) "
+    };
+}
+
+macro_rules! adopt_pg {
+    () => {
+        concat!(
+            placed_pg!(),
+            "UPDATE extents SET generation_id = ?1, seq = m.seq, plain_offset = m.off, \
+               state = 'committed' FROM m \
+              WHERE extents.id = m.extent_id AND extents.bucket_id = ?3 \
+                AND extents.state = 'staged' AND extents.generation_id IS NULL"
+        )
+    };
+}
+
+const ADOPT_RECORD_PG: &str = adopt_pg!();
+const ADOPT_UPLOAD_PG: &str = concat!(adopt_pg!(), upload_source!());
 
 /// References the extents of the value that another generation of the
 /// bucket holds: the two share them through a copy. An extent this
@@ -68,6 +91,14 @@ const REFERENCE_SHARED: &str = concat!(
     "INSERT OR IGNORE INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
      SELECT ?1, m.seq, e.id, m.off FROM m CROSS JOIN extents e ON e.id = m.extent_id \
       WHERE +e.bucket_id = ?3 AND +e.state = 'committed' AND +e.generation_id <> ?1"
+);
+
+const REFERENCE_SHARED_PG: &str = concat!(
+    placed_pg!(),
+    "INSERT INTO generation_extents(generation_id, seq, extent_id, plain_offset) \
+     SELECT ?1, m.seq, e.id, m.off FROM m JOIN extents e ON e.id = m.extent_id \
+      WHERE e.bucket_id = ?3 AND e.state = 'committed' AND e.generation_id <> ?1 \
+     ON CONFLICT (generation_id, seq) DO NOTHING"
 );
 
 /// Whose extents a generation takes.
@@ -139,6 +170,16 @@ pub(super) fn adopt(
     source: Source<'_>,
     values: &[String],
 ) -> Vec<Stmt> {
+    adopt_in(Dialect::Sqlite, g, bucket, source, values)
+}
+
+pub(super) fn adopt_in(
+    dialect: Dialect,
+    g: &GenerationId,
+    bucket: &BucketId,
+    source: Source<'_>,
+    values: &[String],
+) -> Vec<Stmt> {
     let bound = |value: &String| {
         vec![
             text(g.as_str()),
@@ -152,11 +193,14 @@ pub(super) fn adopt(
             Source::Upload(upload) => {
                 let mut params = bound(value);
                 params.push(text(upload.as_str()));
-                stmts.push((ADOPT_UPLOAD, params));
+                stmts.push((dialect.pick(ADOPT_UPLOAD, ADOPT_UPLOAD_PG), params));
             }
             Source::Record => {
-                stmts.push((ADOPT_RECORD, bound(value)));
-                stmts.push((REFERENCE_SHARED, bound(value)));
+                stmts.push((dialect.pick(ADOPT_RECORD, ADOPT_RECORD_PG), bound(value)));
+                stmts.push((
+                    dialect.pick(REFERENCE_SHARED, REFERENCE_SHARED_PG),
+                    bound(value),
+                ));
             }
         }
     }
@@ -326,4 +370,13 @@ mod tests {
             assert_eq!((pair[0].0, pair[1].0), (ADOPT_RECORD, REFERENCE_SHARED));
         }
     }
+}
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<Stmt> {
+    super::pg_manifest(&[
+        (ADOPT_RECORD_PG, "TTT"),
+        (ADOPT_UPLOAD_PG, "TTTT"),
+        (REFERENCE_SHARED_PG, "TTT"),
+    ])
 }
