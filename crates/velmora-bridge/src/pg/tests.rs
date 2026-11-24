@@ -282,3 +282,24 @@ async fn unusable_sql_and_nul_are_refused_without_opening_a_connection() {
         matches!(pg.query("SELECT json_extract(?1)",&[SqlValue::Int(1)]).await,Err(BridgeError::Sql(e)) if e=="pg: untranslated statement")
     );
 }
+
+#[test]
+fn sql_futures_do_not_embed_the_connection_handshake() {
+    use super::{PgConfig, PgConnect, PgConnection, PgSql};
+    struct LargeHandshake;
+    impl PgConnect for LargeHandshake {
+        async fn connect(&self) -> crate::Result<PgConnection> {
+            let handshake = [0_u8; 4096];
+            futures_util::future::pending::<()>().await;
+            std::hint::black_box(handshake);
+            unreachable!()
+        }
+    }
+    let pg = PgSql::new(LargeHandshake, LargeHandshake, PgConfig::default());
+    let read = std::mem::size_of_val(&pg.query("SELECT 1", &[]));
+    let write = std::mem::size_of_val(&pg.batch(vec![]));
+    assert!(
+        read < 4096 && write < 4096,
+        "read future {read}, write future {write}"
+    );
+}

@@ -140,8 +140,8 @@ pub(super) fn numeric(raw: &[u8]) -> Option<i64> {
         return None;
     }
     let mut magnitude = 0_u64;
-    for (i, d) in digits.chunks_exact(2).enumerate() {
-        let digit = u64::from(u16::from_be_bytes([d[0], d[1]]));
+    for (i, &d) in digits.as_chunks::<2>().0.iter().enumerate() {
+        let digit = u64::from(u16::from_be_bytes(d));
         if digit == 0 {
             continue;
         }

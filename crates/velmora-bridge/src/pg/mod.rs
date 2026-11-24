@@ -173,44 +173,55 @@ impl<C: PgConnect> PgSql<C> {
 }
 
 impl<C: PgConnect> Sql for PgSql<C> {
+    // Keep the connector handshake and pipeline state out of the enclosing
+    // service futures' stack layout. These futures are nested several deep.
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        let prepared = Prepared::new(sql, params)?;
-        if prepared.statement.kind == Kind::Read {
-            let conn = self.reader.connect().await.map_err(error::without_guard)?;
-            let result = prepared.run(conn.client(), true, self.recording()).await;
-            conn.finish().await;
-            result.map_err(error::without_guard)?.rows()
-        } else {
-            self.write(&[prepared], true)
-                .await?
-                .pop()
-                .ok_or_else(error::shape)?
-                .rows()
-        }
+        Box::pin(async {
+            let prepared = Prepared::new(sql, params)?;
+            if prepared.statement.kind == Kind::Read {
+                let conn = self.reader.connect().await.map_err(error::without_guard)?;
+                let result = prepared.run(conn.client(), true, self.recording()).await;
+                conn.finish().await;
+                result.map_err(error::without_guard)?.rows()
+            } else {
+                self.write(&[prepared], true)
+                    .await?
+                    .pop()
+                    .ok_or_else(error::shape)?
+                    .rows()
+            }
+        })
+        .await
     }
 
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        let stmt = Prepared::new(sql, params)?;
-        self.write(&[stmt], false)
-            .await?
-            .first()
-            .ok_or_else(error::shape)?
-            .changed()
+        Box::pin(async {
+            let stmt = Prepared::new(sql, params)?;
+            self.write(&[stmt], false)
+                .await?
+                .first()
+                .ok_or_else(error::shape)?
+                .changed()
+        })
+        .await
     }
 
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
         if stmts.is_empty() {
             return Ok(Vec::new());
         }
-        let all = stmts
-            .into_iter()
-            .map(|(sql, args)| Prepared::new(sql, &args))
-            .collect::<Result<Vec<_>>>()?;
-        self.write(&all, false)
-            .await?
-            .iter()
-            .map(batch::Reply::changed)
-            .collect()
+        Box::pin(async {
+            let all = stmts
+                .into_iter()
+                .map(|(sql, args)| Prepared::new(sql, &args))
+                .collect::<Result<Vec<_>>>()?;
+            self.write(&all, false)
+                .await?
+                .iter()
+                .map(batch::Reply::changed)
+                .collect()
+        })
+        .await
     }
 
     fn dialect(&self) -> Dialect {
