@@ -225,6 +225,7 @@ impl Fx {
             job_budget_bytes: BUDGET,
             gc_mode: GcMode::Disposable,
             hot_cap_bytes: velmora_bridge::config::DEFAULT_HOT_CAP_BYTES,
+            hot_ctl: Default::default(),
             maintenance,
             server_side_copy: false,
             get_fanout_bytes: None,
@@ -1137,7 +1138,9 @@ async fn drill_skips_a_provider_that_does_not_read() {
 
 #[tokio::test]
 async fn object_status_evict_and_drill_after_release() {
-    let fx = Fx::new().await;
+    let mut fx = Fx::new().await;
+    Rc::get_mut(&mut fx.bridge).unwrap().cfg.hot_ctl.mode =
+        velmora_bridge::config::HotCtlMode::Shadow;
     let bucket = fx.bucket("slice").await;
     let plain = plaintext();
     // A key with a reserved character, as a client would percent-encode it.
@@ -1243,6 +1246,15 @@ async fn object_status_evict_and_drill_after_release() {
     assert!(
         fx.bridge.nntp.connects() > connects,
         "the drill read from NNTP"
+    );
+    assert_eq!(
+        fx.bridge
+            .catalog
+            .hot_ctl_load(&velmora_bridge::hotctl::MISS_KEYS)
+            .await
+            .unwrap(),
+        vec![None; velmora_bridge::hotctl::MISS_BUCKETS],
+        "drill reads are not customer misses"
     );
     // It filled no cache and restored no pinned copy.
     assert!(fx.bridge.cache.keys().is_empty());

@@ -309,6 +309,69 @@ fn the_meter_matches_d1_after_the_index_drops() {
 }
 
 #[test]
+fn hot_signal_statements_meter_one_row_per_miss_or_hit_flush() {
+    use velmora_bridge::hotctl::{HIT_KEY, MISS_KEYS};
+    use velmora_bridge::sql::SqlCatalog;
+    use velmora_bridge::{Catalog, ExtentId, SqlValue, UnixMs};
+
+    block_on(async {
+        let db = RusqliteSql::with_schema().unwrap();
+        for (sql, _) in MEASURED.iter().take(3) {
+            db.exec(sql, &[]).await.unwrap();
+        }
+        db.meter_writes().unwrap();
+        let catalog = SqlCatalog::new(db);
+        let id = ExtentId::new("x_c");
+        catalog.hot_ghost(&id, UnixMs(1)).await.unwrap();
+        assert_eq!(catalog.sql.writes().billed(), 1);
+        assert_eq!(
+            catalog.hot_ctl_load(&[MISS_KEYS[11]]).await.unwrap(),
+            vec![Some(1)]
+        );
+        for (idx, hours) in [1, 3, 6, 12, 24, 48, 72, 168, 336, 720]
+            .into_iter()
+            .enumerate()
+        {
+            catalog
+                .sql
+                .exec(
+                    "UPDATE extents SET last_read_at = ?1 WHERE id = 'x_c'",
+                    &[SqlValue::Int(1)],
+                )
+                .await
+                .unwrap();
+            catalog.sql.reset_writes();
+            catalog
+                .hot_ghost(&id, UnixMs(1 + hours * 3_600_000))
+                .await
+                .unwrap();
+            assert_eq!(catalog.sql.writes().billed(), 1);
+            assert_eq!(
+                catalog.hot_ctl_load(&[MISS_KEYS[idx]]).await.unwrap(),
+                vec![Some(1)]
+            );
+        }
+        catalog
+            .hot_ghost(&id, UnixMs(2 + 720 * 3_600_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.hot_ctl_load(&[MISS_KEYS[10]]).await.unwrap(),
+            vec![Some(1)]
+        );
+        catalog.sql.reset_writes();
+        catalog.hot_counters_add(0).await.unwrap();
+        assert_eq!(catalog.sql.writes().billed(), 0);
+        catalog.hot_counters_add(10).await.unwrap();
+        assert_eq!(catalog.sql.writes().billed(), 1);
+        assert_eq!(
+            catalog.hot_ctl_load(&[HIT_KEY]).await.unwrap(),
+            vec![Some(10)]
+        );
+    });
+}
+
+#[test]
 fn a_rolled_back_batch_is_not_metered() {
     let db = RusqliteSql::with_schema().expect("schema");
     db.meter_writes().expect("meter");

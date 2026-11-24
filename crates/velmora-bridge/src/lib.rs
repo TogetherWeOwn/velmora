@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod gate;
 pub mod hashstate;
 pub mod hosts;
+pub mod hotctl;
 pub mod ingress;
 pub mod intents;
 pub mod jobs;

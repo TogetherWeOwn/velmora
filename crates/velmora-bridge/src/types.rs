@@ -1255,6 +1255,14 @@ pub struct HotStats {
     pub evictable_extents: u64,
 }
 
+/// Evictable cache occupancy and age, excluding pinned safety copies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotShape {
+    pub evictable_bytes: u64,
+    pub never_read_bytes: u64,
+    pub oldest_read_at: Option<UnixMs>,
+}
+
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses
 /// it if anything here has changed since.
 #[derive(Clone, Debug, PartialEq, Eq)]

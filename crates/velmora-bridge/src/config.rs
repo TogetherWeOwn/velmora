@@ -201,6 +201,106 @@ impl std::error::Error for ConfigError {}
 /// `HOT_CAP_BYTES` when the variable is absent: 100 GiB.
 pub const DEFAULT_HOT_CAP_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
+/// Estimated CPU, R2, and catalogue cost of filling a GiB on a cold GET.
+pub const MISS_USD_PER_GIB: f64 = 0.0016;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HotCtlMode {
+    #[default]
+    Fixed,
+    Shadow,
+    Adaptive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HotCtlConfig {
+    pub mode: HotCtlMode,
+    pub min_bytes: u64,
+    /// None requests unlimited sizing, subject to the signal coverage guard.
+    pub max_bytes: Option<u64>,
+    pub hit_floor: f64,
+    pub hit_margin: f64,
+    pub horizon_h: u32,
+    pub min_reads: u64,
+}
+
+impl Default for HotCtlConfig {
+    fn default() -> Self {
+        Self {
+            mode: HotCtlMode::Fixed,
+            min_bytes: 10 << 30,
+            max_bytes: Some(1 << 40),
+            hit_floor: 0.95,
+            hit_margin: 0.02,
+            horizon_h: 7 * 24,
+            min_reads: 200,
+        }
+    }
+}
+
+impl HotCtlConfig {
+    fn from_vars(get: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        let mode = match get("HOT_CAP_MODE").as_deref().map(str::trim) {
+            None | Some("" | "fixed") => HotCtlMode::Fixed,
+            Some("shadow") => HotCtlMode::Shadow,
+            Some("adaptive") => HotCtlMode::Adaptive,
+            _ => return Err(ConfigError::Invalid("HOT_CAP_MODE".into())),
+        };
+        let min_bytes = optional_u64(get, "HOT_CAP_MIN_BYTES")?.unwrap_or(defaults.min_bytes);
+        let max_bytes = match get("HOT_CAP_MAX_BYTES").as_deref().map(str::trim) {
+            None | Some("") => defaults.max_bytes,
+            Some("none") => None,
+            Some(v) => Some(
+                v.parse::<u64>()
+                    .ok()
+                    .filter(|&n| i64::try_from(n).is_ok())
+                    .ok_or_else(|| ConfigError::Invalid("HOT_CAP_MAX_BYTES".into()))?,
+            ),
+        };
+        if min_bytes == 0
+            || min_bytes > crate::hotctl::MEASURABLE_MAX_BYTES
+            || max_bytes.is_some_and(|max| min_bytes > max)
+        {
+            return Err(ConfigError::Invalid("HOT_CAP_MIN_BYTES".into()));
+        }
+        let fraction = |var: &str, default| match get(var) {
+            Some(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| (0. ..=1.).contains(v))
+                .ok_or_else(|| ConfigError::Invalid(var.into())),
+            _ => Ok(default),
+        };
+        let hit_floor = fraction("HOT_HIT_FLOOR", defaults.hit_floor)?;
+        let hit_margin = fraction("HOT_HIT_MARGIN", defaults.hit_margin)?;
+        let min_reads = optional_u64(get, "MIN_READS")?.unwrap_or(defaults.min_reads);
+        if min_reads == 0 {
+            return Err(ConfigError::Invalid("MIN_READS".into()));
+        }
+        if !(0. < hit_floor && hit_floor <= 1.) {
+            return Err(ConfigError::Invalid("HOT_HIT_FLOOR".into()));
+        }
+        let horizon_h =
+            optional_u64(get, "HOT_CX_HORIZON_H")?.unwrap_or(u64::from(defaults.horizon_h));
+        // Only edges in the fixed reuse histogram can represent the active window exactly.
+        let horizon_h = crate::hotctl::REUSE_HOURS
+            .into_iter()
+            .find(|&edge| u64::from(edge) == horizon_h)
+            .ok_or_else(|| ConfigError::Invalid("HOT_CX_HORIZON_H".into()))?;
+        Ok(Self {
+            mode,
+            min_bytes,
+            max_bytes,
+            hit_floor,
+            hit_margin,
+            horizon_h,
+            min_reads,
+        })
+    }
+}
+
 /// Sockets of one post job when `POST_SOCKETS` is unset. The sockets of
 /// one job leave from one address, which matters for providers that limit
 /// the addresses an account connects from; each socket also holds one
@@ -339,6 +439,7 @@ pub struct BridgeConfig {
     /// Cap on evictable bytes in R2 (released safety copies and cache
     /// fills). Pinned bytes are outside it: uploads are never throttled.
     pub hot_cap_bytes: u64,
+    pub hot_ctl: HotCtlConfig,
     pub maintenance: Maintenance,
     /// Names this catalogue in the keys of its rollback stamp
     /// (`rs/<catalogue id>/<counter>`). Two catalogues over one safety
@@ -1106,6 +1207,7 @@ impl BridgeConfig {
             job_budget_bytes,
             gc_mode,
             hot_cap_bytes,
+            hot_ctl: HotCtlConfig::from_vars(&get)?,
             maintenance,
             catalogue_id,
             server_side_copy,

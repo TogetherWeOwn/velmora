@@ -1267,7 +1267,14 @@ async fn a_piece_that_waits_too_long_is_taken_back_and_produced_again() {
             true => 20,
             false => ms.into(),
         });
-        let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        let mut cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
+        Rc::get_mut(&mut cold.rig.bridge).unwrap().cfg.hot_ctl.mode =
+            velmora_bridge::config::HotCtlMode::Shadow;
+        let hit_flushes = Rc::new(RefCell::new(Vec::new()));
+        let flush: Spawner = {
+            let hit_flushes = Rc::clone(&hit_flushes);
+            Rc::new(move |work| hit_flushes.borrow_mut().push(work))
+        };
         let rig = &cold.rig;
         let parts = [
             pattern(101, 300_000),
@@ -1286,7 +1293,13 @@ async fn a_piece_that_waits_too_long_is_taken_back_and_produced_again() {
             &[],
             Vec::new(),
         );
-        let resp = Rc::clone(&rig.bridge).handle(req.into_request()).await;
+        let resp = Rc::clone(&rig.bridge)
+            .handle_observed_with_hit_flush(
+                req.into_request(),
+                &mut Default::default(),
+                Some(flush),
+            )
+            .await;
         assert_eq!(resp.status, 200);
         let RespBody::Stream(mut body) = resp.body else {
             panic!("a GET body is a stream");
@@ -1323,6 +1336,28 @@ async fn a_piece_that_waits_too_long_is_taken_back_and_produced_again() {
         assert!(extents.iter().all(|e| cached(rig, e)));
         assert_eq!(rig.bridge.nntp.live(), 0);
         assert_eq!(rig.bridge.budget.in_use(), 0);
+        let flushed = std::mem::take(&mut *hit_flushes.borrow_mut());
+        for work in flushed {
+            work.await;
+        }
+        let cat = &rig.bridge.catalog;
+        assert_eq!(
+            cat.hot_ctl_load(&[velmora_bridge::hotctl::HIT_KEY])
+                .await
+                .unwrap(),
+            vec![None]
+        );
+        let missed: i64 = cat
+            .hot_ctl_load(&velmora_bridge::hotctl::MISS_KEYS)
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .sum();
+        assert_eq!(
+            missed as u64,
+            extents.iter().map(|x| x.cipher_size).sum::<u64>()
+        );
     };
     local.run_until(test).await;
 }

@@ -38,6 +38,65 @@ use crate::types::{
 /// Least time between two `last_read_at` writes for one extent. The
 /// eviction order only needs to be this fine.
 pub const READ_STAMP_MS: i64 = 3_600_000;
+const HIT_FLUSH_MS: i64 = 15 * 60 * 1_000;
+// Bound the unflushed traffic when a busy isolate is retired before the
+// time gate. Sparse traffic can still lose its last best-effort batch.
+const HIT_FLUSH_BYTES: u64 = 1 << 30;
+
+#[derive(Clone, Copy, Default)]
+struct HitAccumulator {
+    bytes: u64,
+    last_flush: Option<UnixMs>,
+}
+
+impl HitAccumulator {
+    fn record(&mut self, bytes: u64, now: UnixMs) -> Option<u64> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        let not_due = self
+            .last_flush
+            .is_some_and(|at| now.0.saturating_sub(at.0) < HIT_FLUSH_MS);
+        if self.bytes == 0 || (self.bytes < HIT_FLUSH_BYTES && not_due) {
+            return None;
+        }
+        self.last_flush = Some(now);
+        Some(std::mem::take(&mut self.bytes))
+    }
+}
+
+thread_local! {
+    static HOT_HITS: Cell<HitAccumulator> = const { Cell::new(HitAccumulator { bytes: 0, last_flush: None }) };
+}
+
+/// With zero bytes, only drains an existing batch that aged out.
+pub(super) fn record_hit<C, B, N, J, K, T>(
+    bridge: &Rc<Bridge<C, B, N, J, K, T>>,
+    spawner: &Spawner,
+    bytes: u64,
+) where
+    C: Catalog + 'static,
+    B: BlobStore + 'static,
+    N: NntpConnector + 'static,
+    J: JobSink + 'static,
+    K: Kek + 'static,
+    T: Clock + 'static,
+{
+    let flush = HOT_HITS.with(|slot| {
+        let mut pending = slot.get();
+        let flush = pending.record(bytes, bridge.clock.now());
+        slot.set(pending);
+        flush
+    });
+    if let Some(bytes) = flush {
+        let bridge = Rc::clone(bridge);
+        // A transport error may have committed. Never retry an add.
+        spawner(
+            async move {
+                let _ = bridge.catalog.hot_counters_add(bytes).await;
+            }
+            .boxed_local(),
+        );
+    }
+}
 /// Extents whose last stamp this isolate remembers.
 const STAMP_MEMO: usize = 4096;
 
@@ -162,8 +221,9 @@ pub(super) async fn get_object<
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
     observed: &mut GetObservation,
+    hit_flush: Option<Spawner>,
 ) -> S3Response {
-    match read(bridge, req, false, observed).await {
+    match read(bridge, req, false, observed, hit_flush).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -180,7 +240,7 @@ pub(super) async fn head_object<
     req: S3Request,
     observed: &mut GetObservation,
 ) -> S3Response {
-    match read(bridge, req, true, observed).await {
+    match read(bridge, req, true, observed, None).await {
         Ok(resp) => resp,
         // A HEAD response has no body, errors included.
         Err(mut resp) => {
@@ -301,6 +361,7 @@ async fn read<
     req: S3Request,
     head: bool,
     observed: &mut GetObservation,
+    hit_flush: Option<Spawner>,
 ) -> core::result::Result<S3Response, S3Response> {
     observed.mark_stage(Stage::Auth);
     let authed = authenticate(bridge, &req).await?;
@@ -394,6 +455,7 @@ async fn read<
         range.start,
         range.length(),
         observed,
+        hit_flush,
     )
     .await?;
     Ok(resp)
@@ -414,12 +476,13 @@ pub(super) async fn fanout_piece<
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     req: S3Request,
     observed: &mut GetObservation,
+    hit_flush: Option<Spawner>,
 ) -> S3Response {
     let Ok(grant) = admit(&bridge.kek, &req, bridge.clock.now()) else {
         observed.mark_stage(Stage::Grant);
         return s3_error(ErrorCode::AccessDenied);
     };
-    match granted(bridge, &grant, observed).await {
+    match granted(bridge, &grant, observed, hit_flush).await {
         Ok(resp) | Err(resp) => resp,
     }
 }
@@ -435,6 +498,7 @@ async fn granted<
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     grant: &Grant,
     observed: &mut GetObservation,
+    hit_flush: Option<Spawner>,
 ) -> core::result::Result<S3Response, S3Response> {
     // The grant was minted for a generation that existed and a range
     // inside it; anything else here is a fault, not a client error.
@@ -464,7 +528,16 @@ async fn granted<
             ("content-length".into(), grant.len.to_string()),
             ("content-type".into(), "application/octet-stream".into()),
         ],
-        body: body(bridge, bucket, extents, grant.start, grant.len, observed).await?,
+        body: body(
+            bridge,
+            bucket,
+            extents,
+            grant.start,
+            grant.len,
+            observed,
+            hit_flush,
+        )
+        .await?,
     })
 }
 
@@ -484,6 +557,7 @@ async fn body<
     start: u64,
     len: u64,
     observed: &mut GetObservation,
+    hit_flush: Option<Spawner>,
 ) -> core::result::Result<RespBody, S3Response> {
     observed.mark_stage(Stage::Plan);
     let todo = pieces(extents, start, len).ok_or_else(internal)?;
@@ -495,16 +569,20 @@ async fn body<
     // charge is released when the item is handed over or the body is
     // dropped. A later failure ends the stream with an error; the client
     // sees a body shorter than Content-Length.
+    let measure = bridge.cfg.hot_ctl.mode != crate::config::HotCtlMode::Fixed;
+    let hits = hit_flush
+        .filter(|_| measure)
+        .map(|spawner| (Rc::clone(bridge), spawner));
     let bridge = Rc::clone(bridge);
     let spawner = bridge.budget.spawner().cloned();
     let mut items = driven(spawner.as_ref(), move |out| {
-        relay(bridge, bucket, todo, out)
+        relay(bridge, bucket, todo, out, measure)
     });
     // The first piece is produced before the status line goes out, so an
     // object that cannot be read is an error response, not a cut-off 200.
     let first = match items.next().await {
-        Some(Ok(held)) => held,
-        Some(Err(fail)) => {
+        Some((Ok(held), hit_bytes)) => (Ok(held), hit_bytes),
+        Some((Err(fail), _)) => {
             observed.mark_stage(fail.stage());
             return Err(fail.response());
         }
@@ -514,10 +592,16 @@ async fn body<
         }
     };
     Ok(RespBody::Stream(
-        stream::once(async move { Ok(first) })
+        stream::once(async move { first })
             .chain(items)
-            // The charge ends here, with the bytes leaving.
-            .map(|item| {
+            // Count R2 pieces only when pulled, not when read ahead or
+            // taken back from a stalled stream. The charge ends here too.
+            .map(move |(item, hit_bytes)| {
+                if hit_bytes != 0 {
+                    if let Some((bridge, spawner)) = &hits {
+                        record_hit(bridge, spawner, hit_bytes);
+                    }
+                }
                 item.map(|(bytes, _charge)| bytes)
                     .map_err(|fail| fail.stream_error())
             })
@@ -732,7 +816,8 @@ async fn relay<C, B, N, J, K, T>(
     bridge: Rc<Bridge<C, B, N, J, K, T>>,
     bucket: Bucket,
     todo: Vec<Piece>,
-    out: Out<Item>,
+    out: Out<(Item, u64)>,
+    measure: bool,
 ) where
     C: Catalog,
     B: BlobStore,
@@ -742,6 +827,7 @@ async fn relay<C, B, N, J, K, T>(
     T: Clock,
 {
     let mut cold = Cold::new(&bridge);
+    cold.measure = measure;
     let last = todo.len() - 1;
     let timer = bridge.budget.sleeper();
     // Whether pieces are produced ahead of the reader: on a host that
@@ -754,6 +840,7 @@ async fn relay<C, B, N, J, K, T>(
     for (at, piece) in todo.iter().enumerate() {
         // A piece taken back after a client stall is still the same read.
         let mut first_eligible_at = None;
+        let mut read_from_usenet = false;
         loop {
             if out.ahead() && !eager && !out.is_wanted() {
                 // Nothing is held while the reader is busy: neither a
@@ -765,6 +852,15 @@ async fn relay<C, B, N, J, K, T>(
             let first = *first_eligible_at.get_or_insert_with(|| bridge.clock.now());
             let item = cold.piece(&bucket, piece, first).await;
             let failed = item.is_err();
+            // An abandoned cold attempt still cost a verified fetch. A
+            // warm retry of this same piece is not a separate customer hit.
+            read_from_usenet |= !failed && !cold.from_r2;
+            let hit_bytes = if measure && !failed && !read_from_usenet {
+                piece.extent.cipher_size
+            } else {
+                0
+            };
+            let item = (item, hit_bytes);
             // Before the last item and before an error: the reader of
             // the body may never ask again after either, and the last
             // extent would then be missing from the cache and the
@@ -979,6 +1075,25 @@ where
     item
 }
 
+/// A verified miss is recorded whether or not there is room for a refill.
+/// The refill is returned unpolled so it cannot overwrite the stamp
+/// before observation settles, or is dropped if observation timed out.
+async fn prepare_verified_fill<F: Future<Output = ()>, O: Future<Output = bool>>(
+    room: &ByteBudget,
+    cipher: Vec<u8>,
+    measure: bool,
+    write: impl FnOnce(Vec<u8>, Charge) -> F,
+    observe: impl FnOnce() -> O,
+) -> Option<F> {
+    let put = room
+        .try_charge(cipher.len() as u64)
+        .map(|copy| write(cipher, copy));
+    if measure && !observe().await {
+        return None;
+    }
+    put
+}
+
 /// What a read keeps from one extent to the next while it reads from
 /// Usenet: the connections, and the cache write of the extent before.
 ///
@@ -1014,6 +1129,9 @@ where
     /// When the wait of the piece being made for a provider ends, once
     /// it has begun: no wait for room is begun after it.
     until: Option<UnixMs>,
+    // Only customer GET (possibly a granted subrange), never a copy.
+    measure: bool,
+    from_r2: bool,
 }
 
 /// How many times a body that has begun waits
@@ -1069,6 +1187,8 @@ where
             room: Rc::new(bridge.budget.for_request()),
             mid: false,
             until: None,
+            measure: false,
+            from_r2: false,
         }
     }
 
@@ -1127,6 +1247,30 @@ where
             self.hang_up().await;
         }
         beside(&mut self.put, f).await
+    }
+
+    /// Observe a verified customer miss before its optional refill. A
+    /// timed-out D1 request can still land after its Rust future is
+    /// dropped, so don't start any fill or stamp for this attempt then.
+    async fn observe_miss(&mut self, extent: &ExtentId) -> bool {
+        let bridge = self.bridge;
+        let ghost = bridge.catalog.hot_ghost(extent, bridge.clock.now());
+        let Some(sleep) = bridge.budget.sleeper() else {
+            // Hosts without timers may take an immediate observation,
+            // but must not await a new unbounded write on the GET path.
+            return ghost.now_or_never().is_some();
+        };
+        let completed = matches!(
+            self.wait(select(core::pin::pin!(ghost), sleep(COLD_WAIT_MS)))
+                .await,
+            Either::Left(_)
+        );
+        if !completed {
+            // If both deadlines were ready on the same poll, the ghost
+            // deadline may have won before `wait` closed the sessions.
+            self.hang_up().await;
+        }
+        completed
     }
 
     /// Lets the cache write end, with the connections watched as in
@@ -1253,6 +1397,7 @@ where
                 drop(src);
                 let held = retain(&room, work, plain).ok_or(ReadFail::Internal(Stage::Budget))?;
                 self.wait(stamp_read(bridge, &extent.id, from_cache)).await;
+                self.from_r2 = true;
                 return Ok(held);
             }
         }
@@ -1263,6 +1408,7 @@ where
         let bridge = self.bridge;
         let extent = &piece.extent;
         self.until = None;
+        self.from_r2 = false;
         let span = cipher_span(extent.plain_size, piece.off, piece.len)
             .ok_or(ReadFail::Internal(Stage::Plan))?;
         match self.warm(bucket, piece, span).await {
@@ -1368,17 +1514,25 @@ where
                     let held = room
                         .try_charge(plain.len() as u64)
                         .ok_or(ReadFail::Internal(Stage::Budget))?;
-                    if let Some(copy) = room.try_charge(cipher.len() as u64) {
-                        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
-                        let write = async move {
-                            // Verified already: a cache that does not
-                            // take the copy does not fail the read.
-                            let fill = bridge.cache_fill(&extent, cipher);
-                            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
-                            drop(copy);
-                        };
-                        self.put = Some(write.boxed_local());
-                    }
+                    let spent = Rc::clone(&self.spent);
+                    self.put = prepare_verified_fill(
+                        &room,
+                        cipher,
+                        self.measure,
+                        |cipher, copy| {
+                            let extent = extent.clone();
+                            async move {
+                                // A cache that refuses a verified copy
+                                // does not fail the read.
+                                let fill = bridge.cache_fill(&extent, cipher);
+                                let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
+                                drop(copy);
+                            }
+                            .boxed_local()
+                        },
+                        || self.observe_miss(&extent.id),
+                    )
+                    .await;
                     return Ok((plain, held));
                 }
                 Ok(ColdFetch::Busy) if shortfall > 0 => Stage::Budget,
@@ -1495,6 +1649,70 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn a_verified_miss_is_counted_when_the_cache_copy_does_not_fit() {
+        use crate::ports::BlobMeta;
+        use crate::sql::SqlCatalog;
+        use crate::testkit::{MemBlobStore, RusqliteSql};
+        use crate::types::BucketId;
+
+        let db = RusqliteSql::with_schema().unwrap();
+        db.apply("INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) \
+                 VALUES ('b_c','cold','o',x'00',1,1); \
+                 INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+                 VALUES ('x_c','b_c','staged',1,4096,x'00',x'00',x'00',x'00','held',1);").unwrap();
+        let catalog = SqlCatalog::new(db);
+        let cache = MemBlobStore::new();
+        let extent = ExtentId::new("x_c");
+        let bucket = BucketId::new("b_c");
+        let room = ByteBudget::new(4096);
+        let _plaintext = room.try_charge(1).expect("plaintext fits");
+        let fill = prepare_verified_fill(
+            &room,
+            vec![0; 4096],
+            true,
+            |cipher, _copy| async {
+                let hash = crate::post::sha256(&cipher);
+                cache
+                    .put(
+                        &extent.cache_key(),
+                        cipher,
+                        &BlobMeta {
+                            bucket: &bucket,
+                            extent: &extent,
+                            cipher_sha256: &hash,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            },
+            || async {
+                catalog.hot_ghost(&extent, UnixMs(1)).await.unwrap();
+                true
+            },
+        )
+        .await;
+        if let Some(fill) = fill {
+            fill.await;
+        }
+        assert!(!cache.contains(&extent.cache_key()));
+        assert_eq!(
+            catalog.hot_ctl_load(&["hotg_first"]).await.unwrap(),
+            vec![Some(4096)]
+        );
+    }
+
+    #[test]
+    fn busy_hit_accumulator_flushes_at_one_gib_without_waiting_fifteen_minutes() {
+        const GIB: u64 = 1 << 30;
+        let mut pending = HitAccumulator::default();
+        assert_eq!(pending.record(1, UnixMs(0)), Some(1));
+        assert_eq!(pending.record(GIB - 1, UnixMs(1)), None);
+        assert_eq!(pending.record(1, UnixMs(2)), Some(GIB));
+        assert_eq!(pending.record(0, UnixMs(HIT_FLUSH_MS + 2)), None);
+    }
 
     #[test]
     fn cold_read_port_errors_keep_their_dependency_stage() {
