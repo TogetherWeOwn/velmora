@@ -323,6 +323,17 @@ impl Resp {
             .map(|(_, v)| v.as_str())
     }
 
+    fn expect_slow_down(&self) {
+        assert_eq!(self.outcome(), "503 SlowDown");
+        let retry_after: Vec<_> = self
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(retry_after, ["1"], "expected exactly one Retry-After");
+    }
+
     /// `"<status> <S3 error code>"`, e.g. `404 NoSuchUpload`.
     fn outcome(&self) -> String {
         match xml_value(&self.body, "Code") {
@@ -1874,6 +1885,103 @@ fn plain_put(key: &str) -> Req {
         &[],
         b"bytes".to_vec(),
     )
+}
+
+async fn assert_no_publication(rig: &Rig) {
+    for table in [
+        "generations",
+        "objects",
+        "generation_extents",
+        "outbox",
+        "gc",
+    ] {
+        assert_eq!(
+            rig.count(&format!("SELECT COUNT(*) FROM {table}")).await,
+            0,
+            "{table}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pg_overload_fences_complete_and_discards_its_record() {
+    let rig = Rig::new().await;
+    let catalog = &rig.bridge.catalog;
+    let sql = &catalog.sql;
+    let id = rig.create("alpha", KEY).await;
+    let part = b"staged part";
+    let etag = rig.part("alpha", KEY, &id, 1, part).await;
+    let upload = UploadId::new(&id);
+    let target = UploadTarget {
+        bucket: &rig.alpha.id,
+        key: KEY,
+        id: &upload,
+    };
+    let (mut expected_upload, expected_parts) = catalog.upload(&target).await.unwrap().unwrap();
+    let extents = sql.query("SELECT * FROM extents", &[]).await.unwrap();
+    let pieces = sql
+        .query("SELECT * FROM upload_part_extents", &[])
+        .await
+        .unwrap();
+    let safety_before = rig.bridge.safety.keys();
+
+    // Refuse the whole publish batch before it reaches SQLite. The real
+    // catalogue then settles the PG error by committing the revision fence.
+    sql.overload.set(Some(("INSERT INTO generations", None)));
+    let response = rig.complete("alpha", KEY, &id, &[(1, &etag)]).await;
+    assert!(sql.overload.get().is_none(), "publish fault not reached");
+    response.expect_slow_down();
+    assert_eq!(
+        rig.bridge.safety.keys(),
+        safety_before,
+        "the fenced recovery record must be discarded"
+    );
+    assert_no_publication(&rig).await;
+    expected_upload.revision += 1;
+    assert_eq!(
+        catalog.upload(&target).await.unwrap().unwrap(),
+        (expected_upload, expected_parts),
+        "only the revision fence should change the upload"
+    );
+    assert_eq!(
+        sql.query("SELECT * FROM extents", &[]).await.unwrap(),
+        extents
+    );
+    assert_eq!(
+        sql.query("SELECT * FROM upload_part_extents", &[])
+            .await
+            .unwrap(),
+        pieces
+    );
+
+    let retry = rig.complete("alpha", KEY, &id, &[(1, &etag)]).await;
+    assert_eq!(retry.outcome(), "200", "{}", retry.body);
+    assert_eq!(rig.object(&rig.alpha, KEY).await.unwrap().1, part);
+    assert_eq!(rig.count("SELECT COUNT(*) FROM generations").await, 1);
+}
+
+#[tokio::test]
+async fn pg_overload_during_put_publication_leaves_no_catalogue_rows() {
+    let rig = Rig::new().await;
+    let sql = &rig.bridge.catalog.sql;
+    sql.overload.set(Some(("INSERT INTO generations", None)));
+    let response = rig.send(plain_put(KEY)).await;
+    assert!(sql.overload.get().is_none(), "publish fault not reached");
+    response.expect_slow_down();
+    assert_no_publication(&rig).await;
+    assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 0);
+
+    // Only Complete can fence its publication. PUT's catalogue returns
+    // the overload error directly and leaves the record for recovery.
+    assert_eq!(
+        rig.bridge
+            .safety
+            .keys()
+            .iter()
+            .filter(|key| key.starts_with(velmora_bridge::recovery::GENERATION_PREFIX))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
