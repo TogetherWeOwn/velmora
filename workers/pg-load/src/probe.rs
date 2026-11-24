@@ -39,14 +39,12 @@ impl DrillSession {
         }
     }
     pub fn into_pg(mut self) -> PgConnection {
-        let done = self.done.take().expect("unconsumed driver");
+        // PgConnection stops its driver without waiting. Only raw probes
+        // await `done` through DrillSession::close.
         PgConnection::new(
             self.client.take().expect("open client"),
             self.stop.take().expect("open driver"),
         )
-        .with_shutdown(async move {
-            let _ = done.await;
-        })
     }
     fn client(&self) -> &Client {
         self.client.as_ref().expect("open client")
