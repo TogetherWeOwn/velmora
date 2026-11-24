@@ -39,6 +39,9 @@ use crate::types::{
 /// eviction order only needs to be this fine.
 pub const READ_STAMP_MS: i64 = 3_600_000;
 const HIT_FLUSH_MS: i64 = 15 * 60 * 1_000;
+// Bound the unflushed traffic when a busy isolate is retired before the
+// time gate. Sparse traffic can still lose its last best-effort batch.
+const HIT_FLUSH_BYTES: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Default)]
 struct HitAccumulator {
@@ -49,11 +52,10 @@ struct HitAccumulator {
 impl HitAccumulator {
     fn record(&mut self, bytes: u64, now: UnixMs) -> Option<u64> {
         self.bytes = self.bytes.saturating_add(bytes);
-        if self.bytes == 0
-            || self
-                .last_flush
-                .is_some_and(|at| now.0.saturating_sub(at.0) < HIT_FLUSH_MS)
-        {
+        let not_due = self
+            .last_flush
+            .is_some_and(|at| now.0.saturating_sub(at.0) < HIT_FLUSH_MS);
+        if self.bytes == 0 || (self.bytes < HIT_FLUSH_BYTES && not_due) {
             return None;
         }
         self.last_flush = Some(now);
@@ -65,7 +67,8 @@ thread_local! {
     static HOT_HITS: Cell<HitAccumulator> = const { Cell::new(HitAccumulator { bytes: 0, last_flush: None }) };
 }
 
-fn record_hit<C, B, N, J, K, T>(
+/// With zero bytes, only drains an existing batch that aged out.
+pub(super) fn record_hit<C, B, N, J, K, T>(
     bridge: &Rc<Bridge<C, B, N, J, K, T>>,
     spawner: &Spawner,
     bytes: u64,
@@ -1466,15 +1469,25 @@ where
                         .ok_or(ReadFail::Internal(Stage::Budget))?;
                     if let Some(copy) = room.try_charge(cipher.len() as u64) {
                         let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
-                        let ghost_at = self.measure.then(|| bridge.clock.now());
                         let write = async move {
                             // Verified already: a cache that does not
                             // take the copy does not fail the read.
-                            let fill = bridge.cache_fill(&extent, cipher, ghost_at);
+                            let fill = bridge.cache_fill(&extent, cipher);
                             let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
                             drop(copy);
                         };
                         self.put = Some(write.boxed_local());
+                    } else {
+                        drop(cipher);
+                    }
+                    if self.measure {
+                        // Count the verified miss even when no fill was
+                        // scheduled. Don't poll the fill while recording:
+                        // its first catalogue write replaces the timestamp.
+                        let _ = bridge
+                            .catalog
+                            .hot_ghost(&extent.id, bridge.clock.now())
+                            .await;
                     }
                     return Ok((plain, held));
                 }
@@ -1592,6 +1605,16 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    #[test]
+    fn busy_hit_accumulator_flushes_at_one_gib_without_waiting_fifteen_minutes() {
+        const GIB: u64 = 1 << 30;
+        let mut pending = HitAccumulator::default();
+        assert_eq!(pending.record(1, UnixMs(0)), Some(1));
+        assert_eq!(pending.record(GIB - 1, UnixMs(1)), None);
+        assert_eq!(pending.record(1, UnixMs(2)), Some(GIB));
+        assert_eq!(pending.record(0, UnixMs(HIT_FLUSH_MS + 2)), None);
+    }
 
     #[test]
     fn cold_read_port_errors_keep_their_dependency_stage() {

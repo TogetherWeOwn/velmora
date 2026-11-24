@@ -19,6 +19,8 @@ pub(super) const HOT_SHAPE: &str =
     "(hot_cache_bytes > 0 OR (hot_safety_bytes > 0 AND safety_state NOT IN ('held', 'releasing')))"
 );
 
+// `first` means no LRU timestamp, not necessarily no previous customer
+// GET. Release can seed the existing recency field from creation time.
 const GHOST: &str = "INSERT INTO meta(k, v) SELECT CASE \
     WHEN last_read_at IS NULL THEN ?22 \
     WHEN last_read_at >= ?2 THEN ?12 \

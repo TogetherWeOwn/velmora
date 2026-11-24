@@ -1,6 +1,6 @@
 use velmora_bridge::config::{HotCtlConfig, HotCtlMode};
 use velmora_bridge::hotctl::{
-    decide, Counters, Inputs, Params, Rates, Reason, Sample, Signals, State, EXTENT_BYTES,
+    decide, Counters, Inputs, Params, Rates, Reason, Sample, Signals, State, Step, EXTENT_BYTES,
     MEASURABLE_MAX_BYTES,
 };
 use velmora_bridge::{HotShape, UnixMs};
@@ -60,19 +60,51 @@ fn reset_counters_hold_and_rebaseline() {
         hit: 50 * GIB,
         ..Counters::default()
     };
-    let d = decide(inputs(0, 0, 0, prior), &State::default(), &p);
-    let reset = decide(inputs(1, 0, 0, Counters::default()), &d.next, &p);
+    let mut state = State {
+        cap: Some(p.fixed_cap),
+        ..State::default()
+    };
+    let d = decide(inputs(0, 0, 0, prior), &state, &p);
+    assert_eq!(
+        d.reason,
+        Reason::HoldErr,
+        "a baseline is not an idle sample"
+    );
+    state.sample = d.next.sample;
+    let mut sample = state.sample.unwrap();
+    sample.rates = Some(Rates {
+        hit: 1_000. * EXTENT_BYTES as f64,
+        ..Rates::default()
+    });
+    state.sample = Some(sample);
+    let reset = decide(inputs(1, 0, 0, Counters::default()), &state, &p);
     assert_eq!(reset.reason, Reason::HoldErr);
     assert_eq!(reset.target, d.target);
-    assert_ne!(
-        decide(inputs(2, 0, 0, Counters::default()), &reset.next, &p).reason,
-        Reason::HoldErr
-    );
+    assert_eq!(reset.next.sample.unwrap().rates, sample.rates);
+    let recovered = decide(inputs(2, 0, 0, Counters::default()), &reset.next, &p);
+    assert_eq!(recovered.step, Step::Shrink);
+    assert_eq!(recovered.reason, Reason::Shrink);
+    assert!(recovered.reads_day.unwrap() > 900.);
+}
+
+#[test]
+fn the_first_observed_rate_is_not_diluted_by_the_empty_baseline() {
+    let p = params();
+    let d = decide(inputs(0, 0, 0, Counters::default()), &State::default(), &p);
+    let mut c = Counters {
+        hit: 12 * EXTENT_BYTES,
+        ..Counters::default()
+    };
+    c.miss[11] = EXTENT_BYTES;
+    let d = decide(inputs(1, 0, 0, c), &d.next, &p);
+    assert_eq!(d.reads_day, Some(312.));
+    assert_eq!(d.reason, Reason::FirstRead);
+    assert_eq!(d.target, p.fixed_cap);
 }
 
 #[test]
 fn first_reads_do_not_grow_and_archive_misses_do_not_drive_growth() {
-    for (miss_idx, reason) in [(11, Reason::FirstRead), (8, Reason::Shrink)] {
+    for (miss_idx, reason) in [(11, Reason::FirstRead), (8, Reason::Hold)] {
         let p = params();
         let base = State {
             last_grow_at: Some(UnixMs(0)),
@@ -88,6 +120,22 @@ fn first_reads_do_not_grow_and_archive_misses_do_not_drive_growth() {
         assert_eq!(after.reason, reason);
         assert_eq!(after.target, d.target);
     }
+}
+
+#[test]
+fn measured_hit_floor_blocks_downsize_when_the_reuse_model_disagrees() {
+    let p = params();
+    let base = decide(
+        inputs(0, 100, 72, Counters::default()),
+        &State::default(),
+        &p,
+    );
+    let mut c = Counters::default();
+    c.miss[0] = 10 * GIB;
+    let d = decide(inputs(1, 100, 72, c), &base.next, &p);
+    assert!(d.hit_ratio.unwrap() < p.config.hit_floor);
+    assert_eq!(d.target, p.fixed_cap);
+    assert_eq!(d.reason, Reason::Hold);
 }
 
 #[test]
@@ -110,6 +158,7 @@ fn sub_five_percent_target_is_held_except_to_reach_the_idle_minimum() {
         ..State::default()
     };
     let d = decide(inputs(0, 0, 0, Counters::default()), &base, &p);
+    let d = decide(inputs(1, 0, 0, Counters::default()), &d.next, &p);
     assert_eq!(d.target, p.config.min_bytes);
 }
 
@@ -129,7 +178,14 @@ fn idle_walks_down_in_bounded_steps_and_honors_both_cooldowns() {
             c.hit += 8 * EXTENT_BYTES;
             let d = decide(inputs(h, 0, 0, c), &state, &p);
             let cap = state.cap.unwrap();
-            assert_eq!(d.reason, Reason::Idle);
+            assert_eq!(
+                d.reason,
+                if h == 0 {
+                    Reason::HoldErr
+                } else {
+                    Reason::Idle
+                }
+            );
             assert!((p.config.min_bytes..=cap).contains(&d.target));
             assert!(d.target >= cap - cap / 10);
             if d.target != cap {
@@ -184,6 +240,9 @@ fn unlimited_is_guarded_and_lowering_the_bound_walks_down() {
         900 * GIB,
         "a large bound change still steps down at 10%"
     );
+    assert_eq!(d.step, Step::Shrink);
+    assert_eq!(d.reason.as_str(), "max_lowered");
+    assert!(d.hit_floor_breached);
     p.config.max_bytes = None;
     c.miss[4] += 100 * GIB;
     let d = decide(inputs(37, 900, 1, c), &d.next, &p);
@@ -206,14 +265,14 @@ fn repeated_18_hour_cohort_recovers_the_hit_floor_within_six_runs() {
         sample: Some(Sample {
             observed_at: UnixMs(0),
             counters: c,
-            rates: {
+            rates: Some({
                 let mut rates = Rates {
                     hit: 0.90 * DAY_BYTES as f64,
                     ..Rates::default()
                 };
                 rates.miss[11] = 0.046 * DAY_BYTES as f64;
                 rates
-            },
+            }),
         }),
         ..State::default()
     };

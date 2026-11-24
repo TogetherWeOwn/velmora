@@ -2708,17 +2708,7 @@ where
     ///
     /// Without the first count nothing is written: an uncounted copy
     /// could outlive the cap. `false` = not written for that reason.
-    pub(crate) async fn cache_fill(
-        &self,
-        extent: &ExtentRow,
-        cipher: Vec<u8>,
-        customer_miss_at: Option<UnixMs>,
-    ) -> Result<bool> {
-        if let Some(now) = customer_miss_at {
-            // A fill stamps last_read_at; sample its previous value first.
-            // Instrumentation errors must not change the fill or the read.
-            let _ = self.catalog.hot_ghost(&extent.id, now).await;
-        }
+    pub(crate) async fn cache_fill(&self, extent: &ExtentRow, cipher: Vec<u8>) -> Result<bool> {
         let meta = BlobMeta {
             bucket: &extent.bucket_id,
             extent: &extent.id,
@@ -2773,7 +2763,7 @@ where
             ColdFetch::Filled(cipher) => {
                 // Verified already: a cache that does not take the copy
                 // does not fail the read.
-                let _ = self.cache_fill(extent, cipher.clone(), None).await;
+                let _ = self.cache_fill(extent, cipher.clone()).await;
                 Ok(ColdFetch::Filled(cipher))
             }
             other => Ok(other),

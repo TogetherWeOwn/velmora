@@ -70,7 +70,8 @@ pub struct Rates {
 pub struct Sample {
     pub observed_at: UnixMs,
     pub counters: Counters,
-    pub rates: Rates,
+    /// None until there has been an elapsed interval between snapshots.
+    pub rates: Option<Rates>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -92,6 +93,7 @@ pub enum Reason {
     Shrink,
     Hold,
     CappedAtMax,
+    MaxLowered,
     UnlimitedNeedsCounters,
     NeedsCounters,
 }
@@ -108,8 +110,27 @@ impl Reason {
             Self::Shrink => "shrink",
             Self::Hold => "hold",
             Self::CappedAtMax => "capped_at_max",
+            Self::MaxLowered => "max_lowered",
             Self::UnlimitedNeedsCounters => "unlimited_needs_counters",
             Self::NeedsCounters => "needs_counters",
+        }
+    }
+}
+
+/// The actual rate-limited change, distinct from why the controller asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Hold,
+    Grow,
+    Shrink,
+}
+
+impl Step {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Grow => "grow",
+            Self::Shrink => "shrink",
         }
     }
 }
@@ -123,10 +144,12 @@ pub struct Decision {
     /// Whether to replace the persisted target; the sample may advance even
     /// when the target is held or the deadband suppresses a change.
     pub target_changed: bool,
+    pub step: Step,
     pub reason: Reason,
     pub tau_h: Option<f64>,
     pub rho_gib_h: Option<f64>,
     pub hit_ratio: Option<f64>,
+    pub hit_floor_breached: bool,
     pub reads_day: Option<f64>,
     pub save_usd_mo: Option<f64>,
     pub next: State,
@@ -137,16 +160,21 @@ impl Sample {
         Self {
             observed_at: now,
             counters,
-            rates: Rates::default(),
+            rates: None,
         }
     }
 
-    fn update(self, now: UnixMs, counters: Counters) -> Option<Self> {
+    fn update(self, now: UnixMs, counters: Counters) -> Option<(Self, Rates)> {
         let elapsed_h = now.0.checked_sub(self.observed_at.0)? as f64 / HOUR_MS as f64;
         if elapsed_h <= 0. {
             return None;
         }
-        let weight = -(-elapsed_h / HOURS_PER_DAY).exp_m1();
+        let weight = if self.rates.is_some() {
+            -(-elapsed_h / HOURS_PER_DAY).exp_m1()
+        } else {
+            1.
+        };
+        let previous = self.rates.unwrap_or_default();
         let update = |old: f64, start: u64, end: u64| {
             if !old.is_finite() || old < 0. {
                 return None;
@@ -154,13 +182,21 @@ impl Sample {
             let daily = end.checked_sub(start)? as f64 * HOURS_PER_DAY / elapsed_h;
             Some(old * (1. - weight) + daily * weight)
         };
-        let mut sample = Self::baseline(now, counters);
-        sample.rates.hit = update(self.rates.hit, self.counters.hit, counters.hit)?;
+        let mut rates = Rates {
+            hit: update(previous.hit, self.counters.hit, counters.hit)?,
+            ..Rates::default()
+        };
         for i in 0..MISS_BUCKETS {
-            sample.rates.miss[i] =
-                update(self.rates.miss[i], self.counters.miss[i], counters.miss[i])?;
+            rates.miss[i] = update(previous.miss[i], self.counters.miss[i], counters.miss[i])?;
         }
-        Some(sample)
+        Some((
+            Self {
+                observed_at: now,
+                counters,
+                rates: Some(rates),
+            },
+            rates,
+        ))
     }
 }
 
@@ -177,6 +213,8 @@ fn sum_between(rates: &Rates, lower_h: f64, upper_h: f64) -> f64 {
 
 fn save_usd_mo(rates: &Rates, rho: f64, fixed: u64, target: u64) -> f64 {
     let storage = (fixed as f64 - target as f64) / GIB * STORAGE_USD_PER_GIB_MONTH;
+    // Report the churn penalty only for newly cold reuse ages. When the
+    // target grows that interval is empty; this is a conservative estimate.
     if rho == 0. || target >= fixed {
         return storage;
     }
@@ -194,10 +232,12 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
         target: p.fixed_cap,
         max_bytes: cfg.max_bytes,
         target_changed: false,
+        step: Step::Hold,
         reason: Reason::Fixed,
         tau_h: None,
         rho_gib_h: None,
         hit_ratio: None,
+        hit_floor_breached: false,
         reads_day: None,
         save_usd_mo: None,
         next: *state,
@@ -229,15 +269,25 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
         }
         _ => return d,
     };
-    let sample = match state.sample {
-        None => Sample::baseline(input.now, counters),
+    let (sample, rates) = match state.sample {
+        None => {
+            // No rate yet: a baseline is not evidence of idle traffic.
+            d.next.sample = Some(Sample::baseline(input.now, counters));
+            return d;
+        }
         Some(old) if old.observed_at >= input.now => return d,
         Some(old) => match old.update(input.now, counters) {
             Some(sample) => sample,
             None => {
-                // A reset or corrupt EWMA cannot be differenced. Hold once
-                // and use this good snapshot as the next sample's baseline.
-                d.next.sample = Some(Sample::baseline(input.now, counters));
+                // A reset is a sampling gap, not zero traffic. Rebase
+                // the snapshot but keep the last good smoothed rates.
+                let mut baseline = Sample::baseline(input.now, counters);
+                baseline.rates = old.rates.filter(|rates| {
+                    rates.hit.is_finite()
+                        && rates.hit >= 0.
+                        && rates.miss.iter().all(|v| v.is_finite() && *v >= 0.)
+                });
+                d.next.sample = Some(baseline);
                 return d;
             }
         },
@@ -245,7 +295,7 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
     d.next.sample = Some(sample);
 
     let rho = stamped as f64 / tau;
-    let rates = &sample.rates;
+    let rates = &rates;
     let reads = (rates.hit + rates.miss.iter().sum::<f64>()) / EXTENT_BYTES as f64;
     let horizon = f64::from(cfg.horizon_h);
     let active = rates.hit + sum_between(rates, 0., horizon) + rates.miss[FIRST];
@@ -254,11 +304,12 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
     d.rho_gib_h = Some(rho / GIB);
     d.reads_day = Some(reads);
     d.hit_ratio = hit;
+    let under_floor = hit.is_some_and(|h| h < cfg.hit_floor);
+    d.hit_floor_breached = under_floor;
 
     let (want, reason) = if reads < cfg.min_reads as f64 {
         (cfg.min_bytes as f64, Reason::Idle)
     } else {
-        let under_floor = hit.is_some_and(|h| h < cfg.hit_floor);
         let cx = under_floor
             .then(|| {
                 REUSE_HOURS
@@ -290,6 +341,13 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
         }
     };
 
+    // Don't let the reuse model recommend a smaller cache when measured
+    // active traffic is missing the floor. The spending limit still wins.
+    let (want, reason) = if under_floor && reason != Reason::Idle && want < cap as f64 {
+        (cap as f64, Reason::Hold)
+    } else {
+        (want, reason)
+    };
     let wanted = (want.ceil() as u64).clamp(cfg.min_bytes, max);
     d.reason = if want > max as f64 || cap > max {
         match cfg.max_bytes {
@@ -317,9 +375,18 @@ pub fn decide(input: Inputs, state: &State, p: &Params) -> Decision {
         target = cap;
     }
     if target > cap {
+        d.step = Step::Grow;
         d.next.last_grow_at = Some(input.now);
     } else if target < cap {
+        d.step = Step::Shrink;
         d.next.last_shrink_at = Some(input.now);
+        if cfg.max_bytes.is_some_and(|limit| limit < cap) {
+            d.reason = Reason::MaxLowered;
+        } else if d.reason != Reason::Idle {
+            d.reason = Reason::Shrink;
+        }
+    } else if matches!(d.reason, Reason::GrowCx | Reason::GrowCost | Reason::Shrink) {
+        d.reason = Reason::Hold;
     }
     d.target = target;
     d.target_changed = target != prev_cap;

@@ -795,7 +795,62 @@ async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_w
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn served_r2_hits_flush_in_background_at_most_once_in_fifteen_minutes() {
+async fn dropping_a_cold_get_body_cannot_cancel_its_verified_miss_with_the_refill() {
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
+        cfg.max_extent_bytes = LEN as u64 / 2;
+        cfg.slice_bytes = cfg.max_extent_bytes;
+    })
+    .await;
+    hot.rig
+        .put(&hot.signer, BUCKET, "cold-drop", &Hot::body("cold-drop"))
+        .await
+        .expect(200);
+    let (_, xs) = hot.rig.live(&hot.bucket, "cold-drop").await.unwrap();
+    assert_eq!(xs.len(), 2);
+    hot.pump().await;
+    hot.bridge().evict_batch(0).await.unwrap();
+    assert!(!hot.has_cache(&xs[0]) && !hot.has_safety(&xs[0]));
+    let cat = &hot.bridge().catalog;
+    cat.sql
+        .stall_exec_matching
+        .set(Some("INSERT INTO meta(k, v) SELECT CASE"));
+    let req = hot
+        .signer
+        .sign(
+            hot.rig.now(),
+            Method::Get,
+            &path(BUCKET, "cold-drop"),
+            &[],
+            &[],
+            Vec::new(),
+        )
+        .into_request();
+    let mut handle = pin!(Rc::clone(&hot.rig.bridge).handle(req));
+    let at_miss = std::future::poll_fn(|cx| {
+        let response = handle.as_mut().poll(cx);
+        if response.is_ready() || cat.sql.stall_exec_matching.get().is_none() {
+            Poll::Ready(response)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    assert!(
+        at_miss.is_pending(),
+        "a served miss must not depend on the body continuing to drive its cache refill"
+    );
+    cat.sql.trip.release();
+    // A caller can abandon the body as soon as its first piece has arrived.
+    assert_eq!(handle.await.status, 200);
+    assert_eq!(
+        cat.hot_ctl_load(&["hotg_1h"]).await.unwrap(),
+        vec![Some(xs[0].cipher_size as i64)]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_hit() {
     use std::cell::RefCell;
     use velmora_bridge::hotctl::HIT_KEY;
     let hot = hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
@@ -807,41 +862,48 @@ async fn served_r2_hits_flush_in_background_at_most_once_in_fifteen_minutes() {
     };
     let cat = &hot.bridge().catalog;
     cat.sql.meter_writes().unwrap();
-    let get = || async {
-        let req = hot
-            .signer
-            .sign(
-                hot.rig.now(),
-                Method::Get,
-                &path(BUCKET, "warm"),
-                &[],
-                &[],
-                Vec::new(),
-            )
-            .into_request();
-        Rc::clone(&hot.rig.bridge)
-            .handle_observed_with_hit_flush(req, &mut Default::default(), Some(Rc::clone(&spawner)))
-            .await
+    let get = |key: &'static str| {
+        let (hot, spawner) = (&hot, &spawner);
+        async move {
+            let req = hot
+                .signer
+                .sign(
+                    hot.rig.now(),
+                    Method::Get,
+                    &path(BUCKET, key),
+                    &[],
+                    &[],
+                    Vec::new(),
+                )
+                .into_request();
+            Rc::clone(&hot.rig.bridge)
+                .handle_observed_with_hit_flush(
+                    req,
+                    &mut Default::default(),
+                    Some(Rc::clone(spawner)),
+                )
+                .await
+        }
     };
     // Merely building the response (including opening its first piece) is not a read.
-    drop(get().await);
+    drop(get("warm").await);
     assert!(tasks.borrow().is_empty());
-    Resp::collect(get().await).await.expect(200);
+    Resp::collect(get("warm").await).await.expect(200);
     assert_eq!(cat.sql.writes().table("meta"), 0);
     let task = tasks.borrow_mut().pop().expect("first flush queued");
     task.await;
     assert_eq!(cat.sql.writes().table("meta"), 1);
     hot.bridge().clock.advance_secs(899);
-    Resp::collect(get().await).await.expect(200);
+    Resp::collect(get("warm").await).await.expect(200);
     assert!(tasks.borrow().is_empty());
     hot.bridge().clock.advance_secs(1);
-    Resp::collect(get().await).await.expect(200);
+    Resp::collect(get("not-found").await).await.expect(404);
     let task = tasks.borrow_mut().pop().expect("next flush queued");
     task.await;
     assert_eq!(cat.sql.writes().table("meta"), 2);
     assert_eq!(
         cat.hot_ctl_load(&[HIT_KEY]).await.unwrap(),
-        vec![Some(3 * x.cipher_size as i64)]
+        vec![Some(2 * x.cipher_size as i64)]
     );
 }
 

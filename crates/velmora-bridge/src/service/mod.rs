@@ -288,6 +288,12 @@ where
     where
         Self: 'static,
     {
+        if self.cfg.hot_ctl.mode != crate::config::HotCtlMode::Fixed {
+            if let Some(spawner) = &hit_flush {
+                // A busy isolate need not see another hit to flush old hits.
+                get::record_hit(&self, spawner, 0);
+            }
+        }
         let target = req.raw_target.clone();
         // A sub-range of a large GET, asked for by another invocation of
         // this Worker. It is told apart by its target alone and admitted
