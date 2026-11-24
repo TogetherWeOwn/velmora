@@ -47,20 +47,6 @@ pub fn normalize_statement(sql: &str) -> Result<String> {
 pub struct PgConnection {
     client: Option<tokio_postgres::Client>,
     close: Option<Box<dyn FnOnce()>>,
-    shutdown: Option<Shutdown>,
-}
-
-/// Longest wait, in milliseconds, for the driver's graceful shutdown
-/// (Terminate and socket close) after the caller has its result. Past it
-/// the close hook aborts the driver, which drops the transport.
-pub const SHUTDOWN_LIMIT_MS: u32 = 1_000;
-
-type LocalFuture = core::pin::Pin<Box<dyn core::future::Future<Output = ()>>>;
-
-struct Shutdown {
-    done: LocalFuture,
-    /// Starts the bound when teardown starts, not when the connection opens.
-    limit: Box<dyn FnOnce() -> LocalFuture>,
 }
 
 impl PgConnection {
@@ -68,7 +54,6 @@ impl PgConnection {
         Self {
             client: Some(client),
             close: Some(Box::new(close)),
-            shutdown: None,
         }
     }
 
@@ -76,34 +61,14 @@ impl PgConnection {
         self.client.as_ref().expect("connection still open")
     }
 
-    /// Wait for the driver to finish its normal shutdown after dropping the
-    /// client, for at most as long as the future `limit()` returns takes
-    /// (the runtime's timer, normally [`SHUTDOWN_LIMIT_MS`]). The fallback
-    /// close hook still runs if the caller cancels or the limit passes.
-    pub fn with_shutdown<L>(
-        mut self,
-        done: impl core::future::Future<Output = ()> + 'static,
-        limit: impl FnOnce() -> L + 'static,
-    ) -> Self
-    where
-        L: core::future::Future<Output = ()> + 'static,
-    {
-        self.shutdown = Some(Shutdown {
-            done: Box::pin(done),
-            limit: Box::new(move || Box::pin(limit())),
-        });
-        self
-    }
-
-    /// Teardown only. Callers compute their result before this and return
-    /// it unchanged, so nothing here can turn a confirmed COMMIT into an
-    /// error or a retry: it has no error to report, and a close that hangs
-    /// or fails ends at the limit. Dropping `self` then runs the close hook.
-    async fn finish(mut self) {
+    /// Teardown without waiting. Callers take their result first and
+    /// return it right after this, so nothing that happens to the socket
+    /// can delay, fail or retry a confirmed COMMIT. The close hook stops
+    /// the driver; the runtime's transport requests the socket close on
+    /// drop and does not wait for it. No Terminate is sent: the server
+    /// sees an ordinary disconnect, the same as for a cancelled request.
+    fn finish(mut self) {
         drop(self.client.take());
-        if let Some(Shutdown { done, limit }) = self.shutdown.take() {
-            let _ = futures_util::future::select(done, limit()).await;
-        }
     }
 }
 
@@ -200,7 +165,7 @@ impl<C: PgConnect> PgSql<C> {
             self.recording(),
         )
         .await;
-        conn.finish().await;
+        conn.finish();
         result
     }
 }
@@ -214,7 +179,7 @@ impl<C: PgConnect> Sql for PgSql<C> {
             if prepared.statement.kind == Kind::Read {
                 let conn = self.reader.connect().await.map_err(error::without_guard)?;
                 let result = prepared.run(conn.client(), true, self.recording()).await;
-                conn.finish().await;
+                conn.finish();
                 result.map_err(error::without_guard)?.rows()
             } else {
                 self.write(&[prepared], true)

@@ -1,6 +1,8 @@
 //! Connection teardown after the transaction outcome is known. A scripted
 //! in-memory backend answers the real driver; the client side of the pipe
-//! fails or never finishes its close.
+//! fails or never finishes its close. The in-memory exchange takes
+//! milliseconds; a result that waited on such a close would hit the
+//! deadline instead.
 
 use std::cell::Cell;
 use std::io;
@@ -8,12 +10,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio_postgres::{config::SslMode, Config, NoTls};
 
-use super::{PgConfig, PgConnect, PgConnection, PgSql, SHUTDOWN_LIMIT_MS};
+use super::{PgConfig, PgConnect, PgConnection, PgSql};
 use crate::{BridgeError, Result, Sql, SqlValue};
 
 #[derive(Clone, Copy)]
@@ -36,6 +38,14 @@ struct Teardown {
     io: DuplexStream,
     close: Close,
     closing: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        // Where the Worker transport requests the socket close.
+        self.released.store(true, Ordering::SeqCst);
+    }
 }
 
 impl AsyncRead for Teardown {
@@ -78,15 +88,11 @@ async fn send(out: &mut DuplexStream, tag: u8, body: &[u8]) -> io::Result<()> {
 
 /// Just enough of a backend for the adapter's statements: trust startup,
 /// simple queries, and extended Parse/Bind/Describe/Execute/Sync.
-async fn backend(mut io: DuplexStream, commit: CommitReply, terminated: Arc<AtomicBool>) {
-    let _ = serve(&mut io, commit, &terminated).await;
+async fn backend(mut io: DuplexStream, commit: CommitReply) {
+    let _ = serve(&mut io, commit).await;
 }
 
-async fn serve(
-    io: &mut DuplexStream,
-    commit: CommitReply,
-    terminated: &AtomicBool,
-) -> io::Result<()> {
+async fn serve(io: &mut DuplexStream, commit: CommitReply) -> io::Result<()> {
     let startup = io.read_u32().await?;
     let mut skip = vec![0; startup as usize - 4];
     io.read_exact(&mut skip).await?;
@@ -125,7 +131,6 @@ async fn serve(
             b'E' => send(io, b'C', b"INSERT 0 1\0").await?,
             b'S' => send(io, b'Z', b"T").await?,
             b'X' => {
-                terminated.store(true, Ordering::SeqCst);
                 // Keep the pipe open: the client's close is what is tested.
                 std::future::pending::<()>().await;
             }
@@ -139,7 +144,8 @@ struct Fake {
     commit: CommitReply,
     connects: Cell<u32>,
     closing: Arc<AtomicBool>,
-    terminated: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -149,8 +155,21 @@ impl Fake {
             commit,
             connects: Cell::new(0),
             closing: Arc::default(),
-            terminated: Arc::default(),
+            released: Arc::default(),
+            stopped: Arc::default(),
         }
+    }
+
+    /// The transport is dropped soon after the driver is stopped, without
+    /// anyone waiting for its close.
+    async fn transport_released(&self) -> bool {
+        for _ in 0..100 {
+            if self.released.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
     }
 }
 
@@ -158,11 +177,12 @@ impl PgConnect for &Fake {
     async fn connect(&self) -> Result<PgConnection> {
         self.connects.set(self.connects.get() + 1);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(backend(server_io, self.commit, self.terminated.clone()));
+        tokio::spawn(backend(server_io, self.commit));
         let socket = Teardown {
             io: client_io,
             close: self.close,
             closing: self.closing.clone(),
+            released: self.released.clone(),
         };
         let mut config = Config::new();
         config
@@ -173,19 +193,12 @@ impl PgConnect for &Fake {
             .connect_raw(socket, NoTls)
             .await
             .map_err(super::classify_connect_error)?;
-        let (closed, done) = tokio::sync::oneshot::channel();
-        let driver = tokio::spawn(async move {
-            let _ = connection.await;
-            let _ = closed.send(());
-        });
-        Ok(
-            PgConnection::new(client, move || driver.abort()).with_shutdown(
-                async move {
-                    let _ = done.await;
-                },
-                || tokio::time::sleep(Duration::from_millis(u64::from(SHUTDOWN_LIMIT_MS))),
-            ),
-        )
+        let driver = tokio::spawn(connection);
+        let stopped = self.stopped.clone();
+        Ok(PgConnection::new(client, move || {
+            stopped.store(true, Ordering::SeqCst);
+            driver.abort();
+        }))
     }
 }
 
@@ -200,31 +213,27 @@ fn pg(fake: &Fake, pipeline: bool) -> PgSql<&Fake> {
     )
 }
 
-/// Generous for a loaded runner, far below an unbounded wait.
-fn bound() -> Duration {
-    Duration::from_millis(u64::from(SHUTDOWN_LIMIT_MS)) + Duration::from_secs(5)
-}
+/// Far beyond the in-memory exchange, even on a loaded runner.
+const DEADLINE: Duration = Duration::from_secs(5);
 
-async fn insert(fake: &Fake, pipeline: bool) -> (Result<Vec<u64>>, Duration) {
-    let start = Instant::now();
+async fn insert(fake: &Fake, pipeline: bool) -> Result<Vec<u64>> {
     let stmts = vec![("INSERT INTO t VALUES (?1)", vec![SqlValue::Int(1)])];
-    let result = tokio::time::timeout(bound(), pg(fake, pipeline).batch(stmts))
+    tokio::time::timeout(DEADLINE, pg(fake, pipeline).batch(stmts))
         .await
-        .expect("teardown after the COMMIT reply must be bounded");
-    (result, start.elapsed())
+        .expect("the result must not wait for the connection to close")
 }
 
 #[tokio::test]
-async fn a_close_that_never_resolves_after_a_confirmed_commit_is_bounded_success() {
+async fn a_close_that_never_resolves_does_not_delay_a_confirmed_commit() {
     for pipeline in [true, false] {
         let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-        let (result, took) = insert(&fake, pipeline).await;
+        let result = insert(&fake, pipeline).await;
         assert_eq!(result.unwrap(), [1], "pipeline={pipeline}");
-        // The hang was really reached: Terminate went out, then the close.
-        assert!(fake.terminated.load(Ordering::SeqCst));
-        assert!(fake.closing.load(Ordering::SeqCst));
-        assert!(took >= Duration::from_millis(u64::from(SHUTDOWN_LIMIT_MS)));
-        assert!(took < bound());
+        // Returned with the driver stopped and before the graceful close
+        // (Terminate, then the socket's shutdown) was even started.
+        assert!(fake.stopped.load(Ordering::SeqCst));
+        assert!(!fake.closing.load(Ordering::SeqCst));
+        assert!(fake.transport_released().await);
         assert_eq!(fake.connects.get(), 1, "a committed batch is never retried");
     }
 }
@@ -233,11 +242,8 @@ async fn a_close_that_never_resolves_after_a_confirmed_commit_is_bounded_success
 async fn a_close_error_after_a_confirmed_commit_is_success() {
     for pipeline in [true, false] {
         let fake = Fake::new(Close::Fail, CommitReply::Confirm);
-        let (result, took) = insert(&fake, pipeline).await;
-        assert_eq!(result.unwrap(), [1], "pipeline={pipeline}");
-        assert!(fake.closing.load(Ordering::SeqCst));
-        // A failed close ends the driver at once; no wait for the limit.
-        assert!(took < Duration::from_millis(u64::from(SHUTDOWN_LIMIT_MS)));
+        assert_eq!(insert(&fake, pipeline).await.unwrap(), [1]);
+        assert!(fake.transport_released().await);
         assert_eq!(fake.connects.get(), 1);
     }
 }
@@ -247,7 +253,7 @@ async fn an_error_before_the_commit_is_confirmed_still_propagates() {
     for close in [Close::Hang, Close::Fail] {
         for pipeline in [true, false] {
             let fake = Fake::new(close, CommitReply::Vanish);
-            let (result, _) = insert(&fake, pipeline).await;
+            let result = insert(&fake, pipeline).await;
             assert!(
                 matches!(&result, Err(BridgeError::Sql(s)) if s == "pg: statement failed"),
                 "pipeline={pipeline}"
@@ -258,11 +264,11 @@ async fn an_error_before_the_commit_is_confirmed_still_propagates() {
 }
 
 #[tokio::test]
-async fn a_read_is_not_held_by_a_close_that_never_resolves() {
+async fn a_read_does_not_wait_for_the_connection_to_close() {
     let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-    let rows = tokio::time::timeout(bound(), pg(&fake, true).query("SELECT 1", &[]))
+    let rows = tokio::time::timeout(DEADLINE, pg(&fake, true).query("SELECT 1", &[]))
         .await
-        .expect("teardown after a read must be bounded");
+        .expect("the result must not wait for the connection to close");
     assert!(rows.unwrap().is_empty());
-    assert!(fake.closing.load(Ordering::SeqCst));
+    assert!(fake.transport_released().await);
 }
