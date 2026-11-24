@@ -673,6 +673,12 @@ impl Known {
         self.changed = true;
     }
 
+    /// Remember a checked prefix without letting a later attempt skip
+    /// all checks before publication.
+    fn keep_for_retry(&mut self, key: &str, n: usize, of: usize) {
+        self.keep(key, n.min(of.saturating_sub(1)), of);
+    }
+
     fn forget(&mut self, key: &str) {
         self.changed |= self.plans.remove(key).is_some();
     }
@@ -1778,6 +1784,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 if plans {
                     place.generation = key.clone();
                     place.plans = n as u32;
+                }
+                if parallel {
+                    for (_, later) in scans.range(i + 1..) {
+                        known.keep_for_retry(later.key, later.confirmed, later.named.extents());
+                    }
                 }
                 finished = i;
                 break;

@@ -3166,6 +3166,46 @@ async fn parallel_fresh_retains_the_first_unfinished_generation_in_the_cursor() 
     check_generation_plan_resume(true).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_saves_later_plan_prefixes_at_a_job_boundary() {
+    let w = World::with_parallel_fresh(true);
+    let keys: Vec<_> = (0..JOB_COPIES + 40)
+        .map(|i| format!("x_big_{i:04}"))
+        .collect();
+    for id in keys
+        .iter()
+        .map(String::as_str)
+        .chain(["x_short_1", "x_short_2", "x_short_3"])
+    {
+        let name = format!("m/art/{id}");
+        let bytes = w.record(&name, b"plan").await;
+        w.e2.set(&name, &bytes);
+    }
+    let first = generation(600_000, "_big");
+    let names: Vec<_> = keys.iter().map(String::as_str).collect();
+    w.generation(&first, &names).await;
+    let later = generation(500_000, "_later");
+    w.generation(&later, &["x_short_1", "x_short_2", "x_short_3"])
+        .await;
+
+    let step = w.copier().step(UnixMs(NOW), &sweep("m/g_")).await.unwrap();
+    assert!(w.e2.get(&first).is_none() && w.e2.get(&later).is_none());
+    for i in 1..=3 {
+        assert_eq!(asked_for(w.e2, "HEAD", &format!("m/art/x_short_{i}")), 1);
+    }
+    w.copier()
+        .step(UnixMs(NOW), &step.next.unwrap())
+        .await
+        .unwrap();
+    assert!(w.e2.get(&first).is_some() && w.e2.get(&later).is_some());
+    for (i, heads) in [1, 1, 2].into_iter().enumerate() {
+        assert_eq!(
+            asked_for(w.e2, "HEAD", &format!("m/art/x_short_{}", i + 1)),
+            heads
+        );
+    }
+}
+
 async fn check_generation_plan_resume(parallel: bool) {
     let w = World::with_parallel_fresh(parallel);
     let ids: Vec<String> = (0..600).map(|i| format!("x_{i:04}")).collect();
