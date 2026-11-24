@@ -62,6 +62,16 @@ fn refuses_impossible_read_coverage_before_a_run_starts() {
 }
 
 #[test]
+fn rejects_a_write_plan_below_the_rate_tolerance() {
+    let config =
+        |rate| format!(r#"{{"batches_per_minute":{rate},"minutes":1,"mix":{{"delete":1}}}}"#);
+    assert!(parse_config(&config(4)).is_err()); // Plans 3, but needs 4.
+    assert!(parse_config(&config(6)).is_ok());
+    assert!(parse_config(&config(20)).is_err()); // Plans 18, but needs 19.
+    assert!(parse_config(&config(22)).is_ok()); // Plans 21, which is within 5%.
+}
+
+#[test]
 fn nearest_rank_percentile_does_not_impute_missing_observations() {
     assert_eq!(percentile(&mut [], 99), None);
     assert_eq!(percentile(&mut [10., 5., 8., 1.], 95), Some(10.));

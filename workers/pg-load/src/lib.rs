@@ -91,6 +91,18 @@ pub fn parse_config(json: &str) -> Result<Config, &'static str> {
     {
         return Err("load configuration cannot schedule minimum reads per type in both phases");
     }
+    // The greedy planner stops only when the cheapest operation no longer
+    // fits. Inspect the actual plan only when that remainder could put the
+    // total below the sum of the per-minute minimums.
+    let min_batches = cfg.mix.keys().map(|f| f.batches()).min().unwrap();
+    let allowed_shortfall = (cfg.batches_per_minute / 20) * cfg.minutes;
+    if min_batches - 1 > allowed_shortfall {
+        let minimum = cfg.batches_per_minute * cfg.minutes - allowed_shortfall;
+        let planned: u32 = cfg.plan().iter().map(|job| job.family.batches()).sum();
+        if planned < minimum {
+            return Err("load configuration cannot schedule the minimum write volume");
+        }
+    }
     Ok(cfg)
 }
 
