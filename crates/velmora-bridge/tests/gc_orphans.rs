@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_support::*;
 use velmora_bridge::config::{BridgeConfig, GcMode, Maintenance, ORPHAN_GRACE_MS};
 use velmora_bridge::jobs::{ORPHAN_BATCH, ORPHAN_SCAN};
-use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{ReplayCursor, ReplayLimits, ReplayPhase, ReplayReport};
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES;
 use velmora_bridge::*;
@@ -1045,36 +1045,62 @@ async fn a_delete_of_the_key_covers_the_lingering_record() {
 
 /// A cursor of a replay that has ended publishes nothing. The catalogue
 /// no longer refuses claims for that replay, so a step taken now would
-/// publish beside a claim that deletes the parts it adopts.
+/// publish beside a claim that deletes the parts it adopts. The check of
+/// the held extents only reads, and is still answered.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cursor_of_an_ended_replay_publishes_nothing() {
     let mut t = setup().await;
     t.put("a", b"a").await;
     t.replay_in_place().await;
     let run = t.count("SELECT started_at FROM restore_state WHERE id = 1");
+    let objects = "SELECT COUNT(*) FROM objects WHERE key = 'k'";
 
-    // After the replay, a completion is lost: its record lingers.
+    // After the replay, the pinned copy of "a" goes missing, and a
+    // completion is lost: its record lingers.
+    let held = t.rig.bridge.catalog.held_extents("", 10).await.unwrap();
+    assert_eq!(held.len(), 1);
+    t.rig
+        .bridge
+        .safety
+        .delete(&held[0].safety_key())
+        .await
+        .unwrap();
     let id = t.create("k").await;
     let one = t.part("k", &id, 1, &pattern(1, 3000)).await;
     t.complete_lost("k", &id, &[(1, &one)]).await;
 
-    // The first cursor of that replay, sent again: it is behind what
-    // the replay reached, so the route takes it as one of that replay.
+    // Cursors of that replay, sent again: each is behind what the
+    // replay reached, so the route takes it as one of that replay.
     t.maintenance(Maintenance::Restore);
-    let cursor = ReplayCursor {
+    let first = ReplayCursor {
         run_ms: run,
         ..ReplayCursor::start(UnixMs(0))
     };
-    let (status, report) = t.restore_call(&json!({ "cursor": cursor })).await;
+    let last = ReplayCursor {
+        phase: ReplayPhase::Held,
+        after: String::new(),
+        extent: 0,
+        ..first.clone()
+    };
+    let (status, report) = t.restore_call(&json!({ "cursor": first })).await;
     assert_eq!(status, 200, "{report}");
     assert!(report["next"].is_null(), "{report}");
     assert_eq!(report["published"], 0, "{report}");
+    assert_eq!(t.count(objects), 0);
+    let (status, report) = t.restore_call(&json!({ "cursor": last })).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["held_missing_total"], 1, "{report}");
     assert_eq!(
         t.count("SELECT COUNT(*) FROM restore_state WHERE state <> 'complete'"),
         0
     );
-    t.maintenance(Maintenance::Off);
-    assert_eq!(t.status("k").await, 404);
+
+    // A rollback found since does not make the ended replay one under
+    // way again.
+    t.sql("UPDATE rollback_stamp SET rolled_back_at = 1 WHERE id = 1;");
+    let (status, report) = t.restore_call(&json!({ "cursor": first })).await;
+    assert_eq!(status, 409, "{report}");
+    assert_eq!(t.count(objects), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

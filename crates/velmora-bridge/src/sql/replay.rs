@@ -817,7 +817,7 @@ pub(super) async fn restore_progress<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT since_ms, reached_phase, reached_after, reached_extent \
+            "SELECT since_ms, reached_phase, reached_after, reached_extent, state = 'complete' \
              FROM restore_state WHERE id = 1 AND started_at = ?1",
             &[ms(run)],
         )
@@ -825,12 +825,15 @@ pub(super) async fn restore_progress<S: Sql>(
     let bad = || BridgeError::Sql("row decode: restore progress".into());
     match rows.first().map(Vec::as_slice) {
         None => Ok(None),
-        Some([SqlValue::Int(since), SqlValue::Null, _, _]) => Ok(Some(RestoreProgress {
-            since: UnixMs(*since),
-            reached: None,
-        })),
+        Some([SqlValue::Int(since), SqlValue::Null, _, _, SqlValue::Int(ended)]) => {
+            Ok(Some(RestoreProgress {
+                since: UnixMs(*since),
+                reached: None,
+                ended: *ended != 0,
+            }))
+        }
         Some(
-            [SqlValue::Int(since), SqlValue::Int(phase), SqlValue::Text(after), SqlValue::Int(extent)],
+            [SqlValue::Int(since), SqlValue::Int(phase), SqlValue::Text(after), SqlValue::Int(extent), SqlValue::Int(ended)],
         ) => Ok(Some(RestoreProgress {
             since: UnixMs(*since),
             reached: Some(ReplayMark {
@@ -838,6 +841,7 @@ pub(super) async fn restore_progress<S: Sql>(
                 after: after.clone(),
                 extent: u32::try_from(*extent).map_err(|_| bad())?,
             }),
+            ended: *ended != 0,
         })),
         Some(_) => Err(bad()),
     }

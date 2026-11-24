@@ -72,7 +72,7 @@ use crate::ports::{
 use crate::recovery::{
     delete_blob, revoked_key_id, valid_key_id, write_key_revocation, REVOKED_KEY_PREFIX,
 };
-use crate::replay::{ReplayCursor, ReplayReport};
+use crate::replay::{ReplayCursor, ReplayPhase, ReplayReport};
 use crate::service::INTERRUPTED_RETRIES;
 use crate::types::{
     AccessKeyRow, ArticleState, Body, BridgeError, Bucket, BucketId, ExtentRow, KeyStatus, Method,
@@ -696,7 +696,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
             "This cursor is of an earlier replay. The replay that was started last is not finished.",
         )
     };
-    let cursor = match (body.cursor, body.since_ms) {
+    let (cursor, ended) = match (body.cursor, body.since_ms) {
         (Some(cursor), None) if body.margin_ms.is_none() => {
             // The catalogue knows how far the replay has come. A cursor
             // that is ahead of it (made up, or of another restore
@@ -714,7 +714,7 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                     "This cursor is ahead of the replay. Send `next` of the last response.",
                 ));
             }
-            cursor
+            (cursor, progress.ended)
         }
         (None, Some(since)) if since >= 0 => {
             let margin = body.margin_ms.unwrap_or(RESTORE_MARGIN_MS);
@@ -744,22 +744,25 @@ async fn restore<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek,
                         }),
                     )
                 })?;
-            ReplayCursor {
-                run_ms: run.0,
-                ..ReplayCursor::start(from)
-            }
+            (
+                ReplayCursor {
+                    run_ms: run.0,
+                    ..ReplayCursor::start(from)
+                },
+                false,
+            )
         }
         _ => return Err(bad()),
     };
     let run = crate::types::UnixMs(cursor.run_ms);
-    // A cursor of a replay that has ended takes no step: with nothing
-    // pending, writes and orphan claims are no longer refused
-    // (`guard_no_replay`), and a step would publish beside them. It goes
-    // straight to the end, as the last call sent again always did. A
-    // replay that another call ends after this read is still covered:
-    // claims wait out `ORPHAN_GRACE_MS` after any replay ends, in the
-    // batch that claims.
-    let report = if bridge.catalog.restore_pending().await.or_internal()? {
+    // A cursor of a replay that has ended publishes nothing: the
+    // catalogue no longer refuses writes or orphan claims for it
+    // (`guard_no_replay`), and a manifest or tombstone step would publish
+    // beside them. The held-extent check only reads, so the last call
+    // sent again still reports what is missing. A replay that another
+    // call ends after this read is still covered: claims wait out
+    // `ORPHAN_GRACE_MS` after any replay ends, in the batch that claims.
+    let report = if !ended || cursor.phase == ReplayPhase::Held {
         bridge.replay_step(cursor).await.or_internal()?
     } else {
         ReplayReport::default()
