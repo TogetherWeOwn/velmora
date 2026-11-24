@@ -262,8 +262,7 @@ pub struct CopyPage {
     pub last: Option<String>,
 }
 
-/// `RECOVERY_COPY` and the `E2_*` values, validated. `Debug` shows
-/// neither the access key nor the secret.
+/// Recovery copy settings. `Debug` shows neither the access key nor the secret.
 #[derive(Clone, Debug)]
 pub struct RemoteConfig {
     /// Host of the endpoint. A port is refused.
@@ -274,6 +273,7 @@ pub struct RemoteConfig {
     pub prefix: String,
     pub access_key: Secret,
     pub secret_key: Secret,
+    parallel_fresh: bool,
 }
 
 fn safe(value: &str, extra: &[u8]) -> bool {
@@ -323,7 +323,8 @@ fn key_ok(key: &str) -> bool {
 
 impl RemoteConfig {
     /// `None` = the copy is off (`RECOVERY_COPY` unset or `off`). With
-    /// `on`, every other value is required and checked.
+    /// `on`, the destination settings are required and checked.
+    /// `RECOVERY_COPY_PARALLEL_FRESH=on` opts in to parallel fresh plan checks.
     pub fn from_vars(
         get: impl Fn(&str) -> Option<String>,
     ) -> Result<Option<RemoteConfig>, ConfigError> {
@@ -376,6 +377,7 @@ impl RemoteConfig {
             prefix,
             access_key,
             secret_key,
+            parallel_fresh: get("RECOVERY_COPY_PARALLEL_FRESH").is_some_and(|v| v.trim() == "on"),
         }))
     }
 }
@@ -407,6 +409,10 @@ impl<H: HttpSend> S3Remote<H> {
         let cfg = &self.cfg;
         let named = [cfg.host.as_str(), cfg.bucket.as_str(), cfg.prefix.as_str()].join("\n");
         hex(&Sha256::digest(named.as_bytes())[..8])
+    }
+
+    pub(crate) fn parallel_fresh(&self) -> bool {
+        self.cfg.parallel_fresh
     }
 
     pub fn transport(&self) -> &H {
