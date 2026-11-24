@@ -390,7 +390,6 @@ jobs:
       - run: cargo clippy --locked -p velmora-s3-proto -p velmora-bridge --all-targets --features velmora-bridge/testkit -- -D warnings
       - run: cargo build --locked -p velmora-test-nntp --bin fakesrv
 
-  # Deliberately outside ci-ok until both sets of catalogue SQL variants land.
   bridge-postgres:
     name: bridge PostgreSQL tests
     needs: changes
@@ -698,7 +697,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [rust-test, rust-test-features, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, worker-build, worker-e2e, console-test, alerts-test]
+    needs: [rust-test, rust-test-features, rust-wasm, rust-worker-pinned-tls, rust-msrv, cargo-deny, public-pr-security, changes, bridge-native, bridge-postgres, worker-build, worker-e2e, console-test, alerts-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -711,7 +710,7 @@ jobs:
           # says bridge=false; the filter job itself must succeed.
           if ! jq -e --arg event "$CI_EVENT_NAME" --arg bridge "$BRIDGE" '
             . as $n |
-            ["bridge-native", "worker-build", "worker-e2e"] as $filtered |
+            ["bridge-native", "bridge-postgres", "worker-build", "worker-e2e"] as $filtered |
             ($n | length) > 1 and
             $n["public-pr-security"].result == (if $event == "pull_request" then "success" else "skipped" end) and
             $n.changes.result == "success" and
