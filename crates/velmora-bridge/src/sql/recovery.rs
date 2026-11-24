@@ -33,8 +33,7 @@ pub(super) async fn delete_object_before<S: Sql>(
     delete_before(
         c.sql.dialect(),
         &mut stmts,
-        bucket,
-        key,
+        (bucket, key),
         before,
         condition,
         now,
@@ -64,8 +63,7 @@ pub(super) async fn delete_objects_before<S: Sql>(
         delete_before(
             c.sql.dialect(),
             &mut stmts,
-            bucket,
-            key,
+            (bucket, key),
             before,
             None,
             *now,
@@ -84,8 +82,7 @@ pub(super) async fn delete_objects_before<S: Sql>(
 fn delete_before(
     dialect: Dialect,
     stmts: &mut Vec<Stmt>,
-    bucket: &BucketId,
-    key: &str,
+    (bucket, key): (&BucketId, &str),
     before: &GenerationId,
     condition: Option<&Precondition>,
     now: UnixMs,
