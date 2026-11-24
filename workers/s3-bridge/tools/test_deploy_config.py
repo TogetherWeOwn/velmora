@@ -833,15 +833,18 @@ class HyperdriveTest(GeneratorCase):
         ):
             self.refused({}, error, changed)
 
-    def test_preserves_only_supported_explicit_backend_modes(self):
-        for mode in ("d1", "d1-frozen", "pg", "pg-frozen"):
+    def test_preserves_explicit_d1_modes(self):
+        for mode in ("d1", "d1-frozen"):
             with self.subTest(mode=mode):
                 changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = "{mode}"\n', 1)
                 _, written = self.ok({}, changed)
                 self.assertEqual(tomllib.loads(written.decode())["vars"]["CATALOG_BACKEND"], mode)
-        for value in ('"postgres"', '""', 'true'):
-            changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = {value}\n', 1)
-            self.refused({}, "invalid CATALOG_BACKEND", changed)
+
+    def test_refuses_postgres_and_invalid_modes_before_ci_promotion(self):
+        for value in ('"pg"', '"pg-frozen"', '"postgres"', '""', 'true'):
+            with self.subTest(value=value):
+                changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = {value}\n', 1)
+                self.refused({}, "invalid CATALOG_BACKEND", changed)
 
 
 @unittest.skipUnless(
