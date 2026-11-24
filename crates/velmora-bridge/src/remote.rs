@@ -506,6 +506,8 @@ impl<H: HttpSend> S3Remote<H> {
                 Ok(r)
                     if op == Operation::Get
                         && (400..500).contains(&r.status)
+                        // A missing object is an audit problem, not GET unavailability.
+                        && r.status != 404
                         && s3_error_code(&r) == Some("SlowDown") =>
                 {
                     Some(r)

@@ -359,6 +359,33 @@ async fn audit_distinguishes_missing_bucket_from_missing_key() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn audit_404_is_missing_even_if_the_error_body_says_slowdown() {
+    use velmora_bridge::audit::audit;
+    for headers in [
+        vec![("x-amz-error-code".into(), "Unrecognized".into())],
+        vec![],
+    ] {
+        let w = World::new();
+        let mut source = AuditShelf::default();
+        let at = NOW - 2 * 3_600_000;
+        source.rows.insert(
+            format!("m/g_{at:013x}_sample"),
+            (2, at, Some(b"ok".to_vec())),
+        );
+        *w.e2.get_answer.borrow_mut() = Some(HttpResponse {
+            status: 404,
+            headers,
+            body: b"<Error><Code>SlowDown</Code></Error>".to_vec(),
+        });
+        let counts = audit(&source, &w.remote, &w.clock, UnixMs(NOW), "m/", "m/", |_| 0).await;
+        assert_eq!((counts.missing, counts.unavailable), (1, 0));
+        assert_eq!(counts.problems(), 1);
+        let p = w.e2.problems.borrow()[0];
+        assert_eq!((p.kind, p.status), ("missing", Some(404)));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn audit_slowdown_header_is_unavailable_even_with_another_4xx_status() {
     use velmora_bridge::audit::audit;
     let w = World::new();

@@ -15,8 +15,8 @@ use std::time::Duration;
 use futures_util::future::{select, Either};
 use futures_util::{Stream, StreamExt};
 use velmora_bridge::remote::{
-    s3_audit_error_code, s3_error_code, HttpRequest, HttpResponse, HttpSend, Problem,
-    TransportError, MAX_AUDIT_BYTES,
+    s3_audit_error_code, HttpRequest, HttpResponse, HttpSend, Problem, TransportError,
+    MAX_AUDIT_BYTES,
 };
 
 use worker::{
@@ -50,7 +50,8 @@ fn fits(have: usize, more: usize, most: usize) -> bool {
 fn probe_audit_code(response: &HttpResponse) -> bool {
     (400..500).contains(&response.status)
         && response.status != 429
-        && s3_error_code(response).is_none()
+        // Never use body text to override an explicit provider header.
+        && !response.headers.iter().any(|(name, _)| name == CODE_HEADER)
 }
 
 // Keep at most 4 KiB while recovering an XML-only error code. A failed
@@ -67,8 +68,6 @@ async fn attach_audit_code(
         response.body.extend_from_slice(&chunk[..take]);
         if let Some(code) = s3_audit_error_code(&response.body) {
             // Return the code before any stall in the rest of the body.
-            // A previously unrecognized header must not shadow it.
-            response.headers.retain(|(name, _)| name != CODE_HEADER);
             response.headers.push((CODE_HEADER.into(), code.into()));
             break;
         }
@@ -272,35 +271,24 @@ mod tests {
     }
 
     #[test]
-    fn audit_code_replaces_an_unrecognized_header_with_the_xml_code() {
-        let response = HttpResponse {
-            status: 400,
-            headers: vec![("x-amz-error-code".into(), "Unrecognized".into())],
-            body: vec![],
-        };
-        assert!(probe_audit_code(&response));
-        assert!(!probe_audit_code(&HttpResponse {
-            status: 429,
-            ..response.clone()
-        }));
-        assert!(!probe_audit_code(&HttpResponse {
-            headers: vec![("x-amz-error-code".into(), "AccessDenied".into())],
-            ..response.clone()
-        }));
-        let chunks =
-            futures_util::stream::iter([Ok(b"<Error><Code>SlowDown</Code></Error>".to_vec())]);
-        let future = attach_audit_code(response, chunks);
-        let Poll::Ready(answer) =
-            std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
-        else {
-            panic!("the fixture completes synchronously");
-        };
-        assert_eq!(answer.status, 400);
-        assert_eq!(
-            answer.headers,
-            [("x-amz-error-code".into(), "SlowDown".into())]
-        );
-        assert!(answer.body.is_empty());
+    fn audit_probes_4xx_bodies_only_without_an_explicit_code() {
+        for (status, code, want) in [
+            (400, None, true),
+            (404, None, true),
+            (429, None, false),
+            (503, None, false),
+            (400, Some("AccessDenied"), false),
+            (404, Some("Unrecognized"), false),
+        ] {
+            let response = HttpResponse {
+                status,
+                headers: code
+                    .map(|code| vec![("x-amz-error-code".into(), code.into())])
+                    .unwrap_or_default(),
+                body: vec![],
+            };
+            assert_eq!(probe_audit_code(&response), want, "{status} {code:?}");
+        }
     }
 
     #[test]

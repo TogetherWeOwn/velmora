@@ -155,6 +155,23 @@ test("successful empty audits during the quiet-upload sampling gap do not page",
   }
 });
 
+test("regular empty audits page after 50 hours without a checked record", async () => {
+  const f = fixture();
+  f.healthy(T0);
+  const deadline = T0 + 50 * HOUR;
+  for (let hour = 1; hour <= 50; hour++) {
+    const at = T0 + hour * HOUR;
+    f.row("job", at, { swept: 1 });
+    f.row("walk", at);
+    f.row("audit", at, { detail: '{"counts":{"checked":0,"source_errors":0}}' });
+  }
+  assert.equal(has(await f.check(deadline - 1), AUDIT), false);
+  assert.equal(has(await f.check(deadline), AUDIT), true, "a clean run is not a sample");
+  // Evidence of a sample outside the 24 h problem query still counts.
+  f.row("audit", T0 + 20 * HOUR, { checked: 1 });
+  assert.equal(has(await f.check(deadline), AUDIT), false);
+});
+
 test("a mismatch during startup can page before the missing-history thresholds", async () => {
   const f = fixture();
   f.row("audit", T0, { checked: 1, problems: 1 });
@@ -269,15 +286,18 @@ test("indexed SQLite dry run at one job per two seconds, healthy and saturated",
   for (const [name, params, index] of [
     ["failing", failing, "recovery_copy_log_problem_at"],
     ["stale", stale, "recovery_copy_log_swept_at"],
-    ["audit", [T0, T0 - 2 * HOUR, T0 - 24 * HOUR, T0 - HOUR], "recovery_copy_log_kind_at"],
+    ["audit", [T0, T0 - 2 * HOUR, T0 - 24 * HOUR, T0 - HOUR, T0 - 50 * HOUR], "recovery_copy_log_kind_at"],
   ]) {
     const steps = db.prepare(`EXPLAIN QUERY PLAN ${SQL[name]}`).all(...params).map((r) => r.detail);
     assert.ok(steps.some((s) => s.includes(`INDEX ${index}`) && s.includes("at>? AND at<?")), steps.join("; "));
+    if (name === "audit") {
+      assert.ok(steps.some((s) => s.includes(`SEARCH sample USING INDEX ${index} (kind=? AND at>? AND at<?)`)), steps.join("; "));
+    }
     assert.ok(!steps.some((s) => s.includes("SCAN recovery_copy_log") || s.includes("TEMP B-TREE FOR ORDER BY")), steps.join("; "));
     t.diagnostic(`${name}: ${steps.join("; ")}`);
   }
   const count = db.prepare("SELECT COUNT(*) AS n FROM recovery_copy_log WHERE kind = ? AND at > ? AND at <= ?");
-  for (const [kind, hours, n] of [["job", 6, 10_800], ["job", 2, 3600], ["walk", 48, 2], ["audit", 24, 96]]) {
+  for (const [kind, hours, n] of [["job", 6, 10_800], ["job", 2, 3600], ["walk", 48, 2], ["audit", 24, 96], ["audit", 50, 200]]) {
     assert.equal(count.get(kind, T0 - hours * HOUR, T0).n, n);
   }
   const readProblems = db.prepare(SQL.failing);
@@ -291,5 +311,5 @@ test("indexed SQLite dry run at one job per two seconds, healthy and saturated",
   assert.equal(atLimit.length, 200);
   assert.equal(new Set(atLimit.map((r) => r.pass)).size, 1, "the 200 row cap fails safe even for one pass");
   assert.equal(has(await f.check(T0), FAILING), true);
-  t.diagnostic("10,800 jobs in 6 h and 3,600 in 2 h: 0 healthy / 200 saturated problem-index entries; 0 absent / 1 present sweep-index entry; at most 2 walk and 96 audit candidates");
+  t.diagnostic("10,800 jobs in 6 h and 3,600 in 2 h: 0 healthy / 200 saturated problem-index entries; 0 absent / 1 present sweep-index entry; 2 walk, 96 audit-problem, and up to 200 audit-sample candidates");
 });

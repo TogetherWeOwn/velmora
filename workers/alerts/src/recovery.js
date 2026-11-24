@@ -1,6 +1,8 @@
 // Levels, not incident latches. A healthy row doesn't erase a problem row;
 // it ages out of its own window. The walk, not this sample, covers all keys.
 const HOUR = 3_600_000;
+// A 48 h old-sample threshold plus the normal 2 h observation window.
+const SAMPLE_WINDOW = 50 * HOUR;
 const PROBLEM_LIMIT = 200;
 const count = (field) => `json_extract(CASE WHEN json_valid(detail) THEN detail END, '$.counts.${field}')`;
 const unavailable = `COALESCE(${count("unavailable")}, 0)`;
@@ -18,7 +20,9 @@ export const SQL = Object.freeze({
   audit: `SELECT MAX(problems) AS problems,
       MAX(CASE WHEN at > ?2 AND (checked > 0 OR ${count("source_errors")} = 0) THEN at END) AS completed_at,
       MAX(CASE WHEN at > ?4 AND checked > ${unavailable} THEN at END) AS readable_at,
-      COUNT(DISTINCT CASE WHEN at > ?4 AND checked > 0 AND checked = ${unavailable} THEN pass END) AS unavailable_passes
+      COUNT(DISTINCT CASE WHEN at > ?4 AND checked > 0 AND checked = ${unavailable} THEN pass END) AS unavailable_passes,
+      (SELECT at FROM recovery_copy_log AS sample INDEXED BY recovery_copy_log_kind_at
+        WHERE kind = 'audit' AND at > ?5 AND at <= ?1 AND checked > 0 ORDER BY at DESC LIMIT 1) AS sampled_at
     FROM recovery_copy_log WHERE kind = 'audit' AND at > ?3 AND at <= ?1`,
 });
 
@@ -27,7 +31,7 @@ export async function recoveryConditions(db, now, firstSeen = now) {
   const [failing, stale, audit] = await Promise.all([
     db.prepare(SQL.failing).bind(now, now - 6 * HOUR).all(),
     read("stale", now - 2 * HOUR, now - 48 * HOUR),
-    read("audit", now - 2 * HOUR, now - 24 * HOUR, now - HOUR),
+    read("audit", now - 2 * HOUR, now - 24 * HOUR, now - HOUR, now - SAMPLE_WINDOW),
   ]);
   // Missing history needs a full observation window. Observed problems don't.
   const age = now - Math.min(firstSeen, stale.first_at);
@@ -59,6 +63,7 @@ export async function recoveryConditions(db, now, firstSeen = now) {
   // A quiet keyspace can leave both sampling windows empty. Only count an
   // empty run when the audit explicitly reports that its source reads worked.
   if (age >= 2 * HOUR && audit.completed_at == null) notes.push("No audit checked records or completed without source errors in the last 2 h.");
+  if (age >= SAMPLE_WINDOW && audit.sampled_at == null) notes.push("No audit checked any records in the last 50 h.");
   if (age >= HOUR && audit.readable_at == null && audit.unavailable_passes >= 2) {
     notes.push("Audit GETs were unavailable in multiple passes, with no usable result in the last hour.");
   }
