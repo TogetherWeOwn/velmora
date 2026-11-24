@@ -613,3 +613,211 @@ async fn orphan_claim_cannot_delete_a_concurrently_published_extent() {
         }
     })).await;
 }
+
+#[tokio::test]
+async fn orphan_scan_claim_and_finish_persist_the_gc_decision() {
+    use velmora_bridge::replay::ReplayExtent;
+    let Some(c) = catalogue() else { return };
+    let b = bucket(&c, 6).await;
+    let source = extent(&b, 223);
+    let prepared = c
+        .replay_extents(
+            &b,
+            &[ReplayExtent {
+                row: source.clone(),
+                plan: None,
+                packed: None,
+                parity: None,
+                safety_present: true,
+            }],
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(prepared.is_empty());
+    let id = SqlValue::Text(source.id.as_str().into());
+    c.sql
+        .fixture_exec(
+            "INSERT INTO gc(extent_id,action,due_at) VALUES (?1,'delete_safety',?2)",
+            &[id.clone(), SqlValue::Int(NOW.0)],
+        )
+        .await
+        .unwrap();
+    let now = NOW.plus_ms(32 * 86_400_000);
+    let cutoff = NOW.plus_ms(1);
+    assert!(c.gc_orphans_due(now).await.unwrap());
+    let due = c.gc_orphans(now, cutoff, 2, 2).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].extent_id, source.id);
+    let (claimed, result) = c.gc_orphan_claim(&due, now, cutoff).await;
+    result.unwrap();
+    assert_eq!(claimed, [true]);
+    c.gc_orphan_done(due[0].id, now).await.unwrap();
+    let done = rows(&c, "SELECT done_at FROM gc WHERE extent_id = ?1", &[id]).await;
+    assert_eq!(done, [vec![SqlValue::Int(now.0)]]);
+}
+
+#[tokio::test]
+async fn catalogue_reads_report_live_heads_and_health_and_clean_stale_selftests() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let c = SqlCatalog::new(TestSql::with_schema_unarmed().unwrap());
+    assert!(!c.usage_counters().await.unwrap().seeded);
+    let b = bucket(&c, 7).await;
+    let p = put(&b, "found", 224);
+    assert!(publish(&c, &p, None).await);
+    let heads = c
+        .key_heads(&b.id, &["missing", "found", "missing"])
+        .await
+        .unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|head| head.live.as_ref())
+            .collect::<Vec<_>>(),
+        [None, Some(&p.generation.id), None]
+    );
+    let (found, generation) = c
+        .generation_by_id(&b.id, &p.generation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((found.id, generation.id), (b.id, p.generation.id));
+    let hot = c.hot_stats().await.unwrap();
+    assert_eq!((hot.pinned_bytes, hot.pinned_extents), (69, 1));
+    assert_eq!(
+        c.outbox_stats().await.unwrap().by_stage,
+        [(OutboxStage::Post, 1)]
+    );
+    c.provider_failed("fixture-provider", ProviderFault::LoginRefused, NOW)
+        .await
+        .unwrap();
+    assert!(c
+        .providers_to_probe(NOW, NOW.plus_ms(-1), NOW.plus_ms(-1))
+        .await
+        .unwrap()
+        .is_empty());
+    let tomorrow = NOW.plus_secs(86_400);
+    assert_eq!(
+        c.providers_to_probe(tomorrow, tomorrow, tomorrow)
+            .await
+            .unwrap(),
+        ["fixture-provider"]
+    );
+
+    // A marker from an earlier broken run is detected and removed, even
+    // though the current self-test's batch rolls back normally.
+    c.sql
+        .fixture_exec(
+            "INSERT INTO meta(k,v) VALUES ('guard_selftest_marker',1)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!c.guard_selftest().await.unwrap());
+    assert!(c.guard_selftest().await.unwrap());
+}
+
+#[tokio::test]
+async fn replay_closes_the_posting_pipeline_when_safety_is_absent() {
+    use velmora_bridge::replay::ReplayExtent;
+    let Some(c) = catalogue() else { return };
+    let b = bucket(&c, 8).await;
+    for (key, seed, packed) in [("packed", 225, true), ("rows", 226, false)] {
+        let p = put(&b, key, seed);
+        assert!(publish(&c, &p, None).await);
+        let row = p.extents[0].clone();
+        let (encoded, articles) = velmora_bridge::plan::plan_seeded(
+            &mut velmora::rng::SystemRng,
+            NOW.0 / 1000,
+            &["alt.binaries.test"],
+            &row.id,
+            row.cipher_size,
+            |_| Some([0; 32]),
+        )
+        .unwrap();
+        let replay = ReplayExtent {
+            row: row.clone(),
+            plan: (!packed).then_some(articles),
+            packed: packed.then_some(encoded),
+            parity: None,
+            safety_present: false,
+        };
+        assert!(c
+            .replay_extents(&b, &[replay], p.now)
+            .await
+            .unwrap()
+            .is_empty());
+        let (head, extents) = c.live_object(&b.id, key).await.unwrap().unwrap();
+        assert_eq!(head.id, p.generation.id);
+        assert_eq!(extents[0].safety_state, SafetyState::Deleted);
+        if !packed {
+            let posted = c.articles(&row.id).await.unwrap();
+            assert!(
+                !posted.is_empty()
+                    && posted
+                        .iter()
+                        .all(|article| article.state == ArticleState::Posted)
+            );
+        }
+    }
+    assert_eq!(
+        c.outbox_stats().await.unwrap().by_stage,
+        [(OutboxStage::Done, 2)]
+    );
+}
+
+#[tokio::test]
+async fn orphan_claim_recognizes_the_part_of_an_aborted_upload() {
+    let Some(c) = catalogue() else { return };
+    let b = bucket(&c, 9).await;
+    let id = UploadId::mint([11; 16]);
+    let key = "aborted";
+    let target = UploadTarget {
+        bucket: &b.id,
+        key,
+        id: &id,
+    };
+    c.create_upload(&UploadRow {
+        id: id.clone(),
+        bucket_id: b.id.clone(),
+        key: key.into(),
+        content_json: "{}".into(),
+        user_meta_json: "{}".into(),
+        state: UploadState::Open,
+        revision: 0,
+        completed_generation_id: None,
+        complete_digest: None,
+        result_etag: None,
+        initiated_at: NOW,
+    })
+    .await
+    .unwrap();
+    let x = extent(&b, 227);
+    let part = UploadPartRow {
+        upload_id: id.clone(),
+        part_number: 1,
+        extent_id: x.id.clone(),
+        size: x.plain_size,
+        etag: "\"part\"".into(),
+        uploaded_at: NOW,
+    };
+    assert_eq!(
+        c.put_upload_part(&target, &part, &x, NOW).await.unwrap(),
+        Guard::Applied(())
+    );
+    assert_eq!(
+        c.abort_upload(&target, NOW).await.unwrap(),
+        Guard::Applied(())
+    );
+    let now = NOW.plus_ms(32 * 86_400_000);
+    let cutoff = NOW.plus_ms(1);
+    let due = c.gc_orphans(now, cutoff, 10, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].extent_id, x.id);
+    let (claimed, result) = c.gc_orphan_claim(&due, now, cutoff).await;
+    result.unwrap();
+    assert_eq!(claimed, [true]);
+    c.gc_orphan_done(due[0].id, now).await.unwrap();
+}

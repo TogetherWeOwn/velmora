@@ -303,6 +303,39 @@ async fn listing_normalizes_nul_bounds_and_pages_multibyte_prefixes() {
     assert_eq!(second[0].key, "葉🙂/n§a");
 }
 
+#[tokio::test]
+async fn list_heads_uses_each_bound_shape_with_and_without_a_delimiter() {
+    let fx = Fx::new();
+    let b = fx.bucket("alpha").await;
+    // A prefix composed of the maximum scalar has no exclusive successor.
+    for prefix in ["p", "\u{10ffff}"] {
+        let first = format!("{prefix}a");
+        let next = format!("{prefix}b/one");
+        fx.put(&b.id, &first, T0).await;
+        fx.put(&b.id, &next, T0).await;
+        for delimiter in [None, Some("/")] {
+            let mut q = query(prefix, delimiter, 2);
+            let unbounded = fx.cat.list_heads(&b.id, &q).await.unwrap();
+            assert_eq!(
+                unbounded
+                    .iter()
+                    .map(|row| row.key.as_str())
+                    .collect::<Vec<_>>(),
+                [first.as_str(), next.as_str()]
+            );
+            q.after = Some(first.clone());
+            let exclusive = fx.cat.list_heads(&b.id, &q).await.unwrap();
+            assert_eq!(
+                exclusive
+                    .iter()
+                    .map(|row| row.key.as_str())
+                    .collect::<Vec<_>>(),
+                [next.as_str()]
+            );
+        }
+    }
+}
+
 /// What S3 says a complete listing holds: keys under the prefix in byte
 /// order, folded at the first delimiter after the prefix.
 fn model(all: &[&str], prefix: &str, delimiter: Option<&str>) -> (Vec<String>, Vec<String>) {

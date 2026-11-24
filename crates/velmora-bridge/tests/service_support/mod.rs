@@ -254,6 +254,9 @@ pub struct Blobs {
     pub before_delete: Hook,
     /// Called once, with the key, at the start of the next put.
     pub before_put: Hook,
+    /// One-shot hooks for interleavings that must await real catalogue I/O.
+    pub before_put_async: AsyncHook,
+    pub before_delete_async: AsyncHook,
     /// A put of a key with this prefix waits until this is cleared.
     pub hold_put_prefix: RefCell<Option<String>>,
     /// A put is waiting.
@@ -305,6 +308,15 @@ pub const HOLD_TURNS: u32 = 100_000;
 
 /// Something that happens in the middle of an operation on a store.
 pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
+pub type AsyncHook =
+    RefCell<Option<Box<dyn FnOnce(String) -> futures_util::future::LocalBoxFuture<'static, ()>>>>;
+
+async fn fire_async(hook: &AsyncHook, key: &str) {
+    let hook = hook.borrow_mut().take();
+    if let Some(hook) = hook {
+        hook(key.to_owned()).await;
+    }
+}
 
 fn fire(hook: &Hook, key: &str) {
     let hook = hook.borrow_mut().take();
@@ -338,6 +350,7 @@ impl BlobStore for Blobs {
             .borrow_mut()
             .push((key.to_string(), Sha256::digest(&bytes).into()));
         fire(&self.before_put, key);
+        fire_async(&self.before_put_async, key).await;
         let holds = |key: &str| {
             let prefix = self.hold_put_prefix.borrow();
             prefix.as_deref().is_some_and(|p| key.starts_with(p))
@@ -427,6 +440,7 @@ impl BlobStore for Blobs {
     async fn delete(&self, key: &str) -> Result<()> {
         self.allow_write()?;
         fire(&self.before_delete, key);
+        fire_async(&self.before_delete_async, key).await;
         if self.fail_delete.borrow().as_deref() == Some(key) {
             return Err(BridgeError::Blob("store down".into()));
         }
@@ -986,6 +1000,23 @@ impl<N: NntpConnector + 'static> Rig<N> {
         };
         *count
     }
+}
+
+// ---------------------------------------------------------------------------
+/// Arms an isolated replay fixture. Use the actual D1 runbook statement
+/// on SQLite and the same row transition on the PostgreSQL baseline.
+pub fn arm_restore_fixture(rig: &Rig) {
+    const SQLITE: &str = include_str!("../../../../workers/s3-bridge/ops/restore-arm.sql");
+    const PG: &str = "DO $$ BEGIN \
+        IF to_regclass(current_schema() || '._velmora_import_incomplete') IS NOT NULL THEN \
+            RAISE EXCEPTION 'fixture import incomplete'; END IF; END $$; \
+        INSERT INTO restore_state(id,state,since_ms,started_at) VALUES (1,'replaying',-1,0) \
+        ON CONFLICT(id) DO UPDATE SET \
+          since_ms = CASE WHEN restore_state.state = 'complete' THEN -1 ELSE restore_state.since_ms END, \
+          state = 'replaying', started_at = restore_state.started_at + 1, finished_at = NULL, \
+          reached_phase = NULL, reached_after = NULL, reached_extent = NULL";
+    let db = &rig.bridge.catalog.sql.inner;
+    db.fixture_script(db.fixture(SQLITE, PG)).unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -424,7 +424,7 @@ jobs:
           suite=0
           coverage=0
           cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --tests --no-fail-fast -- --test-threads=4 || suite=$?
-          cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --test pg_statements catalog_statement_coverage -- --ignored --exact || coverage=$?
+          cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --test pg_statements catalog_statement_coverage -- --ignored --exact --nocapture || coverage=$?
           (( suite == 0 && coverage == 0 ))
 
   # The S3 Worker bundle: wasm clippy with the request-target lint

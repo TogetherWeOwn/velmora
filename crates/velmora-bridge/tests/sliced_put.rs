@@ -400,8 +400,10 @@ async fn intent_rows_hold_the_default_tenant_and_no_extent_is_shared() {
     let mut unique = ids.clone();
     unique.dedup();
     assert_eq!(unique.len(), 10);
-    assert_eq!(
-        number(&rig, "SELECT COUNT(*) FROM pragma_table_info('write_intents') WHERE name = 'tenant_id' AND \"notnull\" = 1"),
-        1
+    let not_null = rig.bridge.catalog.sql.inner.fixture(
+        "SELECT COUNT(*) FROM pragma_table_info('write_intents') WHERE name = 'tenant_id' AND \"notnull\" = 1",
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() \
+         AND table_name = 'write_intents' AND column_name = 'tenant_id' AND is_nullable = 'NO'",
     );
+    assert_eq!(number(&rig, not_null), 1);
 }

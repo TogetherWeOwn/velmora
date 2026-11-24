@@ -1638,10 +1638,7 @@ async fn dispatch_survives_a_failed_redrive() {
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "k", &plaintext()).await;
     fx.make_due(&o).await;
-    fx.sql
-        .fixture_exec("DROP TABLE scan_cursors", &[])
-        .await
-        .unwrap();
+    fx.sql.fixture_script("DROP TABLE scan_cursors").unwrap();
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert!(report.redrive_failed);
@@ -1710,9 +1707,16 @@ async fn dispatch_survives_a_failed_revival() {
     let due = fx.put(&bucket, "due", &plaintext()).await;
     fx.make_due(&due).await;
     // Only the revival's own write is refused.
-    let sql = "CREATE TRIGGER no_revive BEFORE UPDATE OF stage ON outbox \
-               WHEN OLD.stage = 'cancelled' BEGIN SELECT RAISE(ABORT, 'down'); END";
-    fx.sql.fixture_exec(sql, &[]).await.unwrap();
+    fx.sql
+        .fixture_script(fx.sql.fixture(
+            "CREATE TRIGGER no_revive BEFORE UPDATE OF stage ON outbox \
+         WHEN OLD.stage = 'cancelled' BEGIN SELECT RAISE(ABORT, 'down'); END",
+            "CREATE FUNCTION refuse_revival() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'fixture revival refused' USING ERRCODE = 'VL001'; END $$; \
+         CREATE TRIGGER no_revive BEFORE UPDATE OF stage ON outbox FOR EACH ROW \
+         WHEN (OLD.stage = 'cancelled') EXECUTE FUNCTION refuse_revival();",
+        ))
+        .unwrap();
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert!(report.redrive_failed);

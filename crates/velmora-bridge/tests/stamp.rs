@@ -671,7 +671,6 @@ async fn a_rollback_into_a_replay_is_not_cleared_by_that_replay() {
 /// really did not end keeps its restore point through it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
-    const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
     let mut rig = rig_selected();
     maintenance(&mut rig, Maintenance::Restore);
     let rig = &rig;
@@ -681,16 +680,16 @@ async fn a_replay_starts_at_its_restore_point_after_the_runbook_statement() {
     };
 
     // No replay ever ran on this database.
-    sql(rig, ARM);
-    sql(rig, ARM);
+    arm_restore_fixture(rig);
+    arm_restore_fixture(rig);
     begin(5000).await.expect(200);
     // A replay ran to its end.
     restore(rig).await;
-    sql(rig, ARM);
-    sql(rig, ARM);
+    arm_restore_fixture(rig);
+    arm_restore_fixture(rig);
     begin(5000).await.expect(200);
     // That one did not end.
-    sql(rig, ARM);
+    arm_restore_fixture(rig);
     let refused = begin(5001).await;
     refused.expect(409);
     let said: Value = serde_json::from_slice(&refused.body).unwrap();

@@ -778,7 +778,7 @@ pub async fn step_to<'a, V>(
     fut: impl Future<Output = V> + 'a,
     at: impl Fn(&Rig) -> bool,
 ) -> Ran<'a, V> {
-    let mut ran = run_until(rig, fut, 0, Trip::Stall).await;
+    let mut ran = resume_until(rig, Box::pin(fut), 0, Trip::Stall).await;
     loop {
         match ran {
             Ran::Stalled(fut) if !at(rig) => ran = resume_until(rig, fut, 0, Trip::Stall).await,

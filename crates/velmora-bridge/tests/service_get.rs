@@ -1989,11 +1989,20 @@ async fn a_read_that_waits_for_a_slot_gets_its_room_beside_a_body_ahead_of_its_r
 async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
     let local = tokio::task::LocalSet::new();
     let test = async {
-        // The time the connections may sit idle is 20 ms here; a piece
-        // waits for its reader as long as it says.
-        let sleeper = timed_sleeper(|ms| match ms > 20_000 {
-            true => 20,
-            false => ms.into(),
+        // Expire the idle connections after the reader consumes the first
+        // piece and another request holds the budget. Real catalogue I/O
+        // must not make the idle timer fire before the test reaches that state.
+        let idle = Rc::new(tokio::sync::Notify::new());
+        let timer = idle.clone();
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            let timer = timer.clone();
+            Box::pin(async move {
+                if ms > 20_000 {
+                    timer.notified().await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
+                }
+            })
         });
         let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
         let rig = &cold.rig;
@@ -2004,6 +2013,14 @@ async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
         ];
         let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
         let budget = &rig.bridge.budget;
+        // Reserve room for exactly one cold fetch before the producer can
+        // run ahead. Both engines must reach the same one-piece state.
+        let need = velmora_bridge::fetch::cold_step_bytes(
+            extents[0].cipher_size,
+            rig.bridge.cfg.cold_sockets,
+        );
+        let reserved = budget.capacity() - need;
+        let other = budget.try_charge(reserved).unwrap();
         let req = cold.signer.sign(
             rig.now(),
             Method::Get,
@@ -2017,18 +2034,31 @@ async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
         let RespBody::Stream(mut body) = resp.body else {
             panic!("a GET body is a stream");
         };
-        eventually("the first piece waits", || {
-            cached(rig, &extents[0]) && budget.in_use() == 300_000
-        })
-        .await;
+        let ready = || cached(rig, &extents[0]) && budget.in_use() == reserved + 300_000;
+        for _ in 0..400 {
+            if ready() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ready(),
+            "first piece did not wait: cache={}, budget={}, held={}, connects={}",
+            cached(rig, &extents[0]),
+            budget.in_use(),
+            rig.bridge.nntp.live(),
+            rig.bridge.nntp.connects()
+        );
         assert!(rig.bridge.nntp.live() > 0, "kept for the next extent");
         let connects = rig.bridge.nntp.connects();
-        // Another request takes all the room there is.
-        let other = budget.try_charge(budget.capacity() - 300_000).unwrap();
+        // The other request takes the rest of the room too.
+        let rest = budget.try_charge(need - 300_000).unwrap();
         assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        idle.notify_one();
         eventually("the connections are ended", || rig.bridge.nntp.live() == 0).await;
         assert!(!cached(rig, &extents[1]));
         assert_eq!(free_slots(rig).await, 2);
+        drop(rest);
         drop(other);
         assert!(body.next().await.unwrap().unwrap() == parts[1]);
         assert!(body.next().await.unwrap().unwrap() == parts[2]);

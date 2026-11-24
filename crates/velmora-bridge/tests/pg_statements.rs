@@ -288,14 +288,21 @@ async fn catalog_statement_coverage() {
         !declared.is_empty(),
         "no PostgreSQL catalogue statements were enumerated"
     );
-    let actual_texts = actual
+    let actual_texts: BTreeSet<_> = actual
         .iter()
         .map(|statement| statement.sql.as_str())
         .collect();
-    let declared_texts = declared
+    let declared_texts: BTreeSet<_> = declared
         .iter()
         .map(|statement| statement.sql.as_str())
         .collect();
+    let exercised = declared_texts.intersection(&actual_texts).count();
+    println!(
+        "PostgreSQL SQL texts: {exercised}/{} executed; {} unexecuted; {} unlisted",
+        declared_texts.len(),
+        declared_texts.len() - exercised,
+        actual_texts.len() - exercised,
+    );
     let errors = compare(&declared_texts, &actual_texts, &exceptions(UNEXECUTED));
     assert!(
         errors.is_empty(),
@@ -314,11 +321,6 @@ async fn catalog_statement_coverage() {
             .collect(),
     )
     .await;
-    println!(
-        "PostgreSQL statement coverage: {} of {} distinct texts executed",
-        actual_texts.len(),
-        declared_texts.len()
-    );
 }
 
 #[test]

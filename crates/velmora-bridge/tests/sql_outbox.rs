@@ -160,12 +160,7 @@ impl Fx {
             "hex(parity)" => db.fixture(column, "upper(encode(parity, 'hex'))"),
             column => column,
         };
-        let expression = if column.contains(" IS ") {
-            format!("CASE WHEN {column} THEN '1' ELSE '0' END")
-        } else {
-            format!("CAST({column} AS TEXT)")
-        };
-        let sql = format!("SELECT {expression} FROM extents WHERE id = ?1");
+        let sql = format!("SELECT {column} FROM extents WHERE id = ?1");
         let rows = self
             .cat
             .sql
@@ -175,6 +170,7 @@ impl Fx {
             .unwrap();
         match &rows[0][0] {
             SqlValue::Text(s) => s.clone(),
+            SqlValue::Int(n) => n.to_string(),
             SqlValue::Null => "NULL".into(),
             other => panic!("unexpected {other:?}"),
         }
@@ -3725,7 +3721,12 @@ async fn gc_drops_a_packed_plan_with_the_article_metadata() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("extent is in service"), "{err}");
+    let expected = fx
+        .cat
+        .sql
+        .0
+        .fixture("extent is in service", "pg: constraint violation");
+    assert!(err.to_string().contains(expected), "{err}");
     assert_eq!(fx.extent(&live, "plan IS NULL").await, "0");
 }
 

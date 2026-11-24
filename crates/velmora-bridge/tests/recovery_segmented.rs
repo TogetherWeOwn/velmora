@@ -61,12 +61,20 @@ fn wipe(rig: &Rig) {
 fn dump(rig: &Rig) -> String {
     let mut out = String::new();
     for t in TABLES {
+        // A fresh replay allocates a new internal scan identity (SQLite
+        // rowid or PostgreSQL seq); it does not change the posting job.
+        let columns = if t == "outbox" {
+            "extent_id, generation_id, stage, attempts, next_at, lease_token, lease_owner, \
+             lease_until, cursor, last_error, updated_at, sent_at"
+        } else {
+            "*"
+        };
         for row in rig
             .bridge
             .catalog
             .sql
             .inner
-            .fixture_query_now(&format!("SELECT * FROM {t} ORDER BY 1, 2"), &[])
+            .fixture_query_now(&format!("SELECT {columns} FROM {t} ORDER BY 1, 2"), &[])
             .unwrap()
         {
             out.push_str(&format!("{t}|{row:?}\n"));

@@ -11,10 +11,7 @@
 mod nntp_support;
 mod service_support;
 
-use std::future::Future;
-use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
 use nntp_support::{TcpConnector, PASS, USER};
 use service_support::*;
@@ -41,16 +38,6 @@ fn resume(remaining: u64) -> Job {
     Job::Evict {
         v: JOB_VERSION,
         remaining,
-    }
-}
-
-/// Runs a future that never has to wait (catalogue, in-memory stores) to
-/// its end, from a place that cannot await: a fault hook.
-fn at_once<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
-    match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(out) => out,
-        Poll::Pending => panic!("the future had to wait"),
     }
 }
 
@@ -1970,12 +1957,14 @@ async fn a_cache_fill_is_never_written_uncounted() {
     // the count. The count after the write restores it.
     let bridge = hot.rig.bridge.clone();
     let cache = &hot.bridge().cache;
-    cache.before_put.replace(Some(Box::new(move |_| {
-        let cache_bytes = bridge.cfg.hot_cap_bytes + cipher as u64;
-        assert_eq!(at_once(bridge.evict_batch(0)).unwrap(), cache_bytes);
+    cache.before_put_async.replace(Some(Box::new(move |_| {
+        Box::pin(async move {
+            let cache_bytes = bridge.cfg.hot_cap_bytes + cipher as u64;
+            assert_eq!(bridge.evict_batch(0).await.unwrap(), cache_bytes);
+        })
     })));
     hot.get_ok("filled").await;
-    assert!(cache.before_put.borrow().is_none());
+    assert!(cache.before_put_async.borrow().is_none());
     assert!(hot.has_cache(&x));
     assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(cipher));
     evict().await;
@@ -2135,11 +2124,17 @@ async fn a_drain_stops_when_an_extent_changes_under_it() {
     let filled = xs[0].id.clone();
     hot.bridge()
         .safety
-        .before_delete
+        .before_delete_async
         .replace(Some(Box::new(move |key| {
-            assert_eq!(key, filled.safety_key());
-            let now = bridge.clock.now();
-            at_once(bridge.catalog.record_cache_fill(&filled, now)).unwrap();
+            Box::pin(async move {
+                assert_eq!(key, filled.safety_key());
+                let now = bridge.clock.now();
+                bridge
+                    .catalog
+                    .record_cache_fill(&filled, now)
+                    .await
+                    .unwrap();
+            })
         })));
     hot.uncounted_fill(&xs[0]).await;
     hot.run(&EVICT).await;
@@ -2176,10 +2171,12 @@ async fn two_drains_at_once_do_not_evict_past_the_low_watermark() {
     let bridge = hot.rig.bridge.clone();
     hot.bridge()
         .safety
-        .before_delete
+        .before_delete_async
         .replace(Some(Box::new(move |_| {
-            let outcome = at_once(bridge.run_job(&EVICT));
-            assert_eq!(outcome, JobOutcome::Ack);
+            Box::pin(async move {
+                let outcome = bridge.run_job(&EVICT).await;
+                assert_eq!(outcome, JobOutcome::Ack);
+            })
         })));
     hot.run(&EVICT).await;
 

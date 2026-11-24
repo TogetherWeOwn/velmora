@@ -2484,17 +2484,10 @@ async fn an_unfinished_replay_refuses_writes_without_maintenance() {
 /// replay, and make the cursors of that replay void.
 #[tokio::test(flavor = "current_thread")]
 async fn the_runbook_statement_closes_a_restored_catalogue() {
-    const ARM: &str = include_str!("../../../workers/s3-bridge/ops/restore-arm.sql");
     let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", b"one").await.expect(200);
-    let arm = || {
-        let postgres = "INSERT INTO restore_state(id,state,since_ms,started_at) VALUES (1,'replaying',-1,0) \
-            ON CONFLICT(id) DO UPDATE SET since_ms = CASE WHEN restore_state.state = 'complete' THEN -1 ELSE restore_state.since_ms END, \
-            state = 'replaying', started_at = restore_state.started_at + 1, finished_at = NULL, \
-            reached_phase = NULL, reached_after = NULL, reached_extent = NULL";
-        sql(&rig, rig.bridge.catalog.sql.inner.fixture(ARM, postgres));
-    };
+    let arm = || arm_restore_fixture(&rig);
     let catalog = &rig.bridge.catalog;
 
     arm();

@@ -874,7 +874,12 @@ async fn complete_vs_abort_race() {
         };
         let object = rig.object(&rig.alpha, KEY).await;
         let state = rig.upload_state(&rig.alpha, KEY, &id).await;
-        if complete_first {
+        let complete_won = if TestSql::postgres_selected() {
+            completed.outcome() == "200"
+        } else {
+            complete_first
+        };
+        if complete_won {
             assert_eq!(completed.outcome(), "200", "{}", completed.body);
             assert_eq!(aborted.outcome(), "404 NoSuchUpload");
             assert_eq!(state, Some(UploadState::Completed));
@@ -898,52 +903,61 @@ async fn complete_vs_abort_race() {
 
 #[tokio::test]
 async fn complete_vs_upload_part_race() {
-    // UploadPart commits first: Complete validated the old part 1, loses
-    // its guard, re-reads and refuses the stale ETag. Nothing is published.
-    let rig = Rig::new().await;
-    let id = rig.create("alpha", KEY).await;
     let old = test_bytes(1, 4096);
     let new = test_bytes(2, 8192);
-    let old_etag = rig.part("alpha", KEY, &id, 1, &old).await;
-    let (part, complete) = rig
-        .race(
-            part_req(RW_KEY, "alpha", KEY, &id, 1, &new),
-            complete_req(RW_KEY, "alpha", KEY, &id, &[(1, &old_etag)], &[]),
-        )
-        .await;
-    assert_eq!(part.outcome(), "200", "{}", part.body);
-    assert_eq!(complete.outcome(), "400 InvalidPart");
-    assert!(rig.object(&rig.alpha, KEY).await.is_none());
-    assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 0);
-    assert_eq!(
-        rig.upload_state(&rig.alpha, KEY, &id).await,
-        Some(UploadState::Open)
-    );
-    let new_etag = part.header("etag").unwrap().to_string();
-    let r = rig.complete("alpha", KEY, &id, &[(1, &new_etag)]).await;
-    assert_eq!(r.outcome(), "200", "{}", r.body);
-    assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == new);
-
-    // Complete commits first: the part arrives at a closed upload and is
-    // refused.
-    let rig = Rig::new().await;
-    let id = rig.create("alpha", KEY).await;
-    let old_etag = rig.part("alpha", KEY, &id, 1, &old).await;
-    let (complete, part) = rig
-        .race(
-            complete_req(RW_KEY, "alpha", KEY, &id, &[(1, &old_etag)], &[]),
-            part_req(RW_KEY, "alpha", KEY, &id, 1, &new),
-        )
-        .await;
-    assert_eq!(complete.outcome(), "200", "{}", complete.body);
-    assert_eq!(part.outcome(), "404 NoSuchUpload");
-    assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == old);
-    // The refused part's blob stays as an orphan for garbage collection:
-    // the handler never deletes from the safety store. No row names it.
-    let pinned = rig.bridge.safety.keys();
-    assert_eq!(pinned.iter().filter(|k| k.starts_with("x/")).count(), 2);
-    assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 1);
-    assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 1);
+    for complete_first in [false, true] {
+        let rig = Rig::new().await;
+        let id = rig.create("alpha", KEY).await;
+        let old_etag = rig.part("alpha", KEY, &id, 1, &old).await;
+        let complete = complete_req(RW_KEY, "alpha", KEY, &id, &[(1, &old_etag)], &[]);
+        let part = part_req(RW_KEY, "alpha", KEY, &id, 1, &new);
+        let (complete, part) = if complete_first {
+            rig.race(complete, part).await
+        } else {
+            let (part, complete) = rig.race(part, complete).await;
+            (complete, part)
+        };
+        // Yielding first orders these tiny in-memory calls, but on real
+        // sockets either request can finish its reads and commit first.
+        let complete_won = if TestSql::postgres_selected() {
+            complete.outcome() == "200"
+        } else {
+            complete_first
+        };
+        if complete_won {
+            assert_eq!(complete.outcome(), "200", "{}", complete.body);
+            assert_eq!(part.outcome(), "404 NoSuchUpload");
+            assert_eq!(
+                rig.upload_state(&rig.alpha, KEY, &id).await,
+                Some(UploadState::Completed)
+            );
+            assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == old);
+            assert_eq!(rig.count("SELECT COUNT(*) FROM extents").await, 1);
+            assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 1);
+            // A part that reached its upload before the close can leave one
+            // orphan blob, but it never acquires a catalogue row.
+            let pinned = rig.bridge.safety.keys();
+            let blobs = pinned.iter().filter(|k| k.starts_with("x/")).count();
+            if TestSql::postgres_selected() {
+                assert!((1..=2).contains(&blobs));
+            } else {
+                assert_eq!(blobs, 2);
+            }
+        } else {
+            assert_eq!(part.outcome(), "200", "{}", part.body);
+            assert_eq!(complete.outcome(), "400 InvalidPart");
+            assert!(rig.object(&rig.alpha, KEY).await.is_none());
+            assert_eq!(rig.count("SELECT COUNT(*) FROM outbox").await, 0);
+            assert_eq!(
+                rig.upload_state(&rig.alpha, KEY, &id).await,
+                Some(UploadState::Open)
+            );
+            let new_etag = part.header("etag").unwrap().to_string();
+            let retry = rig.complete("alpha", KEY, &id, &[(1, &new_etag)]).await;
+            assert_eq!(retry.outcome(), "200", "{}", retry.body);
+            assert!(rig.object(&rig.alpha, KEY).await.unwrap().1 == new);
+        }
+    }
 }
 
 #[tokio::test]
