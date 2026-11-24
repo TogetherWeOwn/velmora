@@ -22,6 +22,7 @@ use velmora_bridge::config::{BridgeConfig, GcMode, Maintenance};
 use velmora_bridge::jobs::{low_watermark, EVICT_BATCH, EVICT_CHECK_SECS};
 use velmora_bridge::service::READ_STAMP_MS;
 use velmora_bridge::sql::HOT_INDEX_ONLY;
+use velmora_bridge::testkit::TestSql;
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -115,6 +116,19 @@ async fn hot() -> Hot {
 impl Hot {
     fn bridge(&self) -> &TestBridge<TcpConnector> {
         &self.rig.bridge
+    }
+
+    /// Match the Worker's bounded wait for a cold miss observation. Without
+    /// a timer the GET only polls that write once, which works for inline
+    /// SQLite but cannot wait for PostgreSQL I/O before starting the fill.
+    fn enable_cold_wait(&mut self) {
+        let bridge = Rc::get_mut(&mut self.rig.bridge).expect("no request in flight");
+        bridge.budget = velmora_bridge::ingress::ByteBudget::new(bridge.cfg.inflight_budget_bytes)
+            .with_sleeper(Rc::new(|ms| {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+                    u64::from(ms),
+                )))
+            }));
     }
 
     fn cfg_mut(&mut self) -> &mut BridgeConfig {
@@ -1192,7 +1206,8 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
     let cat = &bridge.catalog;
     cat.hot_counters_add(96 * GIB).await.unwrap();
     cat.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "INSERT INTO meta(k,v) VALUES ('hotg_first', 4294967296)",
             &[],
         )
@@ -1223,7 +1238,8 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
     // The next tick sees the new eligible misses and grows. Its decision
     // commits first even though both ticks loaded the same state version.
     cat.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "INSERT INTO meta(k,v) VALUES ('hotg_24h', 322122547200)",
             &[],
         )
@@ -1248,11 +1264,12 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
 #[tokio::test(flavor = "current_thread")]
 async fn adaptive_ten_gib_minimum_drains_then_reads_back_byte_exact_from_fake_nntp() {
     use velmora_bridge::config::HotCtlMode;
-    let hot = hot_with(|cfg| {
+    let mut hot = hot_with(|cfg| {
         cfg.hot_ctl.mode = HotCtlMode::Adaptive;
         cfg.hot_cap_bytes = 100 * GIB;
     })
     .await;
+    hot.enable_cold_wait();
     let x = hot.released("p3-roundtrip").await;
     hot.get_ok("p3-roundtrip").await;
     let pinned = hot.put("p3-pinned").await;
@@ -1343,20 +1360,14 @@ async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
     let pinned = hot.put("hold").await;
     assert!(hot.has_safety(&pinned));
     // Even a stale safety count must not include a held copy in the shape.
-    cat.sql
-        .exec(
-            "UPDATE extents SET hot_safety_bytes = cipher_size WHERE id = ?1",
-            &[SqlValue::Text(pinned.id.as_str().to_owned())],
-        )
-        .await
-        .unwrap();
-    cat.sql
-        .exec(
-            "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
-            &[SqlValue::Text(never_read.id.as_str().to_owned())],
-        )
-        .await
-        .unwrap();
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = cipher_size WHERE id = ?1",
+        &pinned,
+    );
+    hot.sql(
+        "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
+        &never_read,
+    );
     assert_eq!(
         cat.hot_shape().await.unwrap(),
         HotShape {
@@ -1367,36 +1378,75 @@ async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
     );
 }
 
+/// Count actual changed meta rows on either backend. SQLite has a native
+/// preupdate hook; PostgreSQL uses a row trigger in the isolated fixture.
+struct MetaWrites<'a>(&'a TestSql);
+
+impl<'a> MetaWrites<'a> {
+    fn start(db: &'a TestSql) -> Self {
+        if db.dialect() == Dialect::Sqlite {
+            db.sqlite().meter_writes().unwrap();
+        } else {
+            db.fixture_script(
+                "CREATE TABLE hot_meta_writes (n BIGINT NOT NULL); \
+                 INSERT INTO hot_meta_writes VALUES (0); \
+                 CREATE FUNCTION count_hot_meta_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                     BEGIN UPDATE hot_meta_writes SET n = n + 1; RETURN NULL; END $$; \
+                 CREATE TRIGGER count_hot_meta_write AFTER INSERT OR UPDATE OR DELETE ON meta \
+                     FOR EACH ROW EXECUTE FUNCTION count_hot_meta_write()",
+            )
+            .unwrap();
+        }
+        Self(db)
+    }
+
+    async fn count(&self) -> u64 {
+        if self.0.dialect() == Dialect::Sqlite {
+            return self.0.sqlite().writes().table("meta");
+        }
+        let rows = self
+            .0
+            .fixture_query("SELECT n FROM hot_meta_writes", &[])
+            .await
+            .unwrap();
+        let [SqlValue::Int(n)] = rows[0].as_slice() else {
+            panic!("expected one integer meta-write count");
+        };
+        u64::try_from(*n).unwrap()
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_write_meta() {
-    let hot = hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    let mut hot =
+        hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    hot.enable_cold_wait();
     let x = hot.released("signal").await;
     hot.bridge().evict_batch(0).await.unwrap();
     hot.bridge().clock.advance_secs(2 * 3600);
     let cat = &hot.bridge().catalog;
-    cat.sql.meter_writes().unwrap();
+    let writes = MetaWrites::start(&cat.sql.inner);
     hot.get_ok("signal").await;
     assert_eq!(
         cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
         vec![Some(x.cipher_size as i64), None]
     );
-    assert_eq!(cat.sql.writes().table("meta"), 1);
-    cat.sql.reset_writes();
+    assert_eq!(writes.count().await, 1);
     hot.get_ok("signal").await;
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, 1);
     assert_eq!(
         cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
         vec![Some(x.cipher_size as i64), None]
     );
 
     hot.bridge().evict_batch(0).await.unwrap();
-    cat.sql.reset_writes();
+    let before = writes.count().await;
     // Internal cold fetch uses the same cache fill, but is not a customer GET.
     assert!(matches!(
         hot.bridge().fetch_cold(&x).await.unwrap(),
         velmora_bridge::fetch::ColdFetch::Filled(_)
     ));
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, before);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1535,7 +1585,7 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
         Rc::new(move |task| tasks.borrow_mut().push(task))
     };
     let cat = &hot.bridge().catalog;
-    cat.sql.meter_writes().unwrap();
+    let writes = MetaWrites::start(&cat.sql.inner);
     let get = |key: &'static str| {
         let (hot, spawner) = (&hot, &spawner);
         async move {
@@ -1563,10 +1613,10 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
     drop(get("warm").await);
     assert!(tasks.borrow().is_empty());
     Resp::collect(get("warm").await).await.expect(200);
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, 0);
     let task = tasks.borrow_mut().pop().expect("first flush queued");
     task.await;
-    assert_eq!(cat.sql.writes().table("meta"), 1);
+    assert_eq!(writes.count().await, 1);
     hot.bridge().clock.advance_secs(899);
     Resp::collect(get("warm").await).await.expect(200);
     assert!(tasks.borrow().is_empty());
@@ -1574,7 +1624,7 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
     Resp::collect(get("not-found").await).await.expect(404);
     let task = tasks.borrow_mut().pop().expect("next flush queued");
     task.await;
-    assert_eq!(cat.sql.writes().table("meta"), 2);
+    assert_eq!(writes.count().await, 2);
     assert_eq!(
         cat.hot_ctl_load(&[HIT_KEY]).await.unwrap(),
         vec![Some(2 * x.cipher_size as i64)]

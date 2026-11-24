@@ -83,6 +83,16 @@ fn state_key(k: &str) -> bool {
     k == "hot_cap_target" || k.starts_with("hot_ctl_")
 }
 
+// Keep one bind per key on both dialects: the PG adapter rewrites the
+// numbered markers, and no packed bind needs a separate size bound.
+fn load_sql(arity: usize) -> String {
+    let placeholders = (1..=arity)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("SELECT k, v FROM meta WHERE k IN ({placeholders})")
+}
+
 pub(super) async fn load<S: Sql>(c: &SqlCatalog<S>, keys: &[&str]) -> Result<Vec<Option<i64>>> {
     if keys.len() > MAX_SQL_PARAMS
         || keys
@@ -96,11 +106,7 @@ pub(super) async fn load<S: Sql>(c: &SqlCatalog<S>, keys: &[&str]) -> Result<Vec
     }
     // One snapshot for all counters. IN uses the primary key point lookups.
     let params = keys.iter().map(|&key| text(key)).collect::<Vec<_>>();
-    let placeholders = (1..=keys.len())
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT k, v FROM meta WHERE k IN ({placeholders})");
+    let sql = load_sql(keys.len());
     let mut result = vec![None; keys.len()];
     for row in c.sql.query(&sql, &params).await? {
         let mut row = Cols::new(row);
@@ -132,4 +138,26 @@ pub(super) async fn store<S: Sql>(
             .map(|&(key, val)| (STORE, vec![text(key), SqlValue::Int(val)])),
     );
     Ok(matches!(guarded(c, stmts).await?, Guard::Applied(())))
+}
+
+/// The hot controller uses shared SQL; list its actual texts and wire
+/// parameter types for PostgreSQL typed PREPARE and execution coverage.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    let mut ghost = vec![T];
+    ghost.extend(std::iter::repeat_n(I, REUSE_HOURS.len()));
+    ghost.extend(std::iter::repeat_n(T, MISS_KEYS.len()));
+
+    let mut statements = vec![
+        (HOT_SHAPE.to_owned(), vec![]),
+        (GHOST.to_owned(), ghost),
+        (COUNTER_ADD.to_owned(), vec![T, I]),
+        (STORE_GUARD.to_owned(), vec![SqlValue::Null]),
+        (STORE_GUARD.to_owned(), vec![I]),
+        (STORE.to_owned(), vec![T, I]),
+    ];
+    statements.extend((1..=MAX_SQL_PARAMS).map(|arity| (load_sql(arity), vec![T; arity])));
+    statements
 }
