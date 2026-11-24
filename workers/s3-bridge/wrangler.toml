@@ -364,6 +364,22 @@ binding = "POST_Q4"
 queue = "velmora-post4"
 
 [[queues.producers]]
+binding = "POST_Q5"
+queue = "velmora-post5"
+
+[[queues.producers]]
+binding = "POST_Q6"
+queue = "velmora-post6"
+
+[[queues.producers]]
+binding = "POST_Q7"
+queue = "velmora-post7"
+
+[[queues.producers]]
+binding = "POST_Q8"
+queue = "velmora-post8"
+
+[[queues.producers]]
 binding = "VERIFY_Q"
 queue = "velmora-verify"
 
@@ -420,6 +436,38 @@ dead_letter_queue = "velmora-dlq"
 
 [[queues.consumers]]
 queue = "velmora-post4"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post5"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post6"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post7"
+max_batch_size = 1
+max_concurrency = 3
+max_retries = 20
+retry_delay = 60
+dead_letter_queue = "velmora-dlq"
+
+[[queues.consumers]]
+queue = "velmora-post8"
 max_batch_size = 1
 max_concurrency = 3
 max_retries = 20
