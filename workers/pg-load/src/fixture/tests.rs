@@ -255,7 +255,7 @@ fn a_failed_run_marker_insert_rolls_back_the_arm_update() {
         db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await
             .unwrap();
-        assert!(claim.is_err(), "the duplicate run key must abort the claim");
+        assert_eq!(claim.unwrap_err(), "record drill run ID: 23505");
         assert_eq!(
             arm.expect("transaction must already be rolled back")
                 .get::<_, i64>(0),
