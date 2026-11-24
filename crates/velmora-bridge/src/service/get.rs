@@ -1071,6 +1071,25 @@ where
     item
 }
 
+/// A verified miss is recorded whether or not there is room for a refill.
+/// The refill is returned to the caller unpolled so it cannot overwrite
+/// the recency timestamp while the miss is being recorded.
+async fn prepare_verified_fill<F: Future<Output = ()>, O: Future<Output = ()>>(
+    room: &ByteBudget,
+    cipher: Vec<u8>,
+    measure: bool,
+    write: impl FnOnce(Vec<u8>, Charge) -> F,
+    observe: impl FnOnce() -> O,
+) -> Option<F> {
+    let put = room
+        .try_charge(cipher.len() as u64)
+        .map(|copy| write(cipher, copy));
+    if measure {
+        observe().await;
+    }
+    put
+}
+
 /// What a read keeps from one extent to the next while it reads from
 /// Usenet: the connections, and the cache write of the extent before.
 ///
@@ -1467,28 +1486,31 @@ where
                     let held = room
                         .try_charge(plain.len() as u64)
                         .ok_or(ReadFail::Internal(Stage::Budget))?;
-                    if let Some(copy) = room.try_charge(cipher.len() as u64) {
-                        let (extent, spent) = (extent.clone(), Rc::clone(&self.spent));
-                        let write = async move {
-                            // Verified already: a cache that does not
-                            // take the copy does not fail the read.
-                            let fill = bridge.cache_fill(&extent, cipher);
-                            let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
-                            drop(copy);
-                        };
-                        self.put = Some(write.boxed_local());
-                    } else {
-                        drop(cipher);
-                    }
-                    if self.measure {
-                        // Count the verified miss even when no fill was
-                        // scheduled. Don't poll the fill while recording:
-                        // its first catalogue write replaces the timestamp.
-                        let _ = bridge
-                            .catalog
-                            .hot_ghost(&extent.id, bridge.clock.now())
-                            .await;
-                    }
+                    let spent = Rc::clone(&self.spent);
+                    self.put = prepare_verified_fill(
+                        &room,
+                        cipher,
+                        self.measure,
+                        |cipher, copy| {
+                            let extent = extent.clone();
+                            async move {
+                                // A cache that refuses a verified copy
+                                // does not fail the read.
+                                let fill = bridge.cache_fill(&extent, cipher);
+                                let _ = Spent::time(&bridge.clock, &spent.put, fill).await;
+                                drop(copy);
+                            }
+                            .boxed_local()
+                        },
+                        || async {
+                            // The refill is not in self.put yet, so wait
+                            // can watch providers without racing the stamp.
+                            let _ = self
+                                .wait(bridge.catalog.hot_ghost(&extent.id, bridge.clock.now()))
+                                .await;
+                        },
+                    )
+                    .await;
                     return Ok((plain, held));
                 }
                 Ok(ColdFetch::Busy) if shortfall > 0 => Stage::Budget,
@@ -1605,6 +1627,59 @@ mod tests {
     use std::sync::Arc;
 
     use futures_util::task::{noop_waker, waker, ArcWake};
+
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn a_verified_miss_is_counted_when_the_cache_copy_does_not_fit() {
+        use crate::ports::BlobMeta;
+        use crate::sql::SqlCatalog;
+        use crate::testkit::{MemBlobStore, RusqliteSql};
+        use crate::types::BucketId;
+
+        let db = RusqliteSql::with_schema().unwrap();
+        db.apply("INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) \
+                 VALUES ('b_c','cold','o',x'00',1,1); \
+                 INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+                 VALUES ('x_c','b_c','staged',1,4096,x'00',x'00',x'00',x'00','held',1);").unwrap();
+        let catalog = SqlCatalog::new(db);
+        let cache = MemBlobStore::new();
+        let extent = ExtentId::new("x_c");
+        let bucket = BucketId::new("b_c");
+        let room = ByteBudget::new(4096);
+        let _plaintext = room.try_charge(1).expect("plaintext fits");
+        let fill = prepare_verified_fill(
+            &room,
+            vec![0; 4096],
+            true,
+            |cipher, _copy| async {
+                let hash = crate::post::sha256(&cipher);
+                cache
+                    .put(
+                        &extent.cache_key(),
+                        cipher,
+                        &BlobMeta {
+                            bucket: &bucket,
+                            extent: &extent,
+                            cipher_sha256: &hash,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            },
+            || async {
+                catalog.hot_ghost(&extent, UnixMs(1)).await.unwrap();
+            },
+        )
+        .await;
+        if let Some(fill) = fill {
+            fill.await;
+        }
+        assert!(!cache.contains(&extent.cache_key()));
+        assert_eq!(
+            catalog.hot_ctl_load(&["hotg_first"]).await.unwrap(),
+            vec![Some(4096)]
+        );
+    }
 
     #[test]
     fn busy_hit_accumulator_flushes_at_one_gib_without_waiting_fifteen_minutes() {

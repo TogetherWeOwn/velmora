@@ -795,13 +795,28 @@ async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_w
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn dropping_a_cold_get_body_cannot_cancel_its_verified_miss_with_the_refill() {
-    let hot = hot_with(|cfg| {
+async fn a_stalled_ghost_write_keeps_the_refill_back_and_closes_idle_sockets() {
+    use velmora_bridge::ingress::ByteBudget;
+    let mut hot = hot_with(|cfg| {
         cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow;
         cfg.max_extent_bytes = LEN as u64 / 2;
         cfg.slice_bytes = cfg.max_extent_bytes;
     })
     .await;
+    let bridge = Rc::get_mut(&mut hot.rig.bridge).unwrap();
+    let clock = bridge.clock.clone();
+    bridge.budget =
+        ByteBudget::new(bridge.cfg.inflight_budget_bytes).with_sleeper(Rc::new(move |ms| {
+            let clock = clock.clone();
+            let due = clock.now().0 + i64::from(ms);
+            Box::pin(std::future::poll_fn(move |_| {
+                if clock.now().0 >= due {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }))
+        }));
     hot.rig
         .put(&hot.signer, BUCKET, "cold-drop", &Hot::body("cold-drop"))
         .await
@@ -839,6 +854,28 @@ async fn dropping_a_cold_get_body_cannot_cancel_its_verified_miss_with_the_refil
     assert!(
         at_miss.is_pending(),
         "a served miss must not depend on the body continuing to drive its cache refill"
+    );
+    assert!(hot.bridge().nntp.live() > 0);
+    hot.bridge().clock.advance_secs(READ_PERMIT_SECS);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(
+                handle.as_mut().poll(cx).is_pending(),
+                "miss write is still stalled"
+            );
+            if hot.bridge().nntp.live() == 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("idle provider socket closes before the stalled miss write resumes");
+    assert!(
+        !hot.has_cache(&xs[0]),
+        "refill must not race the ghost write"
     );
     cat.sql.trip.release();
     // A caller can abandon the body as soon as its first piece has arrived.
