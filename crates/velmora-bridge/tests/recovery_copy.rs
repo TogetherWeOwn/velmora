@@ -1298,6 +1298,28 @@ async fn parallel_fresh_never_publishes_before_plans_even_when_one_put_fails() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_copies_a_shared_plan_once() {
+    for parallel in [false, true] {
+        let w = World::with_parallel_fresh(parallel);
+        w.e2.timed.set(true);
+        let key = "m/art/x_shared";
+        w.record(key, b"shared plan").await;
+        for i in 0..CONCURRENCY {
+            w.generation(&generation(2 * MIN_AGE_MS, &format!("_{i}")), &["x_shared"])
+                .await;
+        }
+        let step = w.copier().step(UnixMs(NOW), &sweep("m/g_")).await.unwrap();
+        assert_eq!(puts_of(w.e2, key), 1, "parallel={parallel}");
+        assert_eq!(
+            step.counts.copied,
+            CONCURRENCY as u64 + 1,
+            "parallel={parallel}"
+        );
+        assert_eq!(step.counts.pending, 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn parallel_fresh_holds_last_pass_generation_without_a_plan() {
     let w = World::with_parallel_fresh(true);
     let key = generation(FRESH_MS - PASS_INTERVAL_MS + 1, "_last");

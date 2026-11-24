@@ -1920,17 +1920,32 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     break;
                 }
             }
-            budget.copies += work.len();
-            budget.timing.plan_checks += work.len() as u64;
+            // Generations that refer to the same exact plan key share its
+            // result. Charge and count the actual check once, and replay the
+            // result in each generation's original order below.
+            let mut keys = Vec::with_capacity(work.len());
+            let mut uses = Vec::with_capacity(work.len());
+            for (i, key) in work {
+                let at = (width > 1)
+                    .then(|| keys.iter().position(|other| *other == key))
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        keys.push(key);
+                        keys.len() - 1
+                    });
+                uses.push((i, at));
+            }
+            budget.copies += keys.len();
+            budget.timing.plan_checks += keys.len() as u64;
             let started = self.clock.now();
-            let looked: Vec<_> = stream::iter(work)
-                .map(|(i, key)| async move { (i, self.plan(key).await) })
+            let looked: Vec<_> = stream::iter(keys)
+                .map(|key| self.plan(key))
                 .buffered(CONCURRENCY)
                 .collect()
                 .await;
             budget.timing.plan_ms += self.elapsed_ms(started);
             let (mut asked, mut down) = (0, 0);
-            for (i, plan) in looked {
+            for &plan in &looked {
                 asked += usize::from(!matches!(plan, Plan::Absent | Plan::Unreadable));
                 match plan {
                     Plan::There | Plan::Absent => {}
@@ -1943,12 +1958,14 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                     }
                     Plan::Refused => counts.refused += 1,
                 }
+            }
+            for (i, at) in uses {
                 let scan = scans
                     .get_mut(&i)
                     .expect("the batch only takes plans from scans");
                 // Only a contiguous successful prefix can be used to
                 // resume this generation; later successes cannot fill a hole.
-                scan.stopped |= !matches!(plan, Plan::There | Plan::Sent);
+                scan.stopped |= !matches!(looked[at], Plan::There | Plan::Sent);
                 scan.confirmed += usize::from(!scan.stopped);
             }
             // A group that asked nothing says nothing about the store.
