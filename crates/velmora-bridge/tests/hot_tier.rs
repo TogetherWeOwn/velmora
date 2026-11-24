@@ -11,7 +11,10 @@
 mod nntp_support;
 mod service_support;
 
+use std::future::Future;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use nntp_support::{TcpConnector, PASS, USER};
 use service_support::*;
