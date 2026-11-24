@@ -901,6 +901,8 @@ mod tests {
             ("clean:123x", Some(123)),
             ("clean:", None),
             ("clean:0000000000000000001", Some(1)),
+            ("clean:00000000000000000001", Some(1)),
+            ("clean:000000000000000000000123", Some(123)),
             (
                 "clean:00000000000000000000009223372036854775807",
                 Some(i64::MAX),
@@ -944,7 +946,9 @@ mod tests {
             if allowed {
                 assert_eq!(result.unwrap(), 0, "{value} at {cutoff}");
             } else {
-                let error = result.unwrap_err();
+                let Err(error) = result else {
+                    panic!("{value} at {cutoff} should be refused");
+                };
                 assert_eq!(
                     error.as_db_error().and_then(|e| e.constraint()),
                     Some("tx_guard_ok"),
