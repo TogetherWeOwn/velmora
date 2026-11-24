@@ -1,0 +1,43 @@
+[package]
+name = "velmora-recover"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+autobins = false
+
+[[bin]]
+name = "velmora-recover"
+path = "src/main.rs"
+required-features = ["recovery-cli"]
+
+[features]
+default = []
+recovery-cli = ["dep:clap", "dep:reqwest", "dep:velmora-kit"]
+
+[dependencies]
+base64 = "0.22"
+crc = "3"
+sha1 = "0.11"
+velmora-s3-proto = { version = "0.1.0", path = "../velmora-s3-proto" }
+clap = { version = "4", features = ["derive"], optional = true }
+quick-xml = "0.42"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+toml = "0.9"
+md5 = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+velmora = { version = "0.1.0", path = "../velmora" }
+velmora-bridge = { version = "0.1.0", path = "../velmora-bridge" }
+velmora-kit = { version = "0.1.0", path = "../velmora-kit", optional = true }
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
