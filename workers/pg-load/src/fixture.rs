@@ -375,7 +375,11 @@ async fn publish<C: PgConnect>(
         )
         .await?
     };
-    applied(matches!(outcome, PublishOutcome::Applied))
+    match outcome {
+        PublishOutcome::Applied => Ok(()),
+        PublishOutcome::FencedOverloaded(_) => Err(OpError::Overloaded),
+        PublishOutcome::Refused(_) | PublishOutcome::Fenced(_) => Err(OpError::Refused),
+    }
 }
 
 pub(crate) fn provider() -> ProviderConfig {

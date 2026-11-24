@@ -26,6 +26,8 @@ const MAX_SAMPLE_GAP_MS: u64 = 2 * SAMPLE_MS;
 const READ_SLOTS: usize = 3;
 const READ_TIMEOUT_MS: f64 = 20_000.0;
 const ARM_KEY: &str = "pg_load_fixture_v1";
+// Distinct from the measured production-style writer lock.
+const DRILL_EXCLUSIVE_LOCK: i64 = 7_413_000_318;
 
 #[allow(async_fn_in_trait)]
 pub trait Runtime {
@@ -310,6 +312,7 @@ struct Completed {
     family: Family,
     minutes: [Option<usize>; 3],
     error: Option<OpError>,
+    unstarted: bool,
 }
 
 async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
@@ -347,15 +350,25 @@ async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
                     peak_logical = peak_logical.max(active.len() + pending.len());
                 }
             }
-            while active.len() < WRITE_POOL_SLOTS {
-                let Some((i, job, queued)) = pending.pop_front() else {
+            while active.len() < WRITE_POOL_SLOTS && !pending.is_empty() {
+                let admitted_at = w.rt.monotonic_ms();
+                if admitted_at >= deadline {
                     break;
-                };
-                queue_wait.push((w.rt.monotonic_ms() - queued).max(0.0));
+                }
+                let (i, job, queued) = pending.pop_front().expect("queued write");
+                queue_wait.push((admitted_at - queued).max(0.0));
                 let w = &w;
                 let provider = &provider;
                 active.push(async move {
                     let mut minutes = [None; 3];
+                    if w.rt.monotonic_ms() >= deadline {
+                        return Completed {
+                            family: job.family,
+                            minutes,
+                            error: None,
+                            unstarted: true,
+                        };
+                    }
                     let mut n = 0;
                     let error = fixture::write(
                         w.cat,
@@ -375,11 +388,14 @@ async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
                         family: job.family,
                         minutes,
                         error,
+                        unstarted: false,
                     }
                 });
                 peak_admitted = peak_admitted.max(active.len());
             }
-        } else {
+        }
+        let expired = w.rt.monotonic_ms() >= deadline;
+        if expired {
             for job in pending
                 .drain(..)
                 .map(|(_, job, _)| job)
@@ -397,7 +413,7 @@ async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
         let at = arrivals
             .peek()
             .map_or(deadline, |(_, job)| w.start + job.at_ms as f64);
-        let done = if now >= deadline {
+        let done = if expired {
             active.next().await // drain; count late acknowledgements separately
         } else if active.is_empty() {
             until(w.rt, at).await;
@@ -412,6 +428,9 @@ async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
         };
         if let Some(done) = done {
             let stats = family.get_mut(&done.family).expect("planned family");
+            if done.unstarted {
+                stats.unstarted_at_deadline_batches += done.family.batches();
+            }
             for minute in done.minutes.into_iter().flatten() {
                 if let Some(total) = minutes.get_mut(minute) {
                     *total += 1;
@@ -454,6 +473,27 @@ async fn advisory(
     duration: u64,
     lock: i64,
 ) -> (Vec<SampleWindow>, Vec<f64>, Option<String>) {
+    sample_advisory(runtime, start, duration, || async {
+        client.query_typed("SELECT EXTRACT(EPOCH FROM (clock_timestamp()-l.waitstart))::float8 * 1000 \
+             FROM pg_catalog.pg_stat_activity a JOIN pg_catalog.pg_locks l USING(pid) \
+             WHERE a.datname=current_database() AND a.wait_event='advisory' \
+             AND l.locktype='advisory' AND NOT l.granted AND l.waitstart IS NOT NULL AND l.objsubid=1 \
+             AND l.classid::bigint=($1::bigint >> 32) AND l.objid::bigint=($1::bigint & 4294967295) \
+             AND NOT (l.classid::bigint=($2::bigint >> 32) AND l.objid::bigint=($2::bigint & 4294967295))",
+             &[(&lock, Type::INT8), (&DRILL_EXCLUSIVE_LOCK, Type::INT8)])
+            .await
+            .map(|rows| rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0)).collect())
+            .map_err(|e| fixture::sql_error("sample advisory waits", e))
+    })
+    .await
+}
+
+async fn sample_advisory<F: std::future::Future<Output = Result<Vec<f64>, String>>>(
+    runtime: &impl Runtime,
+    start: f64,
+    duration: u64,
+    mut sample: impl FnMut() -> F,
+) -> (Vec<SampleWindow>, Vec<f64>, Option<String>) {
     let mut waits = Vec::new();
     let mut error = None;
     let mut samples = Vec::new();
@@ -469,12 +509,16 @@ async fn advisory(
         if dispatched_ms >= duration as f64 {
             break;
         }
-        let result = client.query_typed("SELECT EXTRACT(EPOCH FROM (clock_timestamp()-l.waitstart))::float8 * 1000 \
-             FROM pg_catalog.pg_stat_activity a JOIN pg_catalog.pg_locks l USING(pid) \
-             WHERE a.datname=current_database() AND a.wait_event='advisory' \
-             AND l.locktype='advisory' AND NOT l.granted AND l.waitstart IS NOT NULL AND l.objsubid=1 \
-             AND l.classid::bigint=($1::bigint >> 32) AND l.objid::bigint=($1::bigint & 4294967295)", &[(&lock, Type::INT8)])
-            .await;
+        let query = sample();
+        let timer = until(runtime, start + duration as f64);
+        pin_mut!(query, timer);
+        let result = match select(query, timer).await {
+            Either::Left((result, _)) => result,
+            Either::Right(_) => {
+                error = Some("advisory sampling deadline exceeded".into());
+                break;
+            }
+        };
         match result {
             Ok(rows) => {
                 let received_ms = (runtime.monotonic_ms() - start).max(dispatched_ms);
@@ -483,15 +527,15 @@ async fn advisory(
                         dispatched_ms,
                         received_ms,
                     });
-                    waits.extend(rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0)));
+                    waits.extend(rows);
                 }
             }
             Err(e) => {
-                error = Some(fixture::sql_error("sample advisory waits", e));
+                error = Some(e);
                 break;
             }
         }
-        next_tick = tick + 1;
+        next_tick = (dispatched_ms as u64 / SAMPLE_MS) + 1;
     }
     (samples, waits, error)
 }
@@ -522,6 +566,96 @@ async fn target(client: &Client) -> Result<(String, String, String), String> {
     Ok((row.get(0), row.get(1), row.get(2)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn sampler_scope(client: &Client) -> Result<(), String> {
+    let locked: bool = client
+        .query_typed_one(
+            "SELECT pg_try_advisory_lock($1)",
+            &[(&DRILL_EXCLUSIVE_LOCK, Type::INT8)],
+        )
+        .await
+        .map_err(|e| fixture::sql_error("lock native drill database", e))?
+        .get(0);
+    if !locked {
+        return Err("another native drill is active in this database".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sampler_scope(client: &Client) -> Result<(), String> {
+    // Hyperdrive pools transactions, so a server-session lock is unsafe here.
+    let catalogues: i64 = client
+        .query_typed_one(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+            WHERE c.relname = 'meta' AND c.relkind = 'r' \
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+            &[],
+        )
+        .await
+        .map_err(|e| fixture::sql_error("count rehearsal catalogues", e))?
+        .get(0);
+    if catalogues != 1 {
+        return Err("the rehearsal clone database must contain exactly one catalogue".into());
+    }
+    Ok(())
+}
+
+fn fresh_run_id() -> Result<String, String> {
+    use std::fmt::Write;
+    use velmora::rng::{FillRandom, SystemRng};
+
+    let mut bytes = [0_u8; 16];
+    SystemRng
+        .fill_bytes(&mut bytes)
+        .map_err(|_| "could not generate drill run ID")?;
+    let mut id = String::with_capacity(32);
+    for byte in bytes {
+        write!(&mut id, "{byte:02x}").expect("formatting into String");
+    }
+    Ok(id)
+}
+
+pub(crate) async fn claim_target(client: &Client, run_id: &str) -> Result<(), String> {
+    client
+        .batch_execute("BEGIN READ WRITE")
+        .await
+        .map_err(|e| fixture::sql_error("begin marker claim", e))?;
+    let claimed = client
+        .execute_typed(
+            "UPDATE meta SET v=2 WHERE k=$1 AND v=1",
+            &[(&ARM_KEY, Type::TEXT)],
+        )
+        .await
+        .map_err(|e| fixture::sql_error("claim drill marker", e))?;
+    if claimed != 1 {
+        return Err("drill was already claimed".into());
+    }
+    client
+        .execute_typed(
+            "INSERT INTO meta(k,v) VALUES ('pg_load_run_' || $1,1)",
+            &[(&run_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|e| fixture::sql_error("record drill run ID", e))?;
+    client
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|e| fixture::sql_error("commit marker claim", e))
+}
+
+pub(crate) async fn reader_sees_claim(client: &Client, run_id: &str) -> Result<bool, String> {
+    Ok(client
+        .query_typed_one(
+            "SELECT EXISTS(SELECT FROM meta WHERE k=$1 AND v=2) \
+                AND EXISTS(SELECT FROM meta WHERE k='pg_load_run_' || $2)",
+            &[(&ARM_KEY, Type::TEXT), (&run_id, Type::TEXT)],
+        )
+        .await
+        .map_err(|e| fixture::sql_error("verify drill claim on read pool", e))?
+        .get(0))
+}
+
 /// Admits at most five writer calls, separate from the read probe and sampler.
 /// The two connectors must point at the same explicitly armed drill copy.
 pub async fn run<C: DrillConnect + Clone, R: Runtime>(
@@ -530,6 +664,7 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     runtime: &R,
     config: &Config,
 ) -> Result<Report, String> {
+    let run_id = fresh_run_id()?;
     let jobs = config.plan();
     let pg = PgConfig {
         lock_key: runtime.lock_key(),
@@ -539,6 +674,7 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
         .connect()
         .await
         .map_err(|_| "could not connect read sampler")?;
+    sampler_scope(rd.client()).await?;
     let wr = writer
         .connect()
         .await
@@ -562,36 +698,8 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
             return Err("read role cannot see writer wait events".into());
         }
     }
-    wr.client()
-        .batch_execute("BEGIN READ WRITE")
-        .await
-        .map_err(|e| fixture::sql_error("begin marker claim", e))?;
-    let claimed = wr
-        .client()
-        .execute_typed(
-            "UPDATE meta SET v=2 WHERE k=$1 AND v=1",
-            &[(&ARM_KEY, Type::TEXT)],
-        )
-        .await
-        .map_err(|e| fixture::sql_error("claim drill marker", e))?;
-    if claimed != 1 {
-        return Err("drill was already claimed".into());
-    }
-    wr.client()
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|e| fixture::sql_error("commit marker claim", e))?;
-    // The read origin must see the same one-shot claim, not a separately armed DB.
-    let sees_claim: bool = rd
-        .client()
-        .query_typed_one(
-            "SELECT EXISTS(SELECT FROM meta WHERE k=$1 AND v=2)",
-            &[(&ARM_KEY, Type::TEXT)],
-        )
-        .await
-        .map_err(|e| fixture::sql_error("verify drill claim on read pool", e))?
-        .get(0);
-    if !sees_claim {
+    claim_target(wr.client(), &run_id).await?;
+    if !reader_sees_claim(rd.client(), &run_id).await? {
         return Err("read pool does not see drill claim".into());
     }
     fixture::seed(wr.client(), &jobs).await?;
@@ -692,6 +800,130 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::Cell,
+        future::Future,
+        rc::Rc,
+        task::{Context, Poll, Waker},
+    };
+
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        pin_mut!(future);
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[derive(Default)]
+    struct SampleClock {
+        now: Cell<f64>,
+        delay_next_wake: Cell<f64>,
+    }
+
+    impl Runtime for SampleClock {
+        fn monotonic_ms(&self) -> f64 {
+            self.now.get()
+        }
+        fn wall_ms(&self) -> i64 {
+            1
+        }
+        async fn sleep(&self, duration: Duration) {
+            self.now.set(
+                self.now.get()
+                    + duration.as_secs_f64() * 1_000.0
+                    + self.delay_next_wake.replace(0.0),
+            );
+        }
+    }
+
+    #[test]
+    fn advisory_sampler_times_out_a_request_with_no_response() {
+        let clock = SampleClock::default();
+        let Poll::Ready((samples, waits, error)) =
+            poll_once(sample_advisory(&clock, 0.0, 1_000, std::future::pending))
+        else {
+            panic!("sampler remained pending past its phase deadline");
+        };
+        assert!(samples.is_empty() && waits.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("advisory sampling deadline exceeded")
+        );
+    }
+
+    #[test]
+    fn delayed_sampler_wake_does_not_double_count_its_interval() {
+        let clock = SampleClock {
+            now: Cell::new(0.0),
+            delay_next_wake: Cell::new(250.0),
+        };
+        let Poll::Ready((samples, _, error)) =
+            poll_once(sample_advisory(&clock, 0.0, 1_000, || async {
+                clock.now.set(clock.now.get() + 1.0);
+                Ok(Vec::new())
+            }))
+        else {
+            panic!("immediate sampler queries must complete");
+        };
+        assert!(error.is_none());
+        let dispatched: Vec<_> = samples.into_iter().map(|s| s.dispatched_ms).collect();
+        assert_eq!(dispatched, [0.0, 500.0, 750.0]);
+    }
+
+    #[test]
+    fn writers_do_not_start_at_the_admission_or_first_poll_deadline() {
+        struct DeadlineClock(Cell<usize>);
+        impl Runtime for DeadlineClock {
+            fn monotonic_ms(&self) -> f64 {
+                match self.0.get() {
+                    0 => 60_000.0,
+                    n => {
+                        self.0.set(n - 1);
+                        59_999.0
+                    }
+                }
+            }
+            fn wall_ms(&self) -> i64 {
+                1
+            }
+            async fn sleep(&self, _: Duration) {}
+        }
+
+        #[derive(Clone)]
+        struct CountConnect(Rc<Cell<usize>>);
+        impl PgConnect for CountConnect {
+            async fn connect(&self) -> velmora_bridge::Result<velmora_bridge::pg::PgConnection> {
+                self.0.set(self.0.get() + 1);
+                Err(velmora_bridge::BridgeError::Sql(
+                    "unexpected connection".into(),
+                ))
+            }
+        }
+
+        for before_deadline in [1, 3] {
+            let clock = DeadlineClock(Cell::new(before_deadline));
+            let calls = Rc::new(Cell::new(0));
+            let conn = CountConnect(calls.clone());
+            let cat = SqlCatalog::new(PgSql::new(conn.clone(), conn, PgConfig::default()));
+            let jobs = [Job {
+                family: Family::Gc,
+                at_ms: 0,
+            }];
+            let Poll::Ready(report) = poll_once(writes(Writes {
+                cat: &cat,
+                rt: &clock,
+                start: 0.0,
+                minutes: 1,
+                jobs: &jobs,
+            })) else {
+                panic!("writes without started jobs must finish");
+            };
+            assert_eq!(
+                report.family[&Family::Gc].unstarted_at_deadline_batches,
+                1,
+                "clock budget {before_deadline}"
+            );
+            assert_eq!(calls.get(), 0, "the late write reached the catalogue");
+        }
+    }
 
     #[test]
     fn acceptable_tick_count_cannot_hide_a_contiguous_gap() {

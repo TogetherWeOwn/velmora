@@ -19,6 +19,7 @@ velmora-bridge = { version = "0.1.0", path = "../../crates/velmora-bridge", feat
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "net", "time"] }
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
+velmora = { version = "0.1.0", path = "../../crates/velmora", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 subtle = "2"
