@@ -1,0 +1,2 @@
+# Exact PostgreSQL statement exceptions, one per line: SHA-256 of normalized SQL, then reason.
+# Do not list fixture SQL or wildcard families. Remove an entry once the suite executes it.

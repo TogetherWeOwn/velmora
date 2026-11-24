@@ -18,7 +18,7 @@ fn code(resp: &Resp) -> String {
 
 #[tokio::test(flavor = "current_thread")]
 async fn head_bucket_answers_for_a_granted_bucket_only() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket("bkt-not-granted", true).await;
 
@@ -58,7 +58,7 @@ async fn head_bucket_answers_for_a_granted_bucket_only() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn head_bucket_requires_a_valid_signature() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let mut req = signer.sign(
         rig.now(),
@@ -97,7 +97,7 @@ async fn head_bucket_requires_a_valid_signature() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn get_bucket_location_reports_the_region() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let resp = rig
         .call(
@@ -132,7 +132,7 @@ async fn get_bucket_location_reports_the_region() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn signed_create_bucket_only_confirms_an_owned_bucket() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let body = format!(
         "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
@@ -216,7 +216,7 @@ async fn signed_create_bucket_only_confirms_an_owned_bucket() {
 /// rclone's CreateBucket carries `x-amz-bucket-object-lock-enabled: false`.
 #[tokio::test(flavor = "current_thread")]
 async fn signed_create_bucket_accepts_object_lock_disabled_only() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     for (value, status, want) in [
         ("false", 409, "BucketAlreadyOwnedByYou"),

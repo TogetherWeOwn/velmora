@@ -1150,9 +1150,9 @@ mod pg_manifest_tests {
     #[test]
     fn declared_background_binds_cover_every_statement_position() {
         let statements = pg_background_statements();
-        // Arity checks alone cannot detect a dropped inventory row. This
-        // count includes the generated replay variants at all 50 arities.
-        assert_eq!(statements.len(), 235, "background inventory entry count");
+        // Count every generated replay and hot-controller lookup arity,
+        // plus both wire signatures for the nullable hot-controller guard.
+        assert_eq!(statements.len(), 341, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }
@@ -1168,6 +1168,7 @@ pub fn pg_background_statements() -> Vec<(String, Vec<SqlValue>)> {
         gc::pg_statements(),
         usage::pg_statements(),
         hot::pg_statements(),
+        hotctl::pg_statements(),
         health::pg_statements(),
         permits::pg_statements(),
         crate::gate::pg_statements(),

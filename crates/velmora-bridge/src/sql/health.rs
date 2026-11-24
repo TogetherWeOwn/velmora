@@ -273,7 +273,12 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
     ]
 }
 
-#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+#[cfg(all(
+    test,
+    feature = "pg-test-record",
+    feature = "testkit-pg",
+    not(target_arch = "wasm32")
+))]
 mod postgres_tests {
     use super::{PROVIDER_LOAD, PROVIDER_LOAD_PG};
     use crate::{gate::pg_background_fixture as pg, testkit::RusqliteSql};

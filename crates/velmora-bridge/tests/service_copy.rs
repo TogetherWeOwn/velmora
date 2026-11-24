@@ -50,30 +50,42 @@ async fn collect_garbage<N: NntpConnector + 'static>(rig: &Rig<N>) {
 }
 
 fn open_gc<N: NntpConnector + 'static>(rig: &Rig<N>, extent: &ExtentId) -> i64 {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
+    let rows = rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(
             "SELECT COUNT(*) FROM gc WHERE extent_id = ?1",
-            [extent.as_str()],
-            |r| r.get(0),
+            &[SqlValue::Text(extent.as_str().into())],
         )
-        .unwrap()
-    })
+        .unwrap();
+    let [SqlValue::Int(count)] = rows[0].as_slice() else {
+        panic!("expected GC row count")
+    };
+    *count
 }
 
 fn generation_state<N: NntpConnector + 'static>(rig: &Rig<N>, id: &GenerationId) -> String {
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.query_row(
+    let rows = rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(
             "SELECT state FROM generations WHERE id = ?1",
-            [id.as_str()],
-            |r| r.get(0),
+            &[SqlValue::Text(id.as_str().into())],
         )
-        .unwrap()
-    })
+        .unwrap();
+    let [SqlValue::Text(state)] = rows[0].as_slice() else {
+        panic!("expected generation state")
+    };
+    state.clone()
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn copy_is_a_new_generation_over_the_same_extent() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(5, 300_000);
     let put = rig
@@ -169,7 +181,7 @@ async fn copy_is_a_new_generation_over_the_same_extent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn metadata_directive_copies_or_replaces() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let body = pattern(6, 10_000);
     rig.call(
@@ -236,7 +248,7 @@ async fn metadata_directive_copies_or_replaces() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn source_conditions_that_do_not_hold_are_412() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let put = rig.put(&signer, BUCKET, "a", &pattern(7, 1000)).await;
     let etag = put.header("etag").unwrap().to_owned();
@@ -275,7 +287,7 @@ async fn source_conditions_that_do_not_hold_are_412() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn read_only_grant_on_the_destination_is_refused() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", &pattern(8, 1000))
         .await
@@ -295,7 +307,7 @@ async fn read_only_grant_on_the_destination_is_refused() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn copy_onto_itself_needs_replace() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(9, 70_000);
     rig.call(
@@ -353,7 +365,7 @@ async fn copy_onto_itself_needs_replace() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn requests_the_copy_cannot_honour_store_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.bucket("bkt-other", true).await;
     rig.put(&signer, BUCKET, "a", &pattern(1, 1000))
@@ -440,7 +452,7 @@ async fn requests_the_copy_cannot_honour_store_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn extent_stays_until_the_last_generation_that_references_it_is_gone() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(2, 400_000);
     rig.put(&signer, BUCKET, "src", &body).await.expect(200);
@@ -497,7 +509,7 @@ async fn extent_stays_until_the_last_generation_that_references_it_is_gone() {
 /// refused when it runs, however it came to be queued.
 #[tokio::test(flavor = "current_thread")]
 async fn collector_refuses_an_extent_a_copy_references() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(4, 50_000);
     rig.put(&signer, BUCKET, "src", &body).await.expect(200);
@@ -510,15 +522,21 @@ async fn collector_refuses_an_extent_a_copy_references() {
     }
     assert_eq!(delete(&rig, &signer, "src").await.status, 204);
 
-    rig.bridge.catalog.sql.with_conn(|c| {
-        for action in ["delete_cache", "delete_safety", "shred_key"] {
-            c.execute(
+    for action in ["delete_cache", "delete_safety", "shred_key"] {
+        rig.bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_exec(
                 "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, ?2, 0)",
-                [extent.as_str(), action],
+                &[
+                    SqlValue::Text(extent.as_str().into()),
+                    SqlValue::Text(action.into()),
+                ],
             )
+            .await
             .unwrap();
-        }
-    });
+    }
     collect_garbage(&rig).await;
 
     assert!(rig.bridge.safety.contains(&extent.safety_key()));
@@ -539,7 +557,7 @@ async fn collector_refuses_an_extent_a_copy_references() {
 async fn copy_is_refused_while_it_is_switched_off() {
     let mut cfg = config(Vec::new());
     cfg.server_side_copy = false;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "a", &pattern(1, 1000))
         .await
@@ -556,7 +574,7 @@ async fn copy_is_refused_while_it_is_switched_off() {
 #[tokio::test(flavor = "current_thread")]
 async fn copy_cannot_compute_another_checksum() {
     use base64::Engine as _;
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let body = pattern(1, 1000);
     let sum = base64::engine::general_purpose::STANDARD.encode(sha256(&body));
@@ -644,7 +662,7 @@ async fn multipart_onto(rig: &Rig, signer: &Signer, key: &str, body: &[u8]) {
 /// other write: an extent the other side of a copy references stays.
 #[tokio::test(flavor = "current_thread")]
 async fn multipart_complete_over_either_side_of_a_copy_keeps_the_extent() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(6, 300_000);
     rig.put(&signer, BUCKET, "src", &body).await.expect(200);
@@ -683,7 +701,7 @@ async fn multipart_complete_over_either_side_of_a_copy_keeps_the_extent() {
 /// A copy whose recovery record cannot be written publishes nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_without_its_recovery_record_commits_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -720,13 +738,12 @@ fn lose_the_guard(rig: &Rig, then: impl FnOnce(&TestBridge<NoNntp>, &str) + 'sta
     let hook = move |key: &str| {
         assert!(key.starts_with("m/"), "{key}");
         // The source changes between the read and the batch.
-        bridge.catalog.sql.with_conn(|c| {
-            c.execute(
-                "UPDATE generations SET etag = '\"changed\"' WHERE key = 'src'",
-                [],
-            )
-            .unwrap()
-        });
+        bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_script(r#"UPDATE generations SET etag = '"changed"' WHERE key = 'src'"#)
+            .unwrap();
         then(&bridge, key);
     };
     rig.bridge.safety.before_put.replace(Some(Box::new(hook)));
@@ -737,7 +754,7 @@ fn lose_the_guard(rig: &Rig, then: impl FnOnce(&TestBridge<NoNntp>, &str) + 'sta
 /// removed, the request ends with an error instead of trying again.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_that_cannot_remove_a_lost_record_fails() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -767,7 +784,7 @@ async fn copy_that_cannot_remove_a_lost_record_fails() {
 /// that survived would be replayed before the copy, never over it.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_retry_sorts_after_the_attempt_that_lost() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await
@@ -800,7 +817,7 @@ async fn copy_retry_sorts_after_the_attempt_that_lost() {
 /// answers on the third try does not fail the copy.
 #[tokio::test(flavor = "current_thread")]
 async fn copy_retries_the_delete_of_a_lost_record() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "src", b"payload")
         .await

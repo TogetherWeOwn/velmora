@@ -1,5 +1,5 @@
-//! The set-based publish (`sql::publish`) over SQLite with the D1
-//! schema: CompleteMultipartUpload and a recovery replay give a
+//! The set-based publish (`sql::publish`) over the selected catalogue
+//! backend: CompleteMultipartUpload and a recovery replay give a
 //! generation its extents with one or two statements per value of
 //! placements instead of one or two per extent.
 //!
@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use velmora_bridge::recovery::Recorded;
 use velmora_bridge::replay::{ReplayExtent, ReplayPublish};
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
+use velmora_bridge::testkit::{PublishUnrecorded, TestSql};
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -129,7 +129,7 @@ enum Fault {
 }
 
 struct Rec {
-    db: RusqliteSql,
+    db: TestSql,
     /// Run batches the way they were built before ([`per_extent`]).
     old: Cell<bool>,
     /// One per batch to come, taken from the front.
@@ -152,6 +152,9 @@ struct Rec {
 }
 
 impl Sql for Rec {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.queries
             .borrow_mut()
@@ -179,10 +182,11 @@ impl Sql for Rec {
         };
         let fault = self.faults.borrow_mut().pop_front();
         let ran = match fault {
+            None if self.old.get() => self.db.fixture_batch(stmts).await,
             None => self.db.batch(stmts).await,
             Some(Fault::Guard) => {
                 stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
-                self.db.batch(stmts).await
+                self.db.fixture_batch(stmts).await
             }
             Some(Fault::NotRun(message)) => Err(BridgeError::Sql(message.into())),
             Some(Fault::Unreported(message)) => {
@@ -243,7 +247,12 @@ impl Fx {
     async fn new(old: bool) -> Fx {
         let fx = Fx {
             cat: SqlCatalog::new(Rec {
-                db: RusqliteSql::with_schema().unwrap(),
+                db: if old {
+                    TestSql::with_schema_unrecorded()
+                } else {
+                    TestSql::with_schema()
+                }
+                .unwrap(),
                 old: Cell::new(old),
                 faults: RefCell::new(VecDeque::new()),
                 batches: RefCell::new(Vec::new()),
@@ -261,8 +270,8 @@ impl Fx {
         for (id, name) in [(&fx.bucket, "one"), (&fx.other_bucket, "two")] {
             fx.run(
                 "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
-                 created_at) VALUES (?1, ?2, 'owner', x'07', 1, 1, 0)",
-                &[text(id.as_str()), text(name)],
+                 created_at) VALUES (?1, ?2, 'owner', ?3, 1, 1, 0)",
+                &[text(id.as_str()), text(name), SqlValue::Blob(vec![7])],
             )
             .await;
         }
@@ -287,11 +296,11 @@ impl Fx {
     }
 
     async fn run(&self, sql: &str, params: &[SqlValue]) -> u64 {
-        self.sql().db.exec(sql, params).await.unwrap()
+        self.sql().db.fixture_exec(sql, params).await.unwrap()
     }
 
     async fn count(&self, sql: &str) -> i64 {
-        match self.sql().db.query(sql, &[]).await.unwrap()[0][0] {
+        match self.sql().db.fixture_query(sql, &[]).await.unwrap()[0][0] {
             SqlValue::Int(n) => n,
             ref other => panic!("not an integer: {other:?}"),
         }
@@ -300,20 +309,21 @@ impl Fx {
     /// Every row of every table, by table and then sorted.
     async fn dump(&self) -> Vec<String> {
         let db = &self.sql().db;
-        let tables = db
-            .query(
-                "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                &[],
-            )
-            .await
-            .unwrap();
+        let names = db.fixture(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name",
+        );
+        let tables = db.fixture_query(names, &[]).await.unwrap();
         let mut out = Vec::new();
         for table in tables {
             let SqlValue::Text(name) = &table[0] else {
                 panic!("a table name is text");
             };
-            let rows = db.query(&format!("SELECT * FROM {name}"), &[]).await;
+            let rows = db
+                .fixture_query(&format!("SELECT * FROM {name}"), &[])
+                .await;
             let mut rows: Vec<String> = rows
                 .unwrap()
                 .iter()
@@ -330,7 +340,7 @@ impl Fx {
         let rows = self
             .sql()
             .db
-            .query(&format!("EXPLAIN QUERY PLAN {sql}"), params)
+            .fixture_query(&format!("EXPLAIN QUERY PLAN {sql}"), params)
             .await
             .unwrap();
         rows.into_iter()
@@ -613,6 +623,18 @@ impl Fx {
     }
 }
 
+#[cfg(feature = "testkit-pg")]
+#[tokio::test]
+async fn replay_executes_every_legal_unreadable_plan_window() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let fx = Fx::new(false).await;
+    for size in 1..=50 {
+        assert_eq!(fx.replayed(&vec![5; size]).await.len(), size);
+    }
+}
+
 /// `ids` end to end, in order.
 fn placed(ids: &[ExtentId], sizes: &[u64]) -> Vec<ExtentPlacement> {
     let mut offset = 0;
@@ -726,6 +748,9 @@ const EXTENTS_BY_ID: &str = "INDEX sqlite_autoindex_extents_1 (id=?)";
 
 #[tokio::test]
 async fn the_set_statements_find_each_extent_by_its_primary_key() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN output.
+    }
     // Complete.
     let fx = Fx::new(false).await;
     let s = fx.staged_large().await;
@@ -801,7 +826,7 @@ async fn complete_leaves_the_rows_the_per_extent_statements_left() {
         let placed = fx
             .sql()
             .db
-            .query(
+            .fixture_query(
                 "SELECT e.id, ge.seq, ge.plain_offset, e.seq, e.plain_offset \
                    FROM generation_extents ge JOIN extents e ON e.id = ge.extent_id \
                   WHERE ge.generation_id = ?1 AND e.generation_id = ?1 \
@@ -881,7 +906,7 @@ async fn publishing_again_changes_nothing() {
     let before = fx.dump().await;
     assert_eq!(fx.complete(&s, None).await, Guard::Lost);
     assert_eq!(fx.dump().await, before);
-    let changed = fx.sql().db.batch(set).await.unwrap();
+    let changed = fx.sql().db.fixture_batch(set).await.unwrap();
     assert_eq!(changed, [0, 0, 0]);
     assert_eq!(fx.dump().await, before);
 
@@ -895,7 +920,7 @@ async fn publishing_again_changes_nothing() {
     assert_eq!(fx.replay(&r.copy).await, ReplayPublish::Refused);
     assert_eq!(fx.replay(&r.first).await, ReplayPublish::Refused);
     assert_eq!(fx.dump().await, before);
-    let changed = fx.sql().db.batch(set).await.unwrap();
+    let changed = fx.sql().db.fixture_batch(set).await.unwrap();
     assert_eq!(changed, [0; 6]);
     assert_eq!(fx.dump().await, before);
 }
@@ -1043,7 +1068,7 @@ async fn a_replay_takes_no_extent_of_another_bucket() {
         let fx = &fx;
         async move {
             let sql = "SELECT plain_size FROM extents WHERE id = ?1";
-            match fx.sql().db.query(sql, &[id]).await.unwrap()[0][0] {
+            match fx.sql().db.fixture_query(sql, &[id]).await.unwrap()[0][0] {
                 SqlValue::Int(n) => n as u64,
                 ref other => panic!("not a size: {other:?}"),
             }
@@ -1213,9 +1238,17 @@ async fn a_replay_finds_an_extent_without_a_copy_in_any_value() {
             let whole = fx
                 .sql()
                 .db
-                .query("SELECT safety_state, plan FROM extents WHERE id = ?1", &id);
+                .fixture_query("SELECT safety_state, plan FROM extents WHERE id = ?1", &id);
             let whole = whole.await.unwrap().remove(0);
             // At least one: a usage-counter trigger adds its own row.
+            let damage = fx.sql().db.fixture(
+                damage,
+                if what == "unread" {
+                    "UPDATE extents SET safety_state = 'deleted', plan = decode('00', 'hex') WHERE id = ?1"
+                } else {
+                    damage
+                },
+            );
             assert!(fx.run(damage, &id).await >= 1, "{what}");
             let before = fx.dump().await;
             assert_eq!(fx.replay(&g).await, ReplayPublish::Damaged, "{what} {at}");
@@ -1456,15 +1489,18 @@ async fn rows_written(parts: u16) -> (u64, u64) {
     for old in [false, true] {
         let fx = Fx::new(old).await;
         let s = fx.staged(&fx.bucket, KEY, parts, |_| 100).await;
-        fx.sql().db.meter_writes().unwrap();
+        fx.sql().db.sqlite().meter_writes().unwrap();
         assert_eq!(fx.complete(&s, None).await, Guard::Applied(()));
-        billed.push(fx.sql().db.writes().billed());
+        billed.push(fx.sql().db.sqlite().writes().billed());
     }
     (billed[0], billed[1])
 }
 
 #[tokio::test]
 async fn the_set_statements_write_no_row_more_than_the_per_extent_ones() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite preupdate-hook billing counts.
+    }
     let (set, per_extent) = rows_written(233).await;
     assert_eq!(set, per_extent);
     assert!(set > 233);
@@ -1475,6 +1511,9 @@ async fn the_set_statements_write_no_row_more_than_the_per_extent_ones() {
 #[tokio::test]
 #[ignore = "a measurement: 10,000 parts take a while"]
 async fn rows_written_at_ten_thousand_extents() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: measures SQLite preupdate-hook billing counts.
+    }
     let (set, per_extent) = rows_written(10_000).await;
     println!("rows written per publish at 10,000 extents: set {set}, per extent {per_extent}");
     assert_eq!(set, per_extent);
@@ -1636,7 +1675,10 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
         fx.generation(&fx.bucket, "a", T0.plus_ms(3), &sizes),
         placed(&ids, &sizes),
     );
-    let set = "UPDATE extents SET safety_state = 'deleted', plan = x'00' WHERE id = ?1";
+    let set = fx.sql().db.fixture(
+        "UPDATE extents SET safety_state = 'deleted', plan = x'00' WHERE id = ?1",
+        "UPDATE extents SET safety_state = 'deleted', plan = decode('00', 'hex') WHERE id = ?1",
+    );
     assert!(fx.run(set, &[text(ids[519].as_str())]).await >= 1);
     fx.sql().limits.set(Some(SqlLimits {
         set_rows: 600,

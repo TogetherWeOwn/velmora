@@ -11,7 +11,7 @@ use std::rc::Rc;
 use futures_util::future::join_all;
 use velmora_bridge::gate::*;
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::testkit::TestSql;
 use velmora_bridge::*;
 
 const T0: i64 = 1_762_992_000_123;
@@ -41,9 +41,12 @@ fn pooled(id: &str, max_conns: u32, pool: &str, pool_max_conns: u32) -> Provider
 
 /// One database for the catalogue callers and the gates.
 #[derive(Clone)]
-struct Db(Rc<RusqliteSql>);
+struct Db(Rc<TestSql>);
 
 impl Sql for Db {
+    fn dialect(&self) -> Dialect {
+        self.0.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.0.query(sql, params).await
     }
@@ -116,7 +119,7 @@ struct World {
 impl World {
     fn new() -> Rc<Self> {
         Rc::new(World {
-            db: Db(Rc::new(RusqliteSql::with_schema().unwrap())),
+            db: Db(Rc::new(TestSql::with_schema().unwrap())),
             now: Cell::new(T0),
             stores: RefCell::default(),
             gates: RefCell::default(),
@@ -231,7 +234,7 @@ impl World {
     }
 
     async fn count(&self, sql: &str) -> i64 {
-        match self.db.query(sql, &[]).await.unwrap()[0][0] {
+        match self.db.0.fixture_query(sql, &[]).await.unwrap()[0][0] {
             SqlValue::Int(n) => n,
             ref other => panic!("not an integer: {other:?}"),
         }
@@ -481,7 +484,7 @@ async fn memory_and_slot_rows_decide_alike() {
         pooled("solo", 2, "alone", 1),
     ];
     for seed in 1..=6u64 {
-        let rows = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+        let rows = SqlCatalog::new(TestSql::with_schema().unwrap());
         rows.seed_permits(&providers).await.unwrap();
         let mut core = Core::new(UnixMs(T0));
         let mut rng = Lcg(seed);
@@ -938,7 +941,9 @@ async fn storage_is_written_per_horizon_step_not_per_permit() {
     let store = w.store("permits:all:0");
     let seized = store.saves.get();
     assert!(seized <= 2, "one write for the start, one for the seizure");
-    w.db.0.meter_writes().unwrap();
+    if !TestSql::postgres_selected() {
+        w.db.0.sqlite().meter_writes().unwrap();
+    }
 
     // 30 minutes of jobs: 6 slots taken, renewed every 20 s, given
     // back and taken again every minute. The object leaves memory
@@ -972,11 +977,14 @@ async fn storage_is_written_per_horizon_step_not_per_permit() {
     w.hibernate();
     assert_eq!(w.held("permits:all:0", "p").await, 0);
     assert_eq!(store.saves.get() - seized, busy, "nothing to clear");
-    assert_eq!(
-        w.db.0.writes().billed(),
-        0,
-        "no catalogue row for any acquire, renewal or release"
-    );
+    if !TestSql::postgres_selected() {
+        // sqlite_only: preupdate-hook row billing
+        assert_eq!(
+            w.db.0.sqlite().writes().billed(),
+            0,
+            "no catalogue row for any acquire, renewal or release"
+        );
+    }
 }
 
 /// New code is two writes per gate: the first start under it, and the
@@ -992,7 +1000,9 @@ async fn a_deploy_is_two_writes_and_a_start_is_none() {
     let a = take(&c, &w, &providers[0], JOB, "job-1").await.unwrap();
     let store = w.store("permits:all:0");
     let saves = store.saves.get();
-    w.db.0.meter_writes().unwrap();
+    if !TestSql::postgres_selected() {
+        w.db.0.sqlite().meter_writes().unwrap();
+    }
 
     for _ in 0..10 {
         w.hibernate();
@@ -1015,7 +1025,10 @@ async fn a_deploy_is_two_writes_and_a_start_is_none() {
     w.pass(JOB_MS + SKEW_MS - 10_000);
     w.hibernate();
     assert!(take(&c, &w, &providers[0], JOB, "job-2").await.is_some());
-    assert_eq!(w.db.0.writes().billed(), 0, "no catalogue row");
+    if !TestSql::postgres_selected() {
+        // sqlite_only: preupdate-hook row billing
+        assert_eq!(w.db.0.sqlite().writes().billed(), 0, "no catalogue row");
+    }
     assert_eq!(store.saves.get(), saves + 2);
 }
 
@@ -1680,12 +1693,13 @@ async fn a_gate_does_not_trust_what_it_stored_about_the_rows() {
     assert_eq!(stored.seized.get("p"), Some(&2));
 
     w.restart();
-    w.db.exec(
-        "UPDATE provider_permits SET lease_until = 0, holder = NULL, pool = NULL",
-        &[],
-    )
-    .await
-    .unwrap();
+    w.db.0
+        .fixture_exec(
+            "UPDATE provider_permits SET lease_until = 0, holder = NULL, pool = NULL",
+            &[],
+        )
+        .await
+        .unwrap();
     w.pass(JOB_MS + SKEW_MS + 1);
     let old = w.old_catalog();
     assert!(take(&old, &w, &p, JOB, "old-job").await.is_some());
@@ -2000,7 +2014,9 @@ async fn a_job_is_one_request_per_gate_and_no_row() {
         w.pass(1000);
         let saves = || -> u32 { w.stores.borrow().values().map(|s| s.saves.get()).sum() };
         let saved = saves();
-        w.db.0.meter_writes().unwrap();
+        if !TestSql::postgres_selected() {
+            w.db.0.sqlite().meter_writes().unwrap();
+        }
         for counter in [&w.calls, &w.opens, &w.msgs, &w.posts] {
             counter.set(0);
         }
@@ -2033,7 +2049,14 @@ async fn a_job_is_one_request_per_gate_and_no_row() {
         // Five renewals and the release, per gate.
         assert_eq!(w.msgs.get(), gates * 6, "{at}");
         assert_eq!(saves(), saved, "{at}: no stored row");
-        assert_eq!(w.db.0.writes().billed(), 0, "{at}: no catalogue row");
+        if !TestSql::postgres_selected() {
+            // sqlite_only: preupdate-hook row billing
+            assert_eq!(
+                w.db.0.sqlite().writes().billed(),
+                0,
+                "{at}: no catalogue row"
+            );
+        }
         let open: usize = w.sockets.borrow().values().map(BTreeMap::len).sum();
         assert_eq!(open, 0, "{at}: the sessions ended with the job");
     }
@@ -2148,7 +2171,10 @@ async fn calls_that_cross_the_end_of_a_session_share_the_next() {
     // The release arrives and ends the session; the waiter opens the
     // next one, and that is on its way when a third call comes.
     w.stall.set(false);
-    assert!(step(release.as_mut()).is_ready());
+    tokio::time::timeout(std::time::Duration::from_secs(5), release.as_mut())
+        .await
+        .expect("release completes after the stall clears")
+        .unwrap();
     assert_eq!(w.sessions(name), 0);
     w.stall.set(true);
     assert!(step(one.as_mut()).is_pending());

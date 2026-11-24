@@ -503,23 +503,28 @@ async fn frozen_parent_refuses_a_huge_range_before_looking_up_extents() {
     // Only the generation metadata is needed to refuse it; do not
     // allocate that many fixtures or give the catalogue that query.
     let sql = &rig.bridge.catalog.sql;
-    sql.with_conn(|conn| {
-        conn.execute(
+    sql.inner
+        .fixture_exec(
             "UPDATE generations SET size = ?1 WHERE id = ?2",
-            rusqlite::params![1i64 << 40, generation.id.as_str()],
+            &[
+                SqlValue::Int(1i64 << 40),
+                SqlValue::Text(generation.id.as_str().to_owned()),
+            ],
         )
+        .await
         .unwrap();
-    });
     sql.frozen.set(true);
     rig.bridge.cache.frozen.set(true);
     rig.bridge.safety.frozen.set(true);
-    let before = sql.read_stats().queries;
+    // Both backends count calls at the fixture boundary. The freeze checks
+    // reject writes before this counter, and the test asserts none were tried.
+    let before = sql.trip.calls();
     rig.head(&signer, BUCKET, "big").await.expect(200);
-    let metadata_queries = sql.read_stats().queries - before;
-    let before = sql.read_stats().queries;
+    let metadata_queries = sql.trip.calls() - before;
+    let before = sql.trip.calls();
     let cache_calls = rig.bridge.cache.trip.calls();
     assert_frozen_refusal(front(&rig, &signer, "big", &[]).await);
-    assert_eq!(sql.read_stats().queries - before, metadata_queries);
+    assert_eq!(sql.trip.calls() - before, metadata_queries);
     assert_eq!(rig.bridge.cache.trip.calls(), cache_calls);
     assert_no_frozen_writes(&rig);
 }

@@ -2119,7 +2119,12 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
     ]
 }
 
-#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
+#[cfg(all(
+    test,
+    feature = "pg-test-record",
+    feature = "testkit-pg",
+    not(target_arch = "wasm32")
+))]
 mod pg_plan_tests {
     use super::super::gc::GC_ORPHAN_WINDOW_PG;
     use super::{MARK_SENT_PG, REDRIVE_PG, REDRIVE_WINDOW_PG};

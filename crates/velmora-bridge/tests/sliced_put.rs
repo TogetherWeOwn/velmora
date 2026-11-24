@@ -16,7 +16,7 @@ fn big_rig() -> Rig {
     let mut cfg = config(Vec::new());
     cfg.max_put_bytes = 99 * MIB as u64;
     cfg.intent_sweep = true;
-    rig_with(NoNntp, cfg)
+    rig_with_selected(NoNntp, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ async fn the_limit_is_99_mib_and_16_mib_is_still_one_extent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn every_mode_and_every_cut_reads_back() {
-    let rig = small_rig();
+    let rig = small_rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     // One byte above an extent, a whole number of slices, one byte
     // either side of it, and the limit.
@@ -216,7 +216,7 @@ async fn every_mode_and_every_cut_reads_back() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_body_refused_in_its_last_slice_leaves_nothing_after_one_sweep() {
     let count = refused_bodies(
-        &small_rig(),
+        &small_rig_selected(),
         &Signer::new(AKID, secret()),
         "k",
         &pattern(1, 10 * SLICE),
@@ -224,7 +224,7 @@ async fn a_body_refused_in_its_last_slice_leaves_nothing_after_one_sweep() {
     .len();
     assert_eq!(count, 9);
     for case in 0..count {
-        let rig = small_rig();
+        let rig = small_rig_selected();
         let (bucket, signer) = rig.standard(BUCKET).await;
         // An object under the key, which the refused body must not harm.
         let old = pattern(9, 100);
@@ -293,7 +293,7 @@ async fn a_body_refused_in_its_last_slice_leaves_nothing_after_one_sweep() {
 async fn three_large_bodies_fill_the_budget_and_a_fourth_is_refused() {
     // The production ratio: the budget is six slices (48 MiB at 8 MiB).
     let budget = ingress::ByteBudget::new(6 * SLICE as u64);
-    let rig = rig_with_budget(NoNntp, small_config(), budget);
+    let rig = rig_with_budget_selected(NoNntp, small_config(), budget);
     let (_, signer) = rig.standard(BUCKET).await;
     let body = pattern(1, MAX_PUT);
 
@@ -358,7 +358,7 @@ async fn three_large_bodies_fill_the_budget_and_a_fourth_is_refused() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn intent_rows_hold_the_default_tenant_and_no_extent_is_shared() {
-    let rig = small_rig();
+    let rig = small_rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // The same body twice: nothing is adopted from the first write.
     let body = pattern(1, 5 * SLICE);
@@ -400,8 +400,10 @@ async fn intent_rows_hold_the_default_tenant_and_no_extent_is_shared() {
     let mut unique = ids.clone();
     unique.dedup();
     assert_eq!(unique.len(), 10);
-    assert_eq!(
-        number(&rig, "SELECT COUNT(*) FROM pragma_table_info('write_intents') WHERE name = 'tenant_id' AND \"notnull\" = 1"),
-        1
+    let not_null = rig.bridge.catalog.sql.inner.fixture(
+        "SELECT COUNT(*) FROM pragma_table_info('write_intents') WHERE name = 'tenant_id' AND \"notnull\" = 1",
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() \
+         AND table_name = 'write_intents' AND column_name = 'tenant_id' AND is_nullable = 'NO'",
     );
+    assert_eq!(number(&rig, not_null), 1);
 }

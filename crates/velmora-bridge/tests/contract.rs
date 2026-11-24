@@ -23,7 +23,7 @@ use velmora_bridge::jobs::RESEND_SECS;
 use velmora_bridge::recovery::Recorded;
 use velmora_bridge::sql::SqlCatalog;
 use velmora_bridge::testkit::{
-    FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, MIGRATION_0001,
+    FakeJobs, FixedClock, MemBlobStore, RusqliteSql, TestKek, TestSql, MIGRATION_0001,
 };
 use velmora_bridge::*;
 
@@ -45,23 +45,35 @@ fn text(s: &str) -> SqlValue {
     SqlValue::Text(s.to_string())
 }
 
-fn count(db: &RusqliteSql, table: &str) -> i64 {
-    db.with_conn(|c| {
-        c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap()
-    })
+async fn count(db: &TestSql, table: &str) -> i64 {
+    let rows = db
+        .fixture_query(&format!("SELECT count(*) FROM {table}"), &[])
+        .await
+        .unwrap();
+    let [SqlValue::Int(count)] = rows[0].as_slice() else {
+        panic!("count(*) returned a non-integer")
+    };
+    *count
 }
 
-/// Seeds one bucket row.
-fn seed_bucket(db: &RusqliteSql, id: &str, name: &str) {
-    db.with_conn(|c| {
-        c.execute(
-            "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,disposable,created_at) \
-             VALUES (?1,?2,'p',x'00',1,1,?3)",
-            (id, name, T0.0),
-        )
-        .unwrap()
-    });
+/// Both engines bind the fixture blob, avoiding SQLite's x'00' syntax.
+const INSERT_BUCKET: &str =
+    "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,disposable,created_at) \
+                             VALUES (?1,?2,'p',?3,1,1,?4)";
+
+fn bucket_values(id: &str, name: &str) -> Vec<SqlValue> {
+    vec![
+        text(id),
+        text(name),
+        SqlValue::Blob(vec![0]),
+        SqlValue::Int(T0.0),
+    ]
+}
+
+async fn seed_bucket(db: &TestSql, id: &str, name: &str) {
+    db.fixture_exec(INSERT_BUCKET, &bucket_values(id, name))
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -75,8 +87,8 @@ const INSERT_GC_MARKER: &str =
 
 #[tokio::test(flavor = "current_thread")]
 async fn batch_commits_when_guard_holds() {
-    let db = RusqliteSql::with_schema().unwrap();
-    seed_bucket(&db, "b_0000000000000001", "one");
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    seed_bucket(&db, "b_0000000000000001", "one").await;
     let changed = db
         .batch(vec![
             (GUARD_BUCKET_EXISTS, vec![text("b_0000000000000001")]),
@@ -86,13 +98,17 @@ async fn batch_commits_when_guard_holds() {
         .await
         .unwrap();
     assert_eq!(changed, vec![0, 1, 1]);
-    assert_eq!(count(&db, "gc"), 2);
-    assert_eq!(count(&db, "tx_guard"), 0, "a held guard inserts nothing");
+    assert_eq!(count(&db, "gc").await, 2);
+    assert_eq!(
+        count(&db, "tx_guard").await,
+        0,
+        "a held guard inserts nothing"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn batch_guard_failure_rolls_back_everything() {
-    let db = RusqliteSql::with_schema().unwrap();
+    let db = TestSql::with_schema_unrecorded().unwrap();
     // A statement before the guard and one after it: neither may survive.
     let err = db
         .batch(vec![
@@ -106,39 +122,31 @@ async fn batch_guard_failure_rolls_back_everything() {
         .await
         .unwrap_err();
     assert!(matches!(err, BridgeError::GuardFailed), "{err:?}");
-    assert_eq!(count(&db, "gc"), 0);
-    assert_eq!(count(&db, "tx_guard"), 0);
+    assert_eq!(count(&db, "gc").await, 0);
+    assert_eq!(count(&db, "tx_guard").await, 0);
     // The connection is usable afterwards (no transaction left open).
     db.exec(INSERT_GC_MARKER, &[text("x_later"), SqlValue::Int(T0.0)])
         .await
         .unwrap();
-    assert_eq!(count(&db, "gc"), 1);
+    assert_eq!(count(&db, "gc").await, 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn batch_statement_failure_rolls_back_and_is_not_a_guard_loss() {
-    let db = RusqliteSql::with_schema().unwrap();
-    seed_bucket(&db, "b_0000000000000001", "one");
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    seed_bucket(&db, "b_0000000000000001", "one").await;
     // Third statement violates the UNIQUE bucket name.
-    let insert_bucket = "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) \
-                         VALUES (?1,?2,'p',x'00',1,?3)";
     let err = db
         .batch(vec![
             (INSERT_GC_MARKER, vec![text("x_a"), SqlValue::Int(T0.0)]),
-            (
-                insert_bucket,
-                vec![text("b_0000000000000002"), text("two"), SqlValue::Int(T0.0)],
-            ),
-            (
-                insert_bucket,
-                vec![text("b_0000000000000003"), text("one"), SqlValue::Int(T0.0)],
-            ),
+            (INSERT_BUCKET, bucket_values("b_0000000000000002", "two")),
+            (INSERT_BUCKET, bucket_values("b_0000000000000003", "one")),
         ])
         .await
         .unwrap_err();
     assert!(matches!(err, BridgeError::Sql(_)), "{err:?}");
-    assert_eq!(count(&db, "gc"), 0);
-    assert_eq!(count(&db, "buckets"), 1);
+    assert_eq!(count(&db, "gc").await, 0);
+    assert_eq!(count(&db, "buckets").await, 1);
 
     // A CHECK on another table is a plain SQL error, not a guard loss.
     let err = db
@@ -1900,8 +1908,8 @@ async fn contract_compiles_against_fakes() {
     assert!(kek.version(3).is_none());
     assert!(!format!("{:?}", kek.active().1).contains('2'));
 
-    // Catalogue over rusqlite, every method.
-    let catalog = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+    // Catalogue over the selected test backend, every method.
+    let catalog = SqlCatalog::new(TestSql::with_schema().unwrap());
     exercise_catalog(&catalog).await;
 
     // The service core over the fakes: handle, run_job, dispatch.
@@ -2012,7 +2020,7 @@ fn complete_upload_takes_placements_not_extent_rows() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sql_rejects_more_than_100_params_like_d1() {
-    let db = RusqliteSql::with_schema().unwrap();
+    let db = TestSql::with_schema_unrecorded().unwrap();
     let in_list = |n: usize| {
         let marks: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
         format!(
@@ -2038,13 +2046,14 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         .await
         .unwrap_err(),
     ] {
+        let expected = db.fixture("too many bound parameters", "pg: bind failed");
         assert!(
-            matches!(&err, BridgeError::Sql(m) if m.contains("too many bound parameters")),
+            matches!(&err, BridgeError::Sql(m) if m.contains(expected)),
             "{err:?}"
         );
     }
     assert_eq!(
-        count(&db, "gc"),
+        count(&db, "gc").await,
         0,
         "an over-limit statement rolls back its batch"
     );
@@ -2076,7 +2085,7 @@ async fn sql_rejects_more_than_100_params_like_d1() {
         }
     }
     assert_eq!(
-        count(&db, "gc"),
+        count(&db, "gc").await,
         0,
         "an out-of-range integer rolls back its batch"
     );
@@ -2084,7 +2093,7 @@ async fn sql_rejects_more_than_100_params_like_d1() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn exec_and_batch_run_returning_and_select_to_completion() {
-    let db = RusqliteSql::with_schema().unwrap();
+    let db = TestSql::with_schema_unrecorded().unwrap();
     let returning =
         "INSERT INTO gc(extent_id, action, due_at) VALUES (?1, 'delete_cache', ?2) RETURNING id";
     assert_eq!(
@@ -2110,10 +2119,14 @@ async fn exec_and_batch_run_returning_and_select_to_completion() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn guard_selftest_reports_rollback() {
-    let catalog = SqlCatalog::new(RusqliteSql::with_schema().unwrap());
+    let catalog = SqlCatalog::new(TestSql::with_schema().unwrap());
     assert!(catalog.guard_selftest().await.unwrap());
     assert!(catalog.guard_selftest().await.unwrap(), "repeatable");
-    assert_eq!(count(&catalog.sql, "meta"), 0, "no marker left behind");
+    assert_eq!(
+        count(&catalog.sql, "meta").await,
+        0,
+        "no marker left behind"
+    );
 }
 
 #[test]

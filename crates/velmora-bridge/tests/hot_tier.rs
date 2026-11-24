@@ -14,7 +14,7 @@ mod service_support;
 use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::Poll;
 
 use nntp_support::{TcpConnector, PASS, USER};
 use service_support::*;
@@ -22,6 +22,7 @@ use velmora_bridge::config::{BridgeConfig, GcMode, Maintenance};
 use velmora_bridge::jobs::{low_watermark, EVICT_BATCH, EVICT_CHECK_SECS};
 use velmora_bridge::service::READ_STAMP_MS;
 use velmora_bridge::sql::HOT_INDEX_ONLY;
+use velmora_bridge::testkit::TestSql;
 use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
@@ -41,16 +42,6 @@ fn resume(remaining: u64) -> Job {
     Job::Evict {
         v: JOB_VERSION,
         remaining,
-    }
-}
-
-/// Runs a future that never has to wait (catalogue, in-memory stores) to
-/// its end, from a place that cannot await: a fault hook.
-fn at_once<F: Future>(f: F) -> F::Output {
-    let mut f = pin!(f);
-    match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(out) => out,
-        Poll::Pending => panic!("the future had to wait"),
     }
 }
 
@@ -103,7 +94,7 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
     cfg.gc_mode = GcMode::Off;
     cfg.hot_cap_bytes = 0;
     tune(&mut cfg);
-    let rig = rig_with(TcpConnector::default(), cfg);
+    let rig = rig_with_selected(TcpConnector::default(), cfg);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -127,6 +118,19 @@ impl Hot {
         &self.rig.bridge
     }
 
+    /// Match the Worker's bounded wait for a cold miss observation. Without
+    /// a timer the GET only polls that write once, which works for inline
+    /// SQLite but cannot wait for PostgreSQL I/O before starting the fill.
+    fn enable_cold_wait(&mut self) {
+        let bridge = Rc::get_mut(&mut self.rig.bridge).expect("no request in flight");
+        bridge.budget = velmora_bridge::ingress::ByteBudget::new(bridge.cfg.inflight_budget_bytes)
+            .with_sleeper(Rc::new(|ms| {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+                    u64::from(ms),
+                )))
+            }));
+    }
+
     fn cfg_mut(&mut self) -> &mut BridgeConfig {
         &mut Rc::get_mut(&mut self.rig.bridge)
             .expect("no request in flight")
@@ -139,10 +143,12 @@ impl Hot {
 
     /// Makes the dispatcher's hot-tier check due on its next run.
     fn check_due(&self) {
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.execute("DELETE FROM meta WHERE k = 'hot_checked_at'", [])
-                .unwrap()
-        });
+        self.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_script("DELETE FROM meta WHERE k = 'hot_checked_at'")
+            .unwrap();
     }
 
     /// As a release leaves an extent, without posting it.
@@ -287,29 +293,47 @@ impl Hot {
         );
     }
 
+    fn column(&self, extent: &ExtentRow, column: &str) -> SqlValue {
+        self.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_query_now(
+                &format!("SELECT {column} FROM extents WHERE id = ?1"),
+                &[SqlValue::Text(extent.id.as_str().into())],
+            )
+            .unwrap()
+            .remove(0)
+            .remove(0)
+    }
+
     fn num(&self, extent: &ExtentRow, column: &str) -> Option<i64> {
-        let sql = format!("SELECT {column} FROM extents WHERE id = ?1");
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.query_row(&sql, [extent.id.as_str()], |r| r.get(0))
-                .unwrap()
-        })
+        match self.column(extent, column) {
+            SqlValue::Int(n) => Some(n),
+            SqlValue::Null => None,
+            _ => panic!("expected nullable integer for {column}"),
+        }
     }
 
     fn text(&self, extent: &ExtentRow, column: &str) -> String {
-        let sql = format!("SELECT {column} FROM extents WHERE id = ?1");
-        self.bridge().catalog.sql.with_conn(|c| {
-            c.query_row(&sql, [extent.id.as_str()], |r| r.get(0))
-                .unwrap()
-        })
+        let SqlValue::Text(value) = self.column(extent, column) else {
+            panic!("expected text for {column}")
+        };
+        value
     }
 
     fn sql(&self, sql: &str, extent: &ExtentRow) {
-        let n = self
+        let rows = self
             .bridge()
             .catalog
             .sql
-            .with_conn(|c| c.execute(sql, [extent.id.as_str()]).unwrap());
-        assert_eq!(n, 1, "{sql}");
+            .inner
+            .fixture_query_now(
+                &format!("{sql} RETURNING 1"),
+                &[SqlValue::Text(extent.id.as_str().into())],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{sql}");
     }
 
     fn has_safety(&self, extent: &ExtentRow) -> bool {
@@ -1182,7 +1206,8 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
     let cat = &bridge.catalog;
     cat.hot_counters_add(96 * GIB).await.unwrap();
     cat.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "INSERT INTO meta(k,v) VALUES ('hotg_first', 4294967296)",
             &[],
         )
@@ -1213,7 +1238,8 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
     // The next tick sees the new eligible misses and grows. Its decision
     // commits first even though both ticks loaded the same state version.
     cat.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "INSERT INTO meta(k,v) VALUES ('hotg_24h', 322122547200)",
             &[],
         )
@@ -1238,11 +1264,12 @@ async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
 #[tokio::test(flavor = "current_thread")]
 async fn adaptive_ten_gib_minimum_drains_then_reads_back_byte_exact_from_fake_nntp() {
     use velmora_bridge::config::HotCtlMode;
-    let hot = hot_with(|cfg| {
+    let mut hot = hot_with(|cfg| {
         cfg.hot_ctl.mode = HotCtlMode::Adaptive;
         cfg.hot_cap_bytes = 100 * GIB;
     })
     .await;
+    hot.enable_cold_wait();
     let x = hot.released("p3-roundtrip").await;
     hot.get_ok("p3-roundtrip").await;
     let pinned = hot.put("p3-pinned").await;
@@ -1333,20 +1360,14 @@ async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
     let pinned = hot.put("hold").await;
     assert!(hot.has_safety(&pinned));
     // Even a stale safety count must not include a held copy in the shape.
-    cat.sql
-        .exec(
-            "UPDATE extents SET hot_safety_bytes = cipher_size WHERE id = ?1",
-            &[SqlValue::Text(pinned.id.as_str().to_owned())],
-        )
-        .await
-        .unwrap();
-    cat.sql
-        .exec(
-            "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
-            &[SqlValue::Text(never_read.id.as_str().to_owned())],
-        )
-        .await
-        .unwrap();
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = cipher_size WHERE id = ?1",
+        &pinned,
+    );
+    hot.sql(
+        "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
+        &never_read,
+    );
     assert_eq!(
         cat.hot_shape().await.unwrap(),
         HotShape {
@@ -1357,36 +1378,106 @@ async fn hot_shape_counts_only_evictable_bytes_and_separates_never_read() {
     );
 }
 
+/// Count meta-row writes on either backend. SQLite uses its committed-write
+/// meter. The PostgreSQL fixture's row trigger advances a sequence, so a
+/// subsequent rollback cannot hide that a statement wrote a row.
+struct MetaWrites<'a>(&'a TestSql);
+
+impl<'a> MetaWrites<'a> {
+    fn start(db: &'a TestSql) -> Self {
+        if db.dialect() == Dialect::Sqlite {
+            db.sqlite().meter_writes().unwrap();
+        } else {
+            db.fixture_script(
+                "CREATE SEQUENCE hot_meta_writes; \
+                 CREATE FUNCTION count_hot_meta_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                     BEGIN PERFORM nextval('hot_meta_writes'); RETURN NULL; END $$; \
+                 CREATE TRIGGER count_hot_meta_write AFTER INSERT OR UPDATE OR DELETE ON meta \
+                     FOR EACH ROW EXECUTE FUNCTION count_hot_meta_write()",
+            )
+            .unwrap();
+        }
+        Self(db)
+    }
+
+    async fn count(&self) -> u64 {
+        if self.0.dialect() == Dialect::Sqlite {
+            return self.0.sqlite().writes().table("meta");
+        }
+        let rows = self
+            .0
+            .fixture_query(
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM hot_meta_writes",
+                &[],
+            )
+            .await
+            .unwrap();
+        let [SqlValue::Int(n)] = rows[0].as_slice() else {
+            panic!("expected one integer meta-write count");
+        };
+        u64::try_from(*n).unwrap()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn meta_write_meter_preserves_postgres_rollback_counts() {
+    let db = TestSql::with_schema().unwrap();
+    let writes = MetaWrites::start(&db);
+    assert_eq!(writes.count().await, 0);
+    let result = db
+        .fixture_batch(vec![
+            (
+                "INSERT INTO meta(k, v) VALUES ('meter_rollback', 1)",
+                vec![],
+            ),
+            ("INSERT INTO tx_guard(ok) VALUES (0)", vec![]),
+        ])
+        .await;
+    assert!(
+        matches!(result, Err(BridgeError::GuardFailed)),
+        "{result:?}"
+    );
+    assert!(db
+        .fixture_query("SELECT v FROM meta WHERE k = 'meter_rollback'", &[])
+        .await
+        .unwrap()
+        .is_empty());
+    // The shared SQLite meter intentionally discards rolled-back writes.
+    let expected = u64::from(db.dialect() == Dialect::Postgres);
+    assert_eq!(writes.count().await, expected, "rollback write count");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn customer_cold_fill_records_reuse_before_stamping_and_hot_hit_does_not_write_meta() {
-    let hot = hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    let mut hot =
+        hot_with(|cfg| cfg.hot_ctl.mode = velmora_bridge::config::HotCtlMode::Shadow).await;
+    hot.enable_cold_wait();
     let x = hot.released("signal").await;
     hot.bridge().evict_batch(0).await.unwrap();
     hot.bridge().clock.advance_secs(2 * 3600);
     let cat = &hot.bridge().catalog;
-    cat.sql.meter_writes().unwrap();
+    let writes = MetaWrites::start(&cat.sql.inner);
     hot.get_ok("signal").await;
     assert_eq!(
         cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
         vec![Some(x.cipher_size as i64), None]
     );
-    assert_eq!(cat.sql.writes().table("meta"), 1);
-    cat.sql.reset_writes();
+    assert_eq!(writes.count().await, 1);
     hot.get_ok("signal").await;
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, 1);
     assert_eq!(
         cat.hot_ctl_load(&["hotg_3h", "hotg_1h"]).await.unwrap(),
         vec![Some(x.cipher_size as i64), None]
     );
 
     hot.bridge().evict_batch(0).await.unwrap();
-    cat.sql.reset_writes();
+    let before = writes.count().await;
     // Internal cold fetch uses the same cache fill, but is not a customer GET.
     assert!(matches!(
         hot.bridge().fetch_cold(&x).await.unwrap(),
         velmora_bridge::fetch::ColdFetch::Filled(_)
     ));
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, before);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1525,7 +1616,7 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
         Rc::new(move |task| tasks.borrow_mut().push(task))
     };
     let cat = &hot.bridge().catalog;
-    cat.sql.meter_writes().unwrap();
+    let writes = MetaWrites::start(&cat.sql.inner);
     let get = |key: &'static str| {
         let (hot, spawner) = (&hot, &spawner);
         async move {
@@ -1553,10 +1644,10 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
     drop(get("warm").await);
     assert!(tasks.borrow().is_empty());
     Resp::collect(get("warm").await).await.expect(200);
-    assert_eq!(cat.sql.writes().table("meta"), 0);
+    assert_eq!(writes.count().await, 0);
     let task = tasks.borrow_mut().pop().expect("first flush queued");
     task.await;
-    assert_eq!(cat.sql.writes().table("meta"), 1);
+    assert_eq!(writes.count().await, 1);
     hot.bridge().clock.advance_secs(899);
     Resp::collect(get("warm").await).await.expect(200);
     assert!(tasks.borrow().is_empty());
@@ -1564,7 +1655,7 @@ async fn served_r2_hits_flush_in_background_even_when_the_next_request_is_not_a_
     Resp::collect(get("not-found").await).await.expect(404);
     let task = tasks.borrow_mut().pop().expect("next flush queued");
     task.await;
-    assert_eq!(cat.sql.writes().table("meta"), 2);
+    assert_eq!(writes.count().await, 2);
     assert_eq!(
         cat.hot_ctl_load(&[HIT_KEY]).await.unwrap(),
         vec![Some(2 * x.cipher_size as i64)]
@@ -1869,6 +1960,9 @@ async fn garbage_collection_and_admin_evict_end_the_count() {
 /// pinned total may be read from the older, narrower one.
 #[tokio::test(flavor = "current_thread")]
 async fn periodic_statements_read_only_their_index() {
+    if velmora_bridge::testkit::TestSql::postgres_selected() {
+        return; // sqlite_only: asserts SQLite EXPLAIN QUERY PLAN before and after an index migration.
+    }
     let hot = hot().await;
     let plans = || -> Vec<(&str, &str, String)> {
         HOT_INDEX_ONLY
@@ -1947,12 +2041,14 @@ async fn a_cache_fill_is_never_written_uncounted() {
     // the count. The count after the write restores it.
     let bridge = hot.rig.bridge.clone();
     let cache = &hot.bridge().cache;
-    cache.before_put.replace(Some(Box::new(move |_| {
-        let cache_bytes = bridge.cfg.hot_cap_bytes + cipher as u64;
-        assert_eq!(at_once(bridge.evict_batch(0)).unwrap(), cache_bytes);
+    cache.before_put_async.replace(Some(Box::new(move |_| {
+        Box::pin(async move {
+            let cache_bytes = bridge.cfg.hot_cap_bytes + cipher as u64;
+            assert_eq!(bridge.evict_batch(0).await.unwrap(), cache_bytes);
+        })
     })));
     hot.get_ok("filled").await;
-    assert!(cache.before_put.borrow().is_none());
+    assert!(cache.before_put_async.borrow().is_none());
     assert!(hot.has_cache(&x));
     assert_eq!(hot.num(&x, "hot_cache_bytes"), Some(cipher));
     evict().await;
@@ -2112,11 +2208,17 @@ async fn a_drain_stops_when_an_extent_changes_under_it() {
     let filled = xs[0].id.clone();
     hot.bridge()
         .safety
-        .before_delete
+        .before_delete_async
         .replace(Some(Box::new(move |key| {
-            assert_eq!(key, filled.safety_key());
-            let now = bridge.clock.now();
-            at_once(bridge.catalog.record_cache_fill(&filled, now)).unwrap();
+            Box::pin(async move {
+                assert_eq!(key, filled.safety_key());
+                let now = bridge.clock.now();
+                bridge
+                    .catalog
+                    .record_cache_fill(&filled, now)
+                    .await
+                    .unwrap();
+            })
         })));
     hot.uncounted_fill(&xs[0]).await;
     hot.run(&EVICT).await;
@@ -2153,10 +2255,12 @@ async fn two_drains_at_once_do_not_evict_past_the_low_watermark() {
     let bridge = hot.rig.bridge.clone();
     hot.bridge()
         .safety
-        .before_delete
+        .before_delete_async
         .replace(Some(Box::new(move |_| {
-            let outcome = at_once(bridge.run_job(&EVICT));
-            assert_eq!(outcome, JobOutcome::Ack);
+            Box::pin(async move {
+                let outcome = bridge.run_job(&EVICT).await;
+                assert_eq!(outcome, JobOutcome::Ack);
+            })
         })));
     hot.run(&EVICT).await;
 

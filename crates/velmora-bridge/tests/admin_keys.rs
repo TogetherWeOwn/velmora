@@ -86,7 +86,7 @@ fn assert_no_secret(resp: &Resp, secrets: &[&str]) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn revoked_key_is_refused_on_the_next_request_signed_or_presigned() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let doomed = mint(&rig, &[BUCKET], "rw").await;
     let kept = mint(&rig, &[BUCKET], "ro").await;
@@ -204,7 +204,7 @@ async fn revoked_key_is_refused_on_the_next_request_signed_or_presigned() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unknown_or_malformed_ids_are_404_and_change_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     for id in [
@@ -236,7 +236,7 @@ async fn unknown_or_malformed_ids_are_404_and_change_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_record_write_leaves_the_key_and_a_retry_revokes_it() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     *rig.bridge.safety.fail_put_prefix.borrow_mut() = Some(REVOKED_KEY_PREFIX.to_string());
@@ -254,7 +254,7 @@ async fn a_failed_record_write_leaves_the_key_and_a_retry_revokes_it() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_shows_ids_grants_and_times_never_secrets() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-other", true).await;
     let a = mint(&rig, &[BUCKET, "bkt-other"], "rw").await;
@@ -315,7 +315,7 @@ async fn list_shows_ids_grants_and_times_never_secrets() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn list_pages_past_five_hundred_keys() {
-    let rig = rig();
+    let rig = rig_selected();
     let bucket = rig.bucket(BUCKET, true).await;
     for i in 0..501 {
         let akid = format!("AKVLPAGE{i:012}");
@@ -334,7 +334,7 @@ async fn list_pages_past_five_hundred_keys() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_the_admin_bearer_reaches_the_key_routes() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     let target = format!("/_admin/keys/{}", key.akid);
@@ -374,7 +374,7 @@ async fn only_the_admin_bearer_reaches_the_key_routes() {
 async fn a_restore_forgets_keys_revoked_after_the_export() {
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let bucket = rig.bucket(BUCKET, true).await;
     let doomed = rig
         .key(
@@ -459,7 +459,7 @@ async fn listed_grants<N: NntpConnector + 'static>(rig: &Rig<N>, akid: &str) -> 
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_grant_opens_another_bucket_to_the_key() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
@@ -505,7 +505,7 @@ async fn a_grant_opens_another_bucket_to_the_key() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_second_grant_widens_the_first() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
@@ -543,7 +543,7 @@ async fn a_second_grant_widens_the_first() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn grant_requests_that_name_nothing_or_are_malformed_change_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "ro").await;
     let ok_body = json!({ "bucket": BUCKET, "perm": "rw" });
@@ -599,7 +599,7 @@ async fn grant_requests_that_name_nothing_or_are_malformed_change_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn only_the_admin_bearer_grants() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
@@ -629,7 +629,7 @@ async fn only_the_admin_bearer_grants() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn other_methods_on_grants_are_405_and_revoke_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     let target = format!("/_admin/keys/{}/grants", key.akid);
@@ -653,7 +653,7 @@ async fn other_methods_on_grants_are_405_and_revoke_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_revoked_key_cannot_be_granted() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
@@ -682,7 +682,7 @@ async fn a_revoked_key_cannot_be_granted() {
 async fn no_grant_is_accepted_under_maintenance() {
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let bucket = rig.bucket(BUCKET, true).await;
     let second = rig.bucket("bkt-second", true).await;
     let key = rig
@@ -712,7 +712,7 @@ async fn no_grant_is_accepted_under_maintenance() {
 /// nothing, so it cannot outlive either.
 #[tokio::test(flavor = "current_thread")]
 async fn a_guarded_grant_after_revocation_or_bucket_deletion_writes_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let bucket = rig.bucket(BUCKET, true).await;
     let second = rig.bucket("bkt-second", true).await;
     let key = rig
@@ -802,7 +802,7 @@ async fn a_guarded_grant_after_revocation_or_bucket_deletion_writes_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_grant_is_never_narrowed() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     // Repeating rw is fine.
@@ -826,18 +826,18 @@ async fn a_grant_is_never_narrowed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn no_grant_is_accepted_while_a_replay_is_unfinished() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     rig.bucket("bkt-second", true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.execute(
-            "INSERT INTO restore_state (id, state, since_ms, started_at) \
-             VALUES (1, 'replaying', 0, 1)",
-            [],
+    rig.bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_script(
+            "INSERT INTO restore_state(id,state,since_ms,started_at) VALUES (1,'replaying',0,1)",
         )
         .unwrap();
-    });
     assert!(rig.bridge.catalog.restore_pending().await.unwrap());
 
     let r = grant_req(
@@ -853,7 +853,7 @@ async fn no_grant_is_accepted_while_a_replay_is_unfinished() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn every_admin_answer_is_no_store() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let auth = format!("Bearer {TOKEN}");
     for (method, target, auth) in [
@@ -887,7 +887,7 @@ async fn every_admin_answer_is_no_store() {
 /// get one added.
 #[tokio::test(flavor = "current_thread")]
 async fn admin_refusals_of_the_precheck_are_no_store() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let key = mint(&rig, &[BUCKET], "rw").await;
     let grants = format!("/_admin/keys/{}/grants", key.akid);
@@ -1006,7 +1006,7 @@ async fn admin_refusals_of_the_precheck_are_no_store() {
 /// refuses; a bad kind is refused before anything is written.
 #[tokio::test]
 async fn app_passwords_are_minted_with_their_own_prefix() {
-    let rig = rig();
+    let rig = rig_selected();
     rig.bucket(BUCKET, true).await;
     let r = admin(
         &rig,

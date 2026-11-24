@@ -79,7 +79,7 @@ async fn observed_get<N: NntpConnector + 'static>(
 
 #[tokio::test(flavor = "current_thread")]
 async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let key = "object-lookup-fixture";
     rig.put(&signer, BUCKET, key, b"payload").await.expect(200);
@@ -107,13 +107,16 @@ async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() 
 
     // A two-byte range of a large object is classed by the object, not
     // by the Range header or the XML response's length.
-    sql.with_conn(|conn| {
-        conn.execute(
+    sql.inner
+        .fixture_exec(
             "UPDATE generations SET size = ?1, content_json = 'null' WHERE id = ?2",
-            rusqlite::params![(1_i64 << 30) + 1, generation.id.as_str()],
+            &[
+                SqlValue::Int((1_i64 << 30) + 1),
+                SqlValue::Text(generation.id.as_str().into()),
+            ],
         )
-    })
-    .unwrap();
+        .await
+        .unwrap();
     observed_get(&rig, req().into_request(), "plan", "gt_1gib")
         .await
         .expect_error(500, "InternalError");
@@ -239,7 +242,7 @@ async fn evict<N: NntpConnector + 'static>(rig: &Rig<N>, extent: &ExtentRow) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_get_round_trip() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let body = pattern(7, 300_000);
     rig.call(
@@ -298,7 +301,7 @@ async fn put_get_round_trip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn reserved_key_roundtrip() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let keys = [
         "with space/and more.txt",
@@ -340,7 +343,7 @@ async fn reserved_key_roundtrip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ranges_within_one_extent() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     // Several encryption chunks.
     let body = pattern(11, 400_000);
@@ -377,7 +380,7 @@ async fn ranges_within_one_extent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn ranges_across_extent_boundaries() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let parts = [pattern(1, 150_000), pattern(2, 70_001), pattern(3, 90_000)];
     let whole: Vec<u8> = parts.concat();
@@ -414,7 +417,7 @@ async fn ranges_across_extent_boundaries() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn read_conditions() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let etag = md5_etag(b"payload");
@@ -466,7 +469,7 @@ fn cache_controls(resp: &Resp) -> Vec<&str> {
 /// with the exact length and the strong ETag beside it.
 #[tokio::test(flavor = "current_thread")]
 async fn object_responses_forbid_edge_transforms() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let html = b"<!doctype html><p>mail someone@example.com</p>".repeat(50);
     let etag = md5_etag(&html);
@@ -566,7 +569,7 @@ async fn object_responses_forbid_edge_transforms() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cache_is_tried_before_the_safety_copy() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(5, 200_000);
     rig.put(&signer, BUCKET, "k", &body).await.expect(200);
@@ -589,7 +592,7 @@ async fn cache_is_tried_before_the_safety_copy() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tampered_copy_is_never_served() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(9, 200_000);
     rig.put(&signer, BUCKET, "k", &body).await.expect(200);
@@ -635,7 +638,7 @@ async fn tampered_copy_is_never_served() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_later_extent_that_cannot_be_read_ends_the_stream_with_an_error() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let parts = [pattern(1, 100_000), pattern(2, 100_000)];
     let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
@@ -659,7 +662,7 @@ async fn a_later_extent_that_cannot_be_read_ends_the_stream_with_an_error() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_budget_is_slow_down() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let _held = rig
@@ -674,7 +677,7 @@ async fn full_budget_is_slow_down() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unread_body_stays_charged_to_the_budget() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let parts = [pattern(1, 100_000), pattern(2, 60_000)];
     let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
@@ -1042,7 +1045,7 @@ async fn cold_rig_on(max_conns: u32, sleeper: Option<Sleeper>, spawner: Option<S
     if let Some(spawner) = spawner {
         budget = budget.with_spawner(spawner);
     }
-    let rig = rig_with_budget(TcpConnector::default(), cfg, budget);
+    let rig = rig_with_budget_selected(TcpConnector::default(), cfg, budget);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -1246,7 +1249,17 @@ async fn a_warm_extent_ends_the_connections_of_a_cold_body() {
 /// dropped gives everything back.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
-    let cold = cold_rig().await;
+    tokio::task::LocalSet::new()
+        .run_until(cold_body_waits_for_reader())
+        .await;
+}
+
+async fn cold_body_waits_for_reader() {
+    // Without a spawner, this producer is only polled by the reader, so
+    // waiting after the headers cannot finish its outstanding cache write.
+    // A spawner without a sleeper lets the write finish but does not enable
+    // read-ahead: the producer settles and waits for the next pull.
+    let cold = cold_rig_on(2, None, Some(local_spawner())).await;
     let rig = &cold.rig;
     let parts = [
         pattern(77, 300_000),
@@ -1255,6 +1268,21 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
     ];
     let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
     let budget = &rig.bridge.budget;
+    let settle = |piece_bytes| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if budget.in_use() <= piece_bytes
+                    && rig.bridge.nntp.live() == 0
+                    && free_slots(rig).await == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache write, connections, and slots settle before the next pull");
+    };
     let open = || {
         let req = cold.signer.sign(
             rig.now(),
@@ -1269,6 +1297,7 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
 
     let resp = open().await;
     assert_eq!(resp.status, 200);
+    settle(300_000).await;
     assert_eq!(budget.in_use(), 300_000);
     assert!(cached(rig, &extents[0]) && !cached(rig, &extents[1]));
     assert_eq!(rig.bridge.nntp.live(), 0, "no connection sits idle");
@@ -1284,6 +1313,7 @@ async fn a_cold_body_holds_one_piece_and_no_connection_while_it_waits() {
     );
 
     assert_eq!(body.next().await.unwrap().unwrap(), parts[1]);
+    settle(0).await;
     assert!(cached(rig, &extents[1]) && !cached(rig, &extents[2]));
     assert_eq!(rig.bridge.nntp.live(), 0);
 
@@ -1990,11 +2020,20 @@ async fn a_read_that_waits_for_a_slot_gets_its_room_beside_a_body_ahead_of_its_r
 async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
     let local = tokio::task::LocalSet::new();
     let test = async {
-        // The time the connections may sit idle is 20 ms here; a piece
-        // waits for its reader as long as it says.
-        let sleeper = timed_sleeper(|ms| match ms > 20_000 {
-            true => 20,
-            false => ms.into(),
+        // Expire the idle connections after the reader consumes the first
+        // piece and another request holds the budget. Real catalogue I/O
+        // must not make the idle timer fire before the test reaches that state.
+        let idle = Rc::new(tokio::sync::Notify::new());
+        let timer = idle.clone();
+        let sleeper: Sleeper = Rc::new(move |ms| {
+            let timer = timer.clone();
+            Box::pin(async move {
+                if ms > 20_000 {
+                    timer.notified().await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
+                }
+            })
         });
         let cold = cold_rig_on(2, Some(sleeper), Some(local_spawner())).await;
         let rig = &cold.rig;
@@ -2005,6 +2044,14 @@ async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
         ];
         let extents = cold_parts(&cold, "multi", &parts, &[], &[]).await;
         let budget = &rig.bridge.budget;
+        // Reserve room for exactly one cold fetch before the producer can
+        // run ahead. Both engines must reach the same one-piece state.
+        let need = velmora_bridge::fetch::cold_step_bytes(
+            extents[0].cipher_size,
+            rig.bridge.cfg.cold_sockets,
+        );
+        let reserved = budget.capacity() - need;
+        let other = budget.try_charge(reserved).unwrap();
         let req = cold.signer.sign(
             rig.now(),
             Method::Get,
@@ -2018,18 +2065,31 @@ async fn a_cold_body_that_waits_for_room_does_not_sit_on_its_slots() {
         let RespBody::Stream(mut body) = resp.body else {
             panic!("a GET body is a stream");
         };
-        eventually("the first piece waits", || {
-            cached(rig, &extents[0]) && budget.in_use() == 300_000
-        })
-        .await;
+        let ready = || cached(rig, &extents[0]) && budget.in_use() == reserved + 300_000;
+        for _ in 0..400 {
+            if ready() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ready(),
+            "first piece did not wait: cache={}, budget={}, held={}, connects={}",
+            cached(rig, &extents[0]),
+            budget.in_use(),
+            rig.bridge.nntp.live(),
+            rig.bridge.nntp.connects()
+        );
         assert!(rig.bridge.nntp.live() > 0, "kept for the next extent");
         let connects = rig.bridge.nntp.connects();
-        // Another request takes all the room there is.
-        let other = budget.try_charge(budget.capacity() - 300_000).unwrap();
+        // The other request takes the rest of the room too.
+        let rest = budget.try_charge(need - 300_000).unwrap();
         assert!(body.next().await.unwrap().unwrap() == parts[0]);
+        idle.notify_one();
         eventually("the connections are ended", || rig.bridge.nntp.live() == 0).await;
         assert!(!cached(rig, &extents[1]));
         assert_eq!(free_slots(rig).await, 2);
+        drop(rest);
         drop(other);
         assert!(body.next().await.unwrap().unwrap() == parts[1]);
         assert!(body.next().await.unwrap().unwrap() == parts[2]);
@@ -2754,7 +2814,7 @@ async fn each_extent_of_a_stream_gets_its_own_wait() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn never_posted_object_without_copies_is_unavailable() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let (_, extents) = rig.live(&bucket, "k").await.unwrap();
@@ -2800,13 +2860,14 @@ async fn a_verified_cold_extent_that_cannot_be_opened_reports_decrypt() {
     let rig = &cold.rig;
     let extent = cold.put_and_post("cold.bin", &pattern(29, 300_000)).await;
     evict(rig, &extent).await;
-    rig.bridge.catalog.sql.with_conn(|conn| {
-        conn.execute(
-            "UPDATE extents SET wrapped_file_key = zeroblob(length(wrapped_file_key)) WHERE id = ?1",
-            [extent.id.as_str()],
-        )
+    let db = &rig.bridge.catalog.sql.inner;
+    let update = db.fixture(
+        "UPDATE extents SET wrapped_file_key = zeroblob(length(wrapped_file_key)) WHERE id = ?1",
+        "UPDATE extents SET wrapped_file_key = decode(repeat('00', octet_length(wrapped_file_key)), 'hex') WHERE id = ?1",
+    );
+    db.fixture_exec(update, &[SqlValue::Text(extent.id.as_str().into())])
+        .await
         .unwrap();
-    });
     let req = cold.signer.sign(
         rig.now(),
         Method::Get,
@@ -2883,7 +2944,7 @@ async fn largest_extent_fits_the_smallest_allowed_budget_cold() {
     // What a deployment with this budget reads over: the configuration
     // lowers `COLD_SOCKETS` to what fits beside the extent and its copy.
     cfg.cold_sockets = 1;
-    let rig = rig_with(TcpConnector::default(), cfg);
+    let rig = rig_with_selected(TcpConnector::default(), cfg);
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -3169,13 +3230,21 @@ async fn an_addendum_that_cannot_be_read_rebuilds_nothing() {
     let body = pattern(71, 1_500_000);
     let extent = cold.put_and_post("small.bin", &body).await;
     let (data, _) = stripe(&cold, &extent).await;
-    let changed = cold.rig.bridge.catalog.sql.with_conn(|c| {
-        c.execute(
-            "UPDATE extents SET parity = x'0100' WHERE id = ?1",
-            [extent.id.as_str()],
+    let changed = cold
+        .rig
+        .bridge
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET parity = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(extent.id.as_str().into()),
+                SqlValue::Blob(vec![1, 0]),
+            ],
         )
-        .unwrap()
-    });
+        .await
+        .unwrap();
     assert_eq!(changed, 1);
 
     let resp = cold.cold_get("small.bin", &extent).await;
@@ -3195,27 +3264,34 @@ async fn a_rebuild_posts_nothing_and_writes_nothing_more() {
     let body = pattern(73, 1_500_000);
     let extent = cold.put_and_post("small.bin", &body).await;
     let (data, _) = stripe(&cold, &extent).await;
-    let sql = &cold.rig.bridge.catalog.sql.inner;
-    sql.meter_writes().unwrap();
+    let db = &cold.rig.bridge.catalog.sql.inner;
+    let sqlite = (db.dialect() == Dialect::Sqlite).then(|| db.sqlite());
+    if let Some(sql) = sqlite {
+        sql.meter_writes().unwrap();
+    }
     let posts = |cold: &Cold| {
         let calls = cold.rig.bridge.nntp.calls();
         calls.iter().filter(|call| call.0 == "post").count()
     };
 
-    let before = sql.writes();
+    let before = sqlite.map(|sql| sql.writes());
     cold.cold_get("small.bin", &extent).await.expect(200);
-    let plain = sql.writes().since(&before);
+    let plain = sqlite
+        .zip(before)
+        .map(|(sql, before)| sql.writes().since(&before));
 
     cold.lose([&data[2]]).await;
     let (posted, held) = (posts(&cold), cold.server.posted_count().await);
-    let before = sql.writes();
+    let before = sqlite.map(|sql| sql.writes());
     let resp = cold.cold_get("small.bin", &extent).await;
     resp.expect(200);
     assert!(resp.body == body);
-    let rebuilt = sql.writes().since(&before);
-
-    assert_eq!(rebuilt.writing_statements, plain.writing_statements);
-    assert_eq!(rebuilt.billed(), plain.billed());
+    // sqlite_only: preupdate-hook billing; both engines check output and posts.
+    if let (Some(sql), Some(before), Some(plain)) = (sqlite, before, plain) {
+        let rebuilt = sql.writes().since(&before);
+        assert_eq!(rebuilt.writing_statements, plain.writing_statements);
+        assert_eq!(rebuilt.billed(), plain.billed());
+    }
     assert_eq!(posts(&cold), posted);
     assert_eq!(cold.server.posted_count().await, held);
 }

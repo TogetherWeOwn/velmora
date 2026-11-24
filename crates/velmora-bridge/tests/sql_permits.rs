@@ -1,9 +1,9 @@
-//! `SqlCatalog` provider permits over SQLite with the D1 schema.
+//! `SqlCatalog` provider permits over the selected catalogue backend.
 
 use std::collections::BTreeSet;
 
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::RusqliteSql;
+use velmora_bridge::testkit::TestSql;
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -20,19 +20,19 @@ fn provider(id: &str, max_conns: u32) -> ProviderConfig {
     serde_json::from_str(&json).unwrap()
 }
 
-fn catalog() -> SqlCatalog<RusqliteSql> {
-    SqlCatalog::new(RusqliteSql::with_schema().unwrap())
+fn catalog() -> SqlCatalog<TestSql> {
+    SqlCatalog::new(TestSql::with_schema().unwrap())
 }
 
-async fn count(c: &SqlCatalog<RusqliteSql>, sql: &str) -> i64 {
-    match c.sql.query(sql, &[]).await.unwrap()[0][0] {
+async fn count(c: &SqlCatalog<TestSql>, sql: &str) -> i64 {
+    match c.sql.fixture_query(sql, &[]).await.unwrap()[0][0] {
         SqlValue::Int(n) => n,
         ref other => panic!("not an integer: {other:?}"),
     }
 }
 
 /// Slots held at `now`.
-async fn held(c: &SqlCatalog<RusqliteSql>, now: UnixMs) -> i64 {
+async fn held(c: &SqlCatalog<TestSql>, now: UnixMs) -> i64 {
     let sql = format!(
         "SELECT COUNT(*) FROM provider_permits WHERE lease_until >= {}",
         now.0
@@ -41,7 +41,7 @@ async fn held(c: &SqlCatalog<RusqliteSql>, now: UnixMs) -> i64 {
 }
 
 async fn acquire(
-    c: &SqlCatalog<RusqliteSql>,
+    c: &SqlCatalog<TestSql>,
     p: &ProviderConfig,
     class: PermitClass,
     now: UnixMs,
@@ -349,7 +349,7 @@ async fn pool_limit_counts_live_slots_of_its_own_pool_only() {
 // Health and cooldown
 // ---------------------------------------------------------------------------
 
-async fn load_of(c: &SqlCatalog<RusqliteSql>, id: &str, now: UnixMs) -> Option<ProviderLoad> {
+async fn load_of(c: &SqlCatalog<TestSql>, id: &str, now: UnixMs) -> Option<ProviderLoad> {
     let all = c.provider_load(now).await.unwrap();
     all.into_iter().find(|l| l.provider_id == id)
 }
@@ -466,7 +466,11 @@ async fn a_strike_keeps_its_reason_until_a_good_session() {
         .await
         .unwrap();
     c.sql
-        .apply("UPDATE provider_health SET last_failure_reason = 'not_known_here'")
+        .fixture_exec(
+            "UPDATE provider_health SET last_failure_reason = 'not_known_here'",
+            &[],
+        )
+        .await
         .unwrap();
     let later = load_of(&c, "p1", now).await.unwrap();
     assert_eq!((later.failures, later.fault), (1, None));
@@ -474,10 +478,12 @@ async fn a_strike_keeps_its_reason_until_a_good_session() {
     // A version from before the reason clears the strikes and leaves
     // the reason: a provider with no strike has none.
     c.sql
-        .apply(
+        .fixture_exec(
             "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
                last_failure_reason = 'login_refused'",
+            &[],
         )
+        .await
         .unwrap();
     let stale = load_of(&c, "p1", now).await.unwrap();
     assert_eq!((stale.healthy(), stale.fault), (true, None));
@@ -529,7 +535,7 @@ async fn a_refused_login_cools_down_for_up_to_six_hours() {
 }
 
 /// The providers due for a probe at `now`, with the probe's quiet times.
-async fn due(c: &SqlCatalog<RusqliteSql>, now: UnixMs) -> Vec<String> {
+async fn due(c: &SqlCatalog<TestSql>, now: UnixMs) -> Vec<String> {
     use velmora_bridge::probe::{LOGIN_REFUSED_QUIET_MS, PROBE_QUIET_MS};
     let quiet = now.plus_ms(-PROBE_QUIET_MS);
     let login = now.plus_ms(-LOGIN_REFUSED_QUIET_MS);
@@ -665,7 +671,7 @@ fn capped(id: &str, max_conns: u32, max_ips: u32) -> ProviderConfig {
 }
 
 async fn acquire_as(
-    c: &SqlCatalog<RusqliteSql>,
+    c: &SqlCatalog<TestSql>,
     p: &ProviderConfig,
     class: PermitClass,
     holder: &str,
@@ -675,17 +681,13 @@ async fn acquire_as(
 }
 
 /// The live slots of a provider at `now`: `(slot, holder, background)`.
-async fn live_slots(
-    c: &SqlCatalog<RusqliteSql>,
-    id: &str,
-    now: UnixMs,
-) -> Vec<(u32, String, bool)> {
+async fn live_slots(c: &SqlCatalog<TestSql>, id: &str, now: UnixMs) -> Vec<(u32, String, bool)> {
     let sql = format!(
         "SELECT slot, holder, background FROM provider_permits \
          WHERE provider_id = '{id}' AND lease_until >= {} ORDER BY slot",
         now.0
     );
-    let rows = c.sql.query(&sql, &[]).await.unwrap();
+    let rows = c.sql.fixture_query(&sql, &[]).await.unwrap();
     rows.into_iter()
         .map(|row| match (&row[0], &row[1], &row[2]) {
             (SqlValue::Int(slot), SqlValue::Text(holder), SqlValue::Int(job)) => {
@@ -1226,12 +1228,15 @@ async fn provider_load_counts_live_holders() {
 
 /// A `Sql` that counts the statements it is sent.
 struct Counting {
-    db: RusqliteSql,
+    db: TestSql,
     queries: std::cell::Cell<u32>,
     others: std::cell::Cell<u32>,
 }
 
 impl Sql for Counting {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         self.queries.set(self.queries.get() + 1);
         self.db.query(sql, params).await
@@ -1252,7 +1257,7 @@ impl Sql for Counting {
 #[tokio::test]
 async fn an_acquire_under_every_limit_is_one_statement() {
     let c = SqlCatalog::new(Counting {
-        db: RusqliteSql::with_schema().unwrap(),
+        db: TestSql::with_schema().unwrap(),
         queries: std::cell::Cell::new(0),
         others: std::cell::Cell::new(0),
     });
@@ -1280,7 +1285,7 @@ async fn an_acquire_under_every_limit_is_one_statement() {
     let slots = c
         .sql
         .db
-        .query("SELECT COUNT(*) FROM provider_permits", &[])
+        .fixture_query("SELECT COUNT(*) FROM provider_permits", &[])
         .await
         .unwrap();
     assert_eq!(slots[0][0], SqlValue::Int(4));

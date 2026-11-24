@@ -19,7 +19,7 @@ fn big_rig() -> Rig {
     let mut cfg = config(Vec::new());
     cfg.max_put_bytes = 99 * MIB as u64;
     cfg.intent_sweep = true;
-    rig_with(NoNntp, cfg)
+    rig_with_selected(NoNntp, cfg)
 }
 
 /// A body whose slices all differ: the seed picks the byte of the
@@ -368,7 +368,7 @@ async fn the_limit_of_a_part_is_that_of_a_put_and_one_extent_is_stored_as_before
     // Where no body is sliced, a part stays at one extent.
     let mut cfg = config(Vec::new());
     cfg.intent_sweep = true;
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create(&rig, &signer, KEY).await;
     let req = declared_req_at(
@@ -412,11 +412,9 @@ async fn an_object_of_sliced_parts_comes_back_after_the_catalogue_is_lost() {
     // The catalogue is lost and replayed from the recovery records.
     sql(
         &rig,
-        "PRAGMA foreign_keys = OFF; \
-         DELETE FROM upload_part_extents; DELETE FROM upload_parts; DELETE FROM uploads; \
-         DELETE FROM outbox; DELETE FROM generation_extents; DELETE FROM extents; \
-         DELETE FROM objects; DELETE FROM generations; DELETE FROM key_floors; \
-         PRAGMA foreign_keys = ON;",
+        "DELETE FROM upload_part_extents; DELETE FROM upload_parts; DELETE FROM uploads; \
+         DELETE FROM outbox; DELETE FROM generation_extents; DELETE FROM objects; \
+         DELETE FROM extents; DELETE FROM generations; DELETE FROM key_floors;",
     );
     get(&rig, &signer, KEY).await.expect_error(404, "NoSuchKey");
     restore(&mut rig).await;
@@ -541,7 +539,7 @@ struct Setup {
 }
 
 async fn setup_with(cfg: config::BridgeConfig) -> Setup {
-    let rig = rig_with(NoNntp, cfg);
+    let rig = rig_with_selected(NoNntp, cfg);
     let (_, signer) = rig.standard(BUCKET).await;
     let id = create(&rig, &signer, KEY).await;
     rig.bridge.clock.advance_ms(1000);
@@ -720,14 +718,16 @@ async fn slices_in_service_are_kept_while_the_upload_is_open() {
     // The triggers refuse a shred of a slice after the first as well;
     // the same for the article rows of a slice whose plan is not
     // packed, and for the plan of one whose plan is.
-    let run = |q: String| {
-        let db = &s.rig.bridge.catalog.sql;
-        db.with_conn(|c| c.execute_batch(&q))
-    };
+    let db = &s.rig.bridge.catalog.sql.inner;
+    let run = |q: String| db.fixture_script(&q);
     let refused = |q: &str| {
         let e = run(q.to_owned()).unwrap_err().to_string();
-        assert!(e.contains("extent is in service"), "{q}: {e}");
+        assert!(
+            e.contains(db.fixture("extent is in service", "VL001")),
+            "{q}: {e}"
+        );
     };
+    let blob = db.fixture("x'00'", "decode('00','hex')");
     for id in &ids {
         refused(&format!(
             "UPDATE extents SET wrapped_file_key = NULL WHERE id = '{id}'"
@@ -735,18 +735,33 @@ async fn slices_in_service_are_kept_while_the_upload_is_open() {
         run(format!(
             "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, \
              cipher_offset, cipher_len, payload_sha256, state) \
-             VALUES ('{id}', 0, 'm-{id}', 'g', x'00', 0, 1, x'00', 'planned')"
+             VALUES ('{id}', 0, 'm-{id}', 'g', {blob}, 0, 1, {blob}, 'planned')"
         ))
         .unwrap();
         let rows = format!("DELETE FROM articles WHERE extent_id = '{id}'");
         refused(&rows);
-        run(format!("UPDATE extents SET plan = x'00' WHERE id = '{id}'")).unwrap();
+        run(format!(
+            "UPDATE extents SET plan = {blob} WHERE id = '{id}'"
+        ))
+        .unwrap();
         // Packed: the rows are a copy and may go; the plan stays.
         run(rows).unwrap();
         refused(&format!("UPDATE extents SET plan = NULL WHERE id = '{id}'"));
     }
-    sql(&s.rig, "DROP TRIGGER extents_keep_plan_in_service");
-    sql(&s.rig, "DROP TRIGGER extents_keep_plan_of_slices");
+    sql(
+        &s.rig,
+        db.fixture(
+            "DROP TRIGGER extents_keep_plan_in_service",
+            "DROP TRIGGER extents_keep_plan_in_service ON extents",
+        ),
+    );
+    sql(
+        &s.rig,
+        db.fixture(
+            "DROP TRIGGER extents_keep_plan_of_slices",
+            "DROP TRIGGER extents_keep_plan_of_slices ON extents",
+        ),
+    );
     sql(&s.rig, "UPDATE extents SET plan = NULL");
     let bytes = body(1, 3 * SLICE);
     s.complete(&[md5_etag(&bytes)]).await.expect(200);

@@ -31,7 +31,7 @@ fn assert_nothing_stored<N: NntpConnector + 'static>(rig: &Rig<N>) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_then_head_reports_the_stored_object() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     // Whole seconds are reported; the catalogue keeps milliseconds.
     rig.bridge.clock.advance_ms(999);
@@ -105,7 +105,7 @@ async fn put_then_head_reports_the_stored_object() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn head_uses_the_catalogue_only() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"hello").await.expect(200);
     // With every copy of the bytes gone, HEAD still answers.
@@ -165,7 +165,7 @@ async fn head_uses_the_catalogue_only() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn empty_object_and_overwrite() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let put = rig.put(&signer, BUCKET, "k", b"").await;
     put.expect(200);
@@ -184,15 +184,15 @@ async fn empty_object_and_overwrite() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_is_not_acked_when_the_commit_fails() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
-    rig.bridge.catalog.sql.with_conn(|c| {
-        c.execute_batch(
-            "CREATE TRIGGER refuse BEFORE INSERT ON objects \
-             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
-        )
-        .unwrap()
-    });
+    let db = &rig.bridge.catalog.sql.inner;
+    db.fixture_script(db.fixture(
+        "CREATE TRIGGER refuse BEFORE INSERT ON objects BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        "CREATE FUNCTION refuse_object() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         RAISE EXCEPTION 'fixture refused' USING ERRCODE = 'VL001'; END $$; \
+         CREATE TRIGGER refuse BEFORE INSERT ON objects FOR EACH ROW EXECUTE FUNCTION refuse_object();",
+    )).unwrap();
     let put = rig.put(&signer, BUCKET, "k", b"payload").await;
     put.expect_error(500, "InternalError");
     assert_eq!(put.header("etag"), None);
@@ -207,7 +207,7 @@ async fn put_is_not_acked_when_the_commit_fails() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_is_not_acked_when_the_database_is_down() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.bridge.catalog.sql.fail_writes.set(true);
     let put = rig.put(&signer, BUCKET, "k", b"payload").await;
@@ -249,7 +249,7 @@ async fn put_is_not_acked_when_the_database_is_down() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_is_not_acked_when_the_safety_copy_fails() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.bridge.safety.fail_put.set(true);
     let put = rig.put(&signer, BUCKET, "k", b"payload").await;
@@ -268,7 +268,7 @@ async fn put_is_not_acked_when_the_safety_copy_fails() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_succeeds_when_the_wake_up_is_lost() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.bridge.jobs.fail.set(true);
     let put = rig.put(&signer, BUCKET, "k", b"payload").await;
@@ -300,7 +300,7 @@ async fn put_succeeds_when_the_wake_up_is_lost() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn refused_conditional_write_stores_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     // `If-Match` on a key without an object, and the conditions no
     // write evaluates.
@@ -363,7 +363,7 @@ async fn refused_conditional_write_stores_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unauthenticated_body_never_read() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let good = || {
         signer.sign(
@@ -429,7 +429,7 @@ async fn unauthenticated_body_never_read() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn edge_added_headers_are_ignored() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let edge = [
         ("cf-connecting-ip", "203.0.113.7"),
@@ -483,7 +483,7 @@ async fn edge_added_headers_are_ignored() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn denials_do_not_reveal_what_exists() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let other = rig.bucket("bkt-other", true).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
@@ -550,7 +550,7 @@ async fn denials_do_not_reveal_what_exists() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn read_only_grant_cannot_mutate() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let reader = rig
@@ -579,7 +579,7 @@ async fn read_only_grant_cannot_mutate() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_declared_length_rejected_unread() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let sign = |body: &[u8]| {
         signer.sign(
@@ -629,7 +629,7 @@ async fn oversized_declared_length_rejected_unread() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn full_budget_is_slow_down_and_reads_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let _held = rig
         .bridge
@@ -653,7 +653,7 @@ async fn full_budget_is_slow_down_and_reads_nothing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn digest_mismatch_stores_nothing() {
-    let rig = rig();
+    let rig = rig_selected();
     let (_, signer) = rig.standard(BUCKET).await;
     let body = b"payload";
 
@@ -733,7 +733,7 @@ async fn digest_mismatch_stores_nothing() {
 async fn real_bucket_takes_writes() {
     // This test describes the open gate; closing it must revisit it.
     const { assert!(REAL_DATA_READY) }
-    let rig = rig();
+    let rig = rig_selected();
     let real = rig.bucket("bkt-real", false).await;
     let signer = rig.key(AKID, secret(), KeyStatus::Active).await;
     rig.grant(AKID, &real, Perm::Rw).await;
@@ -762,7 +762,7 @@ async fn real_bucket_takes_writes() {
 async fn restore_mode_refuses_mutations() {
     let mut cfg = config(Vec::new());
     cfg.maintenance = Maintenance::Restore;
-    let frozen = rig_with(NoNntp, cfg);
+    let frozen = rig_with_selected(NoNntp, cfg);
     let (_, signer) = frozen.standard(BUCKET).await;
     let req = signer.sign(
         frozen.now(),
@@ -785,7 +785,7 @@ async fn restore_mode_refuses_mutations() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn delete_is_always_204() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     rig.put(&signer, BUCKET, "k", b"payload").await.expect(200);
     let target = path(BUCKET, "k");
@@ -818,7 +818,7 @@ async fn delete_is_always_204() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn reserved_keys_are_stored_verbatim() {
-    let rig = rig();
+    let rig = rig_selected();
     let (bucket, signer) = rig.standard(BUCKET).await;
     let keys = [
         "with space/and more.txt",

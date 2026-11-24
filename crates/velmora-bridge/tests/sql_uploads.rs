@@ -1,4 +1,4 @@
-//! `SqlCatalog` multipart uploads over SQLite with the D1 schema.
+//! `SqlCatalog` multipart uploads over the selected catalogue backend.
 //!
 //! The catalogue is single-writer per statement batch, so a race is two
 //! batches in either order: each test runs the competing call between the
@@ -11,7 +11,7 @@
 use std::cell::{Cell, RefCell};
 
 use velmora_bridge::sql::SqlCatalog;
-use velmora_bridge::testkit::{PublishUnrecorded, RusqliteSql};
+use velmora_bridge::testkit::{PublishUnrecorded, TestSql};
 use velmora_bridge::*;
 
 const T0: UnixMs = UnixMs(1_762_992_000_123);
@@ -19,7 +19,7 @@ const DAY_MS: i64 = 86_400_000;
 const KEY: &str = "dir/big file.bin";
 
 struct Probe {
-    db: RusqliteSql,
+    db: TestSql,
     /// When set, every batch ends with a failing `tx_guard` insert.
     lose_guard: Cell<bool>,
     /// The statements of every batch, as they were sent.
@@ -31,6 +31,9 @@ fn check_params(params: &[SqlValue]) {
 }
 
 impl Sql for Probe {
+    fn dialect(&self) -> Dialect {
+        self.db.dialect()
+    }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
         check_params(params);
         self.db.query(sql, params).await
@@ -44,6 +47,7 @@ impl Sql for Probe {
         self.batched.borrow_mut().extend(stmts.iter().cloned());
         if self.lose_guard.get() {
             stmts.push(("INSERT INTO tx_guard(ok) VALUES (0)", vec![]));
+            return self.db.fixture_batch(stmts).await;
         }
         self.db.batch(stmts).await
     }
@@ -64,7 +68,7 @@ impl Fx {
     async fn new() -> Fx {
         let fx = Fx {
             cat: SqlCatalog::new(Probe {
-                db: RusqliteSql::with_schema().unwrap(),
+                db: TestSql::with_schema().unwrap(),
                 lose_guard: Cell::new(false),
                 batched: RefCell::new(Vec::new()),
             }),
@@ -75,8 +79,8 @@ impl Fx {
         for (id, name) in [(&fx.bucket, "one"), (&fx.other_bucket, "two")] {
             fx.run(
                 "INSERT INTO buckets(id, name, owner, bdk_wrapped, kek_version, disposable, \
-                 created_at) VALUES (?1, ?2, 'owner', x'07', 1, 1, 0)",
-                &[text(id.as_str()), text(name)],
+                 created_at) VALUES (?1, ?2, 'owner', ?3, 1, 1, 0)",
+                &[text(id.as_str()), text(name), SqlValue::Blob(vec![7])],
             )
             .await;
         }
@@ -90,12 +94,12 @@ impl Fx {
     }
 
     async fn run(&self, sql: &str, params: &[SqlValue]) -> u64 {
-        self.cat.sql.db.exec(sql, params).await.unwrap()
+        self.cat.sql.db.fixture_exec(sql, params).await.unwrap()
     }
 
     /// One integer from a query without parameters.
     async fn count(&self, sql: &str) -> i64 {
-        match self.cat.sql.db.query(sql, &[]).await.unwrap()[0][0] {
+        match self.cat.sql.db.fixture_query(sql, &[]).await.unwrap()[0][0] {
             SqlValue::Int(n) => n,
             ref other => panic!("not an integer: {other:?}"),
         }
@@ -103,7 +107,7 @@ impl Fx {
 
     /// The first column of every row, as text.
     async fn texts(&self, sql: &str, params: &[SqlValue]) -> Vec<String> {
-        let rows = self.cat.sql.db.query(sql, params).await.unwrap();
+        let rows = self.cat.sql.db.fixture_query(sql, params).await.unwrap();
         rows.into_iter()
             .map(|r| match r.into_iter().next() {
                 Some(SqlValue::Text(s)) => s,
@@ -667,23 +671,22 @@ async fn complete_retry_returns_receipt() {
         Guard::Applied(())
     );
     let snapshot = |fx: &Fx| {
-        let conn = &fx.cat.sql.db;
-        conn.with_conn(|c| {
-            let mut dump = Vec::new();
-            for table in [
-                "uploads",
-                "generations",
-                "objects",
-                "extents",
-                "outbox",
-                "gc",
-            ] {
-                let n: i64 = c
-                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                    .unwrap();
-                dump.push((table, n));
-            }
-            dump
+        [
+            "uploads",
+            "generations",
+            "objects",
+            "extents",
+            "outbox",
+            "gc",
+        ]
+        .map(|table| {
+            let rows = fx
+                .cat
+                .sql
+                .db
+                .fixture_query_now(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .unwrap();
+            (table, rows[0][0].clone())
         })
     };
     let before = snapshot(&fx);
@@ -1016,6 +1019,36 @@ fn listing(prefix: &str, limit: u32) -> UploadListQuery {
     }
 }
 
+#[tokio::test]
+async fn upload_listing_normalizes_nul_in_prefix_key_and_id_markers() {
+    let fx = Fx::new().await;
+    let before = fx.create(&fx.bucket, "foo").await;
+    let later = fx.create(&fx.bucket, "foo").await;
+    let next_key = fx.create(&fx.bucket, "foo0").await;
+    assert!(before < later);
+    assert!(fx
+        .cat
+        .list_uploads(&fx.bucket, &listing("foo\0bar", 10))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut q = listing("foo", 10);
+    // An upload ID marker must not bring a truncated key back into the page.
+    q.after = Some(("foo\0bar".into(), Some(before.as_str().into())));
+    let ids = |rows: Vec<OpenUpload>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(fx.cat.list_uploads(&fx.bucket, &q).await.unwrap()).as_slice(),
+        std::slice::from_ref(&next_key)
+    );
+
+    q.after = Some(("foo".into(), Some(format!("{before}\0suffix"))));
+    assert_eq!(
+        ids(fx.cat.list_uploads(&fx.bucket, &q).await.unwrap()),
+        [later, next_key]
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn open_uploads_list_by_key_then_id_within_one_bucket() {
     let fx = Fx::new().await;
@@ -1208,8 +1241,8 @@ async fn a_bucket_is_deleted_only_while_nothing_names_it() {
     let one = bucket_row(&fx.bucket, "one");
     fx.run(
         "INSERT INTO access_keys(access_key_id, principal, secret_wrapped, kek_version, status, \
-         created_at) VALUES ('AK', 'p', x'00', 1, 'active', 0)",
-        &[],
+         created_at) VALUES ('AK', 'p', ?1, 1, 'active', 0)",
+        &[SqlValue::Blob(vec![0])],
     )
     .await;
     for bucket in [&fx.bucket, &fx.other_bucket] {
@@ -1551,11 +1584,14 @@ async fn complete_adopts_a_sliced_part_whole_and_in_order() {
 /// extents table through.
 #[tokio::test]
 async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone() {
+    if TestSql::postgres_selected() {
+        return; // sqlite_only: inspects SQLite VDBE and EXPLAIN QUERY PLAN.
+    }
     let fx = Fx::new().await;
     fx.cat
         .sql
         .db
-        .apply(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
+        .fixture_script(velmora_bridge::testkit::NEXT_DROP_SUPERSEDED_INDEXES)
         .unwrap();
     let id = fx.create(&fx.bucket, KEY).await;
     let t = target(&fx.bucket, KEY, &id);
@@ -1596,7 +1632,7 @@ async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone(
             .cat
             .sql
             .db
-            .query(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .fixture_query(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
             .await
             .unwrap();
         for row in plan {
@@ -1633,14 +1669,17 @@ async fn complete_reads_no_extent_but_its_own_once_the_generation_index_is_gone(
 async fn only_fk_guarded(fx: &Fx, sql: &str, params: &[SqlValue], table: &str) -> bool {
     let db = &fx.cat.sql.db;
     let root = db
-        .query(
+        .fixture_query(
             "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
             &[text(table)],
         )
         .await
         .unwrap();
     let root = root[0][0].clone();
-    let code = db.query(&format!("EXPLAIN {sql}"), params).await.unwrap();
+    let code = db
+        .fixture_query(&format!("EXPLAIN {sql}"), params)
+        .await
+        .unwrap();
     let op = |row: &Row| match &row[1] {
         SqlValue::Text(op) => op.clone(),
         other => panic!("unexpected {other:?}"),
@@ -1688,7 +1727,7 @@ async fn plan_steps(fx: &Fx, sql: &str, params: &[SqlValue]) -> Vec<String> {
         .cat
         .sql
         .db
-        .query(&format!("EXPLAIN QUERY PLAN {sql}"), params)
+        .fixture_query(&format!("EXPLAIN QUERY PLAN {sql}"), params)
         .await
         .unwrap();
     plan.into_iter()
@@ -1740,23 +1779,26 @@ async fn upload_part_seeks_its_own_part_and_gc_rows_are_unchanged() {
     // the alias: only the part tables have an `upload_id` column, so
     // `(upload_id=?)` alone is such a walk; and nothing is scanned but
     // constant rows and the one-row `restore_state`.
-    let ran = std::mem::take(&mut *fx.cat.sql.batched.borrow_mut());
-    let mut by_part = 0;
-    for (sql, params) in &ran {
-        for step in plan_steps(&fx, sql, params).await {
-            by_part += usize::from(step.contains("(upload_id=? AND part_number=?)"));
-            let scan_ok =
-                ["SCAN CONSTANT ROW", "SCAN a", "SCAN restore_state"].contains(&step.as_str());
-            assert!(
-                !step.contains("(upload_id=?)") && (!step.starts_with("SCAN ") || scan_ok),
-                "{sql}\n{step}"
-            );
+    // sqlite_only: VDBE and SQLite planner detail; verify GC on both engines.
+    if !TestSql::postgres_selected() {
+        let ran = std::mem::take(&mut *fx.cat.sql.batched.borrow_mut());
+        let mut by_part = 0;
+        for (sql, params) in &ran {
+            for step in plan_steps(&fx, sql, params).await {
+                by_part += usize::from(step.contains("(upload_id=? AND part_number=?)"));
+                let scan_ok =
+                    ["SCAN CONSTANT ROW", "SCAN a", "SCAN restore_state"].contains(&step.as_str());
+                assert!(
+                    !step.contains("(upload_id=?)") && (!step.starts_with("SCAN ") || scan_ok),
+                    "{sql}\n{step}"
+                );
+            }
         }
+        assert!(
+            by_part >= 3,
+            "the GC select (both tables) and the piece delete"
+        );
     }
-    assert!(
-        by_part >= 3,
-        "the GC select (both tables) and the piece delete"
-    );
 
     // Abort sends every remaining part extent to GC, as before.
     assert_eq!(
