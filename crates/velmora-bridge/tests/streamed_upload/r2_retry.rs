@@ -1,4 +1,5 @@
 use super::*;
+use velmora_bridge::ingress::settled_log_line;
 use velmora_bridge::metrics::RequestObservation;
 
 type Pauses = Rc<RefCell<Vec<u32>>>;
@@ -28,17 +29,29 @@ fn script(rig: &Rig, failures: impl IntoIterator<Item = (FailMode, &'static str)
     rig.bridge.safety.fail_puts.borrow_mut().extend(failures);
 }
 
-async fn put(rig: &Rig, signer: &Signer, body: &[u8]) -> (Resp, String) {
+async fn send_observed(rig: &Rig, request: S3Request) -> (Resp, String) {
     let mut observation = RequestObservation::default();
+    let target = request.raw_target.clone();
     let response = Rc::clone(&rig.bridge)
-        .handle_observed(
-            in_pieces(mode_req(rig, signer, KEY, body, Mode::Literal), CHUNK_64K),
-            &mut observation,
-        )
+        .handle_observed(request, &mut observation)
         .await;
     let response = Resp::collect(response).await;
+    let (_, log) = settled_log_line(
+        "PUT",
+        &target,
+        "retry-test",
+        false,
+        response.status,
+        response.status,
+        &mut observation,
+    );
     assert_eq!(rig.bridge.budget.in_use(), 0);
-    (response, observation.log_fields())
+    (response, log)
+}
+
+async fn put(rig: &Rig, signer: &Signer, body: &[u8]) -> (Resp, String) {
+    let request = in_pieces(mode_req(rig, signer, KEY, body, Mode::Literal), CHUNK_64K);
+    send_observed(rig, request).await
 }
 
 fn assert_backoff(pauses: &Pauses, count: usize) {
@@ -78,9 +91,10 @@ async fn replay_retries_a_whole_16_mib_part_and_names_it_once() {
         &body,
         Mode::UnsignedTrailer,
     );
-    let r = send_in_pieces(&rig, req, 100_003).await;
+    let (r, log) = send_observed(&rig, in_pieces(req, 100_003)).await;
     r.expect(200);
     assert_eq!(r.header("etag"), Some(md5_etag(&body).as_str()));
+    assert!(log.ends_with(" retries=1"), "{log}");
     assert_identical_replay(&rig, 2);
     assert_eq!(rows(&rig), (1, 0, 1));
     assert_backoff(&pauses, 1);
@@ -93,7 +107,9 @@ async fn replay_of_a_landed_put_publishes_one_generation_and_one_extent() {
     let (bucket, signer) = rig.standard(BUCKET).await;
     let body = pattern(2, 3 * CHUNK_64K);
     script(&rig, [(FailMode::StoreThenFail, INTERNAL)]);
-    put(&rig, &signer, &body).await.0.expect(200);
+    let (r, log) = put(&rig, &signer, &body).await;
+    r.expect(200);
+    assert!(log.ends_with(" retries=1"), "{log}");
     assert_backoff(&pauses, 1);
     assert_identical_replay(&rig, 2);
     assert_eq!(rows(&rig), (1, 1, 0));
@@ -105,6 +121,67 @@ async fn replay_of_a_landed_put_publishes_one_generation_and_one_extent() {
         .unwrap();
     assert_eq!(extents[0].cipher_sha256, sha256(&stored.bytes));
     assert!(get(&rig, &signer, KEY).await.body == body);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_can_succeed_on_the_third_attempt() {
+    let (rig, pauses) = retry_rig(48 * MIB as u64);
+    let (_, signer) = rig.standard(BUCKET).await;
+    let body = pattern(3, 2 * CHUNK_64K);
+    script(
+        &rig,
+        [
+            (FailMode::ReadAllThenFail, NETWORK),
+            (FailMode::StoreThenFail, INTERNAL),
+        ],
+    );
+    let (r, log) = put(&rig, &signer, &body).await;
+    r.expect(200);
+    assert_identical_replay(&rig, 3);
+    assert_backoff(&pauses, 2);
+    assert_eq!(rows(&rig), (1, 1, 0));
+    assert!(get(&rig, &signer, KEY).await.body == body);
+    assert!(log.ends_with(" retries=2"), "{log}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_disabled_preserves_the_existing_transient_failure_response_and_log() {
+    let (mut rig, pauses) = retry_rig(48 * MIB as u64);
+    Rc::get_mut(&mut rig.bridge).unwrap().cfg.r2_put_retry = false;
+    let (_, signer) = rig.standard(BUCKET).await;
+    script(&rig, [(FailMode::ReadAllThenFail, NETWORK)]);
+    let (r, log) = put(&rig, &signer, b"payload").await;
+    r.expect_error(500, "InternalError");
+    assert!(
+        log.ends_with(" stage=r2 err=Blob code=r2_put_network_lost"),
+        "{log}"
+    );
+    assert_eq!(
+        rig.bridge.budget.peak(),
+        stream_charge(b"payload".len() as u64)
+    );
+    only_stream(&rig);
+    assert_backoff(&pauses, 0);
+    assert_eq!(rows(&rig), (0, 0, 0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replay_never_retries_an_initial_md5_mismatch() {
+    let (rig, pauses) = retry_rig(48 * MIB as u64);
+    let (_, signer) = rig.standard(BUCKET).await;
+    rig.bridge.safety.false_receipt.set(Some(|mut receipt| {
+        receipt.md5[0] ^= 1;
+        receipt
+    }));
+    let (r, log) = put(&rig, &signer, b"payload").await;
+    r.expect_error(500, "InternalError");
+    assert!(
+        log.ends_with(" stage=r2 err=StoredMd5Mismatch code=-"),
+        "{log}"
+    );
+    only_stream(&rig);
+    assert_backoff(&pauses, 0);
+    assert_eq!(rows(&rig), (0, 0, 0));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -122,7 +199,10 @@ async fn replay_stops_at_three_attempts_and_logs_the_last_fault() {
     let (r, log) = put(&rig, &signer, b"payload").await;
     r.expect_error(500, "InternalError");
     assert_eq!(rig.bridge.safety.streams.borrow().len(), 3);
-    assert_eq!(log, "stage=r2 err=Blob code=r2_put_network_lost retries=2");
+    assert!(
+        log.ends_with(" stage=r2 err=Blob code=r2_put_network_lost retries=2"),
+        "{log}"
+    );
     assert_backoff(&pauses, 2);
     assert_eq!(rows(&rig), (0, 0, 0));
     assert!(blobs(&rig).is_empty());
@@ -154,7 +234,10 @@ async fn replay_checks_both_receipt_fields_and_does_not_repeat_a_mismatch() {
         let (r, log) = put(&rig, &signer, b"payload").await;
         r.expect_error(500, "InternalError");
         assert_eq!(rig.bridge.safety.streams.borrow().len(), 2, "{fault}");
-        assert_eq!(log, format!("stage=r2 err={fault} code=- retries=1"));
+        assert!(
+            log.ends_with(&format!(" stage=r2 err={fault} code=- retries=1")),
+            "{log}"
+        );
         assert_backoff(&pauses, 1);
         assert_eq!(rows(&rig), (0, 0, 0));
     }

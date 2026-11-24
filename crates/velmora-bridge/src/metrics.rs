@@ -449,6 +449,11 @@ impl RequestObservation {
         self.put_retries = self.put_retries.saturating_add(1);
     }
 
+    /// Additional attempts for the streamed safety put, if it replayed.
+    pub fn put_retries(&self) -> u8 {
+        self.put_retries
+    }
+
     /// `stage=<stage> err=<variant> code=<provider code>` for the request
     /// log line of a `5xx`; `-` for what is not known. A streamed safety
     /// put that retried also gives `retries=<number>`.

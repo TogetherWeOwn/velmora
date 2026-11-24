@@ -1618,8 +1618,9 @@ pub fn log_line(method: &str, raw_target: &str, status: u16, request_id: &str) -
 /// [`log_line`]; a `5xx` or a recorded child grant refusal ends with
 /// what the request observed of its failure
 /// ([`crate::metrics::RequestObservation::log_fields`]):
-/// `stage=.. err=.. code=..`, each `-` where nothing is known. Those are
-/// names from fixed lists and numbers, never message text.
+/// `stage=.. err=.. code=..`, each `-` where nothing is known. An upload
+/// that retried its streamed safety put also ends with `retries=N`, even
+/// after success. These are fixed names and numbers, never message text.
 pub fn log_line_with(
     method: &str,
     raw_target: &str,
@@ -1630,7 +1631,12 @@ pub fn log_line_with(
     let line = request_line(method, raw_target, status, request_id);
     let grant_refused = status == 403 && observed.and_then(|o| o.grant_refusal()).is_some();
     if status < 500 && !grant_refused {
-        return line;
+        let retries = observed.map_or(0, |o| o.put_retries());
+        return if retries == 0 {
+            line
+        } else {
+            format!("{line} retries={retries}")
+        };
     }
     let fields = observed.map_or_else(
         || crate::metrics::RequestObservation::default().log_fields(),
@@ -1644,8 +1650,8 @@ pub fn log_line_with(
 /// `intended` answer into a 500, see
 /// [`crate::metrics::RequestObservation::response_status`]), then gives
 /// the status to count the request under and its log line, which has the
-/// wire status and, for a 5xx or a recorded child grant refusal, the
-/// observed failure.
+/// wire status, any streamed safety-put retry count, and (for a 5xx or
+/// a recorded child grant refusal) the observed failure.
 pub fn settled_log_line(
     method: &str,
     raw_target: &str,
