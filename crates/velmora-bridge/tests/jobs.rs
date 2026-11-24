@@ -295,6 +295,7 @@ impl Fx {
             maintenance,
             server_side_copy: false,
             get_fanout_bytes: None,
+            grant_refusal_reasons: false,
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
             verify: Default::default(),

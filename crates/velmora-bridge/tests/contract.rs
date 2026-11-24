@@ -409,6 +409,12 @@ fn config_loads_from_documented_vars() {
     }
     sized.remove("GET_FANOUT_BYTES");
     assert_eq!(load(&sized).unwrap().get_fanout_bytes, None);
+    assert!(!load(&sized).unwrap().grant_refusal_reasons);
+    for value in ["on", "off", "", "ON", " on", "typo"] {
+        sized.insert("GRANT_REFUSAL_REASONS".into(), value.into());
+        assert_eq!(load(&sized).unwrap().grant_refusal_reasons, value == "on");
+    }
+    sized.remove("GRANT_REFUSAL_REASONS");
     // A cold read uses four connections unless told otherwise, from one
     // to eight, and never more than fit the byte budget beside one extent
     // and its copy: 48 MiB less 32 MiB leaves room for ten more.
@@ -678,6 +684,15 @@ fn missing_secret_fails_closed() {
         if name == "GET_FANOUT_BYTES" {
             for _ in 0..2 {
                 assert_eq!(load(&vars).unwrap().get_fanout_bytes, None);
+                vars.insert(name.clone(), "  ".into());
+            }
+            continue;
+        }
+        // Grant refusal reasons: absent or blank is off. Logging only;
+        // no value of it changes an admission decision.
+        if name == "GRANT_REFUSAL_REASONS" {
+            for _ in 0..2 {
+                assert!(!load(&vars).unwrap().grant_refusal_reasons);
                 vars.insert(name.clone(), "  ".into());
             }
             continue;

@@ -459,6 +459,9 @@ pub struct BridgeConfig {
     /// or `0`) = every GET is served by the invocation that received it.
     /// Needs the Worker's service binding to itself.
     pub get_fanout_bytes: Option<u64>,
+    /// Record bounded child grant refusal diagnostics (`GRANT_REFUSAL_REASONS=on`).
+    /// Does not affect admission.
+    pub grant_refusal_reasons: bool,
     /// Accept `http://` as if it were HTTPS (`wrangler dev` only).
     pub dev_trust_http: bool,
     pub providers: Vec<ProviderConfig>,
@@ -1212,6 +1215,7 @@ impl BridgeConfig {
             catalogue_id,
             server_side_copy,
             get_fanout_bytes,
+            grant_refusal_reasons: get("GRANT_REFUSAL_REASONS").as_deref() == Some("on"),
             dev_trust_http,
             providers,
             admin_token: Secret::new(admin_token),

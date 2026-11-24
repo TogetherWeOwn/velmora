@@ -58,6 +58,7 @@ struct Loopback<'a> {
     rig: &'a Rig,
     faults: Faults,
     sent: RefCell<Vec<SubRequest>>,
+    child_failures: RefCell<Vec<(u16, String)>>,
     slept: RefCell<Vec<u32>>,
     out: RefCell<Vec<u8>>,
     closed: Cell<bool>,
@@ -71,6 +72,7 @@ impl<'a> Loopback<'a> {
             rig,
             faults: Faults::default(),
             sent: RefCell::default(),
+            child_failures: RefCell::default(),
             slept: RefCell::default(),
             out: RefCell::default(),
             closed: Cell::new(false),
@@ -111,7 +113,10 @@ impl SubPipe for Loopback<'_> {
             None => sub.token.clone(),
         };
         let req = sub_request(&token, &self.faults.headers.borrow());
-        let resp = Rc::clone(&self.rig.bridge).handle(req).await;
+        let (resp, _, line) = observed_child(self.rig, req).await;
+        if resp.status >= 400 {
+            self.child_failures.borrow_mut().push((resp.status, line));
+        }
         let length = resp
             .headers
             .iter()
@@ -954,6 +959,267 @@ fn grant_for(
     }
 }
 
+async fn observed_child(rig: &Rig, req: S3Request) -> (S3Response, GetObservation, String) {
+    let method = req.method.clone();
+    let target = req.raw_target.clone();
+    let mut observed = GetObservation::default();
+    let resp = Rc::clone(&rig.bridge)
+        .handle_observed(req, &mut observed)
+        .await;
+    let (_, line) = ingress::settled_log_line(
+        method.as_str(),
+        &target,
+        "fixture",
+        false,
+        resp.status,
+        resp.status,
+        &mut observed,
+    );
+    (resp, observed, line)
+}
+
+fn grant_log_rig() -> Rig {
+    let mut rig = fan_rig(Some(CHUNK));
+    Rc::get_mut(&mut rig.bridge)
+        .unwrap()
+        .cfg
+        .grant_refusal_reasons = true;
+    rig
+}
+
+fn log_grant(now: UnixMs) -> Grant {
+    Grant {
+        bucket: BucketId::mint([1; 8]),
+        generation: GenerationId::mint(now, [2; 8]),
+        start: 0,
+        len: 1,
+        expires: now.plus_ms(TOKEN_TTL_MS),
+    }
+}
+
+async fn assert_grant_refusal(rig: &Rig, req: S3Request, reason: &str, code: &str) {
+    let method = req.method.clone();
+    let method = method.as_str();
+    let (resp, observed, line) = observed_child(rig, req).await;
+    let got = Resp::collect(resp).await;
+    let unchanged = Resp::collect(S3Response::error(403, "AccessDenied", "Access Denied")).await;
+    assert_eq!(got.status, unchanged.status);
+    assert_eq!(got.headers, unchanged.headers);
+    assert!(got.body == unchanged.body, "the refusal body changed");
+    let suffix = format!(" status=403 id=fixture stage=grant err={reason} code={code}");
+    assert!(
+        line.ends_with(&suffix),
+        "missing expected log suffix:{suffix}"
+    );
+
+    let point = grant_refusal_point(method, got.status, observed);
+    let blobs = point.analytics_blobs().collect::<Vec<_>>();
+    if method == "GET" {
+        let stage = format!("grant:{reason}");
+        assert_eq!(blobs, ["req", "GET", "4xx", "s3", "IAD", &stage, "unknown"]);
+    } else {
+        assert_eq!(blobs, ["req", method, "4xx", "s3", "IAD"]);
+    }
+}
+
+fn grant_refusal_point(
+    method: &str,
+    status: u16,
+    observed: GetObservation,
+) -> velmora_bridge::metrics::Point {
+    // Refused requests are not classified as admitted sub-requests by
+    // the Worker. Keep that route, the size class and the blob count.
+    request_point(
+        &Request {
+            method,
+            admin: false,
+            sub: false,
+            status,
+            latency_ms: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            colo: "IAD",
+            get: observed,
+        },
+        1,
+    )
+}
+
+#[tokio::test]
+async fn grant_refusal_diagnostics_are_off_by_default() {
+    let rig = fan_rig(Some(CHUNK));
+    let req = sub_request("fixture-not-a-grant", &[]);
+    let (resp, observed, line) = observed_child(&rig, req).await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(
+        line,
+        "req method=GET bucket=_fanout key#=- status=403 id=fixture"
+    );
+    assert_eq!(
+        grant_refusal_point("GET", resp.status, observed)
+            .analytics_blobs()
+            .collect::<Vec<_>>(),
+        ["req", "GET", "4xx", "s3", "IAD", "grant", "unknown"],
+    );
+}
+
+#[tokio::test]
+async fn edge_header_grant_refusal_logs_allowlisted_names() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    let req = sub_request(
+        &token,
+        &[
+            ("X-Forwarded-For".into(), "fixture-header-value".into()),
+            (
+                "cf-fixture-custom-name".into(),
+                "fixture-header-value".into(),
+            ),
+            ("cf-connecting-ip".into(), "fixture-header-value".into()),
+            ("CF-CONNECTING-IP".into(), "fixture-header-value".into()),
+            (
+                "x-forwarded-custom-name".into(),
+                "fixture-header-value".into(),
+            ),
+            ("host".into(), "fixture-header-value".into()),
+        ],
+    );
+    assert_grant_refusal(
+        &rig,
+        req,
+        "EdgeHeader",
+        "cf_connecting_ip+x_forwarded_for+other",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cf_ew_via_grant_refusal_logs_its_allowlisted_name() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    let req = sub_request(
+        &token,
+        &[("cf-ew-via".into(), "fixture-header-value".into())],
+    );
+    assert_grant_refusal(&rig, req, "EdgeHeader", "cf_ew_via").await;
+}
+
+#[tokio::test]
+async fn wrong_method_grant_refusal_logs_method() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    let mut req = sub_request(&token, &[]);
+    req.method = Method::Post;
+    assert_grant_refusal(&rig, req, "Method", "-").await;
+}
+
+#[tokio::test]
+async fn missing_or_duplicate_token_grant_refusal_logs_token_count() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    let mut missing = sub_request(&token, &[]);
+    missing.headers.clear();
+    assert_grant_refusal(&rig, missing, "TokenCount", "-").await;
+    let duplicate = sub_request(
+        &token,
+        &[(TOKEN_HEADER.to_ascii_uppercase(), token.clone())],
+    );
+    assert_grant_refusal(&rig, duplicate, "TokenCount", "-").await;
+}
+
+#[tokio::test]
+async fn malformed_grant_refusal_logs_malformed() {
+    let rig = grant_log_rig();
+    assert_grant_refusal(
+        &rig,
+        sub_request("fixture-not-a-grant", &[]),
+        "Malformed",
+        "-",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_key_grant_refusal_logs_unknown_key() {
+    let rig = grant_log_rig();
+    let other = TestKek::with_versions(7, &[(7, [0x11; 32])]);
+    let token = log_grant(rig.now()).seal(&other).unwrap();
+    assert_grant_refusal(&rig, sub_request(&token, &[]), "UnknownKey", "-").await;
+}
+
+#[tokio::test]
+async fn bad_tag_grant_refusal_logs_bad_tag_even_after_expiry() {
+    let rig = grant_log_rig();
+    let other = TestKek::with_versions(1, &[(1, [0x22; 32])]);
+    let token = log_grant(rig.now()).seal(&other).unwrap();
+    rig.bridge.clock.advance_ms(TOKEN_TTL_MS + 1_750);
+    assert_grant_refusal(&rig, sub_request(&token, &[]), "BadTag", "-").await;
+}
+
+#[tokio::test]
+async fn expired_grant_refusal_logs_whole_seconds_past_expiry() {
+    let rig = grant_log_rig();
+    let token = log_grant(rig.now()).seal(&rig.bridge.kek).unwrap();
+    rig.bridge.clock.advance_ms(TOKEN_TTL_MS);
+    assert_grant_refusal(&rig, sub_request(&token, &[]), "Expired", "0").await;
+    rig.bridge.clock.advance_ms(1_750);
+    assert_grant_refusal(&rig, sub_request(&token, &[]), "Expired", "1").await;
+}
+
+#[test]
+fn a_valid_grant_still_admits() {
+    let rig = fan_rig(Some(CHUNK));
+    let now = rig.now();
+    let grant = log_grant(now);
+    let token = grant.seal(&rig.bridge.kek).unwrap();
+    assert_eq!(
+        fanout::admit(&rig.bridge.kek, &sub_request(&token, &[]), now),
+        Ok(grant)
+    );
+}
+
+#[tokio::test]
+async fn edge_headers_on_a_valid_subrequest_log_the_reason_and_still_refuse() {
+    let (mut rig, _, signer, _) = seeded(Some(CHUNK)).await;
+    Rc::get_mut(&mut rig.bridge)
+        .unwrap()
+        .cfg
+        .grant_refusal_reasons = true;
+    let (_, _, fan) = fanout_of(front(&rig, &signer, "big", &[]).await);
+    let pipe = Loopback::new(&rig);
+    let value = "203.0.113.9";
+    *pipe.faults.headers.borrow_mut() = vec![("cf-connecting-ip".into(), value.into())];
+    let mut parent = GetObservation::default();
+    let fallback = || S3Response::error(500, "InternalError", "fixture");
+    let Err(resp) = fan.open_first_observed(&pipe, fallback, &mut parent).await else {
+        panic!("the first sub-range should be refused");
+    };
+    assert_eq!(resp.status, 500);
+    assert_eq!(
+        parent.log_fields(),
+        "stage=grant err=Status code=upstream_403"
+    );
+    let sent = pipe.sent.borrow();
+    let [sent] = sent.as_slice() else {
+        panic!("the 403 must not be retried");
+    };
+    assert!(fanout::admit(&rig.bridge.kek, &sub_request(&sent.token, &[]), rig.now()).is_ok());
+    let failures = pipe.child_failures.borrow();
+    let [(status, line)] = failures.as_slice() else {
+        panic!("expected exactly one child failure");
+    };
+    assert_eq!(*status, 403);
+    assert!(!line.contains(value), "header value leaked into the log");
+    assert!(
+        !line.contains(&sent.token),
+        "grant token leaked into the log"
+    );
+    assert!(
+        line.ends_with(" status=403 id=fixture stage=grant err=EdgeHeader code=cf_connecting_ip"),
+        "missing expected child grant refusal suffix"
+    );
+}
+
 #[tokio::test]
 async fn a_forged_sub_request_is_refused() {
     let (rig, bucket, signer, data) = seeded(Some(CHUNK)).await;
@@ -1144,7 +1410,12 @@ async fn a_forged_sub_request_is_refused() {
     .await
     .expect(200);
     rig.bridge.clock.advance_ms(1);
-    assert_eq!(Grant::open(kek, &token, rig.now()), Err(Refused::Expired));
+    assert_eq!(
+        Grant::open(kek, &token, rig.now()),
+        Err(Refused::Expired {
+            seconds_past_expiry: 0
+        }),
+    );
     denied(
         sub(
             &rig,
