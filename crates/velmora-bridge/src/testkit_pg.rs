@@ -2,12 +2,13 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use sha2::{Digest, Sha256};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Handle, Id};
 use tokio::task::JoinHandle;
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
@@ -89,13 +90,92 @@ pub(crate) async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)>
     }
 }
 
+// Bound cached sessions, not concurrent operations: if every session is
+// leased, connect as before rather than serializing tests through the pool.
+const MAX_IDLE_SESSIONS: usize = 4;
+
+// Unlike DISCARD ALL, this preserves the driver's internal type-lookup
+// prepared statements. Catalogue operations do not change authorization.
+const RESET_SESSION: &str = "CLOSE ALL; RESET ALL; UNLISTEN *; \
+    SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES";
+
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+type Session = (Client, AbortOnDrop<()>);
+
+struct PendingSession {
+    runtime: Id,
+    reset: AbortOnDrop<Option<Session>>,
+}
+
+#[derive(Default)]
+struct SessionPool(Mutex<Vec<PendingSession>>);
+
+impl SessionPool {
+    fn take_pending(&self, runtime: Id) -> Option<PendingSession> {
+        let mut pending = self.0.lock().unwrap();
+        // Only the originating runtime can drive the socket and reset task.
+        let index = pending
+            .iter()
+            .rposition(|session| session.runtime == runtime)?;
+        Some(pending.swap_remove(index))
+    }
+
+    async fn checkout(&self, config: &Config, runtime: Id) -> Result<Session> {
+        while let Some(mut pending) = self.take_pending(runtime) {
+            // A failed reset is never reused. If checkout is cancelled while
+            // waiting, dropping the reset task also retires its driver.
+            if let Ok(Some(session)) = (&mut pending.reset.0).await {
+                if !session.0.is_closed() {
+                    return Ok(session);
+                }
+            }
+        }
+        let (client, driver) = connect(config).await?;
+        Ok((client, AbortOnDrop(driver)))
+    }
+
+    fn checkin(&self, runtime: Id, session: Session) {
+        let mut pending = self.0.lock().unwrap();
+        if pending.len() < MAX_IDLE_SESSIONS {
+            // Start reset now, even if no later operation checks out this
+            // session. Do not delay the caller of an already confirmed write.
+            let reset = tokio::spawn(async move {
+                session.0.batch_execute(RESET_SESSION).await.ok()?;
+                Some(session)
+            });
+            pending.push(PendingSession {
+                runtime,
+                reset: AbortOnDrop(reset),
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
-pub struct NativePgConnect(Config);
+pub struct NativePgConnect {
+    config: Config,
+    pool: Option<Arc<SessionPool>>,
+}
 
 impl PgConnect for NativePgConnect {
     async fn connect(&self) -> Result<PgConnection> {
-        let (client, task) = connect(&self.0).await?;
-        Ok(PgConnection::new(client, move || task.abort()))
+        let Some(pool) = &self.pool else {
+            let (client, driver) = connect(&self.config).await?;
+            return Ok(PgConnection::new(client, move || driver.abort()));
+        };
+        let runtime = Handle::current().id();
+        let (client, driver) = pool.checkout(&self.config, runtime).await?;
+        let pool = Arc::clone(pool);
+        Ok(PgConnection::recyclable(client, move |client| {
+            pool.checkin(runtime, (client, driver));
+        }))
     }
 }
 
@@ -129,18 +209,26 @@ impl TestPostgres {
         let lock_key = i64::from_be_bytes(hash[..8].try_into().unwrap());
         let mut scoped = base.clone();
         scoped.options(format!("-c search_path={schema},pg_temp"));
-        let connector = NativePgConnect(scoped);
-        let sql = || {
+        // Arbitrary fixture SQL can leave session state that RESET cannot
+        // erase (for example, a custom GUC placeholder). Never pool it.
+        let connector = NativePgConnect {
+            config: scoped,
+            pool: None,
+        };
+        let sql = |connector: NativePgConnect| {
             PgSql::new(
                 connector.clone(),
-                connector.clone(),
+                connector,
                 PgConfig {
                     lock_key,
                     ..PgConfig::default()
                 },
             )
         };
-        let catalog = sql();
+        let catalog = sql(NativePgConnect {
+            config: connector.config.clone(),
+            pool: Some(Arc::default()),
+        });
         #[cfg(feature = "pg-test-record")]
         let catalog = if _record {
             catalog.with_statement_recording()
@@ -163,7 +251,7 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            fixture_sql: sql(),
+            fixture_sql: sql(connector.clone()),
             connector,
         })
     }
@@ -175,7 +263,9 @@ impl TestPostgres {
     /// Open a session for typed PREPARE and fixture setup. The connection is
     /// closed when the current test runtime shuts down or the client is dropped.
     pub async fn client(&self) -> Result<Client> {
-        connect(&self.connector.0).await.map(|(client, _)| client)
+        connect(&self.connector.config)
+            .await
+            .map(|(client, _)| client)
     }
 
     pub(super) fn fixture_query_now(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
@@ -197,7 +287,7 @@ impl TestPostgres {
     }
 
     pub(super) fn fixture_script(&self, script: &str) -> Result<()> {
-        let config = self.connector.0.clone();
+        let config = self.connector.config.clone();
         let script = script.to_owned();
         management(move || async move {
             let (client, _) = connect(&config).await?;

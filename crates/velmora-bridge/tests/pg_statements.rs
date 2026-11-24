@@ -14,7 +14,7 @@ use tokio_postgres::types::Type;
 use velmora_bridge::pg::normalize_statement;
 use velmora_bridge::sql::{pg_background_statements, pg_datapath_statements};
 use velmora_bridge::testkit::TestSql;
-use velmora_bridge::SqlValue;
+use velmora_bridge::{Sql, SqlValue};
 
 const COVERAGE_DIR: &str = "VELMORA_PG_STATEMENTS_DIR";
 const UNEXECUTED: &str = include_str!("pg-unexecuted.txt");
@@ -191,6 +191,168 @@ async fn prepare_rejects_an_omitted_parameter_postgres_can_infer() {
     );
     statement.parameter_oids.push(Type::UNKNOWN.oid());
     prepare(&client, &statement).await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_testkit_reuses_a_session_without_its_state() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    let lock_key = db.postgres_lock_key().unwrap();
+    db.fixture_script(&format!(
+        "CREATE TABLE testkit_session_probe (id bigint PRIMARY KEY);
+         CREATE FUNCTION testkit_dirty_session() RETURNS bigint LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM set_config('application_name', 'dirty testkit session', false);
+             PERFORM pg_advisory_lock({lock_key}::bigint);
+             RETURN pg_backend_pid();
+         END;
+         $$;"
+    ))
+    .unwrap();
+    let probe = "SELECT pg_backend_pid(), current_setting('application_name'),
+                 EXISTS (SELECT 1 FROM pg_locks
+                         WHERE locktype = 'advisory' AND pid = pg_backend_pid()),
+                 (SELECT count(*) FROM testkit_session_probe)";
+    let fresh = db.query(probe, &[]).await.unwrap();
+    let dirty = db
+        .query(
+            "INSERT INTO testkit_session_probe VALUES (1) RETURNING testkit_dirty_session()",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(dirty[0][0], fresh[0][0], "write should reuse the session");
+    let reset = db.query(probe, &[]).await.unwrap();
+    assert_eq!(reset[0][0], fresh[0][0], "read should reuse the session");
+    assert!(reset[0][1] == fresh[0][1], "application_name was not reset");
+    assert_eq!(reset[0][2], SqlValue::Int(0), "session lock was not reset");
+    assert_eq!(reset[0][3], SqlValue::Int(1), "write should be committed");
+}
+
+#[tokio::test]
+async fn postgres_testkit_does_not_reuse_a_failed_write_session() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    db.fixture_script("CREATE TABLE testkit_error_probe (id bigint PRIMARY KEY); INSERT INTO testkit_error_probe VALUES (1);")
+        .unwrap();
+    let pid = "SELECT pg_backend_pid()";
+    let before = db.query(pid, &[]).await.unwrap();
+    assert!(db
+        .exec("INSERT INTO testkit_error_probe VALUES (1)", &[])
+        .await
+        .is_err());
+    let after = db.query(pid, &[]).await.unwrap();
+    assert_ne!(before, after, "a failed write must retire the session");
+}
+
+#[tokio::test]
+async fn postgres_testkit_preserves_private_type_lookup_statements() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    db.fixture_script(
+        "CREATE TYPE testkit_enum_one AS ENUM ('value');
+         CREATE TYPE testkit_enum_two AS ENUM ('value');",
+    )
+    .unwrap();
+    let one = "SELECT 'value'::testkit_enum_one";
+    let two = "SELECT 'value'::testkit_enum_two";
+    db.fixture_exec(one, &[]).await.unwrap();
+    db.fixture_exec(two, &[]).await.unwrap();
+
+    // Also exercise both server type lookups on the same pooled connection.
+    let pid = "SELECT pg_backend_pid()";
+    let before = db.query(pid, &[]).await.unwrap();
+    db.exec(one, &[]).await.unwrap();
+    db.exec(two, &[]).await.unwrap();
+    assert_eq!(before, db.query(pid, &[]).await.unwrap());
+}
+
+#[tokio::test]
+async fn postgres_testkit_fixture_locks_do_not_remain_held_after_return() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    let key = db.postgres_lock_key().unwrap();
+    db.fixture_script(&format!(
+        "CREATE FUNCTION testkit_session_lock() RETURNS void LANGUAGE sql AS $$
+         SELECT pg_advisory_lock({key}::bigint);
+         $$;"
+    ))
+    .unwrap();
+    let lock = "SELECT testkit_session_lock()";
+    let separate = db.postgres().unwrap().client().await.unwrap();
+    let probe = format!(
+        "SET lock_timeout = '500ms'; SELECT pg_advisory_lock({key}::bigint); \
+         SELECT pg_advisory_unlock({key}::bigint);"
+    );
+    db.fixture_exec(lock, &[]).await.unwrap();
+    separate
+        .batch_execute(&probe)
+        .await
+        .unwrap_or_else(|err| panic!("fixture session retained its lock: {:?}", err.code()));
+
+    // Drive an independent session without checking out the pooled one.
+    // The reset must release the lock even if nobody reuses that connection.
+    db.exec(lock, &[]).await.unwrap();
+    separate
+        .batch_execute(&probe)
+        .await
+        .unwrap_or_else(|err| panic!("pooled session retained its lock: {:?}", err.code()));
+}
+
+#[tokio::test]
+async fn postgres_testkit_fixtures_do_not_leave_custom_guc_placeholders() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    db.fixture_script(
+        "CREATE FUNCTION testkit_custom_guc() RETURNS text LANGUAGE sql AS $$
+         SELECT set_config('velmora_test.fixture_guc', 'present', false);
+         $$;",
+    )
+    .unwrap();
+    db.fixture_exec("SELECT testkit_custom_guc()", &[])
+        .await
+        .unwrap();
+    let rows = db
+        .fixture_query(
+            "SELECT current_setting('velmora_test.fixture_guc', true)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![vec![SqlValue::Null]]);
+}
+
+#[tokio::test]
+async fn postgres_testkit_retires_sessions_after_reply_decode_errors() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    db.fixture_script("CREATE TABLE testkit_decode_probe (id bigint PRIMARY KEY);")
+        .unwrap();
+    let pid = "SELECT pg_backend_pid()";
+    for sql in [
+        "SELECT 1.5::numeric",
+        "INSERT INTO testkit_decode_probe VALUES (1) RETURNING 1.5::numeric",
+    ] {
+        let before = db.query(pid, &[]).await.unwrap();
+        assert!(db.query(sql, &[]).await.is_err(), "expected decode error");
+        let after = db.query(pid, &[]).await.unwrap();
+        assert_ne!(
+            before, after,
+            "a decode failure must retire the session: {sql}"
+        );
+    }
 }
 
 #[tokio::test]
