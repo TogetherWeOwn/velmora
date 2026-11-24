@@ -1873,35 +1873,25 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
             if room == 0 || self.spent(budget.started) {
                 break;
             }
-            let mut active = Vec::with_capacity(room);
-            for (&i, scan) in scans.range_mut(first..).take(width) {
-                if scan.done() {
-                    continue;
-                }
-                if matches!(scan.named, Named::Segments(_)) {
-                    // Open only one potentially large segment at a time.
-                    let started = self.clock.now();
-                    self.prepare_plan_scan(scan).await;
-                    budget.timing.plan_ms += self.elapsed_ms(started);
-                    if width > 1 && self.spent(budget.started) {
-                        return;
-                    }
-                }
-                if !scan.done() {
-                    active.push(i);
-                    if active.len() == room {
-                        break;
-                    }
-                } else if i == first {
+            let scan = scans.get_mut(&first).expect("the first scan exists");
+            if matches!(scan.named, Named::Segments(_)) {
+                // Do not wait on other generations' segment reads before
+                // making progress on the first unfinished generation.
+                let started = self.clock.now();
+                self.prepare_plan_scan(scan).await;
+                budget.timing.plan_ms += self.elapsed_ms(started);
+                if scan.done() || (width > 1 && self.spent(budget.started)) {
                     break;
                 }
             }
-            if active.first() != Some(&first) {
-                break;
-            }
-            let mut available: Vec<_> = active
-                .into_iter()
-                .map(|i| (i, scans[&i].next_plans().iter()))
+            let mut available: Vec<_> = scans
+                .range(first..)
+                .take(width)
+                .filter_map(|(&i, scan)| {
+                    let keys = scan.next_plans();
+                    (!scan.done() && !keys.is_empty()).then(|| (i, keys.iter()))
+                })
+                .take(room)
                 .collect();
             // One plan per generation per round: a record with many
             // plans may use spare slots but cannot take them all first.

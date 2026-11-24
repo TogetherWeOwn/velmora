@@ -1319,6 +1319,76 @@ async fn parallel_fresh_copies_a_shared_plan_once() {
     }
 }
 
+struct SlowSegments<'a>(&'a World);
+
+impl BlobStore for SlowSegments<'_> {
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if key.starts_with("m/seg/") {
+            self.0.clock.advance_ms(4_000);
+        }
+        self.0.safety.get(key, span).await
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.0.safety.put(key, bytes, meta).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.0.safety.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.safety.delete(key).await
+    }
+
+    async fn delete_record(&self, refused: &recovery::Unpublished) -> Result<()> {
+        self.0.safety.delete_record(refused).await
+    }
+
+    async fn list(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<String>> {
+        self.0.safety.list(prefix, after, limit).await
+    }
+
+    async fn list_entries(&self, prefix: &str, after: &str, limit: u32) -> Result<Vec<BlobEntry>> {
+        self.0.safety.list_entries(prefix, after, limit).await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parallel_fresh_progresses_when_source_segments_are_slow() {
+    let w = World::with_parallel_fresh(true);
+    let generations: Vec<_> = (0..CONCURRENCY)
+        .map(|i| generation(2 * MIN_AGE_MS, &format!("_{i:02}")))
+        .collect();
+    for key in &generations {
+        w.segmented(key, 1, 1, true).await;
+    }
+    let copier = Copier {
+        safety: &SlowSegments(&w),
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let start = sweep("m/g_");
+    let first = copier.step(UnixMs(NOW), &start).await.unwrap();
+    assert!(
+        w.e2.get(&generations[0]).is_some(),
+        "first generation did not finish"
+    );
+    let next = first.next.expect("remaining generations");
+    let before = generations
+        .iter()
+        .filter(|key| w.e2.get(key).is_some())
+        .count();
+    copier.step(UnixMs(NOW), &next).await.unwrap();
+    let after = generations
+        .iter()
+        .filter(|key| w.e2.get(key).is_some())
+        .count();
+    assert!(after > before, "successor did not make progress");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn parallel_fresh_holds_last_pass_generation_without_a_plan() {
     let w = World::with_parallel_fresh(true);
