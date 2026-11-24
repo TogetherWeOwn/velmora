@@ -333,12 +333,19 @@ jobs:
             echo "bridge=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only HEAD^1 HEAD)
-          if grep -qE '^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)' <<< "$changed"; then
-            echo "bridge=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "bridge=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Treat renames as delete/add and read unquoted paths one at a time.
+          bridge_paths='^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)'
+          bridge=$(git diff --no-renames --name-only -z HEAD^1 HEAD | {
+            matched=false
+            # Read bytes so malformed UTF-8 cannot swallow a NUL delimiter.
+            while LC_ALL=C IFS= read -r -d '' path; do
+              if [[ $path =~ $bridge_paths ]]; then
+                matched=true
+              fi
+            done
+            echo "$matched"
+          })
+          echo "bridge=$bridge" >> "$GITHUB_OUTPUT"
 
   # S3 bridge core: contract tests (rusqlite Sql, in-memory blobs, fakes)
   # and, as lanes land, NntpClient against the in-process test server.
