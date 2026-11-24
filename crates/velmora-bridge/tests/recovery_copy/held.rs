@@ -268,6 +268,42 @@ async fn legacy_sweep_does_not_discard_held_markers_if_the_walk_request_fails() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn disabled_sweep_hands_off_aged_holds_even_without_fresh_work() {
+    for fail in [false, true] {
+        let w = World::new();
+        let key = generation(FRESH_MS + PASS_INTERVAL_MS, "_aged_only");
+        w.generation(&key, &["x_missing"]).await;
+        let (marker, stamp) = held(&key);
+        save_held(&w, [(marker.clone(), stamp)]).await;
+        let now = UnixMs(NOW);
+        rest(&w, now).await;
+        w.raw(WALKED_KEY, (NOW - WALK_SOON_MS).to_string().into_bytes())
+            .await;
+        let copier = Copier {
+            safety: &NoMark(&w.safety, if fail { WANT_KEY } else { "unused" }),
+            kek: &w.kek,
+            clock: &w.clock,
+            remote: &w.remote,
+            maintenance: Maintenance::Off,
+        };
+        let (outcome, report) = copier.run_job_report(&w.jobs, now, "").await;
+        assert_eq!(outcome, JobOutcome::Ack);
+        assert!(report.swept);
+        assert_eq!(report.error, fail.then_some(StepError::Mark));
+        assert_eq!(
+            w.safety.gets_under(SWEEP_KEY),
+            1,
+            "one marker read at the pass boundary"
+        );
+        assert_eq!(
+            time_at(&w, WANT_KEY).await,
+            (!fail).then(|| NOW.to_string())
+        );
+        assert_eq!(held_map(&w).await.contains_key(&marker), fail);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn oversized_held_head_resumes_without_repeating_its_slice_on_redelivery() {
     let w = World::with_parallel_fresh(true);
     let key = generation(FRESH_MS + 1, "_resume");

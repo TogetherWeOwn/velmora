@@ -1231,6 +1231,13 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
         };
         let mut known = Known::default();
         let parallel = self.remote.parallel_fresh();
+        if !parallel && cursor.is_empty() {
+            // A flag-off pass may have no fresh generations to open.
+            // Hand any saved holds to the walk at the pass boundary anyway.
+            // The same loaded marker is reused if this job checks plans.
+            self.load_known(&mut known, &span(Phase::Tombstones, pass))
+                .await;
+        }
         let place = Place::parse(cursor)
             .filter(|place| parallel || place.phase != Phase::Held)
             .unwrap_or_else(|| {
