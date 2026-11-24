@@ -2,6 +2,8 @@
 
 mod batch;
 mod error;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod finish_tests;
 mod params;
 #[cfg(feature = "pg-test-record")]
 mod registry;
@@ -45,7 +47,6 @@ pub fn normalize_statement(sql: &str) -> Result<String> {
 pub struct PgConnection {
     client: Option<tokio_postgres::Client>,
     close: Option<Box<dyn FnOnce()>>,
-    shutdown: Option<core::pin::Pin<Box<dyn core::future::Future<Output = ()>>>>,
 }
 
 impl PgConnection {
@@ -53,7 +54,6 @@ impl PgConnection {
         Self {
             client: Some(client),
             close: Some(Box::new(close)),
-            shutdown: None,
         }
     }
 
@@ -61,18 +61,14 @@ impl PgConnection {
         self.client.as_ref().expect("connection still open")
     }
 
-    /// Wait for the driver to finish its normal shutdown after dropping the
-    /// client. The fallback close hook still runs if the caller cancels.
-    pub fn with_shutdown(mut self, done: impl core::future::Future<Output = ()> + 'static) -> Self {
-        self.shutdown = Some(Box::pin(done));
-        self
-    }
-
-    async fn finish(mut self) {
+    /// Teardown without waiting. Callers take their result first and
+    /// return it right after this, so nothing that happens to the socket
+    /// can delay, fail or retry a confirmed COMMIT. The close hook stops
+    /// the driver; the runtime's transport requests the socket close on
+    /// drop and does not wait for it. No Terminate is sent: the server
+    /// sees an ordinary disconnect, the same as for a cancelled request.
+    fn finish(mut self) {
         drop(self.client.take());
-        if let Some(shutdown) = self.shutdown.take() {
-            shutdown.await;
-        }
     }
 }
 
@@ -169,7 +165,7 @@ impl<C: PgConnect> PgSql<C> {
             self.recording(),
         )
         .await;
-        conn.finish().await;
+        conn.finish();
         result
     }
 }
@@ -183,7 +179,7 @@ impl<C: PgConnect> Sql for PgSql<C> {
             if prepared.statement.kind == Kind::Read {
                 let conn = self.reader.connect().await.map_err(error::without_guard)?;
                 let result = prepared.run(conn.client(), true, self.recording()).await;
-                conn.finish().await;
+                conn.finish();
                 result.map_err(error::without_guard)?.rows()
             } else {
                 self.write(&[prepared], true)

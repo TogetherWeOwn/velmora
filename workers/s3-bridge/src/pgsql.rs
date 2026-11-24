@@ -6,7 +6,6 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_channel::oneshot;
 use futures_util::future::abortable;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_postgres::tls::{ChannelBinding, TlsConnect, TlsStream};
@@ -14,8 +13,9 @@ use tokio_postgres::Config;
 use velmora_bridge::pg::{classify_connect_error, PgConnect, PgConnection};
 use velmora_bridge::{BridgeError, Result};
 use worker::js_sys::{Object, Reflect};
+use worker::wasm_bindgen::closure::Closure;
 use worker::wasm_bindgen::JsValue;
-use worker::wasm_bindgen_futures::{spawn_local, JsFuture};
+use worker::wasm_bindgen_futures::spawn_local;
 use worker::{worker_sys, Hyperdrive, Socket};
 
 pub struct HyperdriveConnect(Hyperdrive);
@@ -34,19 +34,14 @@ impl PgConnect for HyperdriveConnect {
             .connect_raw(socket, UpgradeTls)
             .await
             .map_err(classify_connect_error)?;
-        let (closed, done) = oneshot::channel();
         let (driver, stop) = abortable(connection);
-        // A graceful end drains the driver. On cancellation the abort drops
-        // the actual transport, whose Drop closes the underlying socket.
+        // The driver runs until the request drops its connection. That
+        // aborts it here, and the abort drops the actual transport, whose
+        // Drop requests the socket close without waiting for it.
         spawn_local(async move {
             let _ = driver.await;
-            let _ = closed.send(());
         });
-        Ok(
-            PgConnection::new(client, move || stop.abort()).with_shutdown(async move {
-                let _ = done.await;
-            }),
-        )
+        Ok(PgConnection::new(client, move || stop.abort()))
     }
 }
 
@@ -55,14 +50,20 @@ impl PgConnect for HyperdriveConnect {
 // while connect_raw is still waiting for TLS/authentication responses.
 struct CloseSocket(Option<worker_sys::Socket>);
 
+thread_local! {
+    // One shared no-op rejection handler, so a close leaks no closure.
+    static IGNORE_REJECTION: Closure<dyn FnMut(JsValue)> = Closure::new(|_: JsValue| {});
+}
+
 impl Drop for CloseSocket {
     fn drop(&mut self) {
         if let Some(socket) = self.0.take() {
-            // Request close now, in this invocation. Handle a rejected
-            // promise without exposing provider or socket error strings.
+            // Request close now, in this invocation. A rejection is handled
+            // in JS, so nothing in Rust waits on the close or sees provider
+            // or socket error strings.
             if let Ok(done) = socket.close() {
-                spawn_local(async move {
-                    let _ = JsFuture::from(done).await;
+                IGNORE_REJECTION.with(|ignore| {
+                    let _ = done.catch(ignore);
                 });
             }
         }
