@@ -1119,24 +1119,42 @@ pub fn pg_datapath_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
 
 #[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
 mod pg_manifest_tests {
-    use super::pg_datapath_statements;
+    use super::{pg_background_statements, pg_datapath_statements};
+
+    fn assert_bind_arity(sql: &str, bind_count: usize) {
+        // A typed PREPARE alone may infer missing trailing types. Check
+        // arity after rewriting both anonymous and numbered bind markers.
+        let normalized = crate::pg::normalize_statement(sql).unwrap_or_else(|error| {
+            panic!("invalid PostgreSQL inventory statement: {sql}: {error}")
+        });
+        let highest = normalized
+            .split('\'')
+            .step_by(2)
+            .flat_map(|code| code.split('$').skip(1))
+            .filter_map(|tail| {
+                let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+                tail[..digits].parse::<usize>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(bind_count, highest, "inventory bind count: {sql}");
+    }
 
     #[test]
     fn declared_binds_cover_every_statement_position() {
         for (sql, params) in pg_datapath_statements() {
-            // A typed PREPARE alone may infer missing trailing types. Check
-            // arity explicitly, ignoring markers inside quoted SQL literals.
-            let highest = sql
-                .split('\'')
-                .step_by(2)
-                .flat_map(|code| code.split('?').skip(1))
-                .filter_map(|tail| {
-                    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-                    tail[..digits].parse::<usize>().ok()
-                })
-                .max()
-                .unwrap_or(0);
-            assert_eq!(params.len(), highest, "inventory bind count: {sql}");
+            assert_bind_arity(sql, params.len());
+        }
+    }
+
+    #[test]
+    fn declared_background_binds_cover_every_statement_position() {
+        let statements = pg_background_statements();
+        // Arity checks alone cannot detect a dropped inventory row. This
+        // count includes the generated replay variants at all 50 arities.
+        assert_eq!(statements.len(), 235, "background inventory entry count");
+        for (sql, params) in statements {
+            assert_bind_arity(&sql, params.len());
         }
     }
 }
