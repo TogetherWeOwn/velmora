@@ -65,12 +65,25 @@ pub(crate) async fn seed(client: &Client, jobs: &[Job]) -> std::result::Result<(
         .batch_execute("COMMIT")
         .await
         .map_err(|e| sql_error("commit fixture seed", e))?;
-    // Bound each setup transaction separately from the measured write load.
+    // Dispatch jobs seed a full send batch; keep that expansion inside
+    // the same per-transaction fixture budget as other setup rows.
     const CHUNK: usize = 4096;
-    for (offset, group) in jobs.chunks(CHUNK).enumerate() {
-        seed_group(client, offset * CHUNK, group).await?;
+    let mut offset = 0;
+    let mut rows = READ_KEYS;
+    for (index, job) in jobs.iter().enumerate() {
+        let width = if job.family == Family::Dispatch {
+            DISPATCH_KEYS
+        } else {
+            1
+        };
+        if rows + width > CHUNK {
+            seed_group(client, offset, &jobs[offset..index]).await?;
+            offset = index;
+            rows = 0;
+        }
+        rows += width;
     }
-    Ok(())
+    seed_group(client, offset, &jobs[offset..]).await
 }
 
 async fn seed_group(
@@ -79,7 +92,7 @@ async fn seed_group(
     jobs: &[Job],
 ) -> std::result::Result<(), String> {
     // This dedicated setup connection is dropped on failure, rolling back its transaction.
-    client.batch_execute("BEGIN READ WRITE; CREATE TEMP TABLE load_seed (n bigint, family text, stage text, held boolean, key text, gen text, extent text, upload text) ON COMMIT DROP")
+    client.batch_execute("BEGIN READ WRITE; CREATE TEMP TABLE load_seed (n bigint, family text, stage text, held boolean, key text, gen text, extent text, upload text, width bigint) ON COMMIT DROP")
         .await.map_err(|e| sql_error("create seed table", e))?;
     let mut n = Vec::new();
     let mut families = Vec::new();
@@ -100,7 +113,9 @@ async fn seed_group(
             Some(Family::Gc) => ("gc", "", false),
             Some(Family::PermitsAcquire) => ("permit_acquire", "", false),
             Some(Family::PermitsRelease) => ("permit_release", "", false),
+            Some(Family::Dispatch) => ("dispatch", "post", false),
             Some(Family::OutboxPostMark) => ("post_mark", "post", true),
+            Some(Family::OutboxVerifyRecord) => ("verify_record", "verify", true),
             Some(f) => match outbox_operation(f) {
                 Some((stage, next)) => ("outbox", stage.as_str(), next.is_some()),
                 None => continue,
@@ -112,9 +127,10 @@ async fn seed_group(
         held.push(is_held);
     }
     client.execute_typed("INSERT INTO load_seed SELECT n, family, stage, held, 'pg-load/'||lpad(to_hex(n),16,'0'), \
-         'g_0000000000001'||lpad(to_hex(n),16,'0'), 'x_'||lpad(to_hex(n),26,'0'), lpad(to_hex(n),32,'0') \
+         'g_0000000000001'||lpad(to_hex(n),16,'0'), 'x_'||lpad(to_hex(n),26,'0'), lpad(to_hex(n),32,'0'), \
+         CASE WHEN family='dispatch' THEN $5::bigint ELSE 1 END \
          FROM unnest($1::bigint[], $2::text[], $3::text[], $4::boolean[]) AS t(n,family,stage,held)",
-        &[(&n, Type::INT8_ARRAY), (&families, Type::TEXT_ARRAY), (&stages, Type::TEXT_ARRAY), (&held, Type::BOOL_ARRAY)])
+        &[(&n, Type::INT8_ARRAY), (&families, Type::TEXT_ARRAY), (&stages, Type::TEXT_ARRAY), (&held, Type::BOOL_ARRAY), (&(DISPATCH_KEYS as i64), Type::INT8)])
         .await.map_err(|e| sql_error("populate seed table", e))?;
     client
         .batch_execute(include_str!("seed.sql"))
@@ -429,7 +445,15 @@ pub(crate) async fn write<C: PgConnect>(
         Family::Dispatch => {
             cat.bury_exhausted(50, now).await?;
             count();
-            let due: Vec<_> = (0..DISPATCH_KEYS).map(extent_id).collect();
+            // Match the disjoint dispatch extent IDs seeded for this job.
+            let due: Vec<_> = (0..DISPATCH_KEYS)
+                .map(|piece| {
+                    ExtentId::new(format!(
+                        "x_eeeeeeeeee{:016x}",
+                        row.i * DISPATCH_KEYS + piece
+                    ))
+                })
+                .collect();
             applied(cat.mark_sent(&due, now).await? >= DISPATCH_KEYS as u64)?;
             count();
             cat.record_dispatch(now).await?;
@@ -537,3 +561,6 @@ pub(crate) async fn read<S: Sql>(
             .is_empty(),
     })
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests;
