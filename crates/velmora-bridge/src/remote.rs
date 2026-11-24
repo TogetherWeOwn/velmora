@@ -31,6 +31,7 @@
 use std::fmt;
 
 use base64::Engine;
+use quick_xml::{events::Event, Reader};
 use sha2::{Digest, Sha256};
 /// The longest list answer that is read.
 pub use velmora_s3_proto::sign::MAX_LIST_BYTES;
@@ -98,17 +99,135 @@ impl HttpResponse {
 
 /// No answer came: a network error or the adapter's timeout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NoAnswer;
+pub enum TransportError {
+    NoAnswer,
+    BodyTooLong,
+}
 
 /// Outbound HTTPS. An implementation:
 /// - bounds every request by a timeout;
 /// - never follows a redirect (the request is signed for one host): it
 ///   returns the 3xx as the answer;
 /// - reads at most [`HttpRequest::max_answer`] bytes of the body, and
-///   returns [`NoAnswer`] when the body is longer.
+///   returns [`TransportError`] when the body is longer.
 pub trait HttpSend {
-    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, NoAnswer>;
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError>;
     async fn pause(&self, ms: u64);
+    fn observe(&self, _: Problem) {}
+}
+
+/// Safe diagnostic fields only, never a key, URL, or provider text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub operation: &'static str,
+    pub kind: &'static str,
+    pub status: Option<u16>,
+    pub code: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Put,
+    Verify,
+    Plan,
+    List,
+    Get,
+}
+
+impl Operation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Verify => "verify",
+            Self::Plan => "plan",
+            Self::List => "list",
+            Self::Get => "get",
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::Put => "PUT",
+            Self::Verify | Self::Plan => "HEAD",
+            Self::List | Self::Get => "GET",
+        }
+    }
+}
+
+/// Cap an independent audit GET at 1 MiB.
+pub const MAX_AUDIT_BYTES: usize = 1 << 20;
+
+fn known_s3_error_code(value: &str) -> Option<&'static str> {
+    [
+        "AccessDenied",
+        "AccountProblem",
+        "AllAccessDisabled",
+        "AuthorizationHeaderMalformed",
+        "BucketNotFound",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidArgument",
+        "InvalidBucketName",
+        "InvalidRequest",
+        "InvalidToken",
+        "MethodNotAllowed",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "NotImplemented",
+        "QuotaExceeded",
+        "RequestTimeTooSkewed",
+        "ServiceUnavailable",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+        "StorageQuotaExceeded",
+        "SubscriptionExpired",
+    ]
+    .into_iter()
+    .find(|code| *code == value)
+}
+
+/// A known S3 code from a header or bounded XML; never provider text.
+pub fn s3_error_code(response: &HttpResponse) -> Option<&'static str> {
+    // HEAD commonly has no body. Never retain provider-controlled text.
+    response
+        .header("x-amz-error-code")
+        .and_then(known_s3_error_code)
+        .or_else(|| {
+            let body = std::str::from_utf8(&response.body).ok()?;
+            let (_, error) = body.split_once("<Error>")?;
+            let (error, _) = error.split_once("</Error>")?;
+            let (_, code) = error.split_once("<Code>")?;
+            let (code, _) = code.split_once("</Code>")?;
+            known_s3_error_code(code.trim())
+        })
+}
+
+/// Read a complete, direct `Error/Code` from an already bounded audit prefix.
+/// The enclosing error can still be streaming; no provider text escapes.
+pub fn s3_audit_error_code(prefix: &[u8]) -> Option<&'static str> {
+    let mut xml = Reader::from_reader(prefix);
+    xml.config_mut().trim_text(true);
+    loop {
+        match xml.read_event().ok()? {
+            Event::Decl(_) | Event::Comment(_) => {}
+            Event::Start(tag) if tag.name().as_ref() == "Error" => break,
+            _ => return None,
+        }
+    }
+    loop {
+        match xml.read_event().ok()? {
+            Event::Start(tag) if tag.name().as_ref() == "Code" => {
+                let code = xml.read_text(tag.name()).ok()?;
+                return known_s3_error_code(code.trim());
+            }
+            Event::Start(tag) => {
+                xml.read_to_end(tag.name()).ok()?;
+            }
+            Event::Empty(tag) if tag.name().as_ref() == "Code" => return None,
+            Event::Empty(_) | Event::Comment(_) => {}
+            _ => return None,
+        }
+    }
 }
 
 /// Why a request to the store did not do what was asked. Carries a
@@ -290,13 +409,47 @@ impl<H: HttpSend> S3Remote<H> {
         hex(&Sha256::digest(named.as_bytes())[..8])
     }
 
-    /// Signs and sends, with the retries of the module doc. A 2xx or a
-    /// 404 is returned; every other status is an error.
+    pub fn transport(&self) -> &H {
+        &self.http
+    }
+
+    fn problem(
+        &self,
+        op: Operation,
+        kind: &'static str,
+        status: Option<u16>,
+        code: Option<&'static str>,
+    ) {
+        self.http.observe(Problem {
+            operation: op.name(),
+            kind,
+            status,
+            code,
+        });
+    }
+
+    fn mismatch(&self, op: Operation, status: u16) -> RemoteError {
+        self.problem(op, "mismatch", Some(status), None);
+        RemoteError::Mismatch
+    }
+
+    fn refused(&self, op: Operation, response: &HttpResponse) -> RemoteError {
+        self.problem(
+            op,
+            "refused",
+            Some(response.status),
+            s3_error_code(response),
+        );
+        RemoteError::Refused(response.status)
+    }
+
+    /// Signs and sends, with the retries of the module doc (except the
+    /// one-shot audit GET). Returns a 2xx or a 404; otherwise an error.
     #[allow(clippy::too_many_arguments)]
     async fn call<T: Clock>(
         &self,
         clock: &T,
-        method: &'static str,
+        op: Operation,
         path: &str,
         query: &[(&str, &str)],
         headers: &[(&str, &str)],
@@ -313,6 +466,7 @@ impl<H: HttpSend> S3Remote<H> {
             secret: self.cfg.secret_key.expose().as_bytes(),
             region: &self.cfg.region,
         };
+        let method = op.method();
         let unsigned = Unsigned {
             method,
             path,
@@ -320,12 +474,16 @@ impl<H: HttpSend> S3Remote<H> {
             headers,
             payload_sha256: &payload_sha256,
         };
+        let tries = if op == Operation::Get { 1 } else { TRIES };
         let mut pause = FIRST_PAUSE_MS;
-        for attempt in 1..=TRIES {
+        for attempt in 1..=tries {
             // Signed anew for each try: the date is part of the signature.
             let now = clock.now().0;
             let signed = sign_request(&key, &self.cfg.host, now.div_euclid(1000), &unsigned)
-                .map_err(|_| RemoteError::Unsignable)?;
+                .map_err(|_| {
+                    self.problem(op, "unsignable", None, None);
+                    RemoteError::Unsignable
+                })?;
             let request = HttpRequest {
                 method,
                 url: format!("https://{}{}", self.cfg.host, signed.target),
@@ -333,28 +491,48 @@ impl<H: HttpSend> S3Remote<H> {
                 body: body.to_vec(),
                 max_answer,
             };
-            match self.http.send(&request).await {
-                // No answer, an answer longer than was asked for, a 5xx
-                // or a 429: tried again.
-                Err(NoAnswer) => {}
-                Ok(r) if r.body.len() > max_answer => {}
-                Ok(r) if (500..600).contains(&r.status) || r.status == 429 => {}
+            let exhausted = match self.http.send(&request).await {
+                Err(TransportError::BodyTooLong) if op == Operation::Get => {
+                    return Err(self.mismatch(op, 200));
+                }
+                Err(_) => None,
+                Ok(r) if r.body.len() > max_answer => {
+                    if op == Operation::Get && r.status == 200 {
+                        return Err(self.mismatch(op, r.status));
+                    }
+                    None
+                }
+                Ok(r) if (500..600).contains(&r.status) || r.status == 429 => Some(r),
+                Ok(r)
+                    if op == Operation::Get
+                        && (400..500).contains(&r.status)
+                        // A missing object is an audit problem, not GET unavailability.
+                        && r.status != 404
+                        && s3_error_code(&r) == Some("SlowDown") =>
+                {
+                    Some(r)
+                }
                 Ok(r) if (200..300).contains(&r.status) || r.status == 404 => return Ok(r),
-                Ok(r) => return Err(RemoteError::Refused(r.status)),
-            }
-            if attempt < TRIES {
+                Ok(r) => return Err(self.refused(op, &r)),
+            };
+            if attempt < tries {
                 // Up to half as long again, so that jobs do not retry in step.
                 let jitter = now.rem_euclid(1 + (pause / 2) as i64) as u64;
                 self.http.pause(pause + jitter).await;
                 pause *= 4;
+            } else if let Some(r) = exhausted {
+                self.problem(op, "retry_exhausted", Some(r.status), s3_error_code(&r));
+            } else {
+                self.problem(op, "no_answer", None, None);
             }
         }
         Err(RemoteError::Unavailable)
     }
 
     /// The path of `key` in the store, under the bucket and the prefix.
-    fn path(&self, key: &str) -> Result<String, RemoteError> {
+    fn path(&self, op: Operation, key: &str) -> Result<String, RemoteError> {
         if !key_ok(key) {
+            self.problem(op, "unsignable", None, None);
             return Err(RemoteError::Unsignable);
         }
         Ok(format!("/{}/{}{key}", self.cfg.bucket, self.cfg.prefix))
@@ -366,11 +544,20 @@ impl<H: HttpSend> S3Remote<H> {
         clock: &T,
         key: &str,
     ) -> Result<Option<Listed>, RemoteError> {
+        Ok(self.head_for(clock, key, Operation::Plan).await?.0)
+    }
+
+    async fn head_for<T: Clock>(
+        &self,
+        clock: &T,
+        key: &str,
+        op: Operation,
+    ) -> Result<(Option<Listed>, u16), RemoteError> {
         let r = self
             .call(
                 clock,
-                "HEAD",
-                &self.path(key)?,
+                op,
+                &self.path(op, key)?,
                 &[],
                 &[],
                 &[],
@@ -378,17 +565,57 @@ impl<H: HttpSend> S3Remote<H> {
             )
             .await?;
         if r.status == 404 {
-            return Ok(None);
+            return Ok((None, r.status));
         }
         let size = r.header("content-length").and_then(|v| v.parse().ok());
         let etag = r.header("etag").map(|v| v.trim_matches('"').to_string());
         match (size, etag) {
-            (Some(size), Some(etag)) => Ok(Some(Listed {
-                key: key.to_string(),
-                size,
-                etag,
-            })),
-            _ => Err(RemoteError::Mismatch),
+            (Some(size), Some(etag)) => Ok((
+                Some(Listed {
+                    key: key.to_string(),
+                    size,
+                    etag,
+                }),
+                r.status,
+            )),
+            _ => Err(self.mismatch(op, r.status)),
+        }
+    }
+
+    /// One read-only audit request. Absence is distinct from refusal or
+    /// unavailability; the response body is never read past 1 MiB.
+    pub async fn get<T: Clock>(
+        &self,
+        clock: &T,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, RemoteError> {
+        let op = Operation::Get;
+        let r = self
+            .call(
+                clock,
+                op,
+                &self.path(op, key)?,
+                &[],
+                &[],
+                &[],
+                MAX_AUDIT_BYTES,
+            )
+            .await?;
+        match r.status {
+            200 => Ok(Some(r.body)),
+            404 => {
+                let code = s3_error_code(&r);
+                if matches!(code, Some("NoSuchBucket" | "BucketNotFound")) {
+                    self.problem(op, "refused", Some(404), code);
+                    return Err(RemoteError::Refused(404));
+                }
+                self.problem(op, "missing", Some(404), code);
+                Ok(None)
+            }
+            status => {
+                self.problem(op, "unexpected_status", Some(status), None);
+                Err(RemoteError::Unavailable)
+            }
         }
     }
 
@@ -408,22 +635,24 @@ impl<H: HttpSend> S3Remote<H> {
             ("content-md5", content_md5.as_str()),
             ("x-amz-meta-sha256", sha256.as_str()),
         ];
-        let path = self.path(key)?;
+        let op = Operation::Put;
+        let path = self.path(op, key)?;
         let r = self
-            .call(clock, "PUT", &path, &[], &headers, bytes, MAX_ANSWER_BYTES)
+            .call(clock, op, &path, &[], &headers, bytes, MAX_ANSWER_BYTES)
             .await?;
         if r.status == 404 {
             // The bucket is not there.
-            return Err(RemoteError::Refused(404));
+            return Err(self.refused(op, &r));
         }
-        match self.head(clock, key).await? {
+        let (stored, status) = self.head_for(clock, key, Operation::Verify).await?;
+        match stored {
             Some(stored)
                 if stored.size == bytes.len() as u64
                     && stored.etag.eq_ignore_ascii_case(&hex(&md5)) =>
             {
                 Ok(())
             }
-            _ => Err(RemoteError::Mismatch),
+            _ => Err(self.mismatch(Operation::Verify, status)),
         }
     }
 
@@ -453,14 +682,15 @@ impl<H: HttpSend> S3Remote<H> {
         if !start_after.is_empty() {
             query.push(("start-after", full_after.as_str()));
         }
+        let op = Operation::List;
         let path = format!("/{}", self.cfg.bucket);
         let r = self
-            .call(clock, "GET", &path, &query, &[], &[], MAX_LIST_BYTES)
+            .call(clock, op, &path, &query, &[], &[], MAX_LIST_BYTES)
             .await?;
         if r.status == 404 {
-            return Err(RemoteError::Refused(404));
+            return Err(self.refused(op, &r));
         }
-        let listed = parse_list(&r.body).map_err(|_| RemoteError::Mismatch)?;
+        let listed = parse_list(&r.body).map_err(|_| self.mismatch(op, r.status))?;
         let mut page = CopyPage {
             truncated: listed.truncated,
             ..CopyPage::default()
@@ -474,7 +704,7 @@ impl<H: HttpSend> S3Remote<H> {
                 .filter(|k| k.len() <= MAX_KEY_BYTES)
                 .and_then(|k| k.strip_prefix(own.as_str()))
                 .filter(|k| k.starts_with(prefix) && *k > last.as_str())
-                .ok_or(RemoteError::Mismatch)?
+                .ok_or_else(|| self.mismatch(op, r.status))?
                 .to_string();
             last.clone_from(&key);
             if key_ok(&key) {
@@ -487,7 +717,7 @@ impl<H: HttpSend> S3Remote<H> {
         // The caller goes on from the last key, so a page that says
         // "more" must name one.
         if page.truncated && page.last.is_none() {
-            return Err(RemoteError::Mismatch);
+            return Err(self.mismatch(op, r.status));
         }
         Ok(page)
     }

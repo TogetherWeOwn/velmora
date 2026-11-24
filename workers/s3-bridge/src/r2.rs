@@ -281,6 +281,74 @@ impl BodyReads for ByobReads {
     }
 }
 
+async fn read_body(object: worker::Object, span: Option<ByteSpan>) -> Result<Vec<u8>> {
+    let body = object
+        .body()
+        .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
+    let expected = span.map_or_else(|| object.size(), |s| s.len);
+    let stream = match body.response_body().map_err(blob_err("get body"))? {
+        worker::ResponseBody::Stream(stream) => stream,
+        _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
+    };
+    let Some(mut reads) = ByobReads::new(&stream, expected) else {
+        return Err(BridgeError::Blob("r2: get body failed".into()));
+    };
+    fill_body(&mut reads, expected).await.map_err(|e| {
+        BridgeError::Blob(
+            match (e, span) {
+                (BodyError::Short, Some(_)) => "r2: short range",
+                (BodyError::Short, None) => "r2: short body",
+                (BodyError::Long, _) => "r2: long body",
+                (BodyError::Read, _) => "r2: get body failed",
+            }
+            .into(),
+        )
+    })
+}
+
+impl velmora_bridge::audit::AuditSource for R2Blobs {
+    async fn page(&self, prefix: &str, after: &str) -> Result<velmora_bridge::audit::AuditPage> {
+        use velmora_bridge::audit::{AuditEntry, AuditPage, PAGE_SIZE};
+        let page = self
+            .bucket
+            .list()
+            .prefix(prefix)
+            .start_after(after)
+            .limit(PAGE_SIZE)
+            .execute()
+            .await
+            .map_err(blob_err("audit list"))?;
+        Ok(AuditPage {
+            objects: page
+                .objects()
+                .iter()
+                .map(|o| AuditEntry {
+                    key: o.key(),
+                    size: o.size(),
+                    uploaded: velmora_bridge::UnixMs(o.uploaded().as_millis() as i64),
+                })
+                .collect(),
+            truncated: page.truncated(),
+        })
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let Some(object) = self
+            .bucket
+            .get(key)
+            .execute()
+            .await
+            .map_err(blob_err("audit get"))?
+        else {
+            return Ok(None);
+        };
+        if object.size() > velmora_bridge::remote::MAX_AUDIT_BYTES as u64 {
+            return Ok(None);
+        }
+        read_body(object, None).await.map(Some)
+    }
+}
+
 impl BlobStore for R2Blobs {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
         if self.tombstone_delay_ms > 0
@@ -342,29 +410,7 @@ impl BlobStore for R2Blobs {
         let Some(object) = req.execute().await.map_err(blob_err("get"))? else {
             return Ok(None);
         };
-        let body = object
-            .body()
-            .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
-        let expected = span.map_or_else(|| object.size(), |s| s.len);
-        let stream = match body.response_body().map_err(blob_err("get body"))? {
-            worker::ResponseBody::Stream(stream) => stream,
-            _ => return Err(BridgeError::Blob("r2: get returned no body".into())),
-        };
-        let Some(mut reads) = ByobReads::new(&stream, expected) else {
-            return Err(BridgeError::Blob("r2: get body failed".into()));
-        };
-        let bytes = fill_body(&mut reads, expected).await;
-        bytes.map(Some).map_err(|e| {
-            BridgeError::Blob(
-                match (e, span) {
-                    (BodyError::Short, Some(_)) => "r2: short range",
-                    (BodyError::Short, None) => "r2: short body",
-                    (BodyError::Long, _) => "r2: long body",
-                    (BodyError::Read, _) => "r2: get body failed",
-                }
-                .into(),
-            )
-        })
+        read_body(object, span).await.map(Some)
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {
