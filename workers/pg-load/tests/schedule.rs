@@ -93,6 +93,16 @@ fn dispatch_plan_cannot_pass_validation_with_an_underfilled_minute() {
 }
 
 #[test]
+fn dispatch_plan_cannot_pass_validation_with_an_overfilled_minute() {
+    // The unvalidated plan is [24, 21, 21]; only the upper bound is exceeded.
+    let input = r#"{"batches_per_minute":22,"minutes":3,"mix":{"dispatch":1}}"#;
+    assert_eq!(
+        parse_config(input).unwrap_err(),
+        "load configuration cannot schedule the requested write rate per minute"
+    );
+}
+
+#[test]
 fn nearest_rank_percentile_does_not_impute_missing_observations() {
     assert_eq!(percentile(&mut [], 99), None);
     assert_eq!(percentile(&mut [10., 5., 8., 1.], 95), Some(10.));
