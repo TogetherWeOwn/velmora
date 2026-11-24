@@ -2079,9 +2079,11 @@ operator-owned directory (`umask 077`).
   uses the public schema's fixed lock by default; tests set `search_path` and
   `velmora.lock_key` for the isolated schema. For R1b, set the session's
   `velmora.cutover_attempt` to the F1 attempt id before arming so the SQL also
-  stamps the frozen PG epoch for access reconciliation. After draining, select
-  D1 with maintenance still on and apply the durable access revocations before
-  replay. Use a report taken against that exact frozen PG epoch. Before any
+  stamps the frozen PG epoch for access reconciliation. Wait at least 15
+  minutes from that stamp before producing the access report, applying it, or
+  starting replay: an older Worker invocation may still commit a revocation.
+  Select D1 with maintenance still on and apply the durable access revocations
+  before replay. Use a report taken against that exact frozen PG epoch. Before any
   revocation and before reopening, re-read the access delta in a fresh bounded
   read-only PG snapshot and require it to match the report. A matching epoch
   or WAL position alone does not prove access is unchanged. Compute the exact

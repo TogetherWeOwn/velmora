@@ -403,7 +403,7 @@ def pg_settings(path, role):
         require(sep and name in allowed and name not in values and "\r" not in value, "invalid Postgres env assignment")
         values[name] = value
     branch = values.get("PGBRANCHID")
-    require(branch is None or re.fullmatch(r"[a-z0-9_-]{1,63}", branch), "invalid PGBRANCHID")
+    require(branch is None or re.fullmatch(r"[a-z0-9]{1,63}", branch), "invalid PGBRANCHID")
     user = values.get("PGUSER")
     require(user == role or (branch is not None and user == f"{role}.{branch}"),
             f"PGUSER must name {role} with no suffix or the configured PGBRANCHID")

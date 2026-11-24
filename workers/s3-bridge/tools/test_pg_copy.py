@@ -244,6 +244,9 @@ class CopyTests(unittest.TestCase):
             pg_settings(path, "kofra_ro")
         path.write_text(lines + "PGUSER=kofra_ro.right\n")
         self.assertEqual(pg_settings(path, "kofra_ro")[0]["user"], "kofra_ro.right")
+        path.write_text(lines.replace("=right", "=right_branch") + "PGUSER=kofra_ro.right_branch\n")
+        with self.assertRaisesRegex(Failure, "invalid PGBRANCHID"):
+            pg_settings(path, "kofra_ro")
 
     def test_worker_history_allows_only_f6_pg_versions(self):
         verify = runpy.run_path(str(OPS / "pg-cutover-disarm.py"))["verify_deploy_history"]
