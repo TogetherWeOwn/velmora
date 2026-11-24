@@ -2032,7 +2032,7 @@ operator-owned directory (`umask 077`).
    jq -er '.parts[] | [.key, .bytes, .sha256] | @tsv' export.manifest.json > export.parts.tsv
    : > export.sql.zst
    while IFS="$(printf '\t')" read -r key bytes digest; do
-     rclone copyto -- "$EXPORT_REMOTE:$EXPORT_BUCKET/$key" export.part
+     rclone copyto --ignore-times -- "$EXPORT_REMOTE:$EXPORT_BUCKET/$key" export.part
      test "$(wc -c < export.part)" -eq "$bytes"
      printf '%s  export.part\n' "$digest" | sha256sum --check --status
      cat export.part >> export.sql.zst
@@ -2045,7 +2045,7 @@ operator-owned directory (`umask 077`).
 
    ```sh
    python3 ops/pg-copy.py --capture-boundaries --f1 f1.json > boundaries.json
-   python3 ops/pg-copy.py --export export.sql --sqlite frozen.sqlite --f1 f1.json \
+   python3 ops/pg-copy.py --export export.sql.zst --sqlite frozen.sqlite --f1 f1.json \
      --manifest export.manifest.json --source-boundaries boundaries.json > census.json
    ```
 
