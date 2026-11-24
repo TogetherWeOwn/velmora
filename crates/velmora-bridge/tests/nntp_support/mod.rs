@@ -1185,7 +1185,7 @@ impl Catalog for MemCatalog {
     async fn hot_ctl_load(&self, _: &[&str]) -> Result<Vec<Option<i64>>> {
         unused()
     }
-    async fn hot_ctl_store(&self, _: &[(&str, i64)]) -> Result<()> {
+    async fn hot_ctl_store(&self, _: Option<UnixMs>, _: &[(&str, i64)]) -> Result<bool> {
         unused()
     }
     async fn evict_candidates(&self, _: u32) -> Result<Vec<EvictCandidate>> {

@@ -773,7 +773,7 @@ async fn fixed_and_shadow_keep_the_fixed_cap_in_the_check_and_first_batch() {
         );
         hot.bridge()
             .catalog
-            .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+            .hot_ctl_store(None, &[("hot_cap_target", (10 * GIB) as i64)])
             .await
             .unwrap();
         assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
@@ -812,7 +812,7 @@ async fn adaptive_caps_fall_back_or_clamp_untrusted_targets() {
     ] {
         hot.bridge()
             .catalog
-            .hot_ctl_store(&[("hot_cap_target", value)])
+            .hot_ctl_store(None, &[("hot_cap_target", value)])
             .await
             .unwrap();
         let status = hot.admin_status().await;
@@ -822,10 +822,13 @@ async fn adaptive_caps_fall_back_or_clamp_untrusted_targets() {
     hot.cfg_mut().hot_ctl.max_bytes = None;
     hot.bridge()
         .catalog
-        .hot_ctl_store(&[
-            ("hot_cap_target", (2048 * GIB) as i64),
-            ("hot_ctl_applied_cap", (2048 * GIB) as i64),
-        ])
+        .hot_ctl_store(
+            None,
+            &[
+                ("hot_cap_target", (2048 * GIB) as i64),
+                ("hot_ctl_applied_cap", (2048 * GIB) as i64),
+            ],
+        )
         .await
         .unwrap();
     let status = hot.admin_status().await;
@@ -847,10 +850,13 @@ async fn an_unreadable_adaptive_cap_does_not_evict_at_the_fixed_threshold() {
         &x,
     );
     let cat = &hot.bridge().catalog;
-    cat.hot_ctl_store(&[
-        ("hot_cap_target", (200 * GIB) as i64),
-        ("hot_ctl_applied_cap", (200 * GIB) as i64),
-    ])
+    cat.hot_ctl_store(
+        None,
+        &[
+            ("hot_cap_target", (200 * GIB) as i64),
+            ("hot_ctl_applied_cap", (200 * GIB) as i64),
+        ],
+    )
     .await
     .unwrap();
     assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
@@ -881,7 +887,7 @@ async fn switching_from_shadow_starts_at_the_real_fixed_threshold() {
     );
     hot.bridge()
         .catalog
-        .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+        .hot_ctl_store(None, &[("hot_cap_target", (10 * GIB) as i64)])
         .await
         .unwrap();
     let (shadow, _) = hot.dispatch_and_evict().await;
@@ -968,11 +974,14 @@ async fn a_stale_controller_does_not_cut_an_applied_cap_above_the_fixed_cap() {
     let bridge = hot.bridge();
     bridge
         .catalog
-        .hot_ctl_store(&[
-            ("hot_cap_target", (400 * GIB) as i64),
-            ("hot_ctl_applied_cap", (400 * GIB) as i64),
-            ("hot_ctl_at", bridge.clock.now().0),
-        ])
+        .hot_ctl_store(
+            None,
+            &[
+                ("hot_cap_target", (400 * GIB) as i64),
+                ("hot_ctl_applied_cap", (400 * GIB) as i64),
+                ("hot_ctl_at", bridge.clock.now().0),
+            ],
+        )
         .await
         .unwrap();
     assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
@@ -993,7 +1002,7 @@ async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
     })
     .await;
     let cat = &hot.bridge().catalog;
-    cat.hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+    cat.hot_ctl_store(None, &[("hot_cap_target", (10 * GIB) as i64)])
         .await
         .unwrap();
     *cat.sql.fail_matching.borrow_mut() = Some(("FROM meta WHERE k IN (?1,?2,?3,?4", 0));
@@ -1095,9 +1104,8 @@ async fn overlapping_controls_from_one_snapshot_apply_one_step() {
     .expect("first controller reaches the metadata batch");
     let second = bridge.dispatch().await.unwrap().hot_ctl.unwrap();
     bridge.catalog.sql.selected_batch.release();
-    let first = first.await.unwrap().hot_ctl.unwrap();
-    assert_eq!(first, second);
-    assert_eq!((first.target, first.step), (90 * GIB, "shrink"));
+    assert!(first.await.unwrap().hot_ctl.is_none());
+    assert_eq!((second.target, second.step), (90 * GIB, "shrink"));
     assert_eq!(
         bridge
             .catalog
@@ -1105,6 +1113,79 @@ async fn overlapping_controls_from_one_snapshot_apply_one_step() {
             .await
             .unwrap(),
         vec![Some((90 * GIB) as i64)]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stale_hold_cannot_erase_a_competing_grows_cooldown() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let x = hot.released("competing-control-ticks").await;
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 107374182400 WHERE id = ?1",
+        &x,
+    );
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    hot.bridge().clock.advance_secs(3600);
+    hot.check_due();
+    let bridge = hot.bridge();
+    let cat = &bridge.catalog;
+    cat.hot_counters_add(96 * GIB).await.unwrap();
+    cat.sql
+        .exec(
+            "INSERT INTO meta(k,v) VALUES ('hotg_first', 4294967296)",
+            &[],
+        )
+        .await
+        .unwrap();
+    // The first decision observes a 96% hit rate, between the floor and
+    // shrink margin. Stop its hold before the batch reaches SQLite.
+    cat.sql.stall_batch_key.set(Some("hot_ctl_at"));
+    let mut old = pin!(bridge.dispatch());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            assert!(old.as_mut().poll(cx).is_pending());
+            if cat.sql.stall_batch_key.get().is_none() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("old tick reached its metadata batch");
+    assert_eq!(
+        cat.hot_ctl_load(&["hot_ctl_grow_at"]).await.unwrap(),
+        vec![Some(-1)]
+    );
+
+    // The next tick sees the new eligible misses and grows. Its decision
+    // commits first even though both ticks loaded the same state version.
+    cat.sql
+        .exec(
+            "INSERT INTO meta(k,v) VALUES ('hotg_24h', 322122547200)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let grew = bridge.dispatch().await.unwrap().hot_ctl.unwrap();
+    assert_eq!((grew.target, grew.step), (200 * GIB, "grow"));
+    cat.sql.selected_batch.release();
+    let stale = old.await.unwrap();
+    assert_eq!(
+        cat.hot_ctl_load(&["hot_cap_target", "hot_ctl_grow_at"])
+            .await
+            .unwrap(),
+        vec![Some((200 * GIB) as i64), Some(bridge.clock.now().0)]
+    );
+    assert!(
+        stale.hot_ctl.is_none(),
+        "a lost state update is not a decision"
     );
 }
 
@@ -1127,7 +1208,7 @@ async fn adaptive_ten_gib_minimum_drains_then_reads_back_byte_exact_from_fake_nn
     );
     hot.bridge()
         .catalog
-        .hot_ctl_store(&[("hot_cap_target", (10 * GIB) as i64)])
+        .hot_ctl_store(None, &[("hot_cap_target", (10 * GIB) as i64)])
         .await
         .unwrap();
     let (report, ran) = hot.dispatch_and_evict().await;

@@ -991,8 +991,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn hot_ctl_load(&self, keys: &[&str]) -> Result<Vec<Option<i64>>> {
         hotctl::load(self, keys).await
     }
-    async fn hot_ctl_store(&self, entries: &[(&str, i64)]) -> Result<()> {
-        hotctl::store(self, entries).await
+    async fn hot_ctl_store(
+        &self,
+        expected_at: Option<UnixMs>,
+        entries: &[(&str, i64)],
+    ) -> Result<bool> {
+        hotctl::store(self, expected_at, entries).await
     }
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
         hot::evict_candidates(self, limit).await

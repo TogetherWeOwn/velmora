@@ -1532,8 +1532,14 @@ pub trait Catalog {
     async fn hot_counters_add(&self, hit_bytes: u64) -> Result<()>;
     /// Loads controller metadata and counters in the requested key order.
     async fn hot_ctl_load(&self, keys: &[&str]) -> Result<Vec<Option<i64>>>;
-    /// Atomically replaces only controller state keys, not counters.
-    async fn hot_ctl_store(&self, entries: &[(&str, i64)]) -> Result<()>;
+    /// Atomically replaces controller state (not counters) only if the
+    /// snapshot's controller timestamp is still current. `false`: another
+    /// tick stored first; no part of this decision was written.
+    async fn hot_ctl_store(
+        &self,
+        expected_at: Option<UnixMs>,
+        entries: &[(&str, i64)],
+    ) -> Result<bool>;
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
     /// Starts an eviction in one statement that re-checks the extent:

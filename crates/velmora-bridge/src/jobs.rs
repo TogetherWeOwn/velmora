@@ -1083,10 +1083,15 @@ where
         {
             entries.extend([(HOT_CAP_KEYS[0], target), (HOT_CAP_KEYS[1], applied)]);
         }
-        if self.catalog.hot_ctl_store(&entries).await.is_err() {
-            report.reason = "hold_err";
-            report.step = "hold";
-            return Some(report);
+        let expected_at = rows.get("hot_ctl_at").copied().map(UnixMs);
+        match self.catalog.hot_ctl_store(expected_at, &entries).await {
+            Ok(true) => {}
+            Ok(false) => return None, // A competing tick saved first.
+            Err(_) => {
+                report.reason = "hold_err";
+                report.step = "hold";
+                return Some(report);
+            }
         }
         report.target = decision.target;
         if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
