@@ -522,10 +522,9 @@ fails the job before the deploy). Step 2 in production:
    (production)` takes the bundle the run built, and it is kept for 1
    day. If it is older, wait for the day of the next deploy.
 4. Check the other variables of the `production` environment that the
-   deploy job writes into the config (every `VELMORA_*` one the step
-   "Generate the production wrangler config" reads, among them
-   `VELMORA_S3_HOST`, `VELMORA_D1_DATABASE_ID`, `VELMORA_RECOVERY_COPY`,
-   `VELMORA_RECOVERY_PREFIX` and `VELMORA_VERIFY_MODE`): the run in
+   deploy job writes into the config (every variable the step
+   "Generate the production wrangler config" reads, including
+   `RECOVERY_COPY_PARALLEL_FRESH` and the `VELMORA_*` variables): the run in
    step 5 deploys their values of now, not those of the serving deploy.
    Compare them with what the serving version carries:
    `wrangler versions view <id> --json` lists its variables and

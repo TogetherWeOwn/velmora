@@ -841,8 +841,10 @@ jobs:
       # region, bucket and keys are Worker secrets: this job writes none
       # of them, and a plain var set outside it is gone after a deploy.
       # RECOVERY_COPY_PARALLEL_FRESH adds its binding to prod [vars]
-      # only for "on". Unset, empty or "off" leaves it absent; any
-      # other value fails this step before Wrangler runs.
+      # only for "on". Unset, empty or "off" omits the binding; any
+      # other value fails this step before Wrangler runs. The Worker
+      # falls back to secrets and deploys keep them: never create a
+      # Worker secret named RECOVERY_COPY_PARALLEL_FRESH.
       # The verify stage is switched the same way: VELMORA_VERIFY_MODE
       # (unset, empty or "body": the shipped "body" stays; "light"). Any
       # other value fails this step and nothing is deployed. The shipped
