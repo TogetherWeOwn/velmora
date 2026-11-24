@@ -164,7 +164,7 @@ fn only_the_named_check_is_a_guard_refusal() {
     for code in ["55P03", "57014", "53300", "53400", "40001", "40P01"] {
         assert!(matches!(classify(code,None), BridgeError::Sql(e) if e=="pg: overloaded"));
     }
-    for code in ["22021", "22P02", "42601", "08006"] {
+    for code in ["22021", "22P02", "25006", "42601", "08006"] {
         assert!(matches!(classify(code,None), BridgeError::Sql(e) if e=="pg: statement failed"));
     }
 }
