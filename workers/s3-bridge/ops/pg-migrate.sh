@@ -139,7 +139,7 @@ def connection(path):
         if not line.strip() or line.lstrip().startswith('#'):
             continue
         key, sep, value = line.partition('=')
-        if not sep or key not in DATA_ENV | {'PGSCHEMA', 'PGLOCKKEY', 'PGMIGRATELOCKKEY'} or key in values or '\r' in value:
+        if not sep or key not in DATA_ENV | {'PGSCHEMA', 'PGLOCKKEY', 'PGMIGRATELOCKKEY', 'PGBRANCHID'} or key in values or '\r' in value:
             die(f'invalid or duplicate connection entry on line {n}')
         values[key] = value
     schema = values.pop('PGSCHEMA', 'public')
@@ -152,8 +152,14 @@ def connection(path):
     if (schema == 'public' and (lock, migration_lock) != (W1, MIGRATOR)) or (
             schema != 'public' and ({lock, migration_lock} & {W1, MIGRATOR} or lock == migration_lock)):
         die('public must use the fixed W1 and migrator keys; lane keys must be distinct and non-production')
-    if values.get('PGUSER') != 'kofra_migrate' or not values.get('PGHOST') or not values.get('PGDATABASE'):
-        die('PGHOST, PGDATABASE and PGUSER=kofra_migrate are required')
+    branch = values.pop('PGBRANCHID', None)
+    if branch is not None and not re.fullmatch(r'[a-z0-9]{1,63}', branch):
+        die('PGBRANCHID must be a nonempty literal branch id')
+    allowed_users = {'kofra_migrate'}
+    if branch is not None:
+        allowed_users.add(f'kofra_migrate.{branch}')
+    if values.get('PGUSER') not in allowed_users or not values.get('PGHOST') or not values.get('PGDATABASE'):
+        die('PGHOST, PGDATABASE and PGUSER=kofra_migrate (optionally suffixed with the exact PGBRANCHID) are required')
     host = values['PGHOST']
     if ',' in host or not re.fullmatch(r'[A-Za-z0-9_.-]+', values['PGDATABASE']):
         die('only one host and a literal database name are supported')

@@ -20,7 +20,10 @@ access, but cannot reach the schema until activation. The read-only login has
 Pass the path of a regular, caller-owned `0600` file to `ops/pg-migrate.sh`.
 The syntax is one literal `NAME=value` per line, with blank lines and `#`
 comments allowed: no shell expansion, `export`, quote processing, or inline
-comments. Required keys are `PGHOST`, `PGDATABASE`, and `PGUSER=kofra_migrate`.
+comments. Required keys are `PGHOST`, `PGDATABASE`, and `PGUSER`. Use
+`PGUSER=kofra_migrate` for direct PostgreSQL or `kofra_migrate.BRANCH_ID` for
+PlanetScale routing, with that exact literal branch id in `PGBRANCHID`.
+The server session must still identify as the bare SQL role `kofra_migrate`.
 Optional libpq keys are `PGPORT`, `PGPASSWORD`, `PGSSLMODE`, `PGSSLROOTCERT`,
 and `PGCONNECT_TIMEOUT`. Remote connections require `PGSSLMODE=verify-full`.
 No value is passed in command-line arguments. Keep the file outside the repo.
