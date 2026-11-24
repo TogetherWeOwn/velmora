@@ -201,6 +201,88 @@ fn single_restore_does_not_require_packs_but_full_verification_does() {
 }
 
 #[test]
+fn verify_kit_accepts_the_builder_detached_checksum() {
+    let kit = Fixture::new();
+    kit.fixture();
+    let checksum = kit.0.join("manifest.json.sha256");
+    let digest = fs::read_to_string(&checksum).unwrap();
+    // The kit packager writes the GNU sha256sum text-mode representation.
+    fs::write(checksum, format!("{digest}  manifest.json\n")).unwrap();
+
+    let verify = kit.run("key", &["verify-kit"]);
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn verify_kit_accepts_binary_mode_and_legacy_bare_checksums() {
+    let kit = Fixture::new();
+    kit.fixture();
+    let checksum = kit.0.join("manifest.json.sha256");
+    let digest = fs::read_to_string(&checksum).unwrap();
+    for input in [
+        digest.clone(),
+        format!("{digest}\n"),
+        format!("{digest}\r\n"),
+        format!("{digest} *manifest.json\n"),
+    ] {
+        fs::write(&checksum, &input).unwrap();
+        let verify = kit.run("key", &["verify-kit"]);
+        assert!(
+            verify.status.success(),
+            "{input:?}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
+}
+
+#[test]
+fn verify_kit_rejects_malformed_detached_checksums() {
+    let kit = Fixture::new();
+    kit.fixture();
+    let checksum = kit.0.join("manifest.json.sha256");
+    let digest = fs::read_to_string(&checksum).unwrap();
+    let canonical = format!("{digest}  manifest.json\n");
+    for (case, input) in [
+        (
+            "short digest",
+            format!("{}  manifest.json\n", &digest[..63]),
+        ),
+        ("long bare digest", format!("{digest}0")),
+        ("uppercase bare digest", format!("A{}", &digest[1..])),
+        (
+            "uppercase digest",
+            format!("A{}  manifest.json\n", &digest[1..]),
+        ),
+        (
+            "non-hex digest",
+            format!("g{}  manifest.json\n", &digest[1..]),
+        ),
+        ("wrong filename", format!("{digest}  manifest.toml\n")),
+        (
+            "single separator space",
+            format!("{digest} manifest.json\n"),
+        ),
+        ("missing linefeed", format!("{digest}  manifest.json")),
+        ("wrong line ending", format!("{digest}  manifest.json\r\n")),
+        ("multiple lines", format!("{digest}\n{digest}\n")),
+        ("oversized", format!("{canonical}{}", " ".repeat(4096))),
+    ] {
+        fs::write(&checksum, input).unwrap();
+        let verify = kit.run("key", &["verify-kit"]);
+        assert!(!verify.status.success(), "accepted {case}");
+        assert_eq!(
+            String::from_utf8_lossy(&verify.stderr),
+            "recovery failed: invalid recovery kit manifest\n",
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn verify_kit_rejects_an_undeclared_record_pack() {
     let kit = Fixture::new();
     kit.fixture();
