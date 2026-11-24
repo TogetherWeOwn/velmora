@@ -148,13 +148,11 @@ macro_rules! body_failed {
 /// the range of the key that is read: the job that holds the claim stamps
 /// its rows after it.
 macro_rules! fresh_pass {
-    ($backbones:literal) => {
+    () => {
         concat!(
             "v.extent_id = ?1 AND v.verified_at <= ?6 AND v.lease_token = ?4 \
                AND v.verified_at >= (SELECT updated_at FROM outbox WHERE extent_id = ?1) \
-               AND v.backbone IN (",
-            $backbones,
-            ") AND ",
+               AND v.backbone IN (SELECT value FROM json_each(?7)) AND ",
             counts!(),
             " AND ",
             latest!(),
@@ -234,7 +232,11 @@ pub(super) async fn claim<S: Sql>(
     let rows = c
         .sql
         .query(
-            CLAIM,
+            "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4, \
+               lease_until = ?5, attempts = attempts + 1, updated_at = ?6, sent_at = NULL \
+             WHERE extent_id = ?1 AND generation_id = ?2 AND stage = ?3 AND next_at <= ?6 \
+               AND (lease_until IS NULL OR lease_until < ?6) \
+             RETURNING lease_token, attempts, cursor",
             &[
                 text(extent.as_str()),
                 text(generation.as_str()),
@@ -306,7 +308,14 @@ pub(super) async fn advance<S: Sql>(
     next_at: UnixMs,
     now: UnixMs,
 ) -> Result<bool> {
-    let sql = ADVANCE;
+    let sql = concat!(
+        "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, cursor = 0, \
+           last_error = NULL, \
+           sent_at = CASE WHEN ?5 IN ('post', 'verify', 'release') THEN ?6 END, ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     fenced(c, sql, l, [text(to.as_str()), ms(next_at), ms(now)]).await
 }
 
@@ -317,7 +326,12 @@ pub(super) async fn fail<S: Sql>(
     next_at: UnixMs,
     now: UnixMs,
 ) -> Result<bool> {
-    let sql = FAIL;
+    let sql = concat!(
+        "UPDATE outbox SET next_at = ?5, last_error = ?6, updated_at = ?7, ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     fenced(c, sql, l, [ms(next_at), text(class.as_str()), ms(now)]).await
 }
 
@@ -328,7 +342,12 @@ pub(super) async fn defer<S: Sql>(
     next_at: UnixMs,
     now: UnixMs,
 ) -> Result<bool> {
-    let sql = c.sql.dialect().pick(DEFER, DEFER_PG);
+    let sql = concat!(
+        "UPDATE outbox SET next_at = ?5, updated_at = ?6, attempts = MAX(attempts - 1, 0), ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     fenced(c, sql, l, [ms(next_at), ms(now)]).await
 }
 
@@ -339,10 +358,13 @@ pub(super) async fn defer_at<S: Sql>(
     next_at: UnixMs,
     now: UnixMs,
 ) -> Result<bool> {
-    let sql = c
-        .sql
-        .dialect()
-        .pick(DEFER_WITH_CURSOR, DEFER_WITH_CURSOR_PG);
+    let sql = concat!(
+        "UPDATE outbox SET next_at = ?5, updated_at = ?6, cursor = ?7, \
+         attempts = MAX(attempts - 1, 0), ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     let cursor = SqlValue::Int(i64::from(cursor));
     fenced(c, sql, l, [ms(next_at), ms(now), cursor]).await
 }
@@ -353,7 +375,7 @@ pub(super) async fn set_cursor<S: Sql>(
     cursor: u32,
     _now: UnixMs,
 ) -> Result<bool> {
-    let sql = SET_CURSOR;
+    let sql = concat!("UPDATE outbox SET cursor = ?5 WHERE ", held!());
     fenced(c, sql, l, [SqlValue::Int(i64::from(cursor))]).await
 }
 
@@ -368,7 +390,19 @@ pub(super) async fn job_extent<S: Sql>(
 ) -> Result<Option<JobExtent>> {
     // The extent is in service while any live generation references it,
     // not only the one it was written for (which the outbox row names).
-    let sql = JOB_EXTENT;
+    let sql = concat!(
+        "SELECT e.id, e.bucket_id, e.generation_id, e.state, e.seq, e.plain_offset, \
+           e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
+           e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
+           e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
+           b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
+           CASE WHEN ",
+        live_ref!("e.id"),
+        " THEN 'live' ELSE g.state END, e.parity_count \
+         FROM extents e JOIN buckets b ON b.id = e.bucket_id \
+         JOIN generations g ON g.id = e.generation_id \
+         WHERE e.id = ?1 AND e.generation_id = ?2"
+    );
     let rows = c
         .sql
         .query(sql, &[text(extent.as_str()), text(generation.as_str())])
@@ -426,7 +460,22 @@ pub(super) async fn stored_plan<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<StoredPlan> {
-    let rows = c.sql.query(READ_ARTICLES, &[text(extent.as_str())]).await?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT 0 AS packed, id AS extent_id, -1 AS idx, NULL AS message_id, \
+               NULL AS newsgroup, plan AS headers, cipher_size AS cipher_offset, \
+               0 AS cipher_len, parity AS payload_sha256, NULL AS yenc_name, NULL AS state, \
+               NULL AS provider_id, posted_at, reposted_at \
+             FROM extents WHERE id = ?1 AND plan IS NOT NULL \
+             UNION ALL \
+             SELECT 1, extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
+               cipher_len, payload_sha256, yenc_name, state, provider_id, posted_at, \
+               reposted_at \
+             FROM articles WHERE extent_id = ?1 ORDER BY packed, idx",
+            &[text(extent.as_str())],
+        )
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -502,7 +551,10 @@ pub(super) async fn plan_articles<S: Sql>(
     stmts.push((held_guard!(), lease_params(l, [])?));
     for a in rows {
         stmts.push((
-            INSERT_UNPACKED_ARTICLE,
+            "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
+               cipher_len, payload_sha256, yenc_name, state) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'planned' \
+             WHERE (SELECT article_count FROM extents WHERE id = ?1) IS NULL",
             vec![
                 text(a.extent_id.as_str()),
                 SqlValue::Int(i64::from(a.idx)),
@@ -518,7 +570,8 @@ pub(super) async fn plan_articles<S: Sql>(
     }
     // Last: the inserts above key on the count still being unset.
     stmts.push((
-        FINISH_UNPACKED_PLAN,
+        "UPDATE extents SET article_count = ?2, plan_rev = 1 \
+         WHERE id = ?1 AND article_count IS NULL",
         vec![text(l.extent.as_str()), int(rows.len())?],
     ));
     if !fenced_batch(c, stmts).await? {
@@ -565,7 +618,9 @@ pub(super) async fn plan_packed<S: Sql>(
             // extent's `verifications` in the same batch: a pass is
             // bound to `plan_rev` and the article total only
             // (`counts!`).
-            STORE_PACKED_PLAN,
+            "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3, \
+               parity = ?5, parity_count = ?6 \
+             WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4",
             vec![
                 text(l.extent.as_str()),
                 int(count)?,
@@ -589,7 +644,14 @@ pub(super) async fn mark_posted<S: Sql>(
     provider: &str,
     now: UnixMs,
 ) -> Result<bool> {
-    let sql = MARK_ONE_POSTED;
+    let sql = concat!(
+        "UPDATE articles SET state = 'posted', provider_id = ?6, posted_at = ?7 \
+         WHERE extent_id = ?1 AND idx = ?5 \
+           AND (SELECT plan FROM extents WHERE id = ?1) IS NULL \
+           AND EXISTS (SELECT 1 FROM outbox WHERE ",
+        held!(),
+        ")"
+    );
     let extra = [SqlValue::Int(i64::from(idx)), text(provider), ms(now)];
     fenced(c, sql, l, extra).await
 }
@@ -629,9 +691,9 @@ pub(super) async fn mark_posted_many<S: Sql>(
             .map(|(idx, _)| *idx)
             .collect();
         stmts.push((
-            c.sql
-                .dialect()
-                .pick(MARK_ARTICLES_POSTED, MARK_ARTICLES_POSTED_PG),
+            "UPDATE articles SET state = 'posted', provider_id = ?3, posted_at = ?4 \
+             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
+               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL",
             vec![
                 text(l.extent.as_str()),
                 text(&idx_list(&idxs)),
@@ -645,14 +707,20 @@ pub(super) async fn mark_posted_many<S: Sql>(
     // parity articles when it has an addendum: as many distinct ones
     // below the count of both are all of them.
     stmts.push((
-        c.sql
-            .dialect()
-            .pick(MARK_PACKED_POSTED, MARK_PACKED_POSTED_PG),
+        "UPDATE extents SET posted_at = ?2 \
+         WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL \
+           AND article_count + COALESCE(parity_count, 0) = \
+               (SELECT COUNT(DISTINCT value) FROM json_each(?3) \
+                 WHERE value < article_count + COALESCE(parity_count, 0))",
         vec![text(l.extent.as_str()), ms(now), text(&idx_list(&listed))],
     ));
     // A packed plan that the call did not mark is not posted: nothing
     // is written.
-    stmts.push((GUARD_POSTED_PLAN, vec![text(l.extent.as_str())]));
+    stmts.push((
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
+           (SELECT 1 FROM extents WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL)",
+        vec![text(l.extent.as_str())],
+    ));
     if fenced_batch(c, stmts).await? {
         return Ok(true);
     }
@@ -699,15 +767,14 @@ pub(super) async fn mark_reposted_many<S: Sql>(
     let stmts: Vec<Stmt> = vec![
         (held_guard!(), lease_params(l, [])?),
         (
-            c.sql
-                .dialect()
-                .pick(MARK_ARTICLES_REPOSTED, MARK_ARTICLES_REPOSTED_PG),
+            "UPDATE articles SET reposted_at = MAX(COALESCE(reposted_at, ?3), ?3) \
+             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
+               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL",
             vec![text(l.extent.as_str()), text(&idx_list(idxs)), ms(now)],
         ),
         (
-            c.sql
-                .dialect()
-                .pick(MARK_PACKED_REPOSTED, MARK_PACKED_REPOSTED_PG),
+            "UPDATE extents SET reposted_at = MAX(COALESCE(reposted_at, ?2), ?2) \
+             WHERE id = ?1 AND plan IS NOT NULL",
             vec![text(l.extent.as_str()), ms(now)],
         ),
     ];
@@ -716,7 +783,7 @@ pub(super) async fn mark_reposted_many<S: Sql>(
 
 /// Whether the lease still holds its row (a read; nothing is extended).
 async fn renew_check<S: Sql>(c: &SqlCatalog<S>, l: &Lease) -> Result<bool> {
-    let sql = CHECK_LEASE;
+    let sql = concat!("SELECT 1 FROM outbox WHERE ", held!());
     Ok(!c.sql.query(sql, &lease_params(l, [])?).await?.is_empty())
 }
 
@@ -767,11 +834,29 @@ pub(super) async fn record_verification<S: Sql>(
             // `STAT` goes to `articles_present` (see `tally!`). A row
             // that is replaced takes the claim of the result that
             // replaces it; one that stays keeps its own.
-            WRITE_VERIFICATION,
+            "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
+               plan_rev, articles_ok, articles_present, articles_total, result, kind, mode, \
+               lease_token) \
+             VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
+               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
+               provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
+               articles_ok = excluded.articles_ok, \
+               articles_present = excluded.articles_present, \
+               articles_total = excluded.articles_total, \
+               result = excluded.result, kind = excluded.kind, mode = excluded.mode, \
+               lease_token = excluded.lease_token \
+             WHERE verifications.result = 'ok' \
+               AND NOT (verifications.kind = 'body' AND excluded.kind = 'stat' \
+                 AND excluded.result = 'ok')",
             row,
         ),
         (
-            STAMP_LAST_BODY_VERIFY,
+            "UPDATE extents SET last_verified_at = ?2 \
+             WHERE id = ?1 AND ?3 = 'ok' AND ?4 = ?5 \
+               AND ?5 = article_count + COALESCE(parity_count, 0) AND ?6 = plan_rev \
+               AND ?7 = 'body' \
+               AND (last_verified_at IS NULL OR last_verified_at < ?2)",
             vec![
                 text(v.extent_id.as_str()),
                 ms(v.verified_at),
@@ -811,7 +896,16 @@ pub(super) async fn backbone_status<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
-    let sql = BACKBONE_STATUS;
+    let sql = concat!(
+        "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, ",
+        tally!(),
+        ", v.articles_total, v.result, v.kind, v.mode, ",
+        counts!(),
+        " FROM verifications v JOIN extents e ON e.id = v.extent_id \
+         WHERE v.extent_id = ?1 AND ",
+        latest!(),
+        " ORDER BY v.backbone"
+    );
     let rows = c.sql.query(sql, &[text(extent.as_str())]).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -843,7 +937,20 @@ pub(super) async fn body_checks<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<Vec<BackboneStatus>> {
-    let sql = BODY_CHECKS;
+    let sql = concat!(
+        "SELECT b.backbone, b.provider_id, b.verified_at, b.plan_rev, b.articles_ok, \
+           b.articles_total, b.result, b.kind, b.mode, (b.kind = 'body' AND ",
+        body_on_record!(),
+        ") FROM verifications b JOIN extents e ON e.id = b.extent_id \
+         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev \
+           AND (b.kind = 'body' OR (b.mode = 'size' AND b.result = 'corrupt')) \
+           AND NOT EXISTS (SELECT 1 FROM verifications g \
+             WHERE g.extent_id = b.extent_id AND g.backbone = b.backbone \
+               AND g.plan_rev = b.plan_rev AND g.verified_at > b.verified_at \
+               AND (g.kind = 'body' OR (b.kind <> 'body' AND g.mode = 'size' \
+                 AND g.result = 'corrupt'))) \
+         ORDER BY b.backbone, b.verified_at"
+    );
     let rows = c.sql.query(sql, &[text(extent.as_str())]).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -926,29 +1033,64 @@ pub(super) async fn begin_release<S: Sql>(
     }
     let labels =
         serde_json::to_string(counting).map_err(|_| BridgeError::Invalid("backbone labels"))?;
+    macro_rules! release_guard {
+        ($states:literal) => {
+            concat!(
+                "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+                held!(),
+                " AND lease_until >= ?6) \
+         OR NOT ",
+                live_ref!("?1"),
+                " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+              AND safety_state ",
+                $states,
+                ") \
+         OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
+              WHERE ",
+                fresh_pass!(),
+                " AND NOT (?9 = 1 \
+                AND EXISTS (SELECT 1 FROM verify_escalations z \
+                  WHERE z.backbone = v.backbone AND z.until > e.created_at) \
+                AND NOT EXISTS (SELECT 1 FROM verifications b \
+                  WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
+                body_on_record!(),
+                "))) < ?5 \
+         OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
+                JOIN extents o ON o.id = ?1 \
+                WHERE z.until > o.created_at \
+                  AND z.backbone IN (SELECT value FROM json_each(?7))))) \
+             AND NOT EXISTS (SELECT 1 FROM verifications v \
+              JOIN extents e ON e.id = v.extent_id WHERE ",
+                fresh_pass!(),
+                " AND EXISTS (SELECT 1 FROM verifications b \
+                WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
+                body_on_record!(),
+                ")))"
+            )
+        };
+    }
     // The release-stage guard still accepts `releasing`; the job
     // reopens an interrupted decision before it checks again. The
     // verify-stage batch never takes a copy unless it is `held`.
     let guard = match whole {
-        false => c
-            .sql
-            .dialect()
-            .pick(GUARD_RELEASE_JOB, GUARD_RELEASE_JOB_PG),
-        true => c
-            .sql
-            .dialect()
-            .pick(GUARD_RELEASE_AT_VERIFY, GUARD_RELEASE_AT_VERIFY_PG),
+        false => release_guard!("IN ('held', 'releasing')"),
+        true => release_guard!("= 'held'"),
     };
     let mark = match whole {
         false => (
-            START_SAFETY_RELEASE,
+            "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
+               evict_seq = evict_seq + 1 WHERE id = ?1",
             vec![text(l.extent.as_str()), text(evidence_json)],
         ),
         // The mark and the write of [`finish_release`] as one: the row
         // ends as the two steps of a release job leave it, but for the
         // fence, which moves once for the one change of state.
         true => (
-            COMPLETE_SAFETY_RELEASE,
+            "UPDATE extents SET safety_state = 'released', release_evidence = ?2, \
+               released_at = ?3, hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
             vec![text(l.extent.as_str()), text(evidence_json), ms(now)],
         ),
     };
@@ -973,7 +1115,12 @@ pub(super) async fn begin_release<S: Sql>(
         // [`finish_release`] leave it: nothing of the verify rounds (the
         // resume point, the last error) stays on a row that is done.
         // Last: after this the lease no longer holds.
-        let done = ADVANCE_RELEASE_AT_VERIFY;
+        let done = concat!(
+            "UPDATE outbox SET stage = 'done', updated_at = ?5, cursor = 0, last_error = NULL, ",
+            unlease!(),
+            " WHERE ",
+            held!()
+        );
         stmts.push((done, lease_params(l, [ms(now)])?));
     }
     super::uploads::guarded(c, stmts).await
@@ -988,7 +1135,13 @@ pub(super) async fn escalate_verify<S: Sql>(
     // One batch: the escalation only where this extent has not raised
     // the backbone for this plan, then the note that it has.
     let raise = (
-        RAISE_ESCALATION,
+        "INSERT INTO verify_escalations(backbone, until, raised_at, extent_id, result) \
+         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM verify_raises \
+           WHERE extent_id = ?4 AND backbone = ?1 AND plan_rev = ?6) \
+         ON CONFLICT(backbone) DO UPDATE SET until = excluded.until, \
+           raised_at = excluded.raised_at, extent_id = excluded.extent_id, \
+           result = excluded.result \
+         WHERE excluded.until > verify_escalations.until",
         vec![
             text(&e.backbone),
             ms(e.until),
@@ -999,7 +1152,8 @@ pub(super) async fn escalate_verify<S: Sql>(
         ],
     );
     let note = (
-        c.sql.dialect().pick(RAISE_ONCE, RAISE_ONCE_PG),
+        "INSERT OR IGNORE INTO verify_raises(extent_id, backbone, plan_rev, raised_at) \
+         VALUES (?1, ?2, ?3, ?4)",
         vec![
             text(e.extent_id.as_str()),
             text(&e.backbone),
@@ -1021,7 +1175,7 @@ pub(super) async fn verify_raised<S: Sql>(
     let rows = c
         .sql
         .query(
-            ALREADY_RAISED,
+            "SELECT 1 FROM verify_raises WHERE extent_id = ?1 AND backbone = ?2 AND plan_rev = ?3",
             &[text(extent.as_str()), text(backbone), int(plan_rev)?],
         )
         .await?;
@@ -1033,7 +1187,14 @@ pub(super) async fn verify_escalations<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
 ) -> Result<Vec<VerifyEscalation>> {
-    let rows = c.sql.query(LIST_ESCALATIONS, &[ms(now)]).await?;
+    let rows = c
+        .sql
+        .query(
+            "SELECT backbone, until, raised_at, extent_id, result FROM verify_escalations \
+             WHERE until > ?1 ORDER BY backbone",
+            &[ms(now)],
+        )
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -1063,12 +1224,27 @@ pub(super) async fn finish_release<S: Sql>(
     l: &Lease,
     now: UnixMs,
 ) -> Result<bool> {
-    let guard = GUARD_FINISH_RELEASE;
-    let done = ADVANCE_RELEASE;
+    let guard = concat!(
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+        held!(),
+        " AND stage = 'release' AND lease_until >= ?5) \
+         OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
+           AND safety_state = 'releasing')"
+    );
+    let done = concat!(
+        "UPDATE outbox SET stage = 'done', updated_at = ?5, ",
+        unlease!(),
+        " WHERE ",
+        held!()
+    );
     let stmts = vec![
         (guard, lease_params(l, [ms(now)])?),
         (
-            FINISH_SAFETY_RELEASE,
+            "UPDATE extents SET safety_state = 'released', released_at = ?2, \
+               hot_safety_bytes = cipher_size, \
+               last_read_at = COALESCE(last_read_at, created_at), \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1",
             vec![text(l.extent.as_str()), ms(now)],
         ),
         // Last: after this the lease no longer holds.
@@ -1085,10 +1261,19 @@ pub(super) async fn reopen_release<S: Sql>(
     l: &Lease,
     now: UnixMs,
 ) -> Result<bool> {
-    let guard = GUARD_REOPEN_RELEASE;
+    let guard = concat!(
+        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
+        held!(),
+        " AND stage = 'release' AND lease_until >= ?5)"
+    );
     let stmts = vec![
         (guard, lease_params(l, [ms(now)])?),
-        (REOPEN_RELEASE, vec![text(l.extent.as_str())]),
+        (
+            "UPDATE extents SET safety_state = 'held', release_evidence = NULL, \
+               evict_seq = evict_seq + 1 \
+             WHERE id = ?1 AND safety_state = 'releasing'",
+            vec![text(l.extent.as_str())],
+        ),
     ];
     fenced_batch(c, stmts).await
 }
@@ -1137,7 +1322,11 @@ pub(super) async fn due<S: Sql>(
         let rows = c
             .sql
             .query(
-                c.sql.dialect().pick(DUE_PAGE, DUE_PAGE_PG),
+                "SELECT extent_id, generation_id, stage, next_at FROM outbox \
+                 WHERE stage = ?4 AND next_at <= ?1 \
+                   AND (lease_until IS NULL OR lease_until < ?1) \
+                   AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
+                 ORDER BY next_at, rowid LIMIT ?2",
                 &[
                     ms(now),
                     SqlValue::Int(i64::from(limit)),
@@ -1183,7 +1372,10 @@ pub(super) async fn mark_sent<S: Sql>(
     now: UnixMs,
 ) -> Result<u64> {
     let ids = ids_json(extents.iter().map(ExtentId::as_str).collect());
-    let sql = c.sql.dialect().pick(MARK_SENT, MARK_SENT_PG);
+    let sql = "UPDATE outbox SET sent_at = ?1 \
+               WHERE extent_id IN (SELECT value FROM json_each(?2)) \
+                 AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
+                 AND (lease_until IS NULL OR lease_until < ?1)";
     set_mark(c, sql, ids, now).await
 }
 
@@ -1221,7 +1413,8 @@ pub(super) async fn unmark_sent<S: Sql>(
 ) -> Result<u64> {
     let ids = jobs.iter().filter_map(|j| j.extent().map(ExtentId::as_str));
     let ids = ids_json(ids.collect());
-    let sql = c.sql.dialect().pick(UNMARK_SENT, UNMARK_SENT_PG);
+    let sql = "UPDATE outbox SET sent_at = NULL \
+               WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1";
     set_mark(c, sql, ids, mark).await
 }
 
@@ -1252,12 +1445,19 @@ pub(super) async fn bury_exhausted<S: Sql>(
 ) -> Result<u64> {
     // A limit below the index's would miss the rows between the two:
     // those are read the long way. `jobs::MAX_ATTEMPTS` never is.
+    let sql = if max_attempts >= EXHAUSTED_INDEX_ATTEMPTS {
+        BURY_EXHAUSTED
+    } else {
+        "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
+         WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
+           AND (lease_until IS NULL OR lease_until < ?2)"
+    };
     // Counted by the rows returned, not by the rows changed: a
     // usage-counter trigger adds to the latter.
     let buried = c
         .sql
         .query(
-            &bury_sql(c.sql.dialect(), max_attempts >= EXHAUSTED_INDEX_ATTEMPTS),
+            &format!("{sql} RETURNING 1"),
             &[SqlValue::Int(i64::from(max_attempts)), ms(now)],
         )
         .await?;
@@ -1287,49 +1487,66 @@ pub(super) async fn redrive_underverified<S: Sql>(
     // the held ones of the window.
     let after = c
         .sql
-        .query(REDRIVE_CURSOR, &[])
+        .query("SELECT v FROM scan_cursors WHERE k = 'redrive'", &[])
         .await?
         .into_iter()
         .next()
         .map(|row| Cols::new(row).text())
         .transpose()?
         .unwrap_or_default();
-    let dialect = c.sql.dialect();
-    let mut window = c
+    let window = c
         .sql
         .query(
             // The condition is the index's own `WHERE`, word for word:
             // the planner takes a partial index only then.
-            dialect.pick(REDRIVE_WINDOW, REDRIVE_WINDOW_PG),
+            "SELECT id FROM extents INDEXED BY extents_safety \
+              WHERE safety_state IN ('held', 'releasing') \
+                AND id > ?1 ORDER BY id LIMIT ?2",
             &[text(&after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
     let full = window.len() >= limit as usize;
-    let Some(last) = window.pop() else {
+    let Some(last) = window.into_iter().next_back() else {
         set_redrive_cursor(c, "").await?;
         return Ok(0);
     };
     let last = Cols::new(last).text()?;
-    let mut params = vec![ms(now), text(&labels), SqlValue::Int(i64::from(required))];
-    let sql = match dialect {
-        crate::ports::Dialect::Sqlite => {
-            params.extend([text(&after), text(&last)]);
-            REDRIVE
-        }
-        crate::ports::Dialect::Postgres => {
-            let mut ids = window
-                .into_iter()
-                .map(|row| Cols::new(row).text())
-                .collect::<Result<Vec<_>>>()?;
-            ids.push(last.clone());
-            let ids = serde_json::to_string(&ids)
-                .map_err(|_| BridgeError::Sql("redrive: encode window".into()))?;
-            params.push(SqlValue::Text(ids));
-            REDRIVE_PG
-        }
-    };
+    let sql = concat!(
+        "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
+           last_error = NULL, updated_at = ?1, sent_at = NULL, ",
+        unlease!(),
+        // Driven from the window of the index, each outbox row found by
+        // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
+        // the planner off `outbox_due`, which would walk every `done`
+        // row (every extent ever posted) once per run.
+        " WHERE +stage = 'done' AND extent_id IN ( \
+           SELECT e.id FROM extents e INDEXED BY extents_safety \
+             CROSS JOIN outbox o ON o.extent_id = e.id \
+            WHERE e.safety_state IN ('held', 'releasing') AND e.safety_state = 'held' \
+              AND e.id > ?4 AND e.id <= ?5 AND +o.stage = 'done' AND ",
+        live_ref!("e.id"),
+        " AND (SELECT COUNT(*) FROM verifications v \
+                    WHERE v.extent_id = e.id \
+                      AND v.backbone IN (SELECT value FROM json_each(?2)) AND ",
+        latest!(),
+        " AND ",
+        counts!(),
+        ") < ?3) RETURNING 1"
+    );
     // Counted by the rows returned: see `bury_exhausted`.
-    let moved = c.sql.query(sql, &params).await?;
+    let moved = c
+        .sql
+        .query(
+            sql,
+            &[
+                ms(now),
+                text(&labels),
+                SqlValue::Int(i64::from(required)),
+                text(&after),
+                text(&last),
+            ],
+        )
+        .await?;
     // A short window was the end of the index: start over next time.
     set_redrive_cursor(c, if full { &last } else { "" }).await?;
     Ok(moved.len() as u64)
@@ -1352,7 +1569,7 @@ pub(super) async fn revive_referenced<S: Sql>(
 ) -> Result<u64> {
     let after = c
         .sql
-        .query(REVIVE_CURSOR, &[])
+        .query("SELECT v FROM scan_cursors WHERE k = 'revive'", &[])
         .await?
         .into_iter()
         .next()
@@ -1363,7 +1580,7 @@ pub(super) async fn revive_referenced<S: Sql>(
     let window = c
         .sql
         .query(
-            c.sql.dialect().pick(REVIVE_WINDOW, REVIVE_WINDOW_PG),
+            "SELECT rowid FROM outbox WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
             &[SqlValue::Int(after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
@@ -1375,7 +1592,20 @@ pub(super) async fn revive_referenced<S: Sql>(
             return Ok(0);
         }
     };
-    let sql = c.sql.dialect().pick(REVIVE, REVIVE_PG);
+    let sql = concat!(
+        "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
+                                          WHERE e.id = outbox.extent_id) \
+                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
+                                   ELSE 'done' END, \
+                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, \
+                sent_at = NULL, ",
+        unlease!(),
+        // `+stage`: the window is found by rowid. Through the stage
+        // index the statement would visit every cancelled row there is.
+        " WHERE rowid > ?2 AND rowid <= ?3 AND +stage = 'cancelled' AND ",
+        live_ref!("outbox.extent_id"),
+        " RETURNING 1"
+    );
     // Counted by the rows returned: see `bury_exhausted`.
     let revived = c
         .sql
@@ -1402,7 +1632,7 @@ const PACK_CHUNK: usize = 25;
 pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<PackReport> {
     let after = c
         .sql
-        .query(PACK_CURSOR, &[])
+        .query("SELECT v FROM scan_cursors WHERE k = 'pack'", &[])
         .await?
         .into_iter()
         .next()
@@ -1413,7 +1643,8 @@ pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<
     let window = c
         .sql
         .query(
-            PACK_WINDOW,
+            "SELECT extent_id FROM articles WHERE extent_id > ?1 AND idx = 0 \
+             ORDER BY extent_id LIMIT ?2",
             &[text(&after), SqlValue::Int(i64::from(limit))],
         )
         .await?;
@@ -1446,7 +1677,15 @@ pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<
             };
             if let Some((blob, size)) = packed {
                 stmts.push((
-                    STORE_PACKED_FROM_ROWS,
+                    "UPDATE extents SET plan = ?2, \
+                       posted_at = COALESCE((SELECT MAX(posted_at) FROM articles \
+                                              WHERE extent_id = ?1), ?5), \
+                       reposted_at = (SELECT MAX(reposted_at) FROM articles \
+                                       WHERE extent_id = ?1) \
+                     WHERE id = ?1 AND plan IS NULL AND cipher_size = ?3 \
+                       AND article_count = ?4 \
+                       AND (SELECT COUNT(*) FROM articles \
+                             WHERE extent_id = ?1 AND state = 'posted') = ?4",
                     vec![
                         text(id.as_str()),
                         SqlValue::Blob(blob),
@@ -1461,7 +1700,11 @@ pub(super) async fn pack_plans<S: Sql>(c: &SqlCatalog<S>, limit: u32) -> Result<
             if copy {
                 // Only the rows of a plan that is packed: they are a
                 // copy of it from here on.
-                stmts.push((DROP_PACKED_ARTICLES, vec![text(id.as_str())]));
+                stmts.push((
+                    "DELETE FROM articles WHERE extent_id = ?1 \
+                       AND (SELECT plan FROM extents WHERE id = ?1) IS NOT NULL",
+                    vec![text(id.as_str())],
+                ));
                 packs.push(false);
             }
         }
@@ -1493,7 +1736,7 @@ async fn set_redrive_cursor<S: Sql>(c: &SqlCatalog<S>, at: &str) -> Result<()> {
 async fn set_scan_cursor<S: Sql>(c: &SqlCatalog<S>, k: &str, at: &str) -> Result<()> {
     c.sql
         .exec(
-            c.sql.dialect().pick(SET_SCAN_CURSOR, SET_SCAN_CURSOR_PG),
+            "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES (?1, ?2)",
             &[text(k), text(at)],
         )
         .await?;
@@ -1503,7 +1746,7 @@ async fn set_scan_cursor<S: Sql>(c: &SqlCatalog<S>, k: &str, at: &str) -> Result
 pub(super) async fn record_dispatch<S: Sql>(c: &SqlCatalog<S>, now: UnixMs) -> Result<()> {
     c.sql
         .exec(
-            c.sql.dialect().pick(RECORD_DISPATCH, RECORD_DISPATCH_PG),
+            "INSERT OR REPLACE INTO meta(k, v) VALUES ('last_dispatch_at', ?1)",
             &[ms(now)],
         )
         .await?;
@@ -1524,7 +1767,10 @@ pub(super) async fn outbox_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<OutboxStat
             }
         }
     } else {
-        let rows = c.sql.query(OUTBOX_STATS, &[]).await?;
+        let rows = c
+            .sql
+            .query("SELECT stage, COUNT(*) FROM outbox GROUP BY stage", &[])
+            .await?;
         for row in rows {
             let mut r = Cols::new(row);
             counted.push((r.parsed(OutboxStage::parse)?, r.num::<u64>()?));
@@ -1538,7 +1784,10 @@ pub(super) async fn outbox_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<OutboxStat
         .iter()
         .find(|(s, _)| *s == OutboxStage::Dead)
         .map_or(0, |(_, n)| *n);
-    let rows = c.sql.query(LAST_DISPATCH_AT, &[]).await?;
+    let rows = c
+        .sql
+        .query("SELECT v FROM meta WHERE k = 'last_dispatch_at'", &[])
+        .await?;
     let last_dispatch_at = match rows.into_iter().next() {
         Some(row) => Some(UnixMs(Cols::new(row).num()?)),
         None => None,
@@ -1548,984 +1797,4 @@ pub(super) async fn outbox_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<OutboxStat
         dead,
         last_dispatch_at,
     })
-}
-
-const CLAIM: &str = "UPDATE outbox SET lease_token = lease_token + 1, lease_owner = ?4, \
-               lease_until = ?5, attempts = attempts + 1, updated_at = ?6, sent_at = NULL \
-             WHERE extent_id = ?1 AND generation_id = ?2 AND stage = ?3 AND next_at <= ?6 \
-               AND (lease_until IS NULL OR lease_until < ?6) \
-             RETURNING lease_token, attempts, cursor";
-
-const ADVANCE: &str = concat!(
-    "UPDATE outbox SET stage = ?5, next_at = ?6, updated_at = ?7, attempts = 0, cursor = 0, \
-           last_error = NULL, \
-           sent_at = CASE WHEN ?5 IN ('post', 'verify', 'release') THEN ?6 END, ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const FAIL: &str = concat!(
-    "UPDATE outbox SET next_at = ?5, last_error = ?6, updated_at = ?7, ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const SET_CURSOR: &str = concat!("UPDATE outbox SET cursor = ?5 WHERE ", held!());
-
-const JOB_EXTENT: &str = concat!(
-    "SELECT e.id, e.bucket_id, e.generation_id, e.state, e.seq, e.plain_offset, \
-           e.plain_size, e.cipher_size, e.media_header, e.key_mode, e.wrapped_file_key, \
-           e.plain_md5, e.plain_sha256, e.cipher_sha256, e.safety_state, e.article_count, \
-           e.plan_rev, e.last_verified_at, e.release_evidence, e.released_at, e.created_at, \
-           b.id, b.name, b.owner, b.bdk_wrapped, b.kek_version, b.disposable, b.created_at, \
-           CASE WHEN ",
-    live_ref!("e.id"),
-    " THEN 'live' ELSE g.state END, e.parity_count \
-         FROM extents e JOIN buckets b ON b.id = e.bucket_id \
-         JOIN generations g ON g.id = e.generation_id \
-         WHERE e.id = ?1 AND e.generation_id = ?2"
-);
-
-const READ_ARTICLES: &str = "SELECT 0 AS packed, id AS extent_id, -1 AS idx, NULL AS message_id, \
-               NULL AS newsgroup, plan AS headers, cipher_size AS cipher_offset, \
-               0 AS cipher_len, parity AS payload_sha256, NULL AS yenc_name, NULL AS state, \
-               NULL AS provider_id, posted_at, reposted_at \
-             FROM extents WHERE id = ?1 AND plan IS NOT NULL \
-             UNION ALL \
-             SELECT 1, extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
-               cipher_len, payload_sha256, yenc_name, state, provider_id, posted_at, \
-               reposted_at \
-             FROM articles WHERE extent_id = ?1 ORDER BY packed, idx";
-
-const INSERT_UNPACKED_ARTICLE: &str =
-    "INSERT INTO articles(extent_id, idx, message_id, newsgroup, headers, cipher_offset, \
-               cipher_len, payload_sha256, yenc_name, state) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'planned' \
-             WHERE (SELECT article_count FROM extents WHERE id = ?1) IS NULL";
-
-const FINISH_UNPACKED_PLAN: &str = "UPDATE extents SET article_count = ?2, plan_rev = 1 \
-         WHERE id = ?1 AND article_count IS NULL";
-
-const STORE_PACKED_PLAN: &str = "UPDATE extents SET article_count = ?2, plan_rev = 1, plan = ?3, \
-               parity = ?5, parity_count = ?6 \
-             WHERE id = ?1 AND article_count IS NULL AND cipher_size = ?4";
-
-const MARK_ONE_POSTED: &str = concat!(
-    "UPDATE articles SET state = 'posted', provider_id = ?6, posted_at = ?7 \
-         WHERE extent_id = ?1 AND idx = ?5 \
-           AND (SELECT plan FROM extents WHERE id = ?1) IS NULL \
-           AND EXISTS (SELECT 1 FROM outbox WHERE ",
-    held!(),
-    ")"
-);
-
-const GUARD_POSTED_PLAN: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
-           (SELECT 1 FROM extents WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL)";
-
-const CHECK_LEASE: &str = concat!("SELECT 1 FROM outbox WHERE ", held!());
-
-const WRITE_VERIFICATION: &str =
-    "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, \
-               plan_rev, articles_ok, articles_present, articles_total, result, kind, mode, \
-               lease_token) \
-             VALUES (?1, ?2, ?3, ?4, ?5, CASE ?9 WHEN 'stat' THEN 0 ELSE ?6 END, \
-               CASE ?9 WHEN 'stat' THEN ?6 ELSE 0 END, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(extent_id, backbone, verified_at) DO UPDATE SET \
-               provider_id = excluded.provider_id, plan_rev = excluded.plan_rev, \
-               articles_ok = excluded.articles_ok, \
-               articles_present = excluded.articles_present, \
-               articles_total = excluded.articles_total, \
-               result = excluded.result, kind = excluded.kind, mode = excluded.mode, \
-               lease_token = excluded.lease_token \
-             WHERE verifications.result = 'ok' \
-               AND NOT (verifications.kind = 'body' AND excluded.kind = 'stat' \
-                 AND excluded.result = 'ok')";
-
-const STAMP_LAST_BODY_VERIFY: &str = "UPDATE extents SET last_verified_at = ?2 \
-             WHERE id = ?1 AND ?3 = 'ok' AND ?4 = ?5 \
-               AND ?5 = article_count + COALESCE(parity_count, 0) AND ?6 = plan_rev \
-               AND ?7 = 'body' \
-               AND (last_verified_at IS NULL OR last_verified_at < ?2)";
-
-const BACKBONE_STATUS: &str = concat!(
-    "SELECT v.backbone, v.provider_id, v.verified_at, v.plan_rev, ",
-    tally!(),
-    ", v.articles_total, v.result, v.kind, v.mode, ",
-    counts!(),
-    " FROM verifications v JOIN extents e ON e.id = v.extent_id \
-         WHERE v.extent_id = ?1 AND ",
-    latest!(),
-    " ORDER BY v.backbone"
-);
-
-const BODY_CHECKS: &str = concat!(
-    "SELECT b.backbone, b.provider_id, b.verified_at, b.plan_rev, b.articles_ok, \
-           b.articles_total, b.result, b.kind, b.mode, (b.kind = 'body' AND ",
-    body_on_record!(),
-    ") FROM verifications b JOIN extents e ON e.id = b.extent_id \
-         WHERE b.extent_id = ?1 AND b.plan_rev = e.plan_rev \
-           AND (b.kind = 'body' OR (b.mode = 'size' AND b.result = 'corrupt')) \
-           AND NOT EXISTS (SELECT 1 FROM verifications g \
-             WHERE g.extent_id = b.extent_id AND g.backbone = b.backbone \
-               AND g.plan_rev = b.plan_rev AND g.verified_at > b.verified_at \
-               AND (g.kind = 'body' OR (b.kind <> 'body' AND g.mode = 'size' \
-                 AND g.result = 'corrupt'))) \
-         ORDER BY b.backbone, b.verified_at"
-);
-
-const START_SAFETY_RELEASE: &str =
-    "UPDATE extents SET safety_state = 'releasing', release_evidence = ?2, \
-               evict_seq = evict_seq + 1 WHERE id = ?1";
-
-const COMPLETE_SAFETY_RELEASE: &str =
-    "UPDATE extents SET safety_state = 'released', release_evidence = ?2, \
-               released_at = ?3, hot_safety_bytes = cipher_size, \
-               last_read_at = COALESCE(last_read_at, created_at), \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1";
-
-const ADVANCE_RELEASE_AT_VERIFY: &str = concat!(
-    "UPDATE outbox SET stage = 'done', updated_at = ?5, cursor = 0, last_error = NULL, ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const RAISE_ESCALATION: &str =
-    "INSERT INTO verify_escalations(backbone, until, raised_at, extent_id, result) \
-         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (SELECT 1 FROM verify_raises \
-           WHERE extent_id = ?4 AND backbone = ?1 AND plan_rev = ?6) \
-         ON CONFLICT(backbone) DO UPDATE SET until = excluded.until, \
-           raised_at = excluded.raised_at, extent_id = excluded.extent_id, \
-           result = excluded.result \
-         WHERE excluded.until > verify_escalations.until";
-
-const ALREADY_RAISED: &str =
-    "SELECT 1 FROM verify_raises WHERE extent_id = ?1 AND backbone = ?2 AND plan_rev = ?3";
-
-const LIST_ESCALATIONS: &str =
-    "SELECT backbone, until, raised_at, extent_id, result FROM verify_escalations \
-             WHERE until > ?1 ORDER BY backbone";
-
-const GUARD_FINISH_RELEASE: &str = concat!(
-    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-    held!(),
-    " AND stage = 'release' AND lease_until >= ?5) \
-         OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
-           AND safety_state = 'releasing')"
-);
-
-const ADVANCE_RELEASE: &str = concat!(
-    "UPDATE outbox SET stage = 'done', updated_at = ?5, ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const FINISH_SAFETY_RELEASE: &str =
-    "UPDATE extents SET safety_state = 'released', released_at = ?2, \
-               hot_safety_bytes = cipher_size, \
-               last_read_at = COALESCE(last_read_at, created_at), \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1";
-
-const GUARD_REOPEN_RELEASE: &str = concat!(
-    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-    held!(),
-    " AND stage = 'release' AND lease_until >= ?5)"
-);
-
-const REOPEN_RELEASE: &str = "UPDATE extents SET safety_state = 'held', release_evidence = NULL, \
-               evict_seq = evict_seq + 1 \
-             WHERE id = ?1 AND safety_state = 'releasing'";
-
-const REDRIVE_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'redrive'";
-
-const REVIVE_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'revive'";
-
-const PACK_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'pack'";
-
-const PACK_WINDOW: &str = "SELECT extent_id FROM articles WHERE extent_id > ?1 AND idx = 0 \
-             ORDER BY extent_id LIMIT ?2";
-
-const STORE_PACKED_FROM_ROWS: &str = "UPDATE extents SET plan = ?2, \
-                       posted_at = COALESCE((SELECT MAX(posted_at) FROM articles \
-                                              WHERE extent_id = ?1), ?5), \
-                       reposted_at = (SELECT MAX(reposted_at) FROM articles \
-                                       WHERE extent_id = ?1) \
-                     WHERE id = ?1 AND plan IS NULL AND cipher_size = ?3 \
-                       AND article_count = ?4 \
-                       AND (SELECT COUNT(*) FROM articles \
-                             WHERE extent_id = ?1 AND state = 'posted') = ?4";
-
-const DROP_PACKED_ARTICLES: &str = "DELETE FROM articles WHERE extent_id = ?1 \
-                       AND (SELECT plan FROM extents WHERE id = ?1) IS NOT NULL";
-
-const OUTBOX_STATS: &str = "SELECT stage, COUNT(*) FROM outbox GROUP BY stage";
-
-const LAST_DISPATCH_AT: &str = "SELECT v FROM meta WHERE k = 'last_dispatch_at'";
-
-const DEFER: &str = concat!(
-    "UPDATE outbox SET next_at = ?5, updated_at = ?6, attempts = MAX(attempts - 1, 0), ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const DEFER_PG: &str = concat!(
-    "UPDATE outbox SET next_at = ?5, updated_at = ?6, attempts = GREATEST(attempts - 1, 0), ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const DEFER_WITH_CURSOR: &str = concat!(
-    "UPDATE outbox SET next_at = ?5, updated_at = ?6, cursor = ?7, \
-         attempts = MAX(attempts - 1, 0), ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const DEFER_WITH_CURSOR_PG: &str = concat!(
-    "UPDATE outbox SET next_at = ?5, updated_at = ?6, cursor = ?7, \
-         attempts = GREATEST(attempts - 1, 0), ",
-    unlease!(),
-    " WHERE ",
-    held!()
-);
-
-const MARK_ARTICLES_POSTED: &str =
-    "UPDATE articles SET state = 'posted', provider_id = ?3, posted_at = ?4 \
-             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
-               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL";
-
-const MARK_ARTICLES_POSTED_PG: &str = "UPDATE articles SET state = 'posted', provider_id = ?3, posted_at = ?4 \
-             WHERE extent_id = ?1 AND idx IN (SELECT value::bigint FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) \
-               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL";
-
-const MARK_PACKED_POSTED: &str = "UPDATE extents SET posted_at = ?2 \
-         WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL \
-           AND article_count + COALESCE(parity_count, 0) = \
-               (SELECT COUNT(DISTINCT value) FROM json_each(?3) \
-                 WHERE value < article_count + COALESCE(parity_count, 0))";
-
-const MARK_PACKED_POSTED_PG: &str = "UPDATE extents SET posted_at = ?2 \
-         WHERE id = ?1 AND plan IS NOT NULL AND posted_at IS NULL \
-           AND article_count + COALESCE(parity_count, 0) = \
-               (SELECT COUNT(DISTINCT value::bigint) FROM jsonb_array_elements_text(?3::jsonb) AS j(value) \
-                 WHERE value::bigint < article_count + COALESCE(parity_count, 0))";
-
-const MARK_ARTICLES_REPOSTED: &str =
-    "UPDATE articles SET reposted_at = MAX(COALESCE(reposted_at, ?3), ?3) \
-             WHERE extent_id = ?1 AND idx IN (SELECT value FROM json_each(?2)) \
-               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL";
-
-const MARK_ARTICLES_REPOSTED_PG: &str = "UPDATE articles SET reposted_at = GREATEST(COALESCE(reposted_at, ?3), ?3) \
-             WHERE extent_id = ?1 AND idx IN (SELECT value::bigint FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) \
-               AND (SELECT plan FROM extents WHERE id = ?1) IS NULL";
-
-const MARK_PACKED_REPOSTED: &str =
-    "UPDATE extents SET reposted_at = MAX(COALESCE(reposted_at, ?2), ?2) \
-             WHERE id = ?1 AND plan IS NOT NULL";
-
-const MARK_PACKED_REPOSTED_PG: &str =
-    "UPDATE extents SET reposted_at = GREATEST(COALESCE(reposted_at, ?2), ?2) \
-             WHERE id = ?1 AND plan IS NOT NULL";
-
-const RAISE_ONCE: &str =
-    "INSERT OR IGNORE INTO verify_raises(extent_id, backbone, plan_rev, raised_at) \
-         VALUES (?1, ?2, ?3, ?4)";
-
-const RAISE_ONCE_PG: &str = "INSERT INTO verify_raises(extent_id, backbone, plan_rev, raised_at) \
-         VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING";
-
-const DUE_PAGE: &str = "SELECT extent_id, generation_id, stage, next_at FROM outbox \
-                 WHERE stage = ?4 AND next_at <= ?1 \
-                   AND (lease_until IS NULL OR lease_until < ?1) \
-                   AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
-                 ORDER BY next_at, rowid LIMIT ?2";
-
-const DUE_PAGE_PG: &str = "SELECT extent_id, generation_id, stage, next_at FROM outbox \
-                 WHERE stage = ?4 AND next_at <= ?1 \
-                   AND (lease_until IS NULL OR lease_until < ?1) \
-                   AND (sent_at IS NULL OR sent_at < next_at OR sent_at <= ?3) \
-                 ORDER BY next_at, seq LIMIT ?2";
-
-const MARK_SENT: &str = "UPDATE outbox SET sent_at = ?1 \
-               WHERE extent_id IN (SELECT value FROM json_each(?2)) \
-                 AND +stage IN ('post', 'verify', 'release') AND +next_at <= ?1 \
-                 AND (lease_until IS NULL OR lease_until < ?1)";
-
-// Keep eligibility a residual filter so a short ID list cannot turn
-// into a scan of every due row through outbox_due.
-const MARK_SENT_PG: &str = "UPDATE outbox SET sent_at = ?1 \
-               WHERE extent_id = ANY (ARRAY(SELECT jsonb_array_elements_text(?2::jsonb))) \
-                 AND CASE WHEN stage IN ('post', 'verify', 'release') AND next_at <= ?1 \
-                   THEN lease_until IS NULL OR lease_until < ?1 ELSE FALSE END";
-
-const UNMARK_SENT: &str = "UPDATE outbox SET sent_at = NULL \
-               WHERE extent_id IN (SELECT value FROM json_each(?2)) AND sent_at = ?1";
-
-const UNMARK_SENT_PG: &str = "UPDATE outbox SET sent_at = NULL \
-               WHERE extent_id IN (SELECT value FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) AND sent_at = ?1";
-
-const BURY_EXHAUSTED_PG: &str = "UPDATE outbox \
-       SET stage = 'dead', updated_at = ?2 \
-     WHERE attempts > 50 AND stage IN ('post', 'verify', 'release') AND attempts > ?1 \
-       AND (lease_until IS NULL OR lease_until < ?2)";
-
-const BURY_ANY: &str = "UPDATE outbox SET stage = 'dead', updated_at = ?2 \
-         WHERE stage IN ('post', 'verify', 'release') AND attempts > ?1 \
-           AND (lease_until IS NULL OR lease_until < ?2)";
-
-const REDRIVE_WINDOW: &str = "SELECT id FROM extents INDEXED BY extents_safety \
-              WHERE safety_state IN ('held', 'releasing') \
-                AND id > ?1 ORDER BY id LIMIT ?2";
-
-const REDRIVE_WINDOW_PG: &str = "SELECT id FROM extents \
-              WHERE safety_state IN ('held', 'releasing') \
-                AND id > ?1 ORDER BY id LIMIT ?2";
-
-const REDRIVE: &str = concat!(
-    "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
-           last_error = NULL, updated_at = ?1, sent_at = NULL, ",
-    unlease!(),
-    // Driven from the window of the index, each outbox row found by
-    // its key: `CROSS JOIN` fixes the order and the unary `+` keeps
-    // the planner off `outbox_due`, which would walk every `done`
-    // row (every extent ever posted) once per run.
-    " WHERE +stage = 'done' AND extent_id IN ( \
-           SELECT e.id FROM extents e INDEXED BY extents_safety \
-             CROSS JOIN outbox o ON o.extent_id = e.id \
-            WHERE e.safety_state IN ('held', 'releasing') AND e.safety_state = 'held' \
-              AND e.id > ?4 AND e.id <= ?5 AND +o.stage = 'done' AND ",
-    live_ref!("e.id"),
-    " AND (SELECT COUNT(*) FROM verifications v \
-                    WHERE v.extent_id = e.id \
-                      AND v.backbone IN (SELECT value FROM json_each(?2)) AND ",
-    latest!(),
-    " AND ",
-    counts!(),
-    ") < ?3) RETURNING 1"
-);
-
-const REDRIVE_PG: &str = concat!(
-        "UPDATE outbox SET stage = 'verify', next_at = ?1, cursor = 0, attempts = 0, \
-           last_error = NULL, updated_at = ?1, sent_at = NULL, ",
-        unlease!(),
-        // A sparse ID range can span much of the outbox. Probe only
-        // the selected IDs and keep the live-reference check correlated
-        // so it cannot become a join over the whole key span.
-        " WHERE extent_id = ANY (ARRAY(SELECT jsonb_array_elements_text(?4::jsonb))) \
-            AND CASE WHEN stage = 'done' THEN 1 = (SELECT 1 FROM extents e \
-              WHERE e.id = outbox.extent_id AND e.safety_state = 'held' \
-                AND 1 = (SELECT 1 FROM generation_extents lr \
-                  JOIN generations lg ON lg.id = lr.generation_id \
-                 WHERE lr.extent_id = e.id AND lg.state = 'live' LIMIT 1) \
-                AND (SELECT COUNT(*) FROM verifications v \
-                    WHERE v.extent_id = e.id \
-                      AND v.backbone IN (SELECT value FROM jsonb_array_elements_text(?2::jsonb) AS j(value)) AND ",
-        latest!(),
-        " AND ",
-        counts!(),
-        ") < ?3) ELSE FALSE END RETURNING 1"
-    );
-
-const REVIVE_WINDOW: &str = "SELECT rowid FROM outbox WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
-
-const REVIVE_WINDOW_PG: &str = "SELECT seq FROM outbox WHERE seq > ?1 ORDER BY seq LIMIT ?2";
-
-const REVIVE: &str = concat!(
-    "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
-                                          WHERE e.id = outbox.extent_id) \
-                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
-                                   ELSE 'done' END, \
-                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, \
-                sent_at = NULL, ",
-    unlease!(),
-    // `+stage`: the window is found by rowid. Through the stage
-    // index the statement would visit every cancelled row there is.
-    " WHERE rowid > ?2 AND rowid <= ?3 AND +stage = 'cancelled' AND ",
-    live_ref!("outbox.extent_id"),
-    " RETURNING 1"
-);
-
-const REVIVE_PG: &str = concat!(
-    "UPDATE outbox SET stage = CASE (SELECT e.safety_state FROM extents e \
-                                          WHERE e.id = outbox.extent_id) \
-                                   WHEN 'held' THEN 'post' WHEN 'releasing' THEN 'release' \
-                                   ELSE 'done' END, \
-                attempts = 0, cursor = 0, last_error = NULL, next_at = ?1, updated_at = ?1, \
-                sent_at = NULL, ",
-    unlease!(),
-    // `+stage`: the window is found by rowid. Through the stage
-    // index the statement would visit every cancelled row there is.
-    " WHERE seq > ?2 AND seq <= ?3 AND stage = 'cancelled' AND ",
-    live_ref!("outbox.extent_id"),
-    " RETURNING 1"
-);
-
-const SET_SCAN_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES (?1, ?2)";
-
-const SET_SCAN_CURSOR_PG: &str =
-    "INSERT INTO scan_cursors(k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
-
-const RECORD_DISPATCH: &str = "INSERT OR REPLACE INTO meta(k, v) VALUES ('last_dispatch_at', ?1)";
-
-const RECORD_DISPATCH_PG: &str = "INSERT INTO meta(k, v) VALUES ('last_dispatch_at', ?1) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
-
-macro_rules! release_guard {
-    ($states:literal, $backbones:literal) => {
-        concat!(
-            "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE ",
-            held!(),
-            " AND lease_until >= ?6) \
-     OR NOT ",
-            live_ref!("?1"),
-            " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 \
-          AND safety_state ",
-            $states,
-            ") \
-     OR (SELECT COUNT(*) FROM verifications v JOIN extents e ON e.id = v.extent_id \
-          WHERE ",
-            fresh_pass!($backbones),
-            " AND NOT (?9 = 1 \
-            AND EXISTS (SELECT 1 FROM verify_escalations z \
-              WHERE z.backbone = v.backbone AND z.until > e.created_at) \
-            AND NOT EXISTS (SELECT 1 FROM verifications b \
-              WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-            body_on_record!(),
-            "))) < ?5 \
-     OR ((?8 = 1 OR (?9 = 1 AND EXISTS (SELECT 1 FROM verify_escalations z \
-            JOIN extents o ON o.id = ?1 \
-            WHERE z.until > o.created_at \
-              AND z.backbone IN (",
-            $backbones,
-            ")))) \
-         AND NOT EXISTS (SELECT 1 FROM verifications v \
-          JOIN extents e ON e.id = v.extent_id WHERE ",
-            fresh_pass!($backbones),
-            " AND EXISTS (SELECT 1 FROM verifications b \
-            WHERE b.extent_id = v.extent_id AND b.backbone = v.backbone AND ",
-            body_on_record!(),
-            ")))"
-        )
-    };
-}
-
-const GUARD_RELEASE_JOB: &str = release_guard!(
-    "IN ('held', 'releasing')",
-    "SELECT value FROM json_each(?7)"
-);
-const GUARD_RELEASE_JOB_PG: &str = release_guard!(
-    "IN ('held', 'releasing')",
-    "SELECT value FROM jsonb_array_elements_text(?7::jsonb) AS j(value)"
-);
-
-const GUARD_RELEASE_AT_VERIFY: &str = release_guard!("= 'held'", "SELECT value FROM json_each(?7)");
-const GUARD_RELEASE_AT_VERIFY_PG: &str = release_guard!(
-    "= 'held'",
-    "SELECT value FROM jsonb_array_elements_text(?7::jsonb) AS j(value)"
-);
-
-fn bury_sql(dialect: crate::ports::Dialect, indexed: bool) -> String {
-    let sql = if indexed {
-        dialect.pick(BURY_EXHAUSTED, BURY_EXHAUSTED_PG)
-    } else {
-        BURY_ANY
-    };
-    format!("{sql} RETURNING 1")
-}
-
-/// Actual Postgres texts and representative wire types for typed PREPARE.
-#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
-pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
-    const I: SqlValue = SqlValue::Int(0);
-    const T: SqlValue = SqlValue::Text(String::new());
-    const B: SqlValue = SqlValue::Blob(Vec::new());
-    vec![
-        (held_guard!().to_owned(), vec![T, T, T, I]),
-        (RENEW.to_owned(), vec![T, T, T, I, I]),
-        (CLAIM.to_owned(), vec![T, T, T, T, I, I]),
-        (ADVANCE.to_owned(), vec![T, T, T, I, T, I, I]),
-        (FAIL.to_owned(), vec![T, T, T, I, I, T, I]),
-        (SET_CURSOR.to_owned(), vec![T, T, T, I, I]),
-        (JOB_EXTENT.to_owned(), vec![T, T]),
-        (READ_ARTICLES.to_owned(), vec![T]),
-        (
-            INSERT_UNPACKED_ARTICLE.to_owned(),
-            vec![T, I, T, T, B, I, I, B, T],
-        ),
-        (FINISH_UNPACKED_PLAN.to_owned(), vec![T, I]),
-        (STORE_PACKED_PLAN.to_owned(), vec![T, I, B, I, B, I]),
-        (MARK_ONE_POSTED.to_owned(), vec![T, T, T, I, I, T, I]),
-        (GUARD_POSTED_PLAN.to_owned(), vec![T]),
-        (CHECK_LEASE.to_owned(), vec![T, T, T, I]),
-        (
-            WRITE_VERIFICATION.to_owned(),
-            vec![T, T, T, I, I, I, I, T, T, T, I],
-        ),
-        (STAMP_LAST_BODY_VERIFY.to_owned(), vec![T, I, T, I, I, I, T]),
-        (BACKBONE_STATUS.to_owned(), vec![T]),
-        (BODY_CHECKS.to_owned(), vec![T]),
-        (START_SAFETY_RELEASE.to_owned(), vec![T, T]),
-        (COMPLETE_SAFETY_RELEASE.to_owned(), vec![T, T, I]),
-        (ADVANCE_RELEASE_AT_VERIFY.to_owned(), vec![T, T, T, I, I]),
-        (RAISE_ESCALATION.to_owned(), vec![T, I, I, T, T, I]),
-        (ALREADY_RAISED.to_owned(), vec![T, T, I]),
-        (LIST_ESCALATIONS.to_owned(), vec![I]),
-        (GUARD_FINISH_RELEASE.to_owned(), vec![T, T, T, I, I]),
-        (ADVANCE_RELEASE.to_owned(), vec![T, T, T, I, I]),
-        (FINISH_SAFETY_RELEASE.to_owned(), vec![T, I]),
-        (GUARD_REOPEN_RELEASE.to_owned(), vec![T, T, T, I, I]),
-        (REOPEN_RELEASE.to_owned(), vec![T]),
-        (REDRIVE_CURSOR.to_owned(), vec![]),
-        (REVIVE_CURSOR.to_owned(), vec![]),
-        (PACK_CURSOR.to_owned(), vec![]),
-        (PACK_WINDOW.to_owned(), vec![T, I]),
-        (STORE_PACKED_FROM_ROWS.to_owned(), vec![T, B, I, I, I]),
-        (DROP_PACKED_ARTICLES.to_owned(), vec![T]),
-        (OUTBOX_STATS.to_owned(), vec![]),
-        (LAST_DISPATCH_AT.to_owned(), vec![]),
-        (DEFER_PG.to_owned(), vec![T, T, T, I, I, I]),
-        (DEFER_WITH_CURSOR_PG.to_owned(), vec![T, T, T, I, I, I, I]),
-        (MARK_ARTICLES_POSTED_PG.to_owned(), vec![T, T, T, I]),
-        (MARK_PACKED_POSTED_PG.to_owned(), vec![T, I, T]),
-        (MARK_ARTICLES_REPOSTED_PG.to_owned(), vec![T, T, I]),
-        (MARK_PACKED_REPOSTED_PG.to_owned(), vec![T, I]),
-        (RAISE_ONCE_PG.to_owned(), vec![T, T, I, I]),
-        (DUE_PAGE_PG.to_owned(), vec![I, I, I, T]),
-        (MARK_SENT_PG.to_owned(), vec![I, T]),
-        (UNMARK_SENT_PG.to_owned(), vec![I, T]),
-        (REDRIVE_WINDOW_PG.to_owned(), vec![T, I]),
-        (REDRIVE_PG.to_owned(), vec![I, T, I, T]),
-        (REVIVE_WINDOW_PG.to_owned(), vec![I, I]),
-        (REVIVE_PG.to_owned(), vec![I, I, I]),
-        (SET_SCAN_CURSOR_PG.to_owned(), vec![T, T]),
-        (RECORD_DISPATCH_PG.to_owned(), vec![I]),
-        (
-            GUARD_RELEASE_JOB_PG.to_owned(),
-            vec![T, T, T, I, I, I, T, I, I],
-        ),
-        (
-            GUARD_RELEASE_AT_VERIFY_PG.to_owned(),
-            vec![T, T, T, I, I, I, T, I, I],
-        ),
-        (bury_sql(crate::ports::Dialect::Postgres, false), vec![I, I]),
-        (bury_sql(crate::ports::Dialect::Postgres, true), vec![I, I]),
-    ]
-}
-
-#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
-mod pg_plan_tests {
-    use super::super::gc::GC_ORPHAN_WINDOW_PG;
-    use super::{MARK_SENT_PG, REDRIVE_PG, REDRIVE_WINDOW_PG};
-    use crate::gate::pg_background_fixture::{self as fixture, sql as pg};
-    use serde_json::Value;
-    use tokio_postgres::{SimpleQueryMessage, Transaction};
-
-    async fn explain(tx: &Transaction<'_>, statement: &str) -> Value {
-        let sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE {statement}");
-        let results = tx.simple_query(&sql).await.unwrap();
-        let plan = results.iter().find_map(|message| match message {
-            SimpleQueryMessage::Row(row) => row.get(0),
-            _ => None,
-        });
-        let json: Value =
-            serde_json::from_str(plan.expect("EXPLAIN did not return a plan")).unwrap();
-        json[0]["Plan"].clone()
-    }
-
-    fn bounded_plan(plan: &Value, name: &str, window: usize) {
-        let get = |key: &str| plan[key].as_f64().unwrap_or_default();
-        if let Some(table) = plan["Relation Name"].as_str() {
-            // Include rejected tuples, not just those emitted by the scan.
-            let visited = (get("Actual Rows")
-                + get("Rows Removed by Filter")
-                + get("Rows Removed by Index Recheck"))
-                * get("Actual Loops");
-            let cap = (window * 4) as f64;
-            assert!(
-                visited <= cap && get("Index Searches") <= cap,
-                "{name}: {table} visited {visited} tuples, {} index searches for {window} ids",
-                get("Index Searches")
-            );
-        }
-        if let Some(children) = plan["Plans"].as_array() {
-            for child in children {
-                bounded_plan(child, name, window);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn postgres_background_windows_keep_bounded_scans() {
-        let Some(mut db) = fixture::connect().await else {
-            return;
-        };
-        // Start pinned, then make the middle span sparse through fenced transitions.
-        const RELEASE_GAP: &str =
-            "UPDATE extents SET safety_state = 'released', evict_seq = evict_seq + 1 \
-            WHERE seq BETWEEN 10000 AND 79000 AND seq % 137 <> 0;";
-        let seed = "INSERT INTO buckets (id,name,owner,bdk_wrapped,kek_version,created_at)
-                 VALUES ('b','bucket','owner',''::bytea,1,0);
-             INSERT INTO generations (id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
-                 SELECT 'g'||lpad(i::text,6,'0'),'b','key','live',1,'etag','{}','{}',1,0
-                   FROM generate_series(1,100000) i;
-             INSERT INTO extents (id,bucket_id,generation_id,state,seq,plain_offset,plain_size,cipher_size,
-                                  media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
-                 SELECT 'x'||lpad(i::text,6,'0'),'b','g'||lpad(i::text,6,'0'),'committed',i,i-1,1,1,
-                        ''::bytea,''::bytea,''::bytea,''::bytea,
-                        'held',0
-                   FROM generate_series(1,100000) i;
-             INSERT INTO generation_extents (generation_id,seq,extent_id,plain_offset)
-                 SELECT generation_id,seq,id,plain_offset FROM extents;
-             INSERT INTO outbox (extent_id,generation_id,stage,next_at,updated_at)
-                 SELECT id,generation_id,'done',0,0 FROM extents ORDER BY seq;
-             INSERT INTO extents (id,bucket_id,state,plain_size,cipher_size,media_header,
-                                  plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
-                 SELECT 'orphan'||i,'b','staged',1,1,''::bytea,''::bytea,''::bytea,''::bytea,'held',0
-                   FROM generate_series(1,500) i;
-             INSERT INTO gc(extent_id,action,due_at)
-                 SELECT id,'delete_safety',10 FROM extents WHERE id LIKE 'orphan%';
-             INSERT INTO uploads (id,bucket_id,key,content_json,user_meta_json,state,initiated_at)
-                 SELECT 'upload'||seq,'b','key','{}','{}','open',0 FROM extents WHERE seq IS NOT NULL;
-             INSERT INTO upload_parts (upload_id,part_number,extent_id,size,etag,uploaded_at)
-                 SELECT 'upload'||seq,1,id,1,'etag',0 FROM extents WHERE seq IS NOT NULL;";
-        let tx = fixture::transaction_seeded(&mut db, &format!("{seed}{RELEASE_GAP}")).await;
-        tx.batch_execute(
-            "ANALYZE extents; ANALYZE outbox; ANALYZE generation_extents; ANALYZE generations; \
-                          ANALYZE gc; ANALYZE uploads; ANALYZE upload_parts",
-        )
-        .await
-        .unwrap();
-
-        let ids = tx
-            .query(&pg(REDRIVE_WINDOW_PG), &[&"x010000", &500_i64])
-            .await
-            .unwrap();
-        assert_eq!(ids.len(), 500);
-        let selected: Vec<&str> = ids.iter().map(|row| row.get(0)).collect();
-        let first = serde_json::to_string(&selected[..1]).unwrap();
-        let selected = serde_json::to_string(&selected).unwrap();
-        tx.batch_execute(&format!(
-            "PREPARE redrive(bigint,text,bigint,text) AS {}",
-            pg(REDRIVE_PG)
-        ))
-        .await
-        .unwrap();
-        let plan = explain(&tx, &format!("redrive(1,'[]',1,'{selected}')")).await;
-        assert_eq!(plan["Actual Rows"].as_f64(), Some(ids.len() as f64));
-        bounded_plan(&plan, "redrive", ids.len());
-
-        tx.batch_execute(&format!(
-            "PREPARE mark_sent(bigint,text) AS {}",
-            pg(MARK_SENT_PG)
-        ))
-        .await
-        .unwrap();
-        let plan = explain(&tx, &format!("mark_sent(2,'{first}')")).await;
-        bounded_plan(&plan, "mark sent", 1);
-        let marked: i64 = tx
-            .query_one("SELECT count(*) FROM outbox WHERE sent_at = 2", &[])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(marked, 1);
-
-        tx.batch_execute(&format!(
-            "PREPARE orphans(bigint,bigint,bigint,bigint) AS {}",
-            pg(GC_ORPHAN_WINDOW_PG)
-        ))
-        .await
-        .unwrap();
-        let plan = explain(&tx, "orphans(10,0,0,500)").await;
-        assert_eq!(plan["Actual Rows"].as_f64(), Some(500.));
-        bounded_plan(&plan, "orphan window", 500);
-        let candidates = tx
-            .query(
-                &pg(GC_ORPHAN_WINDOW_PG),
-                &[&10_i64, &0_i64, &0_i64, &500_i64],
-            )
-            .await
-            .unwrap();
-        assert!(candidates.iter().all(|row| row.get::<_, bool>(3)));
-        tx.rollback().await.unwrap();
-    }
-
-    const BUCKET: &str = "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at)
-      VALUES ('b','bucket','owner',X'',1,0);
-      INSERT INTO generations(id,bucket_id,key,state,size,etag,content_json,user_meta_json,extent_count,created_at)
-      VALUES ('g','b','key','live',6,'etag','{}','{}',6,0);";
-    const REVIVE_RELEASE_ONE: &str = "UPDATE extents SET safety_state = 'released', \
-      evict_seq = evict_seq + 1 WHERE id = 'x';";
-    const REVIVE_FIXTURE: &str = "INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,
-      plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at)
-      VALUES ('z','b','g','committed',0,0,1,1,X'',X'',X'',X'','held',0),
-             ('a','b','g','committed',1,1,1,1,X'',X'',X'',X'','held',0),
-             ('y','b','g','committed',2,2,1,1,X'',X'',X'',X'','held',0),
-             ('b','b','g','committed',3,3,1,1,X'',X'',X'',X'','releasing',0),
-             ('x','b','g','committed',4,4,1,1,X'',X'',X'',X'','held',0),
-             ('c','b',NULL,'staged',NULL,NULL,1,1,X'',X'',X'',X'','held',0);
-      INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,lease_token,lease_owner,lease_until)
-      VALUES ('z','g','post',10,0,9,'old',NULL), ('a','g','post',10,0,9,'old',NULL),
-             ('y','g','cancelled',10,0,9,'old',25), ('b','g','cancelled',10,0,9,'old',25),
-             ('x','g','cancelled',10,0,9,'old',25), ('c','g','cancelled',10,0,9,'old',25);";
-
-    #[tokio::test]
-    async fn due_and_revive_match_sqlite_rowid_and_postgres_seq() {
-        use super::{DUE_PAGE, DUE_PAGE_PG, REVIVE, REVIVE_PG, REVIVE_WINDOW, REVIVE_WINDOW_PG};
-        use crate::testkit::RusqliteSql;
-        use rusqlite::params;
-        const STATE: &str = "SELECT extent_id,stage,lease_token,lease_owner,lease_until FROM outbox
-                             WHERE extent_id NOT IN ('z','a') ORDER BY extent_id";
-        let expected = [
-            ("b".to_string(), "release".to_string(), 10_i64, None, None),
-            (
-                "c".to_string(),
-                "cancelled".to_string(),
-                9,
-                Some("old".to_string()),
-                Some(25_i64),
-            ),
-            ("x".to_string(), "done".to_string(), 10, None, None),
-            ("y".to_string(), "post".to_string(), 10, None, None),
-        ];
-        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
-        sqlite.apply(BUCKET).unwrap();
-        sqlite.apply(REVIVE_FIXTURE).unwrap();
-        sqlite.apply(REVIVE_RELEASE_ONE).unwrap();
-        sqlite.with_conn(|db| {
-            let mut due = db.prepare(DUE_PAGE).unwrap();
-            let due = due
-                .query_map(params![20, 2, 20, "post"], |r| r.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(due, ["z", "a"]);
-            for (after, page, revived) in [(2, [3, 4], 2), (4, [5, 6], 1)] {
-                let mut stmt = db.prepare(REVIVE_WINDOW).unwrap();
-                let window = stmt
-                    .query_map(params![after, 2], |r| r.get::<_, i64>(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
-                assert_eq!(window, page);
-                let mut stmt = db.prepare(REVIVE).unwrap();
-                let mut rows = stmt.query(params![30, after, page[1]]).unwrap();
-                let mut count = 0;
-                while rows.next().unwrap().is_some() {
-                    count += 1;
-                }
-                assert_eq!(count, revived);
-            }
-            assert!(db
-                .prepare(REVIVE_WINDOW)
-                .unwrap()
-                .query(params![6, 2])
-                .unwrap()
-                .next()
-                .unwrap()
-                .is_none());
-            let mut stmt = db.prepare(STATE).unwrap();
-            let state = stmt
-                .query_map([], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            assert_eq!(state, expected);
-        });
-        let Some(mut db) = fixture::connect().await else {
-            return;
-        };
-        let tx = fixture::transaction(&mut db).await;
-        for sql in [BUCKET, REVIVE_FIXTURE, REVIVE_RELEASE_ONE] {
-            tx.batch_execute(&sql.replace("X''", "''::bytea"))
-                .await
-                .unwrap();
-        }
-        let due: Vec<String> = tx
-            .query(&pg(DUE_PAGE_PG), &[&20_i64, &2_i64, &20_i64, &"post"])
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-        assert_eq!(due, ["z", "a"]);
-        for (after, page, revived) in [(2_i64, [3_i64, 4_i64], 2), (4, [5, 6], 1)] {
-            let window: Vec<i64> = tx
-                .query(&pg(REVIVE_WINDOW_PG), &[&after, &2_i64])
-                .await
-                .unwrap()
-                .iter()
-                .map(|r| r.get(0))
-                .collect();
-            assert_eq!(window, page);
-            assert_eq!(
-                tx.query(&pg(REVIVE_PG), &[&30_i64, &after, &page[1]])
-                    .await
-                    .unwrap()
-                    .len(),
-                revived
-            );
-        }
-        assert!(tx
-            .query(&pg(REVIVE_WINDOW_PG), &[&6_i64, &2_i64])
-            .await
-            .unwrap()
-            .is_empty());
-        type RevivedRow = (String, String, i64, Option<String>, Option<i64>);
-        let state: Vec<RevivedRow> = tx
-            .query(STATE, &[])
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
-            .collect();
-        assert_eq!(state, expected);
-        tx.rollback().await.unwrap();
-    }
-
-    const RELEASE_FIXTURE: &str = "INSERT INTO extents(id,bucket_id,generation_id,state,seq,plain_offset,
-      plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,article_count,plan_rev)
-      VALUES ('e','b','g','committed',0,0,1,1,X'',X'',X'',X'','held',0,2,1);
-      INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,lease_token,lease_owner,lease_until)
-      VALUES ('e','g','release',10,10,7,'job',30);
-      INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token)
-      VALUES ('e','alpha','p',12,1,2,2,'ok','body',7), ('e','beta','q',13,1,2,2,'ok','body',7);";
-
-    const STAT_ONLY: &str =
-        "UPDATE verifications SET kind='stat', articles_present=2, articles_ok=0;";
-    const BODY_ON_RECORD: &str = "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token)
-           VALUES ('e','alpha','p',9,1,2,2,'ok','body',6);";
-    const ESCALATE: &str =
-        "INSERT INTO verify_escalations(backbone,until,raised_at,extent_id,result)
-           VALUES ('alpha',100,1,'e','missing');";
-
-    #[tokio::test]
-    async fn release_guard_matches_sqlite_and_postgres_across_22_cases() {
-        use super::{
-            GUARD_RELEASE_AT_VERIFY, GUARD_RELEASE_AT_VERIFY_PG, GUARD_RELEASE_JOB,
-            GUARD_RELEASE_JOB_PG,
-        };
-        use crate::testkit::RusqliteSql;
-        use rusqlite::params;
-        let stat_with_body = format!("{STAT_ONLY}{BODY_ON_RECORD}");
-        let escalated_stat = format!("{STAT_ONLY}{ESCALATE}");
-        // name, at verify, need_full, light, fixture changes, allow
-        let cases = [
-            ("fresh body passes", false, 1_i64, 0_i64, "", true),
-            ("extra uncounted failure", false, 1, 0, "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token) VALUES ('e','extra','p',14,1,0,2,'missing','body',7);", true),
-            ("stat with body on record", false, 1, 0, stat_with_body.as_str(), true),
-            ("unsampled light stat", false, 0, 1, STAT_ONLY, true),
-            ("escalated with body on record", false, 0, 1, ESCALATE, true),
-            ("at verify while held", true, 1, 0, "", true),
-            ("finish interrupted release", false, 1, 0, "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = 'e';", true),
-            ("lease inclusive at now", false, 1, 0, "UPDATE outbox SET lease_until=20;", true),
-            ("only one pass", false, 1, 0, "DELETE FROM verifications WHERE backbone='beta';", false),
-            ("second backbone not counted", false, 1, 0, "UPDATE verifications SET backbone='extra' WHERE backbone='beta';", false),
-            ("stale pass token", false, 1, 0, "UPDATE verifications SET lease_token=6 WHERE backbone='beta';", false),
-            ("pass before claim", false, 1, 0, "UPDATE verifications SET verified_at=9 WHERE backbone='beta';", false),
-            ("pass after decision time", false, 1, 0, "UPDATE verifications SET verified_at=21 WHERE backbone='beta';", false),
-            ("later failed body", false, 1, 0, "INSERT INTO verifications(extent_id,backbone,provider_id,verified_at,plan_rev,articles_ok,articles_total,result,kind,lease_token) VALUES ('e','alpha','p',14,1,0,2,'missing','body',7);", false),
-            ("incomplete pass", false, 1, 0, "UPDATE verifications SET articles_ok=1 WHERE backbone='alpha';", false),
-            ("wrong lease token", false, 1, 0, "UPDATE outbox SET lease_token=8;", false),
-            ("expired lease", false, 1, 0, "UPDATE outbox SET lease_until=19;", false),
-            ("already released", false, 1, 0, "UPDATE extents SET safety_state = 'released', evict_seq = evict_seq + 1 WHERE id = 'e';", false),
-            ("no live reference", false, 1, 0, "UPDATE generations SET state='superseded';", false),
-            ("at verify while releasing", true, 1, 0, "UPDATE extents SET safety_state = 'releasing', evict_seq = evict_seq + 1 WHERE id = 'e';", false),
-            ("escalated with stat only", false, 0, 1, escalated_stat.as_str(), false),
-            ("full sample without body", false, 1, 1, STAT_ONLY, false),
-        ];
-        const LABELS: &str = r#"["alpha","beta"]"#;
-        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
-        sqlite.apply(BUCKET).unwrap();
-        sqlite.apply(RELEASE_FIXTURE).unwrap();
-        sqlite.with_conn(|db| {
-            for (name, whole, full, light, changes, allowed) in cases {
-                db.execute_batch("SAVEPOINT release_case").unwrap();
-                let (query, stage) = if whole {
-                    db.execute_batch("UPDATE outbox SET stage='verify'")
-                        .unwrap();
-                    (GUARD_RELEASE_AT_VERIFY, "verify")
-                } else {
-                    (GUARD_RELEASE_JOB, "release")
-                };
-                db.execute_batch(changes).unwrap();
-                let result = db.execute(
-                    query,
-                    params!["e", "g", stage, 7, 2, 20, LABELS, full, light],
-                );
-                if allowed {
-                    assert_eq!(result.unwrap_or_else(|err| panic!("{name}: {err}")), 0);
-                } else {
-                    assert_eq!(
-                        result.unwrap_err().sqlite_error_code(),
-                        Some(rusqlite::ErrorCode::ConstraintViolation),
-                        "{name}"
-                    );
-                }
-                db.execute_batch("ROLLBACK TO release_case; RELEASE release_case")
-                    .unwrap();
-            }
-        });
-        let Some(mut db) = fixture::connect().await else {
-            return;
-        };
-        let mut tx = fixture::transaction(&mut db).await;
-        for sql in [BUCKET, RELEASE_FIXTURE] {
-            tx.batch_execute(&sql.replace("X''", "''::bytea"))
-                .await
-                .unwrap();
-        }
-        use tokio_postgres::types::Type;
-        const T: Type = Type::TEXT;
-        const I: Type = Type::INT8;
-        let types = [T, T, T, I, I, I, T, I, I];
-        let at_verify = tx
-            .prepare_typed(&pg(GUARD_RELEASE_AT_VERIFY_PG), &types)
-            .await
-            .unwrap();
-        let release = tx
-            .prepare_typed(&pg(GUARD_RELEASE_JOB_PG), &types)
-            .await
-            .unwrap();
-        for (name, whole, full, light, changes, allowed) in cases {
-            let case = tx.transaction().await.unwrap();
-            let (query, stage) = if whole {
-                case.batch_execute("UPDATE outbox SET stage='verify'")
-                    .await
-                    .unwrap();
-                (&at_verify, "verify")
-            } else {
-                (&release, "release")
-            };
-            case.batch_execute(changes).await.unwrap();
-            let result = case
-                .execute(
-                    query,
-                    &[
-                        &"e", &"g", &stage, &7_i64, &2_i64, &20_i64, &LABELS, &full, &light,
-                    ],
-                )
-                .await;
-            if allowed {
-                assert_eq!(result.unwrap_or_else(|err| panic!("{name}: {err}")), 0);
-            } else {
-                let error = result.unwrap_err();
-                assert_eq!(
-                    error.as_db_error().and_then(|e| e.constraint()),
-                    Some("tx_guard_ok"),
-                    "{name}: {error:?}"
-                );
-            }
-            case.rollback().await.unwrap();
-        }
-        tx.rollback().await.unwrap();
-    }
 }

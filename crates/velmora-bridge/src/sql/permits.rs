@@ -97,7 +97,9 @@ async fn seed<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig) -> Result<u64> {
 async fn seed_slots<S: Sql>(c: &SqlCatalog<S>, key: &str, conns: SqlValue) -> Result<u64> {
     c.sql
         .exec(
-            c.sql.dialect().pick(SEED_SLOTS, SEED_SLOTS_PG),
+            "INSERT OR IGNORE INTO provider_permits(provider_id, slot) \
+             WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
+             SELECT ?1, n FROM s WHERE n < ?2",
             &[text(key), conns],
         )
         .await
@@ -119,7 +121,11 @@ pub(super) async fn sweep_gates<S: Sql>(
     };
     let rows = c
         .sql
-        .query(LIVE_GATES, &[SqlValue::Int(SEIZED_UNTIL_MS)])
+        .query(
+            "SELECT DISTINCT holder FROM provider_permits \
+             WHERE lease_until = ?1 AND holder IS NOT NULL ORDER BY holder",
+            &[SqlValue::Int(SEIZED_UNTIL_MS)],
+        )
         .await?;
     let mut seized_by = Vec::with_capacity(rows.len());
     for row in rows {
@@ -149,7 +155,7 @@ pub(super) async fn sweep_gates<S: Sql>(
 // and a background job (`?9` = 1) also fewer than `?10` background
 // holders. `?9` is written on the slot.
 macro_rules! take_slot {
-    ($order:literal, $pool:literal, $ip_limit:literal) => {
+    ($order:literal) => {
         concat!(
             "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3, \
                pool = ?6, background = ?9 \
@@ -158,9 +164,9 @@ macro_rules! take_slot {
                ORDER BY slot ",
             $order,
             " LIMIT 1) \
-               AND (", $pool, " IS NULL OR (SELECT COUNT(*) FROM provider_permits \
+               AND (?6 IS NULL OR (SELECT COUNT(*) FROM provider_permits \
                  WHERE pool = ?6 AND lease_until >= ?5) < ?7) \
-               AND (", $ip_limit, " IS NULL \
+               AND (?8 IS NULL \
                  OR ((EXISTS (SELECT 1 FROM provider_permits \
                        WHERE provider_id = ?1 AND holder = ?2 AND lease_until >= ?5) \
                      OR (SELECT COUNT(DISTINCT holder) FROM provider_permits \
@@ -227,8 +233,8 @@ pub(super) async fn acquire_permit<S: Sql>(
     // Reads fill from the top, so they use the reserved slot first and
     // leave the shared ones to background jobs.
     let sql = match class {
-        PermitClass::Read | PermitClass::Drill => c.sql.dialect().pick(TAKE_DESC, TAKE_DESC_PG),
-        PermitClass::Background => c.sql.dialect().pick(TAKE_ASC, TAKE_ASC_PG),
+        PermitClass::Read | PermitClass::Drill => take_slot!("DESC"),
+        PermitClass::Background => take_slot!("ASC"),
     };
     // A second try only when this call had to create the provider's slots.
     for attempt in 0..2 {
@@ -276,7 +282,13 @@ async fn acquire_drill<S: Sql>(
     ];
     // A second try only when this call had to create the slots.
     for attempt in 0..2 {
-        let rows = c.sql.query(ACQUIRE_DRILL, &params).await?;
+        let rows = c
+            .sql
+            .query(
+                "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3,                    pool = NULL, background = 0                  WHERE provider_id = ?1 AND slot = (SELECT slot FROM provider_permits                    WHERE provider_id = ?1 AND slot < ?4 AND lease_until < ?5                    ORDER BY slot LIMIT 1)                  RETURNING slot, token",
+                &params,
+            )
+            .await?;
         if let Some(row) = rows.into_iter().next() {
             let mut r = Cols::new(row);
             return Ok(Some(Permit {
@@ -297,7 +309,13 @@ async fn acquire_drill<S: Sql>(
 /// renewal can extend it (see the module docs). Free slots are not
 /// written again.
 async fn free_expired<S: Sql>(c: &SqlCatalog<S>, p: &ProviderConfig, now: UnixMs) -> Result<()> {
-    c.sql.exec(REAP_EXPIRED, &[text(&p.id), ms(now)]).await?;
+    c.sql
+        .exec(
+            "UPDATE provider_permits SET lease_until = 0, holder = NULL \
+             WHERE provider_id = ?1 AND lease_until > 0 AND lease_until < ?2",
+            &[text(&p.id), ms(now)],
+        )
+        .await?;
     Ok(())
 }
 
@@ -341,179 +359,22 @@ pub(super) fn renew_stmt(p: &Permit, now: UnixMs) -> Result<super::uploads::Stmt
         ms(now),
         SqlValue::Int(ttl_ms(PermitClass::Read)),
     ]);
-    Ok((RENEW_PERMIT, params))
+    Ok((
+        "UPDATE provider_permits \
+         SET lease_until = ?5 + CASE background WHEN 1 THEN ?4 ELSE ?6 END \
+         WHERE provider_id = ?1 AND slot = ?2 AND token = ?3 AND lease_until >= ?5",
+        params,
+    ))
 }
 
 /// Frees the slot if this permit still owns it; otherwise does nothing.
 pub(super) async fn release_permit<S: Sql>(c: &SqlCatalog<S>, p: &Permit) -> Result<()> {
-    c.sql.exec(RELEASE_PERMIT, &permit_params(p)?).await?;
+    c.sql
+        .exec(
+            "UPDATE provider_permits SET lease_until = 0, holder = NULL \
+             WHERE provider_id = ?1 AND slot = ?2 AND token = ?3",
+            &permit_params(p)?,
+        )
+        .await?;
     Ok(())
-}
-
-const SEED_SLOTS: &str = "INSERT OR IGNORE INTO provider_permits(provider_id, slot) \
-             WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
-             SELECT ?1, n FROM s WHERE n < ?2";
-
-const SEED_SLOTS_PG: &str = "INSERT INTO provider_permits(provider_id, slot) \
-             WITH RECURSIVE s(n) AS (SELECT 0::bigint UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
-             SELECT ?1, n FROM s WHERE n < ?2 ON CONFLICT DO NOTHING";
-
-const LIVE_GATES: &str = "SELECT DISTINCT holder FROM provider_permits \
-             WHERE lease_until = ?1 AND holder IS NOT NULL ORDER BY holder";
-
-const ACQUIRE_DRILL: &str = "UPDATE provider_permits SET token = token + 1, holder = ?2, lease_until = ?3,                    pool = NULL, background = 0                  WHERE provider_id = ?1 AND slot = (SELECT slot FROM provider_permits                    WHERE provider_id = ?1 AND slot < ?4 AND lease_until < ?5                    ORDER BY slot LIMIT 1)                  RETURNING slot, token";
-
-const REAP_EXPIRED: &str = "UPDATE provider_permits SET lease_until = 0, holder = NULL \
-             WHERE provider_id = ?1 AND lease_until > 0 AND lease_until < ?2";
-
-const RENEW_PERMIT: &str = "UPDATE provider_permits \
-         SET lease_until = ?5 + CASE background WHEN 1 THEN ?4 ELSE ?6 END \
-         WHERE provider_id = ?1 AND slot = ?2 AND token = ?3 AND lease_until >= ?5";
-
-const RELEASE_PERMIT: &str = "UPDATE provider_permits SET lease_until = 0, holder = NULL \
-             WHERE provider_id = ?1 AND slot = ?2 AND token = ?3";
-
-const TAKE_ASC: &str = take_slot!("ASC", "?6", "?8");
-const TAKE_DESC: &str = take_slot!("DESC", "?6", "?8");
-
-// An absent pool or IP limit binds UNKNOWN, so its IS NULL test has to
-// provide a type even though the other occurrences have a typed context.
-const TAKE_ASC_PG: &str = take_slot!("ASC", "?6::text", "?8::bigint");
-const TAKE_DESC_PG: &str = take_slot!("DESC", "?6::text", "?8::bigint");
-
-/// Actual Postgres texts and representative wire types for typed PREPARE.
-#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
-pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
-    const I: SqlValue = SqlValue::Int(0);
-    const T: SqlValue = SqlValue::Text(String::new());
-    vec![
-        (SEED_SLOTS_PG.to_owned(), vec![T, I]),
-        (LIVE_GATES.to_owned(), vec![I]),
-        (ACQUIRE_DRILL.to_owned(), vec![T, T, I, I, I]),
-        (REAP_EXPIRED.to_owned(), vec![T, I]),
-        (RENEW_PERMIT.to_owned(), vec![T, I, I, I, I, I]),
-        (RELEASE_PERMIT.to_owned(), vec![T, I, I]),
-        (TAKE_ASC_PG.to_owned(), vec![T, T, I, I, I, T, I, I, I, I]),
-        (
-            TAKE_DESC_PG.to_owned(),
-            vec![
-                T,
-                T,
-                I,
-                I,
-                I,
-                SqlValue::Null,
-                I,
-                SqlValue::Null,
-                I,
-                SqlValue::Null,
-            ],
-        ),
-    ]
-}
-
-#[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
-mod postgres_tests {
-    use super::{SEED_SLOTS, SEED_SLOTS_PG, TAKE_ASC, TAKE_ASC_PG, TAKE_DESC, TAKE_DESC_PG};
-    use crate::{gate::pg_background_fixture as pg, testkit::RusqliteSql};
-    use rusqlite::{params, OptionalExtension};
-
-    #[tokio::test]
-    async fn permit_quotas_match_sqlite_and_postgres() {
-        // provider, holder, pool, IP limit, background, expected free slot
-        let cases = [
-            ("p", "job1", Some("pool"), Some(2_i64), 1_i64, Some(0_i64)),
-            ("q", "job2", Some("pool"), Some(2), 1, None), // Pool spans providers.
-            ("p", "job2", None, Some(2), 1, None),         // Background IP reserve.
-            ("p", "job1", None, Some(2), 1, Some(1)),      // Same job adds no IP.
-            ("p", "reader", None, Some(2), 0, Some(3)),    // Read reserve.
-            ("p", "other-reader", None, Some(2), 0, None), // Slot 2 free, IP cap full.
-            ("q", "unlimited", None, None, 0, Some(3)),    // Both limits NULL.
-        ];
-        let sqlite = RusqliteSql::with_schema_unarmed().unwrap();
-        sqlite.with_conn(|db| {
-            for provider in ["p", "q"] {
-                assert_eq!(db.execute(SEED_SLOTS, params![provider, 4]).unwrap(), 4);
-                assert_eq!(db.execute(SEED_SLOTS, params![provider, 4]).unwrap(), 0);
-            }
-            for (provider, holder, pool, ips, background, slot) in cases {
-                let (query, cap) = if background == 1 {
-                    (TAKE_ASC, 3)
-                } else {
-                    (TAKE_DESC, 4)
-                };
-                let found = db
-                    .query_row(
-                        query,
-                        params![
-                            provider,
-                            holder,
-                            50,
-                            cap,
-                            10,
-                            pool,
-                            1,
-                            ips,
-                            background,
-                            ips.map(|n| n - 1)
-                        ],
-                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                    )
-                    .optional()
-                    .unwrap();
-                assert_eq!(found, slot.map(|s| (s, 1)), "{provider}/{holder}");
-            }
-        });
-        let Some(mut db) = pg::connect().await else {
-            return;
-        };
-        let tx = pg::transaction(&mut db).await;
-        let seed = pg::sql(SEED_SLOTS_PG);
-        for provider in ["p", "q"] {
-            assert_eq!(tx.execute(&seed, &[&provider, &4_i64]).await.unwrap(), 4);
-            assert_eq!(tx.execute(&seed, &[&provider, &4_i64]).await.unwrap(), 0);
-        }
-        use tokio_postgres::types::Type;
-        // Match the adapter's explicit INT8 and TEXT wire types, not
-        // PostgreSQL's inference for untyped integer or JSON literals.
-        const T: Type = Type::TEXT;
-        const I: Type = Type::INT8;
-        let types = [T, T, I, I, I, T, I, I, I, I];
-        let take_asc = tx
-            .prepare_typed(&pg::sql(TAKE_ASC_PG), &types)
-            .await
-            .unwrap();
-        let take_desc = tx
-            .prepare_typed(&pg::sql(TAKE_DESC_PG), &types)
-            .await
-            .unwrap();
-        for (provider, holder, pool, ips, background, slot) in cases {
-            let (query, cap) = if background == 1 {
-                (&take_asc, 3_i64)
-            } else {
-                (&take_desc, 4_i64)
-            };
-            let found = tx
-                .query_opt(
-                    query,
-                    &[
-                        &provider,
-                        &holder,
-                        &50_i64,
-                        &cap,
-                        &10_i64,
-                        &pool,
-                        &1_i64,
-                        &ips,
-                        &background,
-                        &ips.map(|n| n - 1),
-                    ],
-                )
-                .await
-                .unwrap()
-                .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)));
-            assert_eq!(found, slot.map(|s| (s, 1)), "{provider}/{holder}");
-        }
-        tx.rollback().await.unwrap();
-    }
 }

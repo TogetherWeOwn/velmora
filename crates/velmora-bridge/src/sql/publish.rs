@@ -164,6 +164,15 @@ pub(super) fn placement_values(
 ///
 /// Running them again changes nothing: an adopted extent is no longer
 /// staged, and a reference that exists is ignored.
+pub(super) fn adopt(
+    g: &GenerationId,
+    bucket: &BucketId,
+    source: Source<'_>,
+    values: &[String],
+) -> Vec<Stmt> {
+    adopt_in(Dialect::Sqlite, g, bucket, source, values)
+}
+
 pub(super) fn adopt_in(
     dialect: Dialect,
     g: &GenerationId,
@@ -359,12 +368,12 @@ mod tests {
             UploadId::new("u_1".to_owned()),
         );
         let values = vec!["[]".to_owned(), "[]".to_owned(), "[]".to_owned()];
-        let live = adopt_in(Dialect::Sqlite, &g, &b, Source::Upload(&u), &values);
+        let live = adopt(&g, &b, Source::Upload(&u), &values);
         assert_eq!(live.len(), 3);
         assert!(live
             .iter()
             .all(|(sql, p)| *sql == ADOPT_UPLOAD && p.len() == 4));
-        let replay = adopt_in(Dialect::Sqlite, &g, &b, Source::Record, &values);
+        let replay = adopt(&g, &b, Source::Record, &values);
         assert_eq!(replay.len(), 6);
         for pair in replay.chunks(2) {
             assert_eq!((pair[0].0, pair[1].0), (ADOPT_RECORD, REFERENCE_SHARED));
