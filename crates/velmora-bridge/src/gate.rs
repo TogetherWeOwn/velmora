@@ -2191,14 +2191,28 @@ pub(crate) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
 #[cfg(all(test, feature = "pg-test-record", not(target_arch = "wasm32")))]
 pub(crate) mod pg_background_fixture {
     use std::path::{Path, PathBuf};
-    use tokio_postgres::{Client, NoTls, Transaction};
+    use tokio_postgres::{Client, Transaction};
 
     pub(crate) async fn connect() -> Option<Client> {
         let url = std::env::var("VELMORA_TEST_PG_URL").ok()?;
-        let (db, driver) = tokio_postgres::connect(&url, NoTls)
-            .await
-            .expect("connect to the Postgres test database");
-        tokio::spawn(driver);
+        #[cfg(feature = "testkit-pg")]
+        let db = {
+            let config = url
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid PostgreSQL test configuration"));
+            let (db, _driver) = crate::testkit::connect_test_postgres(&config)
+                .await
+                .expect("connect to the Postgres test database");
+            db
+        };
+        #[cfg(not(feature = "testkit-pg"))]
+        let db = {
+            let (db, driver) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("connect to the Postgres test database");
+            tokio::spawn(driver);
+            db
+        };
         Some(db)
     }
 

@@ -2171,7 +2171,10 @@ async fn calls_that_cross_the_end_of_a_session_share_the_next() {
     // The release arrives and ends the session; the waiter opens the
     // next one, and that is on its way when a third call comes.
     w.stall.set(false);
-    assert!(step(release.as_mut()).is_ready());
+    tokio::time::timeout(std::time::Duration::from_secs(5), release.as_mut())
+        .await
+        .expect("release completes after the stall clears")
+        .unwrap();
     assert_eq!(w.sessions(name), 0);
     w.stall.set(true);
     assert!(step(one.as_mut()).is_pending());

@@ -40,7 +40,7 @@ fn pg_error(context: &str, error: tokio_postgres::Error) -> BridgeError {
     BridgeError::Sql(format!("pg testkit: {context} (no SQLSTATE)"))
 }
 
-async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)> {
+pub(crate) async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)> {
     if config.get_ssl_mode() == SslMode::Disable {
         let (client, connection) = config
             .connect(NoTls)

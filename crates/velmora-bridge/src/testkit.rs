@@ -33,6 +33,13 @@ use crate::types::{
 #[cfg(feature = "testkit-pg")]
 #[path = "testkit_pg.rs"]
 mod postgres;
+#[cfg(all(
+    test,
+    feature = "testkit-pg",
+    feature = "pg-test-record",
+    not(target_arch = "wasm32")
+))]
+pub(crate) use postgres::connect as connect_test_postgres;
 #[cfg(feature = "testkit-pg")]
 pub use postgres::TestPostgres;
 

@@ -424,6 +424,11 @@ async fn s2_eight_takeover_contenders_leave_one_owner_and_fence_stale_writes() {
             "begin light release ({need_full}): {outcome:?}"
         );
     }
+    let outcome = c.begin_release(&release, 1, &["bb".into()], "[]", t3).await;
+    assert!(
+        matches!(outcome, Ok(Guard::Lost)),
+        "current holder cannot release using the previous holder's pass: {outcome:?}"
+    );
     assert_eq!(rows(&c, snapshot, &bound).await, before);
 
     let t4 = t3.plus_ms(1);

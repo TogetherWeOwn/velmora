@@ -117,6 +117,10 @@ async fn get_catalogue_and_range_planning_failures_keep_their_error_responses() 
         )
         .await
         .unwrap();
+    observed_get(&rig, req().into_request(), "plan", "gt_1gib")
+        .await
+        .expect_error(500, "InternalError");
+
     let mut unsigned = req().into_request();
     unsigned
         .headers

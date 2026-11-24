@@ -385,6 +385,8 @@ jobs:
   # Deliberately outside ci-ok until both sets of catalogue SQL variants land.
   bridge-postgres:
     name: bridge PostgreSQL tests
+    needs: changes
+    if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
     # Measured local suite time and hosted test slowdown imply ~47 minutes plus build.
     timeout-minutes: 75
@@ -421,7 +423,8 @@ jobs:
           VELMORA_TEST_PG_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/velmora_test?sslmode=disable
         run: |
           set -euo pipefail
-          export VELMORA_PG_STATEMENTS_DIR="$(mktemp -d "${RUNNER_TEMP}/velmora-pg-statements.XXXXXX")"
+          VELMORA_PG_STATEMENTS_DIR="$(mktemp -d "${RUNNER_TEMP}/velmora-pg-statements.XXXXXX")"
+          export VELMORA_PG_STATEMENTS_DIR
           suite=0
           coverage=0
           cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --tests --no-fail-fast -- --test-threads=4 || suite=$?
