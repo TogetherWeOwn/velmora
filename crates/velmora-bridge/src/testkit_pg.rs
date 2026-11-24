@@ -40,7 +40,27 @@ fn pg_error(context: &str, error: tokio_postgres::Error) -> BridgeError {
     BridgeError::Sql(format!("pg testkit: {context} (no SQLSTATE)"))
 }
 
+fn prepare_config(config: &Config) -> Result<Config> {
+    let mut config = config.clone();
+    if config.get_ssl_mode() == SslMode::Disable {
+        let loopback = matches!(config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(host)]
+                if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        if !loopback || !config.get_hostaddrs().is_empty() {
+            return Err(BridgeError::Sql(
+                "pg testkit: cleartext requires a single numeric loopback host without hostaddr"
+                    .into(),
+            ));
+        }
+    } else {
+        // Prefer can silently negotiate cleartext. Always require verified TLS.
+        config.ssl_mode(SslMode::Require);
+    }
+    Ok(config)
+}
+
 pub(crate) async fn connect(config: &Config) -> Result<(Client, JoinHandle<()>)> {
+    let config = prepare_config(config)?;
     if config.get_ssl_mode() == SslMode::Disable {
         let (client, connection) = config
             .connect(NoTls)
@@ -232,4 +252,67 @@ where
     })
     .join()
     .map_err(|_| BridgeError::Sql("pg testkit: management thread panicked".into()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cleartext_fixture() -> Option<Config> {
+        let url = std::env::var(URL_VAR).ok()?;
+        let config: Config = url
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid PostgreSQL test configuration"));
+        (config.get_ssl_mode() == SslMode::Disable).then_some(config)
+    }
+
+    #[test]
+    fn cleartext_requires_a_single_numeric_loopback_without_hostaddr() {
+        for input in [
+            "host=192.0.2.1 sslmode=disable",
+            "host=localhost sslmode=disable",
+            "host=127.0.0.1,127.0.0.2 sslmode=disable",
+            "host=127.0.0.1 hostaddr=127.0.0.1 sslmode=disable",
+        ] {
+            let config = input.parse::<Config>().unwrap();
+            assert!(prepare_config(&config).is_err(), "accepted {input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn implicit_tls_mode_does_not_fall_back_on_a_tls_off_server() {
+        let Some(mut config) = cleartext_fixture() else {
+            return;
+        };
+        let (db, driver) = connect(&config).await.unwrap();
+        let server_ssl: String = db.query_one("SHOW ssl", &[]).await.unwrap().get(0);
+        drop(db);
+        driver.abort();
+        if server_ssl != "off" {
+            return;
+        }
+        // Preserve the test endpoint, but restore the mode of a config with no sslmode.
+        config.ssl_mode(Config::new().get_ssl_mode());
+        assert!(
+            connect(&config).await.is_err(),
+            "implicit sslmode accepted a TLS-off PostgreSQL server"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_cleartext_connects_to_the_loopback_fixture() {
+        let Some(config) = cleartext_fixture() else {
+            return;
+        };
+        let (db, driver) = connect(&config).await.unwrap();
+        assert_eq!(
+            db.query_one("SELECT 1", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            1
+        );
+        drop(db);
+        driver.abort();
+    }
 }

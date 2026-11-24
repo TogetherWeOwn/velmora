@@ -928,7 +928,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "pg-test-record")]
+    #[cfg(all(feature = "pg-test-record", feature = "testkit-pg"))]
     #[tokio::test]
     async fn postgres_bucket_verdict_matches_sqlite_cases() {
         use crate::gate::pg_background_fixture as pg;
