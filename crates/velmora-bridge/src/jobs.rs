@@ -871,15 +871,19 @@ where
         let stale = hot_time(rows, "hot_ctl_at")
             .is_some_and(|at| now.0.saturating_sub(at.0) > HOT_CTL_STALE_MS);
         if cfg.mode == HotCtlMode::Adaptive && (rows.get(HOT_CAP_KEYS[1]) == Some(&0) || stale) {
-            // Zero provenance marks shadow. A stale decision can also
-            // survive a period in fixed mode, which writes no state.
-            // Carry over the fixed threshold until adaptive steps it.
-            return (
-                self.cfg
-                    .hot_cap_bytes
-                    .clamp(cfg.min_bytes, hotctl::MEASURABLE_MAX_BYTES),
-                "mode_switch",
-            );
+            // A stale decision may mean fixed mode or an adaptive outage.
+            // Protect both the fixed threshold and any larger cap that this
+            // controller actually applied. Zero provenance marks shadow.
+            let seed = self
+                .cfg
+                .hot_cap_bytes
+                .clamp(cfg.min_bytes, hotctl::MEASURABLE_MAX_BYTES);
+            let applied = hot_unsigned(rows, HOT_CAP_KEYS[1]).filter(|&applied| {
+                applied > 0
+                    && applied <= hotctl::MEASURABLE_MAX_BYTES
+                    && hot_unsigned(rows, HOT_CAP_KEYS[0]) == Some(applied)
+            });
+            return (applied.map_or(seed, |cap| cap.max(seed)), "mode_switch");
         }
         let max = cfg
             .max_bytes

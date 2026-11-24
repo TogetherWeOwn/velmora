@@ -931,6 +931,38 @@ async fn resuming_adaptive_after_fixed_rate_limits_from_the_actual_fixed_cap() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_stale_controller_does_not_cut_an_applied_cap_above_the_fixed_cap() {
+    use velmora_bridge::config::HotCtlMode;
+    let hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Adaptive;
+        cfg.hot_cap_bytes = 100 * GIB;
+    })
+    .await;
+    let x = hot.released("grown-cap-stale").await;
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 322122547200 WHERE id = ?1",
+        &x,
+    );
+    let bridge = hot.bridge();
+    bridge
+        .catalog
+        .hot_ctl_store(&[
+            ("hot_cap_target", (400 * GIB) as i64),
+            ("hot_ctl_applied_cap", (400 * GIB) as i64),
+            ("hot_ctl_at", bridge.clock.now().0),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
+    bridge.clock.advance_secs(80 * 60);
+    assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
+    bridge.clock.advance_secs(45 * 60);
+    assert_eq!(bridge.evict_batch(0).await.unwrap(), 0);
+    assert!(hot.has_safety(&x));
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 400 * GIB);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn unavailable_diagnostics_leave_the_admin_cap_accurate() {
     use velmora_bridge::config::HotCtlMode;
     let hot = hot_with(|cfg| {
