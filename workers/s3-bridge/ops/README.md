@@ -1993,33 +1993,46 @@ different rustc may number the functions differently.
 
 These are opt-in operator tools; they do not deploy a Worker or switch its
 backend. Stop writers and arm the D1 restore fence before taking a **full**
-`wrangler d1 export`. Keep the frozen D1 and the original export. Never use a
-live export, a subset of exported tables, or a reverse PG-to-D1 copy to roll
-back. Run these host tools from a trusted checkout with Python 3, psycopg 3.2+
+export with `catalog-export.sh`. Keep its verified manifest and original SQL;
+the wrapper disables Wrangler disk logging and redacts upload/download URLs.
+Do not run raw `wrangler d1 export` to obtain this receipt. Keep the frozen D1.
+Never use a live export, a subset of tables, or a reverse PG-to-D1 copy to roll back. Run these host tools from a trusted checkout with Python 3, psycopg 3.2+
 (`psycopg[binary]`), `sqlite3` with `-safe`, `psql`, and `zstd` for a compressed
 export. Keep the inputs, working files and output receipts in a private
 operator-owned directory (`umask 077`).
 
 1. Record the freeze start and the exact `restore_state` rows before and after
-   the D1 arm. The F1 JSON contains `f1_started_at_ms` (integer),
-   `restore_state_before` (row object or `null`), `restore_state_armed` (row
-   object), and `f7_started` (boolean; set true durably **before** deploying the
-   first PG version that admits writes). Each row object has `id`, `state`,
-   `since_ms`, `started_at`, `finished_at`, `reached_phase`, `reached_after`,
-   and `reached_extent`. A fresh arm has `id=1`, `state="replaying"`,
-   `since_ms=-1`, a new `started_at` token, and null finish/progress fields.
-2. Load and census the exported data locally. `pg-copy` only opens Postgres
-   if `--apply` is supplied, and never queries D1. For a compressed export,
-   supply the verified, reassembled `.zst` file.
+   the D1 arm. Use `pg-cutover-disarm.py --f1 pre-arm.json --prepare-f1 f1.json`
+   to generate a new private receipt from the pre-arm data. The F1 JSON contains
+   `f1_started_at_ms` (integer), `d1_uuid`, `worker_name`, `f1_attempt_id`
+   (new random 32 lowercase hex digits),
+   `restore_state_before` (row object or `null`) and `restore_state_armed`
+   (row object). Each row object has `id`, `state`, `since_ms`, `started_at`,
+   `finished_at`, `reached_phase`, `reached_after`, and `reached_extent`.
+   The arm has `id=1`, `state="replaying"`, `since_ms=-1`, `started_at` equal
+   to the pre-arm value plus one (or 0 if no previous row), `reached_after`
+   equal to the attempt id, and null finish/phase/extent fields. Use
+   `pg-cutover-disarm.py --f1 f1.json --remote --database <D1-UUID>
+   --operation arm-f1 --confirm-fence`, and require one changed row before
+   draining. Replay ignores `reached_after` while `reached_phase` is null.
+2. While the D1 writers are still frozen, collect the independent source
+   witness. It checks indexed first/last keys and the table set; PK-less tables
+   use capped indexed rowid pages. It never counts or scans an unbounded D1
+   table. The load/copy and verify modes do not call D1. Use the manifest
+   returned by `catalog-export.sh` and its original SQL or verified, reassembled
+   `.zst` file. Keep the generated SQLite seal beside `frozen.sqlite`.
 
    ```sh
-   python3 ops/pg-copy.py --export export.sql --sqlite frozen.sqlite --f1 f1.json > census.json
+   python3 ops/pg-copy.py --capture-boundaries --f1 f1.json > boundaries.json
+   python3 ops/pg-copy.py --export export.sql --sqlite frozen.sqlite --f1 f1.json \
+     --manifest export.manifest.json --source-boundaries boundaries.json > census.json
    ```
 
-   The census reports storage classes, held/releasing count and oldest
-   `created_at` (`s_held_ms`), extent count and timings. Do not coerce violations
-   or ignore a mismatch in the arm record. An exported literal NUL is also a
-   failure, not a value to truncate.
+   The loader rejects wrong bytes or digest before opening SQLite, and checks
+   the independent D1 witness before publishing a local seal. The census
+   reports storage classes, held/releasing count and oldest `created_at`
+   (`s_held_ms`), extent count and timings. Do not coerce violations, ignore an
+   arm mismatch, or repair a source seal. A literal NUL also stops the run.
 3. Provision the destination roles and a fresh schema with `kofra_app` schema
    `USAGE` revoked. Use the migrate role and the literal, mode-0600 libpq file
    described in [the Postgres schema guide](../pg/README.md). The script runs
@@ -2029,8 +2042,10 @@ operator-owned directory (`umask 077`).
    to reuse the target; inspect the failure, then rebuild a fresh target.
 
    ```sh
-   python3 ops/pg-copy.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env --apply > copy.json
-   python3 ops/pg-verify.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env --activate > verify.json
+   python3 ops/pg-copy.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env \
+     --manifest export.manifest.json --source-boundaries boundaries.json --apply > copy.json
+   python3 ops/pg-verify.py --sqlite frozen.sqlite --f1 f1.json --pg-env pg.env \
+     --manifest export.manifest.json --source-boundaries boundaries.json --activate > verify.json
    ```
 
    The imported `outbox.seq` follows the **exported** SQLite rowid order,
@@ -2041,23 +2056,32 @@ operator-owned directory (`umask 077`).
    duplicates. `pg-verify` without `--activate` is read-only. Explicit
    activation follows successful content and schema checks and atomically drops
    the marker and grants `USAGE`. Keep maintenance on through the PG read canary.
+4. Before starting the first deployment that admits writes on PG, persist the
+   F7 boundary in D1 with `pg-cutover-disarm.py --f1 f1.json --remote --database
+   <D1-UUID> --operation mark-f7 --confirm-fence`. Proceed only on one changed
+   row; keep the output receipt with the freeze records. The marker is never
+   cleared to attempt R0.
 
 ### Rollback
 
 - **R0, only before F7 starts:** use `python3 ops/pg-cutover-disarm.py --f1
-  f1.json --remote --confirm-r0 --database <D1-UUID>` with the scoped Cloudflare
-  credentials in the process environment. Local rehearsal uses `--local
-  --database <name> --config <wrangler.toml> [--persist-to <dir>]` instead.
-  It restores the previous row (or deletes the initial arm) with one guarded
-  statement. Only a one-row change authorizes the version rollback. On zero
-  rows, stop and use the R1b replay path on D1; on unknown outcome, inspect the
-  exact restore row and do not blindly retry.
+  f1.json --remote --confirm-r0 --database <D1-UUID> --worker <name>` with the
+  scoped Cloudflare credentials in the process environment. Local tests use
+  `--local --database <name> --config <wrangler.toml> [--persist-to <dir>]`.
+  The remote tool refuses missing deployment history or any PG version since
+  F1 without `MAINTENANCE=restore`, then restores the previous row (or deletes
+  the initial arm) only if the exact attempt still matches and no durable F7
+  marker exists. A zero-change response distinguishes an already-restored row
+  from a different arm, but never authorizes a version rollback on its own.
 - **R1b, once F7 starts:** freeze and pause PG writers, apply
   `pg-restore-arm.sql` with the migrate role and `ON_ERROR_STOP`, then drain.
   This SQL takes the same catalogue lock and refuses an incomplete import. It
   uses the public schema's fixed lock by default; tests set `search_path` and
-  `velmora.lock_key` for the isolated schema. Select D1 with maintenance still
-  on and apply the durable access revocations before replay. Compute the exact
+  `velmora.lock_key` for the isolated schema. For R1b, set the session's
+  `velmora.cutover_attempt` to the F1 attempt id before arming so the SQL also
+  stamps the frozen PG epoch for access reconciliation. After draining, select
+  D1 with maintenance still on and apply the durable access revocations before
+  replay. Use a report taken against that exact frozen PG epoch. Compute the exact
   replay start with `python3 ops/pg-cutover-disarm.py --f1 f1.json --r1b-census
   census.json`. Pass the returned `since_ms` and `margin_ms` to `catalog-replay.sh`
   (margin 0; the tool already subtracts ten minutes). If `held_missing_total`

@@ -1,6 +1,7 @@
 """Shared catalogue migration contracts. No credentials or catalogue values in diagnostics."""
 
 from contextlib import closing, contextmanager
+from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 OPS = Path(__file__).resolve().parent
 SAFE_INT = 2**53 - 1
@@ -24,8 +27,29 @@ TABLES = (
     "usage_hours", "usage_recounts", "verify_raises", "verify_escalations", "recovery_copy_log",
 )
 UNKEYED = {"tx_guard", "recovery_copy_log"}
+SOURCE_KEYS = {
+    "buckets": ("id",), "access_keys": ("access_key_id",), "grants": ("access_key_id", "bucket_id"),
+    "generations": ("id",), "objects": ("bucket_id", "key"), "extents": ("id",),
+    "articles": ("extent_id", "idx"), "verifications": ("extent_id", "backbone", "verified_at"),
+    "outbox": ("extent_id",), "uploads": ("id",), "upload_parts": ("upload_id", "part_number"),
+    "gc": ("id",), "provider_permits": ("provider_id", "slot"), "meta": ("k",),
+    "provider_health": ("provider_id",), "scan_cursors": ("k",), "generation_extents": ("generation_id", "seq"),
+    "key_floors": ("bucket_id", "key"), "restore_state": ("id",), "rollback_stamp": ("id",),
+    "write_intents": ("extent_id",), "upload_part_extents": ("upload_id", "part_number", "piece"),
+    "usage_global": ("id",), "usage_buckets": ("kind", "bucket_id"), "usage_hours": ("hour",),
+    "usage_recounts": ("id",), "verify_raises": ("extent_id", "backbone", "plan_rev"),
+    "verify_escalations": ("backbone",),
+}
+INT_KEY = {"gc", "restore_state", "rollback_stamp", "usage_global", "usage_buckets", "usage_hours", "usage_recounts"}
+ROWID_TEXT_PK = {"access_keys", "buckets", "extents", "generations", "outbox", "uploads"}
+KEYLESS_COLUMNS = {"tx_guard": ("ok",), "recovery_copy_log": ("at", "kind", "pass", "swept", "problems", "checked", "detail")}
+D1_SYSTEM = {"_cf_KV", "_cf_METADATA", "d1_migrations"}
 PG_TYPES = {"INTEGER": "int8", "TEXT": "text", "BLOB": "bytea"}
 JSON_CAP = 1 << 20
+ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
+D1_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+F7_PREFIX = "cutover_f7:"
+R1B_PREFIX = "cutover_r1b:"
 
 
 class Failure(Exception):
@@ -83,10 +107,17 @@ def safe_int(value):
 
 
 def f1_receipt(path):
-    receipt = json_input(path)
+    return validate_f1(json_input(path))
+
+
+def validate_f1(receipt):
     require(safe_int(receipt.get("f1_started_at_ms")) and receipt["f1_started_at_ms"] >= 0,
             "invalid F1 start timestamp")
-    require(type(receipt.get("f7_started")) is bool, "missing F7 deploy state")
+    attempt, uuid = receipt.get("f1_attempt_id"), receipt.get("d1_uuid")
+    require(isinstance(attempt, str) and ATTEMPT_ID.fullmatch(attempt), "missing or invalid F1 attempt ID")
+    require(isinstance(uuid, str) and D1_UUID.fullmatch(uuid), "missing or invalid F1 D1 UUID")
+    worker = receipt.get("worker_name")
+    require(isinstance(worker, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", worker), "invalid F1 Worker name")
     for key, nullable in (("restore_state_before", True), ("restore_state_armed", False)):
         require(key in receipt, "F1 receipt is missing restore_state")
         row = receipt[key]
@@ -104,7 +135,8 @@ def f1_receipt(path):
             text.encode("utf-8", "strict")
     before = receipt["restore_state_before"]
     expected = dict.fromkeys(RESTORE_COLUMNS)
-    expected.update(id=1, state="replaying", since_ms=-1, started_at=0 if before is None else before["started_at"] + 1)
+    expected.update(id=1, state="replaying", since_ms=-1, reached_after=attempt,
+                    started_at=0 if before is None else before["started_at"] + 1)
     require(before is None or before["state"] == "complete" or before["since_ms"] == -1,
             "F1 cannot replace an unfinished replay")
     require(receipt["restore_state_armed"] == expected, "F1 restore_state does not match the expected arm")
@@ -113,6 +145,196 @@ def f1_receipt(path):
 
 def restore_values(record):
     return tuple(record[column] for column in RESTORE_COLUMNS)
+
+
+def encode_row(digest, row):
+    for value in row:
+        if value is None:
+            digest.update(b"n")
+            continue
+        if type(value) is int:
+            prefix, body = b"i", str(value).encode("ascii")
+        elif type(value) is str:
+            prefix, body = b"t", value.encode("utf-8")
+        elif type(value) is bytes:
+            prefix, body = b"b", value
+        else:
+            raise Failure("unexpected value type while hashing catalogue")
+        digest.update(prefix + b":" + str(len(body)).encode("ascii") + b":")
+        digest.update(body)
+
+
+def row_hash(row):
+    digest = sha256()
+    encode_row(digest, row)
+    return digest.digest()
+
+
+def boundary_select(table, keys, descending):
+    cols = idents(keys)
+    lower = "-9223372036854775808" if table in INT_KEY else "''"
+    order = ", ".join(ident(k) + (" DESC" if descending else " ASC") for k in keys)
+    return f"SELECT {cols} FROM {ident(table)} WHERE {ident(keys[0])} >= {lower} ORDER BY {order} LIMIT 1"
+
+
+def boundary_data(read, receipt):
+    results = {}
+    for table, keys in SOURCE_KEYS.items():
+        fingerprints = []
+        for desc in (False, True):
+            rows = read(table, boundary_select(table, keys, desc), ())
+            require(len(rows) <= 1, f"{table}: source lookup returned extra rows")
+            fingerprints.append(row_hash(tuple(rows[0][k] for k in keys)).hex() if rows else None)
+        if table in ROWID_TEXT_PK:
+            # The export can be rowid-ordered instead of ordered by the text PK.
+            # Witness its ends as well; never compare raw rowid numbers.
+            for order in ("ASC", "DESC"):
+                sql = (f"SELECT {idents(keys)} FROM {ident(table)} WHERE rowid >= -9223372036854775808 "
+                       f"ORDER BY rowid {order} LIMIT 1")
+                rows = read(table, sql, ())
+                require(len(rows) <= 1, f"{table}: rowid boundary lookup returned extra rows")
+                fingerprints.append(row_hash(tuple(rows[0][k] for k in keys)).hex() if rows else None)
+        results[table] = fingerprints
+    # These small tables have no PK; rowid gaps do not survive SQL export and
+    # endpoint values could be identical duplicates. Read indexed rowid pages
+    # and produce the exact multiset here and on the later SQLite file.
+    for table, cols in KEYLESS_COLUMNS.items():
+        total, count, last = 0, 0, None
+        while True:
+            op, lower, params = (">=", "-9223372036854775808", ()) if last is None else (">", "?", (last,))
+            page = read(table, f"SELECT rowid, {idents(cols)} FROM {ident(table)} WHERE rowid {op} {lower} ORDER BY rowid LIMIT 250", params)
+            require(len(page) <= 250 and count + len(page) <= 10_000, f"{table}: source witness exceeds bounded row budget")
+            for r in page:
+                require(safe_int(r["rowid"]) and (last is None or r["rowid"] > last), f"{table}: invalid rowid order")
+                last = r["rowid"]
+                total += int.from_bytes(row_hash(tuple(r[col] for col in cols)), "big")
+                count += 1
+            if len(page) < 250:
+                break
+        results[table] = [count, f"{total % (1 << 256):064x}"]
+    return dict(format=1, f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"], tables=results)
+
+
+def sqlite_boundaries(db, receipt):
+    # sqlite3.Row preserves types and allows name lookup without copying BLOBs.
+    original = db.row_factory
+    try:
+        db.row_factory = sqlite3.Row
+        return boundary_data(lambda _t, sql, args: db.execute(sql, args).fetchall(), receipt)
+    finally:
+        db.row_factory = original
+
+
+def check_boundaries(db, expected, receipt):
+    actual = sqlite_boundaries(db, receipt)
+    require(actual["format"] == expected.get("format") and actual["f1_attempt_id"] == expected.get("f1_attempt_id")
+            and actual["d1_uuid"] == expected.get("d1_uuid") and isinstance(expected.get("tables"), dict)
+            and actual["tables"].keys() == expected["tables"].keys(), "source boundary manifest is missing, invalid, or for another F1")
+    for table, value in actual["tables"].items():
+        require(value == expected["tables"][table], f"{table}: frozen D1 source boundary mismatch; export is incomplete or changed")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def cloudflare(path, payload=None):
+    account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+    token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+    require(re.fullmatch(r"[0-9a-f]{32}", account) and token, "missing Cloudflare API credentials")
+    req = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{account}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": "velmora-cutover"},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as response:
+            body = response.read(JSON_CAP + 1)
+    except urllib.error.HTTPError as error:
+        raise Failure(f"Cloudflare HTTP {error.code}; stop") from None
+    except (OSError, ValueError):
+        raise Failure("Cloudflare network failure; stop") from None
+    require(len(body) <= JSON_CAP, "Cloudflare response exceeds limit; stop")
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise Failure("Cloudflare response is not JSON; stop") from None
+    require(isinstance(data, dict) and data.get("success") is True, "Cloudflare API refused the operation; stop")
+    return data
+
+
+def d1_query(uuid, sql, params):
+    require(D1_UUID.fullmatch(uuid or ""), "remote D1 operation requires a database UUID")
+    result = cloudflare(f"/d1/database/{uuid}/query", dict(sql=sql, params=params)).get("result")
+    require(isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict)
+            and result[0].get("success") is True and isinstance(result[0].get("results"), list)
+            and isinstance(result[0].get("meta"), dict), "D1 query response invalid; stop")
+    return result[0]
+
+
+def capture_boundaries(receipt, query=d1_query):
+    uuid = receipt["d1_uuid"]
+    proof = dict(indexed_lookups=0, max_data_rows_read=0)
+
+    def read(table, sql, params, maximum=250):
+        if table != "sqlite_schema":
+            plan = query(uuid, "EXPLAIN QUERY PLAN " + sql, params)["results"]
+            require(len(plan) == 1 and str(plan[0].get("detail", "")).startswith(f"SEARCH {table} USING "),
+                    f"{table}: bounded indexed D1 lookup not proven; stop")
+        answer = query(uuid, sql, params)
+        scanned = answer["meta"].get("rows_read")
+        require(type(scanned) is int and 0 <= scanned <= maximum and len(answer["results"]) <= maximum,
+                f"{table}: indexed D1 query exceeded its read bound; stop")
+        if table != "sqlite_schema":
+            proof["indexed_lookups"] += 1
+            proof["max_data_rows_read"] = max(proof["max_data_rows_read"], scanned)
+        return answer["results"]
+
+    arm_sql = f"SELECT {idents(RESTORE_COLUMNS)} FROM restore_state WHERE id=1"
+    require(read("restore_state", arm_sql, (), 1) == [receipt["restore_state_armed"]], "D1 does not match the recorded F1 arm")
+    names = read("sqlite_schema", "SELECT name FROM sqlite_schema WHERE rowid BETWEEN 1 AND 1024 AND type='table' ORDER BY rowid LIMIT 65", (), 1024)
+    require({r["name"] for r in names} - D1_SYSTEM - {"sqlite_sequence"} == set(TABLES), "frozen D1 table set differs from baseline")
+    result = boundary_data(lambda t, sql, args: read(t, sql, args, 1 if t in SOURCE_KEYS else 250), receipt)
+    require(read("restore_state", arm_sql, (), 1) == [receipt["restore_state_armed"]], "D1 arm changed during source capture")
+    result["proof"] = proof
+    return result
+
+
+def source_manifest(path, receipt):
+    manifest = json_input(path)
+    require(type(manifest.get("format")) is int and manifest["format"] == 2
+            and type(manifest.get("sql_bytes")) is int and manifest["sql_bytes"] > 0
+            and isinstance(manifest.get("sql_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", manifest["sql_sha256"])
+            and safe_int(manifest.get("restore_point_ms"))
+            and manifest["restore_point_ms"] >= receipt["f1_started_at_ms"], "invalid or stale catalogue export manifest")
+    return manifest
+
+
+def seal_path(sqlite):
+    return sqlite.with_name(sqlite.name + ".wp5-seal.json")
+
+
+def seal_content(sqlite, manifest, receipt, boundaries):
+    require(not any(sqlite.with_name(sqlite.name + suffix).exists() for suffix in ("-wal", "-journal")),
+            "SQLite source must not have a live journal")
+    with sqlite.open("rb") as src:
+        return dict(format=1, f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"],
+                    raw_sql_sha256=manifest["sql_sha256"], raw_sql_bytes=manifest["sql_bytes"],
+                    sqlite_sha256=file_digest(src, "sha256").hexdigest(),
+                    boundaries_sha256=sha256(json.dumps(boundaries, sort_keys=True).encode()).hexdigest())
+
+
+def write_seal(sqlite, manifest, receipt, boundaries):
+    with seal_path(sqlite).open("x", encoding="utf-8") as out:
+        json.dump(seal_content(sqlite, manifest, receipt, boundaries), out, sort_keys=True)
+        out.write("\n")
+
+
+def check_seal(sqlite, manifest, receipt, boundaries):
+    require(seal_path(sqlite).is_file(), "SQLite source seal is missing; reload the validated export")
+    require(json_input(seal_path(sqlite)) == seal_content(sqlite, manifest, receipt, boundaries),
+            "SQLite source, manifest, or F1 attempt does not match its seal")
 
 
 @contextmanager
@@ -128,7 +350,7 @@ def source_schema(db):
     objects = dict(db.execute("SELECT name,type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"))
     require(MARKER not in objects, "D1 export has an incomplete import marker")
     actual = {name for name, kind in objects.items() if kind == "table"}
-    actual -= {"_cf_KV", "_cf_METADATA", "d1_migrations"}
+    actual -= D1_SYSTEM
     require(actual == set(TABLES), "D1 export catalogue table set differs from the baseline")
     schema = {}
     for table in TABLES:
@@ -137,7 +359,7 @@ def source_schema(db):
         columns = {row[1]: row[2] for row in rows}
         idents(columns)
         keys = tuple(row[1] for row in sorted(rows, key=lambda row: row[5]) if row[5])
-        require(bool(keys) == (table not in UNKEYED), f"{table}: unexpected D1 primary key")
+        require(keys == SOURCE_KEYS.get(table, ()), f"{table}: unexpected D1 primary key")
         schema[table] = (columns, keys)
     require(tuple(schema["restore_state"][0]) == RESTORE_COLUMNS, "D1 restore_state schema differs from the baseline")
     return schema
@@ -164,6 +386,7 @@ def pg_settings(path, role):
         "PGHOST": "host", "PGPORT": "port", "PGDATABASE": "dbname", "PGUSER": "user",
         "PGPASSWORD": "password", "PGSSLMODE": "sslmode", "PGSSLROOTCERT": "sslrootcert",
         "PGCONNECT_TIMEOUT": "connect_timeout", "PGSCHEMA": None, "PGLOCKKEY": None, "PGMIGRATELOCKKEY": None,
+        "PGBRANCHID": None,
     }
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     with os.fdopen(fd, encoding="utf-8", newline="") as inp:
@@ -179,9 +402,13 @@ def pg_settings(path, role):
         name, sep, value = line.partition("=")
         require(sep and name in allowed and name not in values and "\r" not in value, "invalid Postgres env assignment")
         values[name] = value
-    require(values.get("PGHOST") and values.get("PGUSER") == role and
-            re.fullmatch(r"[A-Za-z0-9_.-]+", values.get("PGDATABASE", "")),
-            f"literal PGHOST, PGDATABASE and PGUSER={role} required")
+    branch = values.get("PGBRANCHID")
+    require(branch is None or re.fullmatch(r"[a-z0-9_-]{1,63}", branch), "invalid PGBRANCHID")
+    user = values.get("PGUSER")
+    require(user == role or (branch is not None and user == f"{role}.{branch}"),
+            f"PGUSER must name {role} with no suffix or the configured PGBRANCHID")
+    require(values.get("PGHOST") and re.fullmatch(r"[A-Za-z0-9_.-]+", values.get("PGDATABASE", "")),
+            "literal PGHOST and PGDATABASE required")
     schema = values.get("PGSCHEMA", "public")
     require(re.fullmatch(r"[a-z][a-z0-9_]{0,62}", schema) and not schema.startswith("pg_")
             and schema != "information_schema", "invalid PGSCHEMA")
@@ -212,6 +439,7 @@ def postgres(path, role="kofra_migrate"):
     finally:
         os.environ.update(ambient)
     with connection as db:
+        require(db.execute("SELECT session_user::text").fetchone() == (role,), "unexpected bare Postgres session role")
         db.execute(f"SET search_path TO {ident(schema)}")
         require(db.execute("SELECT current_schema(), current_setting('server_encoding')").fetchone() == (schema, "UTF8"),
                 "Postgres target schema must exist and use UTF8")

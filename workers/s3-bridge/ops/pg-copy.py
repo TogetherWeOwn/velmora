@@ -2,7 +2,7 @@
 """Load an existing Wrangler D1 export locally, census it, and optionally COPY to PG."""
 
 import argparse
-from contextlib import closing
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -12,19 +12,32 @@ import tempfile
 from time import monotonic
 
 from pg_catalog import (
-    Failure, MARKER, PG_TYPES, SAFE_INT, app_has_usage, check_source_arm, diagnostic_main,
-    f1_receipt, ident, idents, lock_w1, marker_exists, migrate, pg_columns, postgres,
-    projection, require, restore_values, source_schema, sqlite_source,
+    Failure, MARKER, PG_TYPES, SAFE_INT, app_has_usage, capture_boundaries, check_boundaries,
+    check_seal, check_source_arm, diagnostic_main, f1_receipt, ident, idents, json_input,
+    lock_w1, marker_exists, migrate, pg_columns, postgres, projection, require, restore_values,
+    source_manifest, source_schema, sqlite_source, write_seal,
 )
 
 
-def load_stream(stream, command):
+def verify_dump(stream, manifest):
+    digest, n = sha256(), 0
+    for part in iter(lambda: stream.read(1 << 20), b""):
+        require(b"\0" not in part, "D1 SQL export contains a literal NUL byte; stop before loading")
+        n += len(part)
+        digest.update(part)
+    require(n == manifest["sql_bytes"] and digest.hexdigest() == manifest["sql_sha256"],
+            "D1 export byte count or SHA-256 differs from the verified manifest")
+    stream.seek(0)
+
+
+def load_stream(stream, command, manifest):
     # Wrangler's export contains a defer_foreign_keys pragma and no explicit
     # transaction. Wrap it to avoid an fsync per INSERT. Standard SQLite .dump
     # instead has a BEGIN, optionally preceded by comments or a pragma.
     head = stream.read(65_536)
     require(head, "empty D1 export")
     has_begin = re.match(rb"(?:\s|--[^\n]*\n|PRAGMA[^;]*;)*BEGIN\b", head, re.IGNORECASE)
+    digest, n = sha256(), 0
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as loader:
         try:
             if not has_begin:
@@ -32,8 +45,12 @@ def load_stream(stream, command):
             part = head
             while part:
                 require(b"\0" not in part, "D1 SQL export contains a literal NUL byte; stop before loading")
+                n += len(part)
+                digest.update(part)
                 loader.stdin.write(part)
                 part = stream.read(1 << 20)
+            require(n == manifest["sql_bytes"] and digest.hexdigest() == manifest["sql_sha256"],
+                    "D1 export changed during SQLite load")
             if not has_begin:
                 loader.stdin.write(b"\nCOMMIT;\n")
             loader.stdin.close()
@@ -42,7 +59,7 @@ def load_stream(stream, command):
         require(loader.wait() == 0, f"local SQLite export load exited {loader.returncode}")
 
 
-def load_dump(dump, target):
+def load_dump(dump, target, manifest, boundaries, receipt):
     require(not target.exists(), "refusing to overwrite the SQLite source")
     # Safe CLI mode disallows shell escapes and opening another database. The
     # dump may contain trigger bodies and multiline strings; let SQLite parse it.
@@ -52,14 +69,23 @@ def load_dump(dump, target):
             compressed = inp.read(4) == b"\x28\xb5\x2f\xfd"
             inp.seek(0)
             if compressed:
-                with subprocess.Popen(["zstd", "-dc"], stdin=inp, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as zstd:
-                    with closing(zstd.stdout) as stream:
-                        load_stream(stream, command)
-                    require(zstd.wait() == 0, "zstd export decompression failed")
+                with tempfile.TemporaryFile(dir=target.absolute().parent) as expanded:
+                    result = subprocess.run(["zstd", "-dc"], stdin=inp, stdout=expanded, stderr=subprocess.DEVNULL)
+                    require(result.returncode == 0, "zstd export decompression failed")
+                    expanded.seek(0)
+                    verify_dump(expanded, manifest)
+                    load_stream(expanded, command, manifest)
             else:
-                load_stream(inp, command)
+                verify_dump(inp, manifest)
+                load_stream(inp, command, manifest)
+        # Do not publish a merely well-formed prefix with missing tail rows.
+        with sqlite_source(Path(work.name)) as db:
+            source_schema(db)
+            check_source_arm(db, receipt)
+            check_boundaries(db, boundaries, receipt)
         # Only publish a fully loaded file, and do not overwrite on races.
         os.link(work.name, target)
+        write_seal(target, manifest, receipt, boundaries)
 
 
 def census(db, schema):
@@ -160,30 +186,43 @@ def mark_ready(db, key):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--export", type=Path, help="existing Wrangler SQL dump (plain or zstd)")
-    parser.add_argument("--sqlite", type=Path, required=True, help="local database to create or reuse")
+    parser.add_argument("--sqlite", type=Path, help="local database to create or reuse")
+    parser.add_argument("--manifest", type=Path, help="verified catalog-export.sh format-2 manifest")
+    parser.add_argument("--source-boundaries", type=Path, help="independent frozen D1 source witness")
+    parser.add_argument("--capture-boundaries", action="store_true", help="run bounded indexed reads on the frozen D1 UUID in F1")
     parser.add_argument("--f1", type=Path, required=True, help="recorded before/armed D1 restore_state rows")
     parser.add_argument("--pg-env", type=Path)
     parser.add_argument("--apply", action="store_true", help="initialize and COPY; default is local census only")
     args = parser.parse_args()
     require(args.apply == (args.pg_env is not None), "--pg-env and --apply must be specified together")
     receipt = f1_receipt(args.f1)
+    if args.capture_boundaries:
+        require(not any((args.apply, args.export, args.sqlite, args.manifest, args.source_boundaries)),
+                "--capture-boundaries accepts only --f1")
+        print(json.dumps(capture_boundaries(receipt), sort_keys=True))
+        return
+    require(args.sqlite and args.manifest and args.source_boundaries, "--sqlite, --manifest and --source-boundaries are required")
+    manifest = source_manifest(args.manifest, receipt)
+    boundaries = json_input(args.source_boundaries)
     timings = {}
     started = monotonic()
     if args.export:
-        load_dump(args.export, args.sqlite)
+        load_dump(args.export, args.sqlite, manifest, boundaries, receipt)
         timings["sqlite_load_s"] = monotonic() - started
     with sqlite_source(args.sqlite) as db:
         started = monotonic()
         source = source_schema(db)
+        check_seal(args.sqlite, manifest, receipt, boundaries)
+        check_boundaries(db, boundaries, receipt)
         summary = census(db, source)
         check_source_arm(db, receipt)
         require(db.execute("PRAGMA integrity_check(1)").fetchone() == ("ok",), "D1 SQLite integrity check failed")
         extent_count = db.execute("SELECT count(*) FROM extents").fetchone()[0]
         s_held, held_count = db.execute("SELECT min(created_at),count(*) FROM extents WHERE safety_state IN ('held','releasing')").fetchone()
         timings["sqlite_census_integrity_s"] = monotonic() - started
-        report = dict(census=summary, extent_count=extent_count, s_held_ms=s_held, held_count=held_count)
+        report = dict(census=summary, extent_count=extent_count, s_held_ms=s_held, held_count=held_count,
+                      f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"])
         if args.apply:
-            require(not receipt["f7_started"], "COPY is not allowed after F7 started")
             started = monotonic()
             with postgres(args.pg_env) as (pg, schema, key):
                 ensure_unclaimed(pg, schema)

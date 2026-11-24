@@ -1,8 +1,10 @@
 """Local-only D1 export, Postgres COPY/verify, and rollback integration tests."""
 
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -12,12 +14,17 @@ import uuid
 
 BRIDGE = Path(__file__).resolve().parents[1]
 OPS = BRIDGE / "ops"
+sys.path.insert(0, str(OPS))
+from pg_catalog import Failure, capture_boundaries, pg_settings, seal_path, sqlite_boundaries, write_seal
+
+ATTEMPT = "0" * 31 + "1"
+D1_ID = "00000000-0000-0000-0000-000000000005"
 BEFORE = dict(id=1, state="complete", since_ms=4, started_at=9, finished_at=12,
               reached_phase=5, reached_after="é'\n", reached_extent=2)
 ARMED = dict(id=1, state="replaying", since_ms=-1, started_at=10, finished_at=None,
-             reached_phase=None, reached_after=None, reached_extent=None)
-F1 = dict(f1_started_at_ms=1_000_000, restore_state_before=BEFORE,
-          restore_state_armed=ARMED, f7_started=False)
+             reached_phase=None, reached_after=ATTEMPT, reached_extent=None)
+F1 = dict(f1_started_at_ms=1_000_000, restore_state_before=BEFORE, restore_state_armed=ARMED,
+          f1_attempt_id=ATTEMPT, d1_uuid=D1_ID, worker_name="wp5-local")
 LIMIT = 2**53 - 1
 
 
@@ -68,21 +75,45 @@ class CopyTests(unittest.TestCase):
         self.path = Path(scratch.name)
         self.db = self.path / "source.sqlite"
         self.f1 = self.path / "f1.json"
+        self.manifest = self.path / "export-manifest.json"
+        self.boundaries = self.path / "source-boundaries.json"
         self.f1.write_text(json.dumps(F1))
         self.f1.chmod(0o600)
         with sqlite3.connect(self.db) as db:
             fixture(db)
         self.db.chmod(0o600)
+        self.seal_fixture()
+
+    def seal_fixture(self):
+        # Direct SQLite edge fixtures simulate a sealed export, including
+        # intentional malformed values that the SQL loader itself rejects.
+        with sqlite3.connect(self.db) as db:
+            dump = "\n".join(db.iterdump()).encode()
+            boundaries = sqlite_boundaries(db, F1)
+        manifest = self.manifest_for(dump)
+        self.boundaries.write_text(json.dumps(boundaries))
+        seal_path(self.db).unlink(missing_ok=True)
+        write_seal(self.db, manifest, F1, boundaries)
+
+    def manifest_for(self, contents):
+        manifest = dict(format=2, restore_point_ms=F1["f1_started_at_ms"],
+                        sql_bytes=len(contents), sql_sha256=sha256(contents).hexdigest())
+        self.manifest.write_text(json.dumps(manifest))
+        return manifest
+
+    def source_args(self):
+        return ["--f1", self.f1, "--manifest", self.manifest, "--source-boundaries", self.boundaries]
 
     def copy(self, *args):
-        return run("pg-copy.py", "--sqlite", self.db, "--f1", self.f1, *args)
+        return run("pg-copy.py", "--sqlite", self.db, *self.source_args(), *args)
 
     def test_dump_load_and_census_reports_held_for_replay(self):
         dump = self.path / "export.sql"
         with sqlite3.connect(self.db) as db, dump.open("w") as out:
             out.writelines(line + "\n" for line in db.iterdump())
         loaded = self.path / "loaded.sqlite"
-        result = run("pg-copy.py", "--export", dump, "--sqlite", loaded, "--f1", self.f1)
+        self.manifest_for(dump.read_bytes())
+        result = run("pg-copy.py", "--export", dump, "--sqlite", loaded, *self.source_args())
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual((report["s_held_ms"], report["held_count"], report["extent_count"]), (100, 2, 2))
@@ -93,6 +124,32 @@ class CopyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["since_ms"], 0)
 
+    def test_truncated_export_without_seal_must_not_load(self):
+        dump = self.path / "truncated.sql"
+        dest = self.path / "unsealed.sqlite"
+        with sqlite3.connect(self.db) as db, dump.open("w") as out:
+            out.write("PRAGMA defer_foreign_keys=TRUE;\n")
+            out.writelines(line + "\n" for line in db.iterdump() if line not in ("BEGIN TRANSACTION;", "COMMIT;"))
+        # Even a syntactically complete file must not load without provenance.
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, "--f1", self.f1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--manifest", result.stderr)
+        self.assertFalse(dest.exists())
+        original = dump.read_bytes()
+        self.manifest_for(original)
+        data = b"\n".join(line for line in original.split(b"\n")
+                           if not line.startswith(b"INSERT INTO \"scan_cursors\" VALUES('revive'"))
+        self.assertNotEqual(data, original)
+        dump.write_bytes(data)
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
+        self.assertIn("byte count or SHA-256", result.stderr)
+        self.assertFalse(dest.exists())
+        # A short export sealed as-is must still fail the independent D1 witness.
+        self.manifest_for(data)
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
+        self.assertIn("scan_cursors: frozen D1 source boundary mismatch", result.stderr)
+        self.assertFalse(dest.exists())
+
     def test_wrangler_style_export_is_transactional_and_rejects_raw_nul(self):
         dump = self.path / "wrangler.sql"
         dest = self.path / "loaded.sqlite"
@@ -101,12 +158,14 @@ class CopyTests(unittest.TestCase):
             out.writelines(line + "\n" for line in db.iterdump() if line not in ("BEGIN TRANSACTION;", "COMMIT;"))
         with dump.open("a") as out:
             out.write("INSERT INTO scan_cursors VALUES ('new','before\0after');\n")
-        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, "--f1", self.f1)
+        self.manifest_for(dump.read_bytes())
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("literal NUL", result.stderr)
         self.assertFalse(dest.exists())
         dump.write_bytes(dump.read_bytes().replace(b"before\0after", b"clean"))
-        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, "--f1", self.f1)
+        self.manifest_for(dump.read_bytes())
+        result = run("pg-copy.py", "--export", dump, "--sqlite", dest, *self.source_args())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["extent_count"], 2)
 
@@ -124,10 +183,76 @@ class CopyTests(unittest.TestCase):
                 db.execute("PRAGMA ignore_check_constraints=ON")
                 db.execute(update)
                 db.commit()
+                self.seal_fixture()
                 result = self.copy()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(label, result.stderr)
                 db.execute(undo)
+
+    def test_prepare_f1_creates_distinct_private_attempts(self):
+        pre = self.path / "pre.json"
+        pre.write_text(json.dumps({k: v for k, v in F1.items() if k not in ("f1_attempt_id", "restore_state_armed")}))
+        attempts = []
+        for seq in range(2):
+            target = self.path / f"attempt{seq}.json"
+            result = run("pg-cutover-disarm.py", "--f1", pre, "--prepare-f1", target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            receipt = json.loads(target.read_text())
+            attempts.append(receipt["f1_attempt_id"])
+            self.assertEqual(receipt["restore_state_armed"], dict(ARMED, reached_after=attempts[-1]))
+        self.assertNotEqual(*attempts)
+
+    def test_source_witness_uses_bounded_index_plans(self):
+        with sqlite3.connect(self.db) as db:
+            db.row_factory = sqlite3.Row
+            def query(uuid, sql, params):
+                self.assertEqual(uuid, D1_ID)
+                rows = [dict(row) for row in db.execute(sql, params)]
+                return {"results": rows, "meta": {"rows_read": len(rows)}}
+            manifest = capture_boundaries(F1, query=query)
+            proof = manifest.pop("proof")
+            self.assertGreater(proof["indexed_lookups"], 60)
+            self.assertEqual(proof["max_data_rows_read"], 2)
+            self.assertEqual(manifest, sqlite_boundaries(db, F1))
+
+    def test_branch_suffix_must_match_configured_branch(self):
+        path = self.path / "branch.env"
+        lines = "PGHOST=/local\nPGDATABASE=db\nPGBRANCHID=right\n"
+        path.write_text(lines + "PGUSER=kofra_ro.wrong\n")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(Failure, "configured PGBRANCHID"):
+            pg_settings(path, "kofra_ro")
+        path.write_text(lines + "PGUSER=kofra_ro.right\n")
+        self.assertEqual(pg_settings(path, "kofra_ro")[0]["user"], "kofra_ro.right")
+
+    def test_worker_history_allows_only_f6_pg_versions(self):
+        verify = runpy.run_path(str(OPS / "pg-cutover-disarm.py"))["verify_deploy_history"]
+        def deploy(name, when):
+            return dict(id=name, created_on=when, versions=[dict(version_id=D1_ID)])
+        post = deploy("post", "1970-01-01T00:17:00Z")
+        pre = deploy("pre", "1970-01-01T00:16:00Z")
+        def cf(mode, page1, page2=None):
+            def query(path):
+                if "/versions/" in path:
+                    bindings = [dict(name="CATALOG_BACKEND", type="plain_text", text="pg")]
+                    if mode is not None:
+                        bindings.append(dict(name="MAINTENANCE", type="plain_text", text=mode))
+                    return dict(result=dict(resources=dict(bindings=bindings)))
+                if page2 is not None and "page=1&" in path:
+                    return dict(result=dict(deployments=page1), result_info=dict(page=1, total_pages=2))
+                return dict(result=dict(deployments=page2 if page2 is not None else page1))
+            return query
+        verify("wp5-local", F1, cf("restore", [post, pre]))
+        verify("wp5-local", F1, cf("restore", [post], [pre]))
+        for maintenance in ("off", None):
+            with self.assertRaisesRegex(Failure, "admitted writes"):
+                verify("wp5-local", F1, cf(maintenance, [post, pre]))
+        with self.assertRaisesRegex(Failure, "truncated"):
+            verify("wp5-local", F1, cf("restore", [post]))
+        with self.assertRaisesRegex(Failure, "does not match"):
+            verify("wrong-worker", F1, cf("restore", [post, pre]))
 
     def pg(self):
         if not os.environ.get("WP5_TEST_PG_SOCKET"):
@@ -191,13 +316,13 @@ class CopyTests(unittest.TestCase):
         conn.execute("SELECT set_config('velmora.lock_key','7413000555',false)")
         arm = (OPS / "pg-restore-arm.sql").read_text()
         conn.execute(arm, prepare=False)
-        self.assertEqual(conn.execute("SELECT * FROM restore_state").fetchone(), tuple(ARMED.values()))
+        self.assertEqual(conn.execute("SELECT * FROM restore_state").fetchone(), tuple(dict(ARMED, reached_after=None).values()))
         conn.execute("UPDATE restore_state SET since_ms=3,reached_phase=7")
         conn.execute(arm, prepare=False)
         self.assertEqual(conn.execute("SELECT since_ms,started_at,reached_phase FROM restore_state").fetchone(), (3, 11, None))
 
     def verify(self, env, *args):
-        return run("pg-verify.py", "--pg-env", env, "--sqlite", self.db, "--f1", self.f1, *args)
+        return run("pg-verify.py", "--pg-env", env, "--sqlite", self.db, *self.source_args(), *args)
 
     def test_interrupted_copy_keeps_claim_and_disallows_arm(self):
         conn, env = self.pg()
@@ -205,6 +330,7 @@ class CopyTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute("PRAGMA foreign_keys=OFF")
             db.execute("UPDATE outbox SET extent_id='missing' WHERE extent_id='a'")
+        self.seal_fixture()
         result = self.copy("--pg-env", env, "--apply")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("23503", result.stderr)
@@ -256,7 +382,23 @@ class CopyTests(unittest.TestCase):
 
         d1("CREATE TABLE restore_state(id INTEGER PRIMARY KEY,state TEXT,since_ms INTEGER,started_at INTEGER,"
            "finished_at INTEGER,reached_phase INTEGER,reached_after TEXT,reached_extent INTEGER)")
-        d1("INSERT INTO restore_state VALUES (1,'replaying',-1,10,NULL,NULL,NULL,NULL)")
+        d1("CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)")
+        d1("INSERT INTO restore_state VALUES (1,'complete',4,9,12,5,CAST(X'c3a9270a' AS TEXT),2)")
+        result = run("pg-cutover-disarm.py", "--f1", self.f1, *local, "--operation", "arm-f1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(d1("SELECT * FROM restore_state"), [ARMED])
+        stale_f1 = self.path / "stale.json"
+        other = "2" * 32
+        stale_f1.write_text(json.dumps(dict(F1, f1_attempt_id=other, restore_state_armed=dict(ARMED, reached_after=other),
+                                               f7_started=False)))
+        stale = run("pg-cutover-disarm.py", "--f1", stale_f1, *local)
+        self.assertNotEqual(stale.returncode, 0, "an equal epoch from another F1 disarmed the live row")
+        marked = run("pg-cutover-disarm.py", "--f1", self.f1, *local, "--operation", "mark-f7")
+        self.assertEqual(marked.returncode, 0, marked.stderr)
+        stale = run("pg-cutover-disarm.py", "--f1", self.f1, *local)
+        self.assertNotEqual(stale.returncode, 0, "a stale F1 receipt accepted an already-started F7")
+        self.assertEqual(d1("SELECT * FROM restore_state"), [ARMED])
+        d1("DELETE FROM meta")  # fixture reset only; operators never clear it
         result = run("pg-cutover-disarm.py", "--f1", self.f1, *local)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(d1("SELECT * FROM restore_state"), [BEFORE])
@@ -264,9 +406,11 @@ class CopyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("changed 0 rows", result.stderr)
         self.assertEqual(d1("SELECT * FROM restore_state"), [BEFORE])
-        d1("UPDATE restore_state SET state='replaying',since_ms=-1,started_at=0,finished_at=NULL,"
-           "reached_phase=NULL,reached_after=NULL,reached_extent=NULL")
+        self.assertIn("already matches the pre-arm row", result.stderr)
+        d1("DELETE FROM restore_state")
         self.f1.write_text(json.dumps(dict(F1, restore_state_before=None, restore_state_armed=dict(ARMED, started_at=0))))
+        result = run("pg-cutover-disarm.py", "--f1", self.f1, *local, "--operation", "arm-f1")
+        self.assertEqual(result.returncode, 0, result.stderr)
         result = run("pg-cutover-disarm.py", "--f1", self.f1, *local)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(d1("SELECT * FROM restore_state"), [])

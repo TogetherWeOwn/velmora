@@ -9,27 +9,11 @@ from pathlib import Path
 from time import monotonic
 
 from pg_catalog import (
-    MARKER, app_has_usage, check_source_arm, diagnostic_main, f1_receipt, ident, idents,
-    lock_w1, marker_exists, migrate, pg_columns, postgres, projection, require,
-    restore_values, source_count, source_schema, sqlite_source,
+    MARKER, app_has_usage, check_boundaries, check_seal, check_source_arm, diagnostic_main,
+    encode_row, f1_receipt, ident, idents, json_input, lock_w1, marker_exists, migrate,
+    pg_columns, postgres, projection, require, restore_values, source_count, source_manifest,
+    source_schema, sqlite_source,
 )
-
-
-def encode_row(digest, row):
-    for value in row:
-        if value is None:
-            digest.update(b"n")
-            continue
-        if type(value) is int:
-            prefix, body = b"i", str(value).encode("ascii")
-        elif type(value) is str:
-            prefix, body = b"t", value.encode("utf-8")
-        elif type(value) is bytes:
-            prefix, body = b"b", value
-        else:
-            require(False, "unexpected value type while hashing catalogue")
-        digest.update(prefix + b":" + str(len(body)).encode("ascii") + b":")
-        digest.update(body)
 
 
 def stream_pg(db, query, params=()):
@@ -146,21 +130,26 @@ def main():
     parser.add_argument("--sqlite", type=Path, required=True)
     parser.add_argument("--f1", type=Path, required=True)
     parser.add_argument("--pg-env", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--source-boundaries", type=Path, required=True)
     parser.add_argument("--chunk-rows", type=int, default=10_000, help="keyset page size, at most 10000")
     parser.add_argument("--activate", action="store_true", help="drop the complete import marker and give kofra_app USAGE")
     args = parser.parse_args()
     require(1 <= args.chunk_rows <= 10_000, "chunk size must be 1–10000")
     receipt = f1_receipt(args.f1)
-    require(not args.activate or not receipt["f7_started"], "activation is not allowed after F7 started")
+    manifest = source_manifest(args.manifest, receipt)
+    boundaries = json_input(args.source_boundaries)
     with sqlite_source(args.sqlite) as db, postgres(args.pg_env) as (pg, schema, key), pg.transaction():
+        source = source_schema(db)
+        check_seal(args.sqlite, manifest, receipt, boundaries)
+        check_boundaries(db, boundaries, receipt)
+        check_source_arm(db, receipt)
         if args.activate:
             # Keep every W1 writer out from the first PG read through the
             # activation commit. A count-only recheck cannot detect an UPDATE.
             lock_w1(pg, key)
         else:
             pg.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        source = source_schema(db)
-        check_source_arm(db, receipt)
         pg_columns(pg, schema, source)
         marked = marker_exists(pg)
         if args.activate:

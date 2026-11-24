@@ -8,6 +8,8 @@ DO $arm$
 DECLARE
   catalogue_schema text := current_schema();
   scoped_key bigint := nullif(current_setting('velmora.lock_key', true), '')::bigint;
+  attempt text := nullif(current_setting('velmora.cutover_attempt', true), '');
+  stamped bigint;
 BEGIN
   IF catalogue_schema = 'public' THEN
     IF scoped_key IS NOT NULL AND scoped_key <> 7413000001 THEN
@@ -38,6 +40,22 @@ BEGIN
       reached_after = NULL,
       reached_extent = NULL
   $sql$, catalogue_schema);
+  IF attempt IS NOT NULL THEN
+    IF attempt !~ '^[0-9a-f]{32}$' THEN
+      RAISE EXCEPTION 'invalid cutover attempt';
+    END IF;
+    EXECUTE format($sql$
+      INSERT INTO %I.meta(k,v)
+      SELECT $1, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+      FROM %I.restore_state WHERE id=1 AND state='replaying' AND since_ms=-1
+      ON CONFLICT(k) DO UPDATE SET v=excluded.v
+    $sql$, catalogue_schema, catalogue_schema) USING 'cutover_r1b:' || attempt;
+    GET DIAGNOSTICS stamped = ROW_COUNT;
+    IF stamped <> 1 THEN
+      RAISE EXCEPTION 'cannot stamp a cutover freeze over an unfinished replay';
+    END IF;
+    EXECUTE format('UPDATE %I.restore_state SET reached_after=$1 WHERE id=1', catalogue_schema) USING attempt;
+  END IF;
 END
 $arm$;
 
