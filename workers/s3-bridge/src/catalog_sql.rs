@@ -15,7 +15,7 @@ const _: () = assert!(
     "pg-test-unlocked must not be enabled in the S3 Worker"
 );
 
-// Fallback direct-origin budget for a 25-connection instance with 3
+// Direct-origin budget for a 25-connection instance with 3
 // superuser-reserved connections. The drill is absent at production rollout.
 const PG_WRITE_LIMIT: u16 = 5; // Hyperdrive minimum
 const PG_READ_LIMIT: u16 = 8;

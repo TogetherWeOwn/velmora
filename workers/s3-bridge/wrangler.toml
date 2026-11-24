@@ -312,9 +312,10 @@ migrations_dir = "migrations"
 
 # Activate and supply real config IDs together at cutover. Leaving these
 # commented preserves stock D1 deploys (unbound or fake IDs would fail deploy).
-# Hyperdrive origin: PgBouncer (6432); direct PostgreSQL (5432) is the fallback.
-# Configure the host/port on Hyperdrive, not in Worker code. Disable caching.
-# Initial origin limits: writes 5, reads 8. Direct fallback on 25 connections:
+# Use direct PostgreSQL (5432) as the Hyperdrive origin; configure host/port on
+# Hyperdrive and disable caching. The app role must default to read-only.
+# Do not use the pooled origin (6432): it did not preserve the role default.
+# Initial origin limits: writes 5, reads 8. Direct origin on 25 connections:
 # 3 superuser-reserved; 5 write + 8 read + 5 temporary drill + 4 ops = 22.
 # Without the drill there are 5 spare. Do not reuse a drill ID in production.
 # [[hyperdrive]]
