@@ -48,8 +48,25 @@ pub enum SqlValue {
 /// One result row, columns in statement order.
 pub type Row = Vec<SqlValue>;
 
+/// The SQL dialect used by a catalogue adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// Select the engine-specific text where a statement is not portable.
+    pub const fn pick(self, sqlite: &'static str, pg: &'static str) -> &'static str {
+        match self {
+            Self::Sqlite => sqlite,
+            Self::Postgres => pg,
+        }
+    }
+}
+
 /// The catalogue database: D1 (`workers/s3-bridge/src/d1.rs`), rusqlite
-/// (`testkit`), later Hyperdrive.
+/// (`testkit`), or Postgres.
 ///
 /// `batch` is all-or-nothing. A `tx_guard` CHECK failure is
 /// `Err(BridgeError::GuardFailed)` (DESIGN §A.11); any other failing
@@ -82,6 +99,9 @@ pub trait Sql {
     /// writes such a figure down itself.
     fn limits(&self) -> SqlLimits {
         SqlLimits::D1
+    }
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
     }
 }
 
