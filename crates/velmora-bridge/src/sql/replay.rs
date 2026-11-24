@@ -1337,7 +1337,8 @@ const GUARD_NO_REPLAY: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE EXISTS \
            (SELECT 1 FROM restore_state WHERE id = 1 AND state <> 'complete') \
            OR EXISTS (SELECT 1 FROM rollback_stamp WHERE id = 1 AND rolled_back_at IS NOT NULL)";
 
-const REPLAY_PROGRESS: &str = "SELECT since_ms, reached_phase, reached_after, reached_extent, state = 'complete' \
+const REPLAY_PROGRESS: &str =
+    "SELECT since_ms, reached_phase, reached_after, reached_extent, state = 'complete' \
              FROM restore_state WHERE id = 1 AND started_at = ?1";
 
 const ADVANCE_REPLAY_PROGRESS: &str =

@@ -731,13 +731,38 @@ fn adaptive_wiring_does_not_change_eviction_candidates_fences_or_watermark() {
             sql,
             "pub(super) async fn begin_evict",
             "\n}\n",
-            "aaa72d021a381da6563d4599a6a2387a1600d2e43ee74b9fdffb8f0d3cc7854d",
+            "19a6f438a3eeb9cfc9de366fcdacff2f8122e469210fdd00e0667927234419f4",
         ),
         (
             sql,
             "pub(super) async fn finish_evict",
             "\n}\n",
-            "79da077229615a72875cb3455a679873d68ad323a354dda93775e54071fb189a",
+            "c85022163c692ed8e95707f86c4246d8247f0f791149ac1037d2462e39452d79",
+        ),
+        // The dialect port moved the unchanged fence SQL out of these bodies.
+        (
+            sql,
+            "const BEGIN_EVICT_PINNED: &str =",
+            "\n);",
+            "69a904d3bf71d4033f71e88da9aa601210e47587168e6b3f6b0b268e8bed1ed6",
+        ),
+        (
+            sql,
+            "const BEGIN_EVICT_UNPINNED: &str =",
+            "\n);",
+            "1e819f30b0016b857a2dcf2d17e0d9aad79d1bbdf61c42d87e4f9818a49b906d",
+        ),
+        (
+            sql,
+            "const FINISH_EVICT_PINNED: &str =",
+            "\";",
+            "e979160ed886b4e606edf17a53719b267f3e8ee55ef4be090462fb67446b1118",
+        ),
+        (
+            sql,
+            "const FINISH_EVICT_UNPINNED: &str =",
+            "\";",
+            "9c92d308449b933f6dd533717c08b9af642c195fb17a3ce94153d598e692ace5",
         ),
         (
             jobs,
