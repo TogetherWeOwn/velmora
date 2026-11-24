@@ -557,9 +557,16 @@ pub(super) async fn fanout_piece<
     observed: &mut GetObservation,
     hit_flush: Option<Spawner>,
 ) -> S3Response {
-    let Ok(grant) = admit(&bridge.kek, &req, bridge.clock.now()) else {
-        observed.mark_stage(Stage::Grant);
-        return s3_error(ErrorCode::AccessDenied);
+    let grant = match admit(&bridge.kek, &req, bridge.clock.now()) {
+        Ok(grant) => grant,
+        Err(reason) => {
+            if bridge.cfg.grant_refusal_reasons {
+                observed.mark_grant_refusal(reason);
+            } else {
+                observed.mark_stage(Stage::Grant);
+            }
+            return s3_error(ErrorCode::AccessDenied);
+        }
     };
     match granted(bridge, &grant, observed, hit_flush).await {
         Ok(resp) | Err(resp) => resp,

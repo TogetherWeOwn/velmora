@@ -1927,6 +1927,14 @@ colo still in `blob5`:
   including UploadPart, which does not know the whole object size. This does not disclose the exact object size or indicate that a
   range fanned out.
 
+With `GRANT_REFUSAL_REASONS=on` (off when unset or set to anything else),
+child grant refusals append `stage=grant err=<Reason> code=<detail>` to
+request logs. `Expired` reports whole seconds past expiry. `EdgeHeader`
+reports only allowlisted header labels joined by `+`, with unlisted
+matches collapsed to `other`. The existing GET 403 points use
+`grant:<Reason>` in `blob6`, without the log detail. The child's 403 and
+the parent's response and telemetry are unchanged.
+
 A failed queue wake-up does not produce an `outbox` response stage. The
 write has already committed, and the dispatcher can resend from the
 outbox. The response and its count remain those of a successful write.

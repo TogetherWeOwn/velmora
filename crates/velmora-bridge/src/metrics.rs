@@ -43,7 +43,10 @@ impl Point {
             .chain(core::iter::once(self.colo.as_str()))
             .chain(self.failure.into_iter().flat_map(|observed| {
                 [
-                    observed.stage.unwrap_or(FailureStage::Other).code(),
+                    observed.grant_refusal().map_or_else(
+                        || observed.stage.unwrap_or(FailureStage::Other).code(),
+                        |reason| reason.labels().1,
+                    ),
                     observed.size.code(),
                 ]
             }))
@@ -159,6 +162,8 @@ pub enum ProviderCode {
     NntpIo(&'static str),
     /// The HTTP status a sub-request (or another upstream) answered.
     Upstream(u16),
+    /// A child's grant refusal; carries only bounded diagnostic data.
+    GrantRefusal(crate::fanout::Refused),
 }
 
 impl Fault {
@@ -218,6 +223,7 @@ impl Fault {
             ProviderCode::NntpReply(code) => format!("nntp_{code}"),
             ProviderCode::NntpIo(kind) => format!("nntp_io_{kind}"),
             ProviderCode::Upstream(status) => format!("upstream_{status}"),
+            ProviderCode::GrantRefusal(reason) => reason.log_code(),
         }
     }
 }
@@ -378,6 +384,23 @@ impl RequestObservation {
     pub fn mark_fault(&mut self, stage: FailureStage, fault: Fault) {
         self.stage = Some(stage);
         self.fault = Some(fault);
+    }
+
+    pub(crate) fn mark_grant_refusal(&mut self, reason: crate::fanout::Refused) {
+        self.mark_fault(
+            FailureStage::Grant,
+            Fault {
+                variant: reason.labels().0,
+                code: ProviderCode::GrantRefusal(reason),
+            },
+        );
+    }
+
+    pub(crate) fn grant_refusal(&self) -> Option<crate::fanout::Refused> {
+        match self.fault?.code {
+            ProviderCode::GrantRefusal(reason) => Some(reason),
+            _ => None,
+        }
     }
 
     /// The stage and the port error that failed it.

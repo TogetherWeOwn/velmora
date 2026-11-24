@@ -1615,8 +1615,9 @@ pub fn log_line(method: &str, raw_target: &str, status: u16, request_id: &str) -
     log_line_with(method, raw_target, status, request_id, None)
 }
 
-/// [`log_line`]; for a `5xx` it ends with what the request observed of
-/// its failure ([`crate::metrics::RequestObservation::log_fields`]):
+/// [`log_line`]; a `5xx` or a recorded child grant refusal ends with
+/// what the request observed of its failure
+/// ([`crate::metrics::RequestObservation::log_fields`]):
 /// `stage=.. err=.. code=..`, each `-` where nothing is known. Those are
 /// names from fixed lists and numbers, never message text.
 pub fn log_line_with(
@@ -1627,7 +1628,8 @@ pub fn log_line_with(
     observed: Option<&crate::metrics::RequestObservation>,
 ) -> String {
     let line = request_line(method, raw_target, status, request_id);
-    if status < 500 {
+    let grant_refused = status == 403 && observed.and_then(|o| o.grant_refusal()).is_some();
+    if status < 500 && !grant_refused {
         return line;
     }
     let fields = observed.map_or_else(
@@ -1642,7 +1644,8 @@ pub fn log_line_with(
 /// `intended` answer into a 500, see
 /// [`crate::metrics::RequestObservation::response_status`]), then gives
 /// the status to count the request under and its log line, which has the
-/// wire status and, for a 5xx, the observed failure.
+/// wire status and, for a 5xx or a recorded child grant refusal, the
+/// observed failure.
 pub fn settled_log_line(
     method: &str,
     raw_target: &str,

@@ -2116,6 +2116,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         maintenance: Maintenance::Off,
         server_side_copy: true,
         get_fanout_bytes: None,
+        grant_refusal_reasons: false,
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         verify: Default::default(),

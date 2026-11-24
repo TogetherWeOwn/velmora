@@ -108,15 +108,72 @@ pub fn is_internal_target(raw_target: &str) -> bool {
 /// `fetch`). A client cannot remove them. A request through the service
 /// binding has none.
 pub fn from_edge(req: &S3Request) -> bool {
-    req.headers.iter().any(|(name, _)| {
-        let name = name.to_ascii_lowercase();
-        name.starts_with("cf-")
-            || name.starts_with("x-forwarded-")
-            || name == "x-real-ip"
-            || name == "forwarded"
-            || name == "via"
-            || name == "true-client-ip"
+    req.headers
+        .iter()
+        .any(|(name, _)| edge_header(name).is_some())
+}
+
+// The header rule is broader than this log allowlist. In particular, an
+// arbitrary name with a refused prefix is reported only as `other`.
+const EDGE_HEADER_LABELS: &[(&str, &str)] = &[
+    ("cf-connecting-ip", "cf_connecting_ip"),
+    ("cf-connecting-ipv6", "cf_connecting_ipv6"),
+    ("cf-ipcountry", "cf_ipcountry"),
+    ("cf-ray", "cf_ray"),
+    ("cf-visitor", "cf_visitor"),
+    ("cf-worker", "cf_worker"),
+    ("x-forwarded-for", "x_forwarded_for"),
+    ("x-forwarded-host", "x_forwarded_host"),
+    ("x-forwarded-port", "x_forwarded_port"),
+    ("x-forwarded-proto", "x_forwarded_proto"),
+    ("x-real-ip", "x_real_ip"),
+    ("forwarded", "forwarded"),
+    ("via", "via"),
+    ("true-client-ip", "true_client_ip"),
+];
+const _: () = assert!(EDGE_HEADER_LABELS.len() < u16::BITS as usize);
+
+fn edge_header(name: &str) -> Option<u16> {
+    let name = name.to_ascii_lowercase();
+    let refused = name.starts_with("cf-")
+        || name.starts_with("x-forwarded-")
+        || name == "x-real-ip"
+        || name == "forwarded"
+        || name == "via"
+        || name == "true-client-ip";
+    refused.then(|| {
+        1 << EDGE_HEADER_LABELS
+            .iter()
+            .position(|(header, _)| *header == name)
+            .unwrap_or(EDGE_HEADER_LABELS.len())
     })
+}
+
+/// Bounded set of log labels for the edge headers that refused a grant.
+/// Carries neither header text nor values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeHeaders(u16);
+
+impl EdgeHeaders {
+    fn of(req: &S3Request) -> Option<Self> {
+        let bits = req
+            .headers
+            .iter()
+            .filter_map(|(name, _)| edge_header(name))
+            .fold(0, |bits, bit| bits | bit);
+        (bits != 0).then_some(Self(bits))
+    }
+
+    fn log_code(self) -> String {
+        EDGE_HEADER_LABELS
+            .iter()
+            .map(|(_, label)| *label)
+            .chain(core::iter::once("other"))
+            .enumerate()
+            .filter_map(|(i, label)| (self.0 & (1 << i) != 0).then_some(label))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
 }
 
 /// What one sub-request may read.
@@ -131,14 +188,45 @@ pub struct Grant {
     pub expires: UnixMs,
 }
 
-/// Why a token was refused. Never told to the caller: every refusal is
-/// the same `403`.
+/// Why admission was refused. Never told to the caller: every refusal
+/// is the same `403`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
+    EdgeHeader(EdgeHeaders),
+    Method,
+    TokenCount,
     Malformed,
     UnknownKey,
     BadTag,
-    Expired,
+    /// Whole seconds since expiry, measured on the checking invocation.
+    Expired {
+        seconds_past_expiry: i64,
+    },
+}
+
+impl Refused {
+    /// The bounded log reason and the corresponding Analytics stage.
+    pub(crate) fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::EdgeHeader(_) => ("EdgeHeader", "grant:EdgeHeader"),
+            Self::Method => ("Method", "grant:Method"),
+            Self::TokenCount => ("TokenCount", "grant:TokenCount"),
+            Self::Malformed => ("Malformed", "grant:Malformed"),
+            Self::UnknownKey => ("UnknownKey", "grant:UnknownKey"),
+            Self::BadTag => ("BadTag", "grant:BadTag"),
+            Self::Expired { .. } => ("Expired", "grant:Expired"),
+        }
+    }
+
+    pub(crate) fn log_code(self) -> String {
+        match self {
+            Self::EdgeHeader(headers) => headers.log_code(),
+            Self::Expired {
+                seconds_past_expiry,
+            } => seconds_past_expiry.to_string(),
+            _ => "-".to_string(),
+        }
+    }
 }
 
 /// An id that can stand in a token: the separator and anything outside
@@ -266,7 +354,11 @@ impl Grant {
         }
         // Only a token that verified is told apart by its age.
         if now >= grant.expires {
-            return Err(Refused::Expired);
+            // Expiry is a nonnegative parsed decimal, and `now` is at
+            // least expiry here, so the difference fits in i64.
+            return Err(Refused::Expired {
+                seconds_past_expiry: (now.0 - grant.expires.0) / 1000,
+            });
         }
         Ok(grant)
     }
@@ -276,8 +368,11 @@ impl Grant {
 /// the edge, must be a `GET` of [`INTERNAL_TARGET`] and must carry
 /// exactly one token, which must verify.
 pub fn admit<K: Kek>(kek: &K, req: &S3Request, now: UnixMs) -> Result<Grant, Refused> {
-    if from_edge(req) || req.method != crate::types::Method::Get {
-        return Err(Refused::Malformed);
+    if let Some(headers) = EdgeHeaders::of(req) {
+        return Err(Refused::EdgeHeader(headers));
+    }
+    if req.method != crate::types::Method::Get {
+        return Err(Refused::Method);
     }
     let mut tokens = req
         .headers
@@ -286,7 +381,7 @@ pub fn admit<K: Kek>(kek: &K, req: &S3Request, now: UnixMs) -> Result<Grant, Ref
         .map(|(_, value)| value.as_str());
     match (tokens.next(), tokens.next()) {
         (Some(token), None) => Grant::open(kek, token, now),
-        _ => Err(Refused::Malformed),
+        _ => Err(Refused::TokenCount),
     }
 }
 
