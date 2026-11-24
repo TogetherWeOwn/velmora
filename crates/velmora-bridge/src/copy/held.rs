@@ -27,6 +27,17 @@ fn stamped(key: &str) -> Option<(i64, u32)> {
     Some((at, u32::try_from(at / 1000).ok()?))
 }
 
+fn hold_key(entry: &str, stamp: u32) -> Option<&str> {
+    let key = entry.strip_prefix(PREFIX)?;
+    (stamped(key)?.1 == stamp).then_some(key)
+}
+
+pub(super) fn has_hold(saved: &BTreeMap<String, u32>) -> bool {
+    saved
+        .iter()
+        .any(|(entry, &stamp)| hold_key(entry, stamp).is_some())
+}
+
 pub(super) fn retain(
     saved: BTreeMap<String, u32>,
     since: i64,
@@ -36,10 +47,7 @@ pub(super) fn retain(
     let holds: BTreeSet<String> = if parallel {
         saved
             .iter()
-            .filter_map(|(entry, &stamp)| {
-                let key = entry.strip_prefix(PREFIX)?;
-                (stamped(key)?.1 == stamp).then(|| key.to_owned())
-            })
+            .filter_map(|(entry, &stamp)| hold_key(entry, stamp).map(str::to_owned))
             .take(SWEEP_RECORDS)
             .collect()
     } else {
@@ -77,7 +85,7 @@ impl Known {
 impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
     /// Save a request before forgetting why it was needed. One write
     /// suffices for every hold relinquished by this job.
-    async fn ask_for_held_walk(&self, known: &mut Known) -> bool {
+    pub(super) async fn ask_for_held_walk(&self, known: &mut Known) -> bool {
         if !known.walk_requested {
             known.walk_requested = self.save_time(WANT_KEY, self.clock.now()).await.is_ok();
             known.mark_failed |= !known.walk_requested;

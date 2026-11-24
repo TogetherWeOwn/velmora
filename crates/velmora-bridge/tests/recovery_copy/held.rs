@@ -240,6 +240,31 @@ async fn legacy_sweep_ignores_held_markers() {
         "legacy publication rule is unchanged"
     );
     assert!(!held_map(&w).await.contains_key(&entry.0));
+    assert_eq!(time_at(&w, WANT_KEY).await, Some(NOW.to_string()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_sweep_does_not_discard_held_markers_if_the_walk_request_fails() {
+    let w = World::new();
+    let key = generation(FRESH_MS - PASS_INTERVAL_MS + 1, "_rollback");
+    w.generation(&key, &["x_missing"]).await;
+    let entry = held(&key);
+    save_held(&w, [entry.clone()]).await;
+    let now = UnixMs(NOW);
+    rest(&w, now).await;
+    let copier = Copier {
+        safety: &NoMark(&w.safety, WANT_KEY),
+        kek: &w.kek,
+        clock: &w.clock,
+        remote: &w.remote,
+        maintenance: Maintenance::Off,
+    };
+    let (outcome, report) = copier.run_job_report(&w.jobs, now, "").await;
+    assert_eq!(
+        (outcome, report.error),
+        (JobOutcome::Ack, Some(StepError::Mark))
+    );
+    assert_eq!(held_map(&w).await.get(&entry.0), Some(&entry.1));
 }
 
 #[tokio::test(flavor = "current_thread")]

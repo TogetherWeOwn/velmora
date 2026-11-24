@@ -1527,6 +1527,11 @@ impl<B: BlobStore, K: Kek, T: Clock, H: HttpSend> Copier<'_, B, K, T, H> {
                 return;
             }
         };
+        // Switching the opt-in off hands its holds to the legacy walk.
+        // Keep the marker intact if we cannot persist that request.
+        if !parallel && held::has_hold(&saved) && !self.ask_for_held_walk(known).await {
+            known.unread = true;
+        }
         // Held entries are obligations, not proof that a plan is present.
         let matches = known
             .destination_tag()
