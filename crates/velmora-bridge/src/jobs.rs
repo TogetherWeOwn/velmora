@@ -868,16 +868,18 @@ where
 
     fn hot_ctl_cap(&self, rows: &HotRows, now: UnixMs) -> (u64, &'static str) {
         let cfg = self.cfg.hot_ctl;
+        let max = cfg
+            .max_bytes
+            .unwrap_or(hotctl::MEASURABLE_MAX_BYTES)
+            .min(hotctl::MEASURABLE_MAX_BYTES);
         let stale = hot_time(rows, "hot_ctl_at")
             .is_some_and(|at| now.0.saturating_sub(at.0) > HOT_CTL_STALE_MS);
         if cfg.mode == HotCtlMode::Adaptive && (rows.get(HOT_CAP_KEYS[1]) == Some(&0) || stale) {
             // A stale decision may mean fixed mode or an adaptive outage.
-            // Protect both the fixed threshold and any larger cap that this
-            // controller actually applied. Zero provenance marks shadow.
-            let seed = self
-                .cfg
-                .hot_cap_bytes
-                .clamp(cfg.min_bytes, hotctl::MEASURABLE_MAX_BYTES);
+            // Seed from the fixed threshold within the current bounds.
+            // Only a previously applied cap can exceed a lowered maximum;
+            // zero provenance marks shadow, which never applied its target.
+            let seed = self.cfg.hot_cap_bytes.clamp(cfg.min_bytes, max);
             let applied = hot_unsigned(rows, HOT_CAP_KEYS[1]).filter(|&applied| {
                 applied > 0
                     && applied <= hotctl::MEASURABLE_MAX_BYTES
@@ -885,10 +887,6 @@ where
             });
             return (applied.map_or(seed, |cap| cap.max(seed)), "mode_switch");
         }
-        let max = cfg
-            .max_bytes
-            .unwrap_or(hotctl::MEASURABLE_MAX_BYTES)
-            .min(hotctl::MEASURABLE_MAX_BYTES);
         let Some(target) = hot_unsigned(rows, HOT_CAP_KEYS[0]).filter(|&target| target > 0) else {
             return (
                 self.cfg.hot_cap_bytes.clamp(cfg.min_bytes, max),

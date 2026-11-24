@@ -900,6 +900,28 @@ async fn switching_from_shadow_starts_at_the_real_fixed_threshold() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_lower_maximum_is_enforced_on_the_first_drain_after_shadow() {
+    use velmora_bridge::config::HotCtlMode;
+    let mut hot = hot_with(|cfg| {
+        cfg.hot_ctl.mode = HotCtlMode::Shadow;
+        cfg.hot_cap_bytes = 100 * GIB;
+        cfg.hot_ctl.max_bytes = Some(40 * GIB);
+    })
+    .await;
+    let x = hot.released("bounded-shadow-switch").await;
+    hot.sql(
+        "UPDATE extents SET hot_safety_bytes = 53687091200 WHERE id = ?1",
+        &x,
+    );
+    hot.dispatch_and_evict().await.0.hot_ctl.unwrap();
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 0);
+    hot.cfg_mut().hot_ctl.mode = HotCtlMode::Adaptive;
+    assert_eq!(hot.admin_status().await["hot"]["cap_bytes"], 40 * GIB);
+    assert_eq!(hot.bridge().evict_batch(0).await.unwrap(), 50 * GIB);
+    assert!(!hot.has_safety(&x));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn resuming_adaptive_after_fixed_rate_limits_from_the_actual_fixed_cap() {
     use velmora_bridge::config::HotCtlMode;
     let mut hot = hot_with(|cfg| {
