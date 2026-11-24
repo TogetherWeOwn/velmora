@@ -2081,7 +2081,10 @@ operator-owned directory (`umask 077`).
   `velmora.cutover_attempt` to the F1 attempt id before arming so the SQL also
   stamps the frozen PG epoch for access reconciliation. After draining, select
   D1 with maintenance still on and apply the durable access revocations before
-  replay. Use a report taken against that exact frozen PG epoch. Compute the exact
+  replay. Use a report taken against that exact frozen PG epoch. Before any
+  revocation and before reopening, re-read the access delta in a fresh bounded
+  read-only PG snapshot and require it to match the report. A matching epoch
+  or WAL position alone does not prove access is unchanged. Compute the exact
   replay start with `python3 ops/pg-cutover-disarm.py --f1 f1.json --r1b-census
   census.json`. Pass the returned `since_ms` and `margin_ms` to `catalog-replay.sh`
   (margin 0; the tool already subtracts ten minutes). If `held_missing_total`
