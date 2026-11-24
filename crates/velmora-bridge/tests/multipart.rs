@@ -1034,8 +1034,8 @@ async fn complete_vs_upload_part_race() {
                 .await;
             (complete, part)
         };
-        // Yielding first orders these tiny in-memory calls, but on real
-        // sockets either request can finish its reads and commit first.
+        // Both requests reach their terminal catalogue batch. The gates
+        // let the prescribed first batch finish before releasing the second.
         if complete_first {
             assert_eq!(complete.outcome(), "200", "{}", complete.body);
             assert_eq!(part.outcome(), "404 NoSuchUpload");
