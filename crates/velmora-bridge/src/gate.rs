@@ -1051,7 +1051,7 @@ impl<S: Sql, D: GateStore> Gate<S, D> {
         self.sql
             .batch(vec![
                 (
-                    SEED,
+                    self.sql.dialect().pick(SEED, SEED_PG),
                     vec![text(&p.id), SqlValue::Int(i64::from(p.max_conns))],
                 ),
                 (WAKE, vec![text(&idle), text(&holder)]),
@@ -2168,4 +2168,22 @@ impl<T: GateTransport> PermitGate for GateClient<T> {
             first_error
         })
     }
+}
+
+const SEED_PG: &str = "INSERT INTO provider_permits(provider_id, slot) \
+     WITH RECURSIVE s(n) AS (SELECT 0::bigint UNION ALL SELECT n + 1 FROM s WHERE n + 1 < ?2) \
+     SELECT ?1, n FROM s WHERE n < ?2 ON CONFLICT DO NOTHING";
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(crate) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (SEED_PG.to_owned(), vec![T, I]),
+        (SEIZE.to_owned(), vec![T, T, I, I, T, I, I]),
+        (WAKE.to_owned(), vec![T, T]),
+        (OWNED.to_owned(), vec![T, T, I, I, I, T, T]),
+        (HAND_BACK.to_owned(), vec![T, T]),
+    ]
 }

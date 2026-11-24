@@ -45,7 +45,10 @@ pub const COUNTERS: &str = "SELECT all_x AND all_o AND all_g, \
   FROM usage_global WHERE id = 1";
 
 pub(super) async fn counters<S: Sql>(c: &SqlCatalog<S>) -> Result<UsageCounters> {
-    let rows = c.sql.query(COUNTERS, &[]).await?;
+    let rows = c
+        .sql
+        .query(c.sql.dialect().pick(COUNTERS, COUNTERS_PG), &[])
+        .await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(UsageCounters::default());
     };
@@ -84,14 +87,7 @@ fn hour(r: &mut Cols) -> Result<UsageHour> {
 }
 
 async fn recount_state<S: Sql>(c: &SqlCatalog<S>) -> Result<RecountState> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT pass, started_at, rows_seen, all_x, all_o, all_g, adopt \
-               FROM usage_global WHERE id = 2",
-            &[],
-        )
-        .await?;
+    let rows = c.sql.query(SELECT_RECOUNT_STATE, &[]).await?;
     let idle = RecountState {
         running: false,
         started_at: UnixMs(0),
@@ -137,9 +133,7 @@ async fn recount_record<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT started_at, finished_at, rows, adopted, drift, detail \
-               FROM usage_recounts WHERE ?1 IS NULL OR started_at = ?1 \
-              ORDER BY id DESC LIMIT 1",
+            c.sql.dialect().pick(RECOUNT_RECORD, RECOUNT_RECORD_PG),
             &[started_at.map_or(SqlValue::Null, ms)],
         )
         .await?;
@@ -158,10 +152,7 @@ async fn recount_record<S: Sql>(
 }
 
 /// Each `MIN` is one seek in `outbox_due(stage, next_at)`.
-pub const OLDEST: &str = "SELECT \
-   (SELECT MIN(next_at) FROM outbox WHERE stage = 'post'), \
-   (SELECT MIN(next_at) FROM outbox WHERE stage = 'verify'), \
-   (SELECT MIN(next_at) FROM outbox WHERE stage = 'release')";
+pub const OLDEST: &str = OLDEST_BY_STAGE;
 
 /// One row per bucket with a counted object (a bucket emptied since
 /// keeps a row of zeros until a recount is adopted): the bucket count,
@@ -174,19 +165,7 @@ pub(super) async fn snapshot<S: Sql>(c: &SqlCatalog<S>, hours: u32) -> Result<Us
     // The hour under way, with what is already filed for it: counters
     // switched off and on again within an hour filed its first part.
     // One statement, so no event is in both or in neither.
-    let current = c
-        .sql
-        .query(
-            "SELECT g.hour, g.h_posts + COALESCE(h.posts, 0), \
-                    g.h_verifies + COALESCE(h.verifies, 0), \
-                    g.h_releases + COALESCE(h.releases, 0), \
-                    g.h_dead + COALESCE(h.dead, 0), \
-                    g.h_failures + COALESCE(h.failures, 0) \
-               FROM usage_global g LEFT JOIN usage_hours h ON h.hour = g.hour \
-              WHERE g.id = 1",
-            &[],
-        )
-        .await?;
+    let current = c.sql.query(CURRENT_HOUR, &[]).await?;
     counters.current = hour(&mut Cols::new(first(current)?))?;
     let mut totals = Cols::new(first(c.sql.query(BUCKET_TOTALS, &[]).await?)?);
     let (live_objects, live_bytes, buckets_counted) = (totals.num()?, totals.num()?, totals.num()?);
@@ -196,8 +175,7 @@ pub(super) async fn snapshot<S: Sql>(c: &SqlCatalog<S>, hours: u32) -> Result<Us
     let rows = c
         .sql
         .query(
-            "SELECT hour, posts, verifies, releases, dead, failures \
-               FROM usage_hours WHERE hour <> ?2 ORDER BY hour DESC LIMIT ?1",
+            PREVIOUS_HOURS,
             // Not the current hour: what is filed for it is in the
             // current figures above, and one filed between the two
             // reads would be there twice.
@@ -242,17 +220,7 @@ pub(super) async fn buckets<S: Sql>(
     // page too, with no bucket in it.
     let rows = c
         .sql
-        .query(
-            "SELECT g.ok, p.bucket_id, p.name, p.live_objects, p.live_bytes \
-               FROM (SELECT (all_x = 1 AND all_o = 1 AND all_g = 1) AS ok \
-                       FROM usage_global WHERE id = 1) g \
-               LEFT JOIN (SELECT u.bucket_id, b.name, u.live_objects, u.live_bytes \
-                            FROM usage_buckets u JOIN buckets b ON b.id = u.bucket_id \
-                           WHERE u.kind = 1 AND u.bucket_id > ?1 \
-                           ORDER BY u.bucket_id LIMIT ?2) p ON 1 = 1 \
-              ORDER BY p.bucket_id",
-            &[text(after), SqlValue::Int(i64::from(limit))],
-        )
+        .query(BUCKET_PAGE, &[text(after), SqlValue::Int(i64::from(limit))])
         .await?;
     let mut seeded = false;
     let mut out = Vec::with_capacity(rows.len());
@@ -294,23 +262,11 @@ pub(super) async fn recount_start<S: Sql>(
         .sql
         .batch(vec![
             (
-                "DELETE FROM usage_buckets WHERE kind = 2 AND EXISTS \
-                   (SELECT 1 FROM usage_global WHERE id = 2 AND (pass = 0 OR ?1 = 1)) \
-                   AND (?2 = 0 OR EXISTS (SELECT 1 FROM usage_global \
-                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))",
+                RECOUNT_CLEAR_OLD_BUCKETS,
                 vec![restart.clone(), only_on.clone()],
             ),
             (
-                "UPDATE usage_global SET \
-                   cur_x = '', all_x = 0, cur_o = '', all_o = 0, cur_g = '', all_g = 0, \
-                   x_unreleased = 0, unreleased_bytes = 0, x_released = 0, \
-                   released_bytes = 0, x_deleted = 0, \
-                   ob_post = 0, ob_verify = 0, ob_release = 0, ob_done = 0, \
-                   ob_cancelled = 0, ob_dead = 0, \
-                   pass = 1, started_at = ?2, rows_seen = 0, adopt = ?3 \
-                 WHERE id = 2 AND (pass = 0 OR ?1 = 1) \
-                   AND (?4 = 0 OR EXISTS (SELECT 1 FROM usage_global \
-                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))",
+                RECOUNT_START,
                 vec![restart, ms(now), SqlValue::Int(i64::from(adopt)), only_on],
             ),
         ])
@@ -431,9 +387,10 @@ macro_rules! bucket_drift {
 
 /// The counters a recount can check, as a JSON object of row `$r`.
 macro_rules! levels_json {
-    ($r:literal) => {
+    ($r:literal, $ctor:literal) => {
         concat!(
-            "json_object('extents_unreleased', ",
+            $ctor,
+            "('extents_unreleased', ",
             $r,
             ".x_unreleased, ",
             "'unreleased_bytes', ",
@@ -484,9 +441,9 @@ const FINISH_RECORD: &str = concat!(
     "       ELSE 0 END, \
             CASE WHEN l.all_x = 1 AND l.all_o = 1 AND l.all_g = 1 THEN \
               json_object('live', ",
-    levels_json!("l"),
+    levels_json!("l", "json_object"),
     ", 'recount', ",
-    levels_json!("s"),
+    levels_json!("s", "json_object"),
     ", 'buckets_differing', ",
     bucket_drift!(),
     ") END \
@@ -497,47 +454,15 @@ const FINISH_RECORD: &str = concat!(
 
 /// Ends a counted recount: one batch, so the comparison, the adoption
 /// and the reset of row 2 see the same counters.
-fn finish_stmts(now: UnixMs) -> Vec<Stmt> {
+fn finish_stmts(dialect: crate::ports::Dialect, now: UnixMs) -> Vec<Stmt> {
     vec![
-        (FINISH_RECORD, vec![ms(now)]),
-        (
-            concat!("DELETE FROM usage_buckets WHERE kind = 1 AND ", adopting!()),
-            vec![],
-        ),
-        (
-            concat!(
-                "INSERT INTO usage_buckets (kind, bucket_id, live_objects, live_bytes) \
-                 SELECT 1, bucket_id, live_objects, live_bytes FROM usage_buckets \
-                  WHERE kind = 2 AND ",
-                adopting!()
-            ),
-            vec![],
-        ),
+        (dialect.pick(FINISH_RECORD, FINISH_RECORD_PG), vec![ms(now)]),
+        (FINISH_REMOVE_UNCOUNTED_BUCKETS, vec![]),
+        (FINISH_ADOPT_BUCKETS, vec![]),
         // Last of the three that read `adopting`: it ends it.
-        (
-            concat!(
-                "UPDATE usage_global SET \
-                   (x_unreleased, unreleased_bytes, x_released, released_bytes, x_deleted, \
-                    ob_post, ob_verify, ob_release, ob_done, ob_cancelled, ob_dead) = \
-                   (SELECT x_unreleased, unreleased_bytes, x_released, released_bytes, \
-                           x_deleted, ob_post, ob_verify, ob_release, ob_done, \
-                           ob_cancelled, ob_dead FROM usage_global WHERE id = 2), \
-                   all_x = 1, all_o = 1, all_g = 1 \
-                 WHERE id = 1 AND ",
-                adopting!()
-            ),
-            vec![],
-        ),
-        (
-            concat!("DELETE FROM usage_buckets WHERE kind = 2 AND ", counted!()),
-            vec![],
-        ),
-        (
-            "UPDATE usage_global SET pass = 0, adopt = 0, \
-               cur_x = '', all_x = 0, cur_o = '', all_o = 0, cur_g = '', all_g = 0 \
-             WHERE id = 2 AND pass = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1",
-            vec![],
-        ),
+        (FINISH_ADOPT_GLOBAL, vec![]),
+        (FINISH_CLEAR_COUNTED, vec![]),
+        (FINISH_RESET, vec![]),
     ]
 }
 
@@ -560,21 +485,38 @@ pub(super) async fn recount_step<S: Sql>(
     };
     match state.table {
         "extents" => {
-            c.sql.exec(STEP_EXTENTS, &limit()).await?;
+            c.sql
+                .exec(
+                    c.sql.dialect().pick(STEP_EXTENTS, STEP_EXTENTS_PG),
+                    &limit(),
+                )
+                .await?;
         }
         "outbox" => {
-            c.sql.exec(STEP_OUTBOX, &limit()).await?;
+            c.sql
+                .exec(c.sql.dialect().pick(STEP_OUTBOX, STEP_OUTBOX_PG), &limit())
+                .await?;
         }
         "generations" => {
             c.sql
                 .batch(vec![
-                    (STEP_GENERATIONS_BUCKETS, limit()),
-                    (STEP_GENERATIONS_CURSOR, limit()),
+                    (
+                        c.sql
+                            .dialect()
+                            .pick(STEP_GENERATIONS_BUCKETS, STEP_GENERATIONS_BUCKETS_PG),
+                        limit(),
+                    ),
+                    (
+                        c.sql
+                            .dialect()
+                            .pick(STEP_GENERATIONS_CURSOR, STEP_GENERATIONS_CURSOR_PG),
+                        limit(),
+                    ),
                 ])
                 .await?;
         }
         "finish" => {
-            let changed = c.sql.batch(finish_stmts(now)).await?;
+            let changed = c.sql.batch(finish_stmts(c.sql.dialect(), now)).await?;
             // Ended by this call, not by another that ran beside it.
             if changed.last().copied().unwrap_or(0) == 1 {
                 // The record of the pass this step saw; after a restart
@@ -603,35 +545,19 @@ pub(super) async fn recount_step<S: Sql>(
 pub(super) async fn off<S: Sql>(c: &SqlCatalog<S>) -> Result<()> {
     c.sql
         .batch(vec![
-            (
-                "UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0, \
-                   cur_x = '', cur_o = '', cur_g = '', pass = 0, adopt = 0",
-                vec![],
-            ),
+            (RESET_RECOUNT_STATE, vec![]),
             // The event totals and the hour under way count "since the
             // counters were switched on": they start again with the
             // next recount, and do not span the time in between. The
             // hour under way is filed first, so its events are kept.
             (
-                "INSERT INTO usage_hours \
-                   (hour, posts, verifies, releases, dead, failures) \
-                 SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
-                   FROM usage_global WHERE id = 1 AND hour > 0 \
-                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0 \
-                 ON CONFLICT (hour) DO UPDATE SET \
-                   posts = posts + excluded.posts, verifies = verifies + excluded.verifies, \
-                   releases = releases + excluded.releases, dead = dead + excluded.dead, \
-                   failures = failures + excluded.failures",
+                c.sql
+                    .dialect()
+                    .pick(SAVE_CURRENT_HOUR, SAVE_CURRENT_HOUR_PG),
                 vec![],
             ),
-            (
-                "UPDATE usage_global SET posts_total = 0, verifies_total = 0, \
-                   releases_total = 0, dead_total = 0, failures_total = 0, \
-                   hour = 0, h_posts = 0, h_verifies = 0, h_releases = 0, \
-                   h_dead = 0, h_failures = 0 WHERE id = 1",
-                vec![],
-            ),
-            ("DELETE FROM usage_buckets WHERE kind = 2", vec![]),
+            (CLEAR_ACTIVITY_COUNTERS, vec![]),
+            (RESET_COUNTED_BUCKETS, vec![]),
         ])
         .await?;
     Ok(())
@@ -643,4 +569,237 @@ pub(super) async fn recounts<S: Sql>(
     c: &SqlCatalog<S>,
 ) -> Result<(RecountState, Option<UsageRecount>)> {
     Ok((recount_state(c).await?, last_recount(c).await?))
+}
+
+const SELECT_RECOUNT_STATE: &str =
+    "SELECT pass, started_at, rows_seen, all_x, all_o, all_g, adopt \
+               FROM usage_global WHERE id = 2";
+
+const OLDEST_BY_STAGE: &str = "SELECT \
+   (SELECT MIN(next_at) FROM outbox WHERE stage = 'post'), \
+   (SELECT MIN(next_at) FROM outbox WHERE stage = 'verify'), \
+   (SELECT MIN(next_at) FROM outbox WHERE stage = 'release')";
+
+const CURRENT_HOUR: &str = "SELECT g.hour, g.h_posts + COALESCE(h.posts, 0), \
+                    g.h_verifies + COALESCE(h.verifies, 0), \
+                    g.h_releases + COALESCE(h.releases, 0), \
+                    g.h_dead + COALESCE(h.dead, 0), \
+                    g.h_failures + COALESCE(h.failures, 0) \
+               FROM usage_global g LEFT JOIN usage_hours h ON h.hour = g.hour \
+              WHERE g.id = 1";
+
+const PREVIOUS_HOURS: &str = "SELECT hour, posts, verifies, releases, dead, failures \
+               FROM usage_hours WHERE hour <> ?2 ORDER BY hour DESC LIMIT ?1";
+
+const BUCKET_PAGE: &str = "SELECT g.ok, p.bucket_id, p.name, p.live_objects, p.live_bytes \
+               FROM (SELECT (all_x = 1 AND all_o = 1 AND all_g = 1) AS ok \
+                       FROM usage_global WHERE id = 1) g \
+               LEFT JOIN (SELECT u.bucket_id, b.name, u.live_objects, u.live_bytes \
+                            FROM usage_buckets u JOIN buckets b ON b.id = u.bucket_id \
+                           WHERE u.kind = 1 AND u.bucket_id > ?1 \
+                           ORDER BY u.bucket_id LIMIT ?2) p ON 1 = 1 \
+              ORDER BY p.bucket_id";
+
+const RECOUNT_CLEAR_OLD_BUCKETS: &str = "DELETE FROM usage_buckets WHERE kind = 2 AND EXISTS \
+                   (SELECT 1 FROM usage_global WHERE id = 2 AND (pass = 0 OR ?1 = 1)) \
+                   AND (?2 = 0 OR EXISTS (SELECT 1 FROM usage_global \
+                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))";
+
+const RECOUNT_START: &str = "UPDATE usage_global SET \
+                   cur_x = '', all_x = 0, cur_o = '', all_o = 0, cur_g = '', all_g = 0, \
+                   x_unreleased = 0, unreleased_bytes = 0, x_released = 0, \
+                   released_bytes = 0, x_deleted = 0, \
+                   ob_post = 0, ob_verify = 0, ob_release = 0, ob_done = 0, \
+                   ob_cancelled = 0, ob_dead = 0, \
+                   pass = 1, started_at = ?2, rows_seen = 0, adopt = ?3 \
+                 WHERE id = 2 AND (pass = 0 OR ?1 = 1) \
+                   AND (?4 = 0 OR EXISTS (SELECT 1 FROM usage_global \
+                         WHERE id = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1))";
+
+const FINISH_RESET: &str = "UPDATE usage_global SET pass = 0, adopt = 0, \
+               cur_x = '', all_x = 0, cur_o = '', all_o = 0, cur_g = '', all_g = 0 \
+             WHERE id = 2 AND pass = 1 AND all_x = 1 AND all_o = 1 AND all_g = 1";
+
+const RESET_RECOUNT_STATE: &str = "UPDATE usage_global SET all_x = 0, all_o = 0, all_g = 0, \
+                   cur_x = '', cur_o = '', cur_g = '', pass = 0, adopt = 0";
+
+const CLEAR_ACTIVITY_COUNTERS: &str =
+    "UPDATE usage_global SET posts_total = 0, verifies_total = 0, \
+                   releases_total = 0, dead_total = 0, failures_total = 0, \
+                   hour = 0, h_posts = 0, h_verifies = 0, h_releases = 0, \
+                   h_dead = 0, h_failures = 0 WHERE id = 1";
+
+const RESET_COUNTED_BUCKETS: &str = "DELETE FROM usage_buckets WHERE kind = 2";
+
+const COUNTERS_PG: &str = "SELECT all_x <> 0 AND all_o <> 0 AND all_g <> 0, \
+       x_unreleased, unreleased_bytes, x_released, released_bytes, x_deleted, \
+       ob_post, ob_verify, ob_release, ob_done, ob_cancelled, ob_dead, \
+       posts_total, verifies_total, releases_total, dead_total, failures_total, \
+       hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
+  FROM usage_global WHERE id = 1";
+
+const SAVE_CURRENT_HOUR: &str = "INSERT INTO usage_hours \
+                   (hour, posts, verifies, releases, dead, failures) \
+                 SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
+                   FROM usage_global WHERE id = 1 AND hour > 0 \
+                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0 \
+                 ON CONFLICT (hour) DO UPDATE SET \
+                   posts = posts + excluded.posts, verifies = verifies + excluded.verifies, \
+                   releases = releases + excluded.releases, dead = dead + excluded.dead, \
+                   failures = failures + excluded.failures";
+
+const SAVE_CURRENT_HOUR_PG: &str = "INSERT INTO usage_hours \
+                   (hour, posts, verifies, releases, dead, failures) \
+                 SELECT hour, h_posts, h_verifies, h_releases, h_dead, h_failures \
+                   FROM usage_global WHERE id = 1 AND hour > 0 \
+                    AND h_posts + h_verifies + h_releases + h_dead + h_failures > 0 \
+                 ON CONFLICT (hour) DO UPDATE SET \
+                   posts = usage_hours.posts + excluded.posts, verifies = usage_hours.verifies + excluded.verifies, \
+                   releases = usage_hours.releases + excluded.releases, dead = usage_hours.dead + excluded.dead, \
+                   failures = usage_hours.failures + excluded.failures";
+
+const RECOUNT_RECORD: &str = "SELECT started_at, finished_at, rows, adopted, drift, detail \
+               FROM usage_recounts WHERE ?1 IS NULL OR started_at = ?1 \
+              ORDER BY id DESC LIMIT 1";
+
+const RECOUNT_RECORD_PG: &str = "SELECT started_at, finished_at, rows, adopted, drift, detail \
+               FROM usage_recounts WHERE ?1::bigint IS NULL OR started_at = ?1 \
+              ORDER BY id DESC LIMIT 1";
+
+const STEP_EXTENTS_PG: &str = "UPDATE usage_global SET \
+   x_unreleased = x_unreleased + p.unrel, unreleased_bytes = unreleased_bytes + p.unrel_b, \
+   x_released = x_released + p.rel, released_bytes = released_bytes + p.rel_b, \
+   x_deleted = x_deleted + p.del, \
+   rows_seen = rows_seen + p.n, cur_x = COALESCE(p.last, cur_x), all_x = (p.n < ?1)::int \
+ FROM (SELECT COUNT(*) AS n, MAX(id) AS last, \
+         COALESCE(SUM((safety_state IN ('held', 'releasing'))::int), 0) AS unrel, \
+         COALESCE(SUM(CASE WHEN safety_state IN ('held', 'releasing') \
+                           THEN cipher_size ELSE 0 END), 0) AS unrel_b, \
+         COALESCE(SUM((safety_state = 'released')::int), 0) AS rel, \
+         COALESCE(SUM(CASE WHEN safety_state = 'released' \
+                           THEN cipher_size ELSE 0 END), 0) AS rel_b, \
+         COALESCE(SUM((safety_state = 'deleted')::int), 0) AS del \
+       FROM (SELECT id, safety_state, cipher_size FROM extents \
+              WHERE id > (SELECT cur_x FROM usage_global WHERE id = 2) \
+              ORDER BY id LIMIT ?1)) AS p \
+ WHERE usage_global.id = 2 AND pass = 1 AND all_x = 0";
+
+const STEP_OUTBOX_PG: &str = "UPDATE usage_global SET \
+   ob_post = ob_post + p.post, ob_verify = ob_verify + p.verify, \
+   ob_release = ob_release + p.release, ob_done = ob_done + p.done, \
+   ob_cancelled = ob_cancelled + p.cancelled, ob_dead = ob_dead + p.dead, \
+   rows_seen = rows_seen + p.n, cur_o = COALESCE(p.last, cur_o), all_o = (p.n < ?1)::int \
+ FROM (SELECT COUNT(*) AS n, MAX(extent_id) AS last, \
+         COALESCE(SUM((stage = 'post')::int), 0) AS post, \
+         COALESCE(SUM((stage = 'verify')::int), 0) AS verify, \
+         COALESCE(SUM((stage = 'release')::int), 0) AS release, \
+         COALESCE(SUM((stage = 'done')::int), 0) AS done, \
+         COALESCE(SUM((stage = 'cancelled')::int), 0) AS cancelled, \
+         COALESCE(SUM((stage = 'dead')::int), 0) AS dead \
+       FROM (SELECT extent_id, stage FROM outbox \
+              WHERE extent_id > (SELECT cur_o FROM usage_global WHERE id = 2) \
+              ORDER BY extent_id LIMIT ?1)) AS p \
+ WHERE usage_global.id = 2 AND pass = 1 AND all_x = 1 AND all_o = 0";
+
+const STEP_GENERATIONS_BUCKETS_PG: &str = concat!(
+    "INSERT INTO usage_buckets (kind, bucket_id, live_objects, live_bytes) \
+     SELECT 2, bucket_id, COUNT(*), SUM(size) FROM (",
+    generations_chunk!("bucket_id, state, size"),
+    ") WHERE state = 'live' GROUP BY bucket_id \
+     ON CONFLICT (kind, bucket_id) DO UPDATE SET \
+       live_objects = usage_buckets.live_objects + excluded.live_objects, \
+       live_bytes = usage_buckets.live_bytes + excluded.live_bytes"
+);
+
+const STEP_GENERATIONS_CURSOR_PG: &str = concat!(
+    "UPDATE usage_global SET rows_seen = rows_seen + p.n, \
+       cur_g = COALESCE(p.last, cur_g), all_g = (p.n < ?1)::int \
+     FROM (SELECT COUNT(*) AS n, MAX(id) AS last FROM (",
+    generations_chunk!("id"),
+    ")) AS p \
+     WHERE usage_global.id = 2 AND pass = 1 AND all_x = 1 AND all_o = 1 AND all_g = 0"
+);
+
+const FINISH_RECORD_PG: &str = concat!(
+    "INSERT INTO usage_recounts (started_at, finished_at, rows, adopted, drift, detail) \
+     SELECT s.started_at, ?1, s.rows_seen, \
+            (s.adopt = 1 OR l.all_x = 0 OR l.all_o = 0 OR l.all_g = 0)::int, \
+            CASE WHEN l.all_x = 1 AND l.all_o = 1 AND l.all_g = 1 THEN \
+              (l.x_unreleased <> s.x_unreleased)::int + (l.unreleased_bytes <> s.unreleased_bytes)::int \
+              + (l.x_released <> s.x_released)::int + (l.released_bytes <> s.released_bytes)::int \
+              + (l.x_deleted <> s.x_deleted)::int + (l.ob_post <> s.ob_post)::int \
+              + (l.ob_verify <> s.ob_verify)::int + (l.ob_release <> s.ob_release)::int \
+              + (l.ob_done <> s.ob_done)::int + (l.ob_cancelled <> s.ob_cancelled)::int \
+              + (l.ob_dead <> s.ob_dead)::int + ",
+    bucket_drift!(),
+    "       ELSE 0 END, \
+            CASE WHEN l.all_x = 1 AND l.all_o = 1 AND l.all_g = 1 THEN \
+              json_build_object('live', ",
+    levels_json!("l", "json_build_object"),
+    ", 'recount', ",
+    levels_json!("s", "json_build_object"),
+    ", 'buckets_differing', ",
+    bucket_drift!(),
+    ")::text END \
+       FROM usage_global s, usage_global l \
+      WHERE s.id = 2 AND l.id = 1 AND s.pass = 1 \
+        AND s.all_x = 1 AND s.all_o = 1 AND s.all_g = 1"
+);
+
+const FINISH_REMOVE_UNCOUNTED_BUCKETS: &str =
+    concat!("DELETE FROM usage_buckets WHERE kind = 1 AND ", adopting!());
+
+const FINISH_ADOPT_BUCKETS: &str = concat!(
+    "INSERT INTO usage_buckets (kind, bucket_id, live_objects, live_bytes) \
+                 SELECT 1, bucket_id, live_objects, live_bytes FROM usage_buckets \
+                  WHERE kind = 2 AND ",
+    adopting!()
+);
+
+const FINISH_ADOPT_GLOBAL: &str = concat!(
+    "UPDATE usage_global SET \
+                   (x_unreleased, unreleased_bytes, x_released, released_bytes, x_deleted, \
+                    ob_post, ob_verify, ob_release, ob_done, ob_cancelled, ob_dead) = \
+                   (SELECT x_unreleased, unreleased_bytes, x_released, released_bytes, \
+                           x_deleted, ob_post, ob_verify, ob_release, ob_done, \
+                           ob_cancelled, ob_dead FROM usage_global WHERE id = 2), \
+                   all_x = 1, all_o = 1, all_g = 1 \
+                 WHERE id = 1 AND ",
+    adopting!()
+);
+
+const FINISH_CLEAR_COUNTED: &str =
+    concat!("DELETE FROM usage_buckets WHERE kind = 2 AND ", counted!());
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (BUCKET_TOTALS.to_owned(), vec![]),
+        (SELECT_RECOUNT_STATE.to_owned(), vec![]),
+        (OLDEST_BY_STAGE.to_owned(), vec![]),
+        (CURRENT_HOUR.to_owned(), vec![]),
+        (PREVIOUS_HOURS.to_owned(), vec![I, I]),
+        (BUCKET_PAGE.to_owned(), vec![T, I]),
+        (RECOUNT_CLEAR_OLD_BUCKETS.to_owned(), vec![I, I]),
+        (RECOUNT_START.to_owned(), vec![I, I, I, I]),
+        (FINISH_RESET.to_owned(), vec![]),
+        (RESET_RECOUNT_STATE.to_owned(), vec![]),
+        (CLEAR_ACTIVITY_COUNTERS.to_owned(), vec![]),
+        (RESET_COUNTED_BUCKETS.to_owned(), vec![]),
+        (COUNTERS_PG.to_owned(), vec![]),
+        (SAVE_CURRENT_HOUR_PG.to_owned(), vec![]),
+        (RECOUNT_RECORD_PG.to_owned(), vec![I]),
+        (STEP_EXTENTS_PG.to_owned(), vec![I]),
+        (STEP_OUTBOX_PG.to_owned(), vec![I]),
+        (STEP_GENERATIONS_BUCKETS_PG.to_owned(), vec![I]),
+        (STEP_GENERATIONS_CURSOR_PG.to_owned(), vec![I]),
+        (FINISH_RECORD_PG.to_owned(), vec![I]),
+        (FINISH_REMOVE_UNCOUNTED_BUCKETS.to_owned(), vec![]),
+        (FINISH_ADOPT_BUCKETS.to_owned(), vec![]),
+        (FINISH_ADOPT_GLOBAL.to_owned(), vec![]),
+        (FINISH_CLEAR_COUNTED.to_owned(), vec![]),
+    ]
 }

@@ -59,20 +59,7 @@ pub(super) async fn provider_load<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT provider_id, SUM(held), SUM(uses), MAX(failures), MAX(cooldowns), \
-               MAX(cooldown_until), COUNT(DISTINCT live_holder), \
-               COUNT(DISTINCT live_job), MAX(reason) FROM ( \
-               SELECT provider_id, lease_until >= ?1 AS held, token AS uses, 0 AS failures, \
-                 0 AS cooldowns, 0 AS cooldown_until, \
-                 CASE WHEN lease_until >= ?1 THEN holder END AS live_holder, \
-                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job, \
-                 NULL AS reason \
-                 FROM provider_permits \
-               UNION ALL \
-               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL, \
-                 last_failure_reason \
-                 FROM provider_health) \
-             GROUP BY provider_id ORDER BY provider_id",
+            c.sql.dialect().pick(PROVIDER_LOAD, PROVIDER_LOAD_PG),
             &[ms(now)],
         )
         .await?;
@@ -112,25 +99,16 @@ pub(super) async fn provider_failed<S: Sql>(
     // row may come from a longer cap than this strike's: `MIN` holds
     // both the count and the time to this one's.
     let (max_ms, max_steps) = cooldown_cap(fault);
-    const TRIP: &str = "(failures + 1 >= ?3 OR cooldowns > 0)";
-    let update = format!(
-        "UPDATE provider_health SET \
-           failures = CASE WHEN {TRIP} THEN 0 ELSE failures + 1 END, \
-           cooldowns = CASE WHEN {TRIP} THEN MIN(cooldowns + 1, ?6) ELSE cooldowns END, \
-           cooldown_until = CASE WHEN {TRIP} THEN ?2 + MIN(?4 << cooldowns, ?5) \
-             ELSE cooldown_until END, \
-           last_failure_at = ?2, last_failure_reason = ?7 \
-         WHERE provider_id = ?1 AND cooldown_until <= ?2"
-    );
+    let update = c.sql.dialect().pick(STRIKE, STRIKE_PG);
     c.sql
         .exec(
-            "INSERT OR IGNORE INTO provider_health(provider_id) VALUES (?1)",
+            c.sql.dialect().pick(SEED_HEALTH, SEED_HEALTH_PG),
             &[text(provider)],
         )
         .await?;
     c.sql
         .exec(
-            &update,
+            update,
             &[
                 text(provider),
                 ms(now),
@@ -151,13 +129,7 @@ pub(super) async fn provider_recovered<S: Sql>(
     now: UnixMs,
 ) -> Result<()> {
     c.sql
-        .exec(
-            "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
-               last_ok_at = ?2, last_failure_reason = NULL \
-             WHERE provider_id = ?1 AND cooldown_until <= ?2 \
-               AND (failures > 0 OR cooldowns > 0)",
-            &[text(provider), ms(now)],
-        )
+        .exec(RECOVER_PROVIDER, &[text(provider), ms(now)])
         .await?;
     Ok(())
 }
@@ -178,12 +150,9 @@ pub(super) async fn providers_to_probe<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT provider_id FROM provider_health \
-             WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
-               AND CASE WHEN last_failure_reason = ?4 \
-                 THEN COALESCE(last_failure_at, 0) <= ?3 \
-                 ELSE MAX(COALESCE(last_failure_at, 0), cooldown_until) <= ?2 END \
-             ORDER BY provider_id",
+            c.sql
+                .dialect()
+                .pick(PROVIDERS_TO_PROBE, PROVIDERS_TO_PROBE_PG),
             &[
                 ms(now),
                 ms(quiet_since),
@@ -193,4 +162,113 @@ pub(super) async fn providers_to_probe<S: Sql>(
         )
         .await?;
     rows.into_iter().map(|row| Cols::new(row).text()).collect()
+}
+
+const PROVIDER_LOAD: &str =
+    "SELECT provider_id, SUM(held), SUM(uses), MAX(failures), MAX(cooldowns), \
+               MAX(cooldown_until), COUNT(DISTINCT live_holder), \
+               COUNT(DISTINCT live_job), MAX(reason) FROM ( \
+               SELECT provider_id, lease_until >= ?1 AS held, token AS uses, 0 AS failures, \
+                 0 AS cooldowns, 0 AS cooldown_until, \
+                 CASE WHEN lease_until >= ?1 THEN holder END AS live_holder, \
+                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job, \
+                 NULL AS reason \
+                 FROM provider_permits \
+               UNION ALL \
+               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL, \
+                 last_failure_reason \
+                 FROM provider_health) \
+             GROUP BY provider_id ORDER BY provider_id";
+
+const PROVIDER_LOAD_PG: &str =
+    "SELECT provider_id, SUM(held), SUM(uses), MAX(failures), MAX(cooldowns), \
+               MAX(cooldown_until), COUNT(DISTINCT live_holder), \
+               COUNT(DISTINCT live_job), MAX(reason) FROM ( \
+               SELECT provider_id, (lease_until >= ?1)::int AS held, token AS uses, 0 AS failures, \
+                 0 AS cooldowns, 0 AS cooldown_until, \
+                 CASE WHEN lease_until >= ?1 THEN holder END AS live_holder, \
+                 CASE WHEN lease_until >= ?1 AND background = 1 THEN holder END AS live_job, \
+                 NULL AS reason \
+                 FROM provider_permits \
+               UNION ALL \
+               SELECT provider_id, 0, 0, failures, cooldowns, cooldown_until, NULL, NULL, \
+                 last_failure_reason \
+                 FROM provider_health) AS loads \
+             GROUP BY provider_id ORDER BY provider_id";
+
+const SEED_HEALTH: &str = "INSERT OR IGNORE INTO provider_health(provider_id) VALUES (?1)";
+
+const SEED_HEALTH_PG: &str =
+    "INSERT INTO provider_health(provider_id) VALUES (?1) ON CONFLICT DO NOTHING";
+
+const RECOVER_PROVIDER: &str =
+    "UPDATE provider_health SET failures = 0, cooldowns = 0, cooldown_until = 0, \
+               last_ok_at = ?2, last_failure_reason = NULL \
+             WHERE provider_id = ?1 AND cooldown_until <= ?2 \
+               AND (failures > 0 OR cooldowns > 0)";
+
+const PROVIDERS_TO_PROBE: &str = "SELECT provider_id FROM provider_health \
+             WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
+               AND CASE WHEN last_failure_reason = ?4 \
+                 THEN COALESCE(last_failure_at, 0) <= ?3 \
+                 ELSE MAX(COALESCE(last_failure_at, 0), cooldown_until) <= ?2 END \
+             ORDER BY provider_id";
+
+const PROVIDERS_TO_PROBE_PG: &str = "SELECT provider_id FROM provider_health \
+             WHERE (failures > 0 OR cooldowns > 0) AND cooldown_until <= ?1 \
+               AND CASE WHEN last_failure_reason = ?4 \
+                 THEN COALESCE(last_failure_at, 0) <= ?3 \
+                 ELSE GREATEST(COALESCE(last_failure_at, 0), cooldown_until) <= ?2 END \
+             ORDER BY provider_id";
+
+macro_rules! trip {
+    () => {
+        "(failures + 1 >= ?3 OR cooldowns > 0)"
+    };
+}
+
+const STRIKE: &str = concat!(
+    "UPDATE provider_health SET \
+           failures = CASE WHEN ",
+    trip!(),
+    " THEN 0 ELSE failures + 1 END, \
+           cooldowns = CASE WHEN ",
+    trip!(),
+    " THEN MIN(cooldowns + 1, ?6) ELSE cooldowns END, \
+           cooldown_until = CASE WHEN ",
+    trip!(),
+    " THEN ?2 + MIN(?4 << cooldowns, ?5) \
+             ELSE cooldown_until END, \
+           last_failure_at = ?2, last_failure_reason = ?7 \
+         WHERE provider_id = ?1 AND cooldown_until <= ?2"
+);
+
+const STRIKE_PG: &str = concat!(
+    "UPDATE provider_health SET \
+           failures = CASE WHEN ",
+    trip!(),
+    " THEN 0 ELSE failures + 1 END, \
+           cooldowns = CASE WHEN ",
+    trip!(),
+    " THEN LEAST(cooldowns + 1, ?6) ELSE cooldowns END, \
+           cooldown_until = CASE WHEN ",
+    trip!(),
+    " THEN ?2 + LEAST(?4 << cooldowns::int, ?5) \
+             ELSE cooldown_until END, \
+           last_failure_at = ?2, last_failure_reason = ?7 \
+         WHERE provider_id = ?1 AND cooldown_until <= ?2"
+);
+
+/// Actual Postgres texts and representative wire types for typed PREPARE.
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    const I: SqlValue = SqlValue::Int(0);
+    const T: SqlValue = SqlValue::Text(String::new());
+    vec![
+        (PROVIDER_LOAD_PG.to_owned(), vec![I]),
+        (SEED_HEALTH_PG.to_owned(), vec![T]),
+        (RECOVER_PROVIDER.to_owned(), vec![T, I]),
+        (PROVIDERS_TO_PROBE_PG.to_owned(), vec![I, I, I, T]),
+        (STRIKE_PG.to_owned(), vec![T, I, I, I, I, I, T]),
+    ]
 }

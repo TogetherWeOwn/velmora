@@ -1140,3 +1140,21 @@ mod pg_manifest_tests {
         }
     }
 }
+
+#[doc(hidden)]
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub fn pg_background_statements() -> Vec<(String, Vec<SqlValue>)> {
+    [
+        outbox::pg_statements(),
+        replay::pg_statements(),
+        gc::pg_statements(),
+        usage::pg_statements(),
+        hot::pg_statements(),
+        health::pg_statements(),
+        permits::pg_statements(),
+        crate::gate::pg_statements(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
