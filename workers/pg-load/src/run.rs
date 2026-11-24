@@ -113,7 +113,7 @@ pub struct Report {
     advisory_sampling_ticks: u64,
     advisory_expected_ticks: u64,
     advisory_missed_ticks: u64,
-    advisory_sample_offsets_ms: Vec<f64>,
+    advisory_sample_windows_ms: Vec<SampleWindow>,
     advisory_max_gap_ms: f64,
     advisory_gap_tolerance_ms: u64,
     advisory_wait_samples: usize,
@@ -441,13 +441,19 @@ async fn writes<C: PgConnect, R: Runtime>(w: Writes<'_, C, R>) -> WritesResult {
     }
 }
 
+#[derive(Serialize)]
+struct SampleWindow {
+    dispatched_ms: f64,
+    received_ms: f64,
+}
+
 async fn advisory(
     client: &Client,
     runtime: &impl Runtime,
     start: f64,
     duration: u64,
     lock: i64,
-) -> (Vec<f64>, Vec<f64>, Option<String>) {
+) -> (Vec<SampleWindow>, Vec<f64>, Option<String>) {
     let mut waits = Vec::new();
     let mut error = None;
     let mut samples = Vec::new();
@@ -459,6 +465,10 @@ async fn advisory(
             break;
         }
         until(runtime, start + (tick * SAMPLE_MS) as f64).await;
+        let dispatched_ms = (runtime.monotonic_ms() - start).max(0.0);
+        if dispatched_ms >= duration as f64 {
+            break;
+        }
         let result = client.query_typed("SELECT EXTRACT(EPOCH FROM (clock_timestamp()-l.waitstart))::float8 * 1000 \
              FROM pg_catalog.pg_stat_activity a JOIN pg_catalog.pg_locks l USING(pid) \
              WHERE a.datname=current_database() AND a.wait_event='advisory' \
@@ -467,9 +477,12 @@ async fn advisory(
             .await;
         match result {
             Ok(rows) => {
-                let receipt = (runtime.monotonic_ms() - start).max(0.0);
-                if receipt <= duration as f64 {
-                    samples.push(receipt);
+                let received_ms = (runtime.monotonic_ms() - start).max(dispatched_ms);
+                if received_ms <= duration as f64 {
+                    samples.push(SampleWindow {
+                        dispatched_ms,
+                        received_ms,
+                    });
                     waits.extend(rows.into_iter().map(|row| row.get::<_, f64>(0).max(0.0)));
                 }
             }
@@ -483,13 +496,16 @@ async fn advisory(
     (samples, waits, error)
 }
 
-fn sampler_coverage(samples: &[f64], duration: u64) -> (bool, f64) {
-    let mut previous = 0.0_f64;
+fn sampler_coverage(samples: &[SampleWindow], duration: u64) -> (bool, f64) {
+    let mut previous_dispatch = 0.0_f64;
     let mut max_gap = 0.0_f64;
-    for sample in samples.iter().copied().chain([duration as f64]) {
-        max_gap = max_gap.max(sample - previous);
-        previous = previous.max(sample);
+    // The server sampled somewhere in each dispatch-to-receipt window.
+    // Use the worst case between windows, not the gap between arrivals.
+    for sample in samples {
+        max_gap = max_gap.max(sample.received_ms - previous_dispatch);
+        previous_dispatch = sample.dispatched_ms;
     }
+    max_gap = max_gap.max(duration as f64 - previous_dispatch);
     (
         samples.len() as u64 * 10 >= (duration / SAMPLE_MS) * 9,
         max_gap,
@@ -617,8 +633,8 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     )
     .await;
     drop(rd);
-    let (sample_offsets, mut waits, advisory_error) = sampled;
-    let ticks = sample_offsets.len() as u64;
+    let (sample_windows, mut waits, advisory_error) = sampled;
+    let ticks = sample_windows.len() as u64;
     let WritesResult {
         family,
         minutes: completed,
@@ -626,7 +642,7 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
     } = write_result;
     let target = config.batches_per_minute;
     let expected_ticks = duration / SAMPLE_MS;
-    let (enough_ticks, max_gap) = sampler_coverage(&sample_offsets, duration);
+    let (enough_ticks, max_gap) = sampler_coverage(&sample_windows, duration);
     let gap_covered = max_gap <= MAX_SAMPLE_GAP_MS as f64;
     let (unloaded_covered, loaded_covered) = (unloaded.covered(), loaded.covered());
     let r3a_coverage = Coverage {
@@ -661,7 +677,7 @@ pub async fn run<C: DrillConnect + Clone, R: Runtime>(
         advisory_sampling_ticks: ticks,
         advisory_expected_ticks: expected_ticks,
         advisory_missed_ticks: expected_ticks.saturating_sub(ticks),
-        advisory_sample_offsets_ms: sample_offsets,
+        advisory_sample_windows_ms: sample_windows,
         advisory_max_gap_ms: max_gap,
         advisory_gap_tolerance_ms: MAX_SAMPLE_GAP_MS,
         advisory_wait_samples: waits.len(),
@@ -679,16 +695,48 @@ mod tests {
 
     #[test]
     fn acceptable_tick_count_cannot_hide_a_contiguous_gap() {
-        let timestamps: Vec<_> = (0..40)
+        let instantaneous = |ms| SampleWindow {
+            dispatched_ms: ms,
+            received_ms: ms,
+        };
+        let windows: Vec<_> = (0..40)
             .filter(|i| !(10..=12).contains(i))
-            .map(|i| f64::from(i * 250))
+            .map(|i| instantaneous(f64::from(i * 250)))
             .collect();
-        let (enough_ticks, gap) = sampler_coverage(&timestamps, 10_000);
+        let (enough_ticks, gap) = sampler_coverage(&windows, 10_000);
         assert!(enough_ticks);
         assert_eq!(gap, 1_000.0);
         assert!(gap > MAX_SAMPLE_GAP_MS as f64);
-        assert_eq!(sampler_coverage(&[800.0, 950.0], 1_000).1, 800.0);
-        assert_eq!(sampler_coverage(&[0.0, 150.0], 1_000).1, 850.0);
+        assert_eq!(
+            sampler_coverage(&[instantaneous(800.0), instantaneous(950.0)], 1_000).1,
+            800.0
+        );
+        assert_eq!(
+            sampler_coverage(&[instantaneous(0.0), instantaneous(150.0)], 1_000).1,
+            850.0
+        );
+    }
+
+    #[test]
+    fn receipt_spacing_cannot_hide_an_unobserved_interval() {
+        let mut windows = vec![
+            SampleWindow {
+                dispatched_ms: 0.0,
+                received_ms: 450.0,
+            },
+            SampleWindow {
+                dispatched_ms: 850.0,
+                received_ms: 900.0,
+            },
+        ];
+        windows.extend((4..40).map(|i| SampleWindow {
+            dispatched_ms: f64::from(i * 250),
+            received_ms: f64::from(i * 250),
+        }));
+        let (enough_ticks, gap) = sampler_coverage(&windows, 10_000);
+        assert!(enough_ticks);
+        assert_eq!(gap, 900.0);
+        assert!(gap > MAX_SAMPLE_GAP_MS as f64);
     }
 
     #[test]
