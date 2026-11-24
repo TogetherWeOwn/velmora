@@ -111,9 +111,7 @@ pub(super) fn internal() -> S3Response {
 /// Unknown outcomes and all existing D1 errors retain their old response.
 pub(super) fn catalog_error(error: BridgeError) -> S3Response {
     if error.is_pg_overloaded() {
-        let mut response = s3_error(ErrorCode::SlowDown);
-        response.headers.push(("retry-after".into(), "1".into()));
-        response
+        s3_error(ErrorCode::SlowDown)
     } else {
         internal()
     }

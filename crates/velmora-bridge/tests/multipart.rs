@@ -1951,6 +1951,13 @@ async fn pg_overload_before_delete_many_work_is_a_request_failure() {
     let resp = rig.send(delete_many_req(&["first".into()])).await;
     assert!(sql.overload.get().is_none());
     assert_eq!(resp.outcome(), "503 SlowDown");
+    let retry_after = resp
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(retry_after, ["1"]);
 }
 
 #[tokio::test]
