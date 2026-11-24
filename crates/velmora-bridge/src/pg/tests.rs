@@ -120,6 +120,15 @@ fn frozen_d1_comment_handling_matches_sqlite() {
         ),
         ("SELECT :arg(--); DELETE FROM items", false),
         ("SELECT $1(/*); DELETE FROM items", false),
+        (
+            "WITH x AS (SELECT 1) \u{FEFF}INSERT \u{FEFF}INTO items SELECT 1",
+            false,
+        ),
+        ("SELECT \u{00E9}", false),
+        ("SELECT name\u{00E9}", false),
+        ("SELECT '\u{00E9}' AS [\u{00E9}] /* \u{FEFF} */", true),
+        ("SELECT (1", false),
+        ("SELECT 1)", false),
     ];
 
     let mut mismatches = Vec::new();

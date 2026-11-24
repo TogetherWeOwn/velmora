@@ -157,6 +157,9 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 i += 1;
             }
             b')' => {
+                if !postgres && depth == 0 {
+                    return Err(untranslated());
+                }
                 depth = depth.saturating_sub(1);
                 previous.clear();
                 i += 1;
@@ -199,9 +202,15 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                 i += sql[i..].find(delimiter).ok_or_else(untranslated)? + delimiter.len();
                 previous.clear();
             }
+            // SQLite can treat a UTF-8 BOM as whitespace, not part of the
+            // next keyword. Refuse unquoted non-ASCII instead of guessing.
+            b if !postgres && !b.is_ascii() => return Err(untranslated()),
             b if word_start(b) => {
                 i += 1;
-                while bytes.get(i).is_some_and(|&b| word_byte(b) || b == b'$') {
+                while bytes
+                    .get(i)
+                    .is_some_and(|&b| (postgres || b.is_ascii()) && (word_byte(b) || b == b'$'))
+                {
                     i += 1;
                 }
                 let token = sql[start..i].to_ascii_uppercase();
@@ -240,6 +249,9 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             }
         }
         text.push_str(&sql[start..i]);
+    }
+    if !postgres && depth != 0 {
+        return Err(untranslated());
     }
     let select = command.ok_or_else(untranslated)?;
     Ok(Statement {
