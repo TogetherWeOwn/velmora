@@ -480,6 +480,9 @@ pub struct FailSql {
     /// Stalls one matching write at the tripwire until the test releases it.
     pub stall_exec_matching: Cell<Option<&'static str>>,
     pub selected_exec: Tripwire,
+    /// Stalls one batch with a matching first text parameter.
+    pub stall_batch_key: Cell<Option<&'static str>>,
+    pub selected_batch: Tripwire,
     /// Runs the given SQL once, just before a read whose text contains
     /// the string, after letting the given number of such reads through:
     /// what another request commits between two reads of this one.
@@ -633,7 +636,18 @@ impl Sql for FailSql {
                 None => {}
             }
         }
-        self.trip.guard(sql_down, self.inner.batch(stmts)).await
+        let stall = self.stall_batch_key.get().is_some_and(|key| {
+            stmts.iter().any(
+                |(_, params)| matches!(params.first(), Some(SqlValue::Text(found)) if found == key),
+            )
+        });
+        let call = self.trip.guard(sql_down, self.inner.batch(stmts));
+        if stall {
+            self.stall_batch_key.set(None);
+            self.selected_batch.arm(0, Trip::Stall);
+            return self.selected_batch.guard(sql_down, call).await;
+        }
+        call.await
     }
 }
 
@@ -717,6 +731,8 @@ pub fn rig_with_budget<N: NntpConnector + 'static>(
                 fail_matching: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),
                 selected_exec: Tripwire::default(),
+                stall_batch_key: Cell::new(None),
+                selected_batch: Tripwire::default(),
                 before_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),
                 overloaded: Cell::new(0),

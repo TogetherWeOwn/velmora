@@ -1238,6 +1238,7 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             enqueued: 1,
             gc_enqueued: true,
             evict_enqueued: false,
+            hot_ctl: None,
             buried: 0,
             permits_seeded: true,
             redriven: 0,

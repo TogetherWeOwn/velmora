@@ -1449,13 +1449,66 @@ pub enum JobOutcome {
     Retry { delay_secs: u32 },
 }
 
+/// Reported configured upper bound (not the temporary measurement ceiling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum HotCtlMax {
+    Bytes(u64),
+    Unbounded(&'static str),
+}
+
+/// The last adaptive cache decision, separate from the eviction threshold.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HotCtlReport {
+    pub mode: &'static str,
+    pub cap_before: u64,
+    pub cap_after: u64,
+    pub target_before: u64,
+    pub target: u64,
+    pub max: HotCtlMax,
+    pub step: &'static str,
+    pub reason: &'static str,
+    pub cap_reason: &'static str,
+    pub at: Option<i64>,
+    pub actual_evictable_bytes: u64,
+    pub tau_h: Option<f64>,
+    pub rho_gib_h: Option<f64>,
+    #[serde(rename = "H")]
+    pub hit_ratio: Option<f64>,
+    pub hit_floor_breached: bool,
+    pub reads_day: Option<f64>,
+    pub save_usd_mo: Option<f64>,
+    pub input_rates: Option<HotCtlRates>,
+}
+
+/// Rates used by the decision, as bytes/day. Misses follow the public
+/// controller's `REUSE_HOURS` order, then older and unstamped.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HotCtlRates {
+    pub hit_bytes_day: f64,
+    pub miss_bytes_day: [f64; crate::hotctl::MISS_BUCKETS],
+}
+
+impl HotCtlReport {
+    pub fn log_line(&self) -> serde_json::Result<String> {
+        #[derive(Serialize)]
+        struct LogLine<'a> {
+            hot_ctl: &'a HotCtlReport,
+        }
+        serde_json::to_string(&LogLine { hot_ctl: self })
+    }
+}
+
 /// Result of one cron dispatcher run.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DispatchReport {
     pub enqueued: u32,
     pub gc_enqueued: bool,
     /// Evictable bytes exceeded the hot-tier cap: an eviction job was sent.
     pub evict_enqueued: bool,
+    /// Present when the opted-in controller was evaluated on this tick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_ctl: Option<HotCtlReport>,
     pub buried: u64,
     pub permits_seeded: bool,
     /// `done` extents with too few verified backbones sent back to verify,

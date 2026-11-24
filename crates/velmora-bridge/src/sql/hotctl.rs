@@ -1,10 +1,10 @@
 //! Read-only hot-tier shape and isolated controller metadata. The eviction
 //! predicate and byte expression below match the existing covering index.
 
-use super::uploads::{text, Cols};
+use super::uploads::{guarded, text, Cols};
 use super::SqlCatalog;
 use crate::hotctl::{HIT_KEY, MISS_KEYS, REUSE_HOURS};
-use crate::ports::{Sql, SqlValue, MAX_SQL_PARAMS};
+use crate::ports::{Guard, Sql, SqlValue, MAX_SQL_PARAMS};
 use crate::types::{BridgeError, ExtentId, HotShape, Result, UnixMs};
 
 macro_rules! evictable_bytes {
@@ -37,6 +37,10 @@ const GHOST: &str = "INSERT INTO meta(k, v) SELECT CASE \
     ON CONFLICT(k) DO UPDATE SET v = meta.v + excluded.v";
 const COUNTER_ADD: &str = "INSERT INTO meta(k, v) VALUES (?1, ?2) \
     ON CONFLICT(k) DO UPDATE SET v = meta.v + excluded.v";
+// An absent row is a valid initial version. Check it inside the same
+// transaction as all state writes, including the new version timestamp.
+const STORE_GUARD: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE \
+    (SELECT v FROM meta WHERE k = 'hot_ctl_at') IS DISTINCT FROM ?1";
 const STORE: &str = "INSERT INTO meta(k, v) VALUES (?1, ?2) \
     ON CONFLICT(k) DO UPDATE SET v = excluded.v";
 
@@ -111,16 +115,21 @@ pub(super) async fn load<S: Sql>(c: &SqlCatalog<S>, keys: &[&str]) -> Result<Vec
     Ok(result)
 }
 
-pub(super) async fn store<S: Sql>(c: &SqlCatalog<S>, entries: &[(&str, i64)]) -> Result<()> {
+pub(super) async fn store<S: Sql>(
+    c: &SqlCatalog<S>,
+    expected_at: Option<UnixMs>,
+    entries: &[(&str, i64)],
+) -> Result<bool> {
     if entries.len() > MAX_SQL_PARAMS || entries.iter().any(|(k, _)| !state_key(k)) {
         return Err(BridgeError::Invalid("hot controller store keys"));
     }
-    if !entries.is_empty() {
-        let stmts = entries
+    let expected = expected_at.map_or(SqlValue::Null, |at| SqlValue::Int(at.0));
+    let mut stmts = Vec::with_capacity(entries.len() + 1);
+    stmts.push((STORE_GUARD, vec![expected]));
+    stmts.extend(
+        entries
             .iter()
-            .map(|&(key, val)| (STORE, vec![text(key), SqlValue::Int(val)]))
-            .collect();
-        c.sql.batch(stmts).await?;
-    }
-    Ok(())
+            .map(|&(key, val)| (STORE, vec![text(key), SqlValue::Int(val)])),
+    );
+    Ok(matches!(guarded(c, stmts).await?, Guard::Applied(())))
 }

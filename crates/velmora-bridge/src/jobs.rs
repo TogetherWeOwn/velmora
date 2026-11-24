@@ -30,7 +30,10 @@
 //!   not apply to it. The only keys it can name are an extent's
 //!   `x/<extent>` and `c/<extent>`.
 
-use crate::config::{GcMode, Maintenance, ORPHAN_GRACE_MS};
+use std::collections::BTreeMap;
+
+use crate::config::{GcMode, HotCtlMode, Maintenance, ORPHAN_GRACE_MS};
+use crate::hotctl::{self, Counters, Rates, Reason, Sample, Signals, State, Step};
 use crate::ports::{
     BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
     PERMIT_SECS,
@@ -40,9 +43,200 @@ use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
     BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
-    GenerationId, Job, JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
+    GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job, JobOutcome, Oldest,
+    OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
 use crate::verify::release_labels;
+
+const HOT_CTL_EVERY_MS: i64 = 3_600_000;
+const HOT_CTL_STALE_MS: i64 = 2 * HOT_CTL_EVERY_MS;
+const HOT_CAP_KEYS: [&str; 2] = ["hot_cap_target", "hot_ctl_applied_cap"];
+const HOT_EFFECTIVE_CAP_KEYS: [&str; 3] = [HOT_CAP_KEYS[0], HOT_CAP_KEYS[1], "hot_ctl_at"];
+const HOT_REPORT_KEYS: [&str; 11] = [
+    "hot_ctl_at",
+    "hot_ctl_cap_before",
+    "hot_ctl_target_before",
+    "hot_ctl_reason",
+    "hot_ctl_step",
+    "hot_ctl_tau",
+    "hot_ctl_rho",
+    "hot_ctl_hit",
+    "hot_ctl_breach",
+    "hot_ctl_reads",
+    "hot_ctl_saving",
+];
+const HOT_STATE_KEYS: [&str; 4] = [
+    "hot_ctl_grow_at",
+    "hot_ctl_shrink_at",
+    "hot_ctl_sample_at",
+    "hot_ctl_has_rates",
+];
+const HOT_SNAPSHOT_KEYS: [&str; 1 + hotctl::MISS_BUCKETS] = [
+    "hot_ctl_snap_hit",
+    "hot_ctl_snap_1h",
+    "hot_ctl_snap_3h",
+    "hot_ctl_snap_6h",
+    "hot_ctl_snap_12h",
+    "hot_ctl_snap_24h",
+    "hot_ctl_snap_48h",
+    "hot_ctl_snap_72h",
+    "hot_ctl_snap_7d",
+    "hot_ctl_snap_14d",
+    "hot_ctl_snap_30d",
+    "hot_ctl_snap_older",
+    "hot_ctl_snap_first",
+];
+const HOT_RATE_KEYS: [&str; 1 + hotctl::MISS_BUCKETS] = [
+    "hot_ctl_rate_hit",
+    "hot_ctl_rate_1h",
+    "hot_ctl_rate_3h",
+    "hot_ctl_rate_6h",
+    "hot_ctl_rate_12h",
+    "hot_ctl_rate_24h",
+    "hot_ctl_rate_48h",
+    "hot_ctl_rate_72h",
+    "hot_ctl_rate_7d",
+    "hot_ctl_rate_14d",
+    "hot_ctl_rate_30d",
+    "hot_ctl_rate_older",
+    "hot_ctl_rate_first",
+];
+// Append new labels; indexes are persisted in meta.
+const HOT_REASONS: [Reason; 12] = [
+    Reason::Fixed,
+    Reason::HoldErr,
+    Reason::Idle,
+    Reason::FirstRead,
+    Reason::GrowCx,
+    Reason::GrowCost,
+    Reason::Shrink,
+    Reason::Hold,
+    Reason::CappedAtMax,
+    Reason::MaxLowered,
+    Reason::UnlimitedNeedsCounters,
+    Reason::NeedsCounters,
+];
+const HOT_STEPS: [Step; 3] = [Step::Hold, Step::Grow, Step::Shrink];
+// D1 returns numbers through JS. Keep report fixed-point values within
+// the exact integer range, reserving one sentinel for absent values.
+const HOT_SCALE: f64 = 1_000_000.;
+const HOT_NONE: i64 = -9_007_199_254_740_991;
+type HotRows = BTreeMap<&'static str, i64>;
+
+fn hot_unsigned(rows: &HotRows, key: &str) -> Option<u64> {
+    rows.get(key).and_then(|&value| u64::try_from(value).ok())
+}
+
+fn hot_time(rows: &HotRows, key: &str) -> Option<UnixMs> {
+    rows.get(key).copied().filter(|&at| at >= 0).map(UnixMs)
+}
+
+fn hot_label<T: Copy>(rows: &HotRows, key: &str, labels: &[T]) -> Option<T> {
+    let index = usize::try_from(*rows.get(key)?).ok()?;
+    labels.get(index).copied()
+}
+
+fn hot_decimal(rows: &HotRows, key: &str) -> Option<f64> {
+    rows.get(key)
+        .copied()
+        .filter(|&value| value != HOT_NONE)
+        .map(|value| value as f64 / HOT_SCALE)
+}
+
+fn hot_counters(rows: &HotRows, hit: &str, misses: &[&str], new: bool) -> Option<Counters> {
+    let count = |key| match rows.get(key) {
+        Some(&value) => u64::try_from(value).ok(),
+        None => new.then_some(0),
+    };
+    let mut counters = Counters {
+        hit: count(hit)?,
+        ..Counters::default()
+    };
+    for (slot, &key) in counters.miss.iter_mut().zip(misses) {
+        *slot = count(key)?;
+    }
+    Some(counters)
+}
+
+fn hot_sample(rows: &HotRows, observed_at: UnixMs) -> Option<Sample> {
+    let counters = hot_counters(rows, HOT_SNAPSHOT_KEYS[0], &HOT_SNAPSHOT_KEYS[1..], false)?;
+    let rates = match rows.get("hot_ctl_has_rates").copied()? {
+        0 => None,
+        1 => {
+            let r = hot_counters(rows, HOT_RATE_KEYS[0], &HOT_RATE_KEYS[1..], false)?;
+            Some(Rates {
+                hit: r.hit as f64,
+                miss: r.miss.map(|n| n as f64),
+            })
+        }
+        _ => return None,
+    };
+    Some(Sample {
+        observed_at,
+        counters,
+        rates,
+    })
+}
+
+fn hot_encode(decision: &hotctl::Decision, now: UnixMs) -> Vec<(&'static str, i64)> {
+    let decimal = |value: Option<f64>| {
+        value.filter(|v| v.is_finite()).map_or(HOT_NONE, |v| {
+            ((v * HOT_SCALE).round() as i64).clamp(HOT_NONE + 1, -HOT_NONE)
+        })
+    };
+    let millis = |at: Option<UnixMs>| at.map_or(-1, |at| at.0);
+    let mut rows = vec![
+        ("hot_ctl_at", now.0),
+        (
+            "hot_ctl_reason",
+            HOT_REASONS
+                .iter()
+                .position(|&r| r == decision.reason)
+                .unwrap_or(HOT_REASONS.len()) as i64,
+        ),
+        (
+            "hot_ctl_step",
+            HOT_STEPS
+                .iter()
+                .position(|&s| s == decision.step)
+                .unwrap_or(0) as i64,
+        ),
+        ("hot_ctl_tau", decimal(decision.tau_h)),
+        ("hot_ctl_rho", decimal(decision.rho_gib_h)),
+        ("hot_ctl_hit", decimal(decision.hit_ratio)),
+        ("hot_ctl_breach", i64::from(decision.hit_floor_breached)),
+        ("hot_ctl_reads", decimal(decision.reads_day)),
+        ("hot_ctl_saving", decimal(decision.save_usd_mo)),
+        ("hot_ctl_grow_at", millis(decision.next.last_grow_at)),
+        ("hot_ctl_shrink_at", millis(decision.next.last_shrink_at)),
+        (
+            "hot_ctl_sample_at",
+            millis(decision.next.sample.map(|sample| sample.observed_at)),
+        ),
+    ];
+    if let Some(sample) = decision.next.sample {
+        rows.extend(
+            HOT_SNAPSHOT_KEYS
+                .into_iter()
+                .zip(
+                    [sample.counters.hit]
+                        .into_iter()
+                        .chain(sample.counters.miss),
+                )
+                .map(|(k, v)| (k, v as i64)),
+        );
+        rows.push(("hot_ctl_has_rates", i64::from(sample.rates.is_some())));
+        if let Some(rates) = sample.rates {
+            rows.extend(
+                HOT_RATE_KEYS
+                    .into_iter()
+                    .zip([rates.hit].into_iter().chain(rates.miss))
+                    .map(|(k, v)| (k, (v.round() as i64).clamp(0, -HOT_NONE))),
+            );
+        }
+    }
+    rows
+}
 
 /// Recount steps one cron run takes: 5 chunks of 4,000 rows, about
 /// 5.7 million table rows a day.
@@ -582,7 +776,7 @@ where
         }
         let mut excess = remaining;
         if excess == 0 {
-            let cap = self.cfg.hot_cap_bytes;
+            let cap = self.effective_cap().await?;
             let total = self.catalog.evictable_bytes().await?;
             if total <= cap {
                 return Ok(0);
@@ -662,15 +856,284 @@ where
         })
     }
 
+    /// The effective eviction cap. Fixed and shadow keep the exact old
+    /// threshold without reading controller state.
+    async fn effective_cap(&self) -> Result<u64> {
+        if self.cfg.hot_ctl.mode != HotCtlMode::Adaptive {
+            return Ok(self.cfg.hot_cap_bytes);
+        }
+        // An unreadable cap is not a missing row: starting a drain at
+        // the fixed cap could discard the active cache after a grow.
+        let rows = self.hot_ctl_rows(&HOT_EFFECTIVE_CAP_KEYS).await?;
+        Ok(self.hot_ctl_cap(&rows, self.clock.now()).0)
+    }
+
+    fn hot_ctl_cap(&self, rows: &HotRows, now: UnixMs) -> (u64, &'static str) {
+        let cfg = self.cfg.hot_ctl;
+        let max = cfg
+            .max_bytes
+            .unwrap_or(hotctl::MEASURABLE_MAX_BYTES)
+            .min(hotctl::MEASURABLE_MAX_BYTES);
+        let stale = hot_time(rows, "hot_ctl_at")
+            .is_some_and(|at| now.0.saturating_sub(at.0) > HOT_CTL_STALE_MS);
+        if cfg.mode == HotCtlMode::Adaptive && (rows.get(HOT_CAP_KEYS[1]) == Some(&0) || stale) {
+            // A stale decision may mean fixed mode or an adaptive outage.
+            // Seed from the fixed threshold within the current bounds.
+            // Only a previously applied cap can exceed a lowered maximum;
+            // zero provenance marks shadow, which never applied its target.
+            let seed = self.cfg.hot_cap_bytes.clamp(cfg.min_bytes, max);
+            let applied = hot_unsigned(rows, HOT_CAP_KEYS[1]).filter(|&applied| {
+                applied > 0
+                    && applied <= hotctl::MEASURABLE_MAX_BYTES
+                    && hot_unsigned(rows, HOT_CAP_KEYS[0]) == Some(applied)
+            });
+            return (applied.map_or(seed, |cap| cap.max(seed)), "mode_switch");
+        }
+        let Some(target) = hot_unsigned(rows, HOT_CAP_KEYS[0]).filter(|&target| target > 0) else {
+            return (
+                self.cfg.hot_cap_bytes.clamp(cfg.min_bytes, max),
+                "fixed_fallback",
+            );
+        };
+        if target < cfg.min_bytes {
+            (cfg.min_bytes, "clamped_min")
+        } else if target > max {
+            // Only an already applied, measurable cap can temporarily
+            // exceed a newly lowered bound. A bare target cannot.
+            if target <= hotctl::MEASURABLE_MAX_BYTES
+                && hot_unsigned(rows, HOT_CAP_KEYS[1]) == Some(target)
+            {
+                (target, "max_lowered")
+            } else {
+                (max, "clamped_max")
+            }
+        } else {
+            (target, "stored")
+        }
+    }
+
+    async fn hot_ctl_rows(&self, keys: &[&'static str]) -> Result<HotRows> {
+        Ok(keys
+            .iter()
+            .copied()
+            .zip(self.catalog.hot_ctl_load(keys).await?)
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect())
+    }
+
+    fn hot_ctl_report(&self, rows: &HotRows, actual: u64) -> HotCtlReport {
+        let (target, cap_reason) = self.hot_ctl_cap(rows, self.clock.now());
+        let (mode, target, reason, cap_reason) = match self.cfg.hot_ctl.mode {
+            HotCtlMode::Fixed => ("fixed", self.cfg.hot_cap_bytes, "fixed", "fixed"),
+            mode => (
+                if mode == HotCtlMode::Shadow {
+                    "shadow"
+                } else {
+                    "adaptive"
+                },
+                target,
+                hot_label(rows, "hot_ctl_reason", &HOT_REASONS)
+                    .unwrap_or(Reason::HoldErr)
+                    .as_str(),
+                cap_reason,
+            ),
+        };
+        let cap = if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
+            target
+        } else {
+            self.cfg.hot_cap_bytes
+        };
+        HotCtlReport {
+            mode,
+            cap_before: hot_unsigned(rows, "hot_ctl_cap_before").unwrap_or(cap),
+            cap_after: cap,
+            target_before: hot_unsigned(rows, "hot_ctl_target_before").unwrap_or(target),
+            target,
+            max: self
+                .cfg
+                .hot_ctl
+                .max_bytes
+                .map_or(HotCtlMax::Unbounded("none"), HotCtlMax::Bytes),
+            reason,
+            cap_reason,
+            step: hot_label(rows, "hot_ctl_step", &HOT_STEPS)
+                .unwrap_or(Step::Hold)
+                .as_str(),
+            at: hot_time(rows, "hot_ctl_at").map(|at| at.0),
+            actual_evictable_bytes: actual,
+            tau_h: hot_decimal(rows, "hot_ctl_tau"),
+            rho_gib_h: hot_decimal(rows, "hot_ctl_rho"),
+            hit_ratio: hot_decimal(rows, "hot_ctl_hit"),
+            hit_floor_breached: rows.get("hot_ctl_breach") == Some(&1),
+            reads_day: hot_decimal(rows, "hot_ctl_reads"),
+            save_usd_mo: hot_decimal(rows, "hot_ctl_saving"),
+            input_rates: None,
+        }
+    }
+
+    async fn hot_ctl_diagnostics_unavailable(&self, actual: u64) -> Result<HotCtlReport> {
+        // Diagnostic data is optional, but status must not invent a cap.
+        let rows = if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
+            self.hot_ctl_rows(&HOT_EFFECTIVE_CAP_KEYS).await?
+        } else {
+            HotRows::new()
+        };
+        let mut report = self.hot_ctl_report(&rows, actual);
+        report.reason = "diagnostics_unavailable";
+        Ok(report)
+    }
+
+    pub(crate) async fn hot_ctl_status(&self, actual: u64) -> Result<HotCtlReport> {
+        if self.cfg.hot_ctl.mode == HotCtlMode::Fixed {
+            return Ok(self.hot_ctl_report(&HotRows::new(), actual));
+        }
+        let keys: Vec<_> = HOT_CAP_KEYS.into_iter().chain(HOT_REPORT_KEYS).collect();
+        match self.hot_ctl_rows(&keys).await {
+            Ok(rows) => Ok(self.hot_ctl_report(&rows, actual)),
+            Err(_) => self.hot_ctl_diagnostics_unavailable(actual).await,
+        }
+    }
+
+    async fn hot_ctl_check(&self, now: UnixMs, shape: HotShape) -> Option<HotCtlReport> {
+        if self.cfg.hot_ctl.mode == HotCtlMode::Fixed {
+            return None;
+        }
+        let recent = |rows: &HotRows| {
+            hot_time(rows, "hot_ctl_at")
+                .is_some_and(|at| at <= now && now.0.saturating_sub(at.0) < HOT_CTL_EVERY_MS)
+        };
+        match self.hot_ctl_rows(&["hot_ctl_at"]).await {
+            Ok(rows) if recent(&rows) => return None,
+            Ok(_) => {}
+            Err(_) => {
+                return self
+                    .hot_ctl_diagnostics_unavailable(shape.evictable_bytes)
+                    .await
+                    .ok()
+            }
+        }
+        let keys: Vec<_> = HOT_CAP_KEYS
+            .into_iter()
+            .chain(HOT_REPORT_KEYS)
+            .chain(HOT_STATE_KEYS)
+            .chain(HOT_SNAPSHOT_KEYS)
+            .chain(HOT_RATE_KEYS)
+            .chain([hotctl::HIT_KEY])
+            .chain(hotctl::MISS_KEYS)
+            .collect();
+        let rows = match self.hot_ctl_rows(&keys).await {
+            Ok(rows) => rows,
+            Err(_) => {
+                return self
+                    .hot_ctl_diagnostics_unavailable(shape.evictable_bytes)
+                    .await
+                    .ok()
+            }
+        };
+        // A concurrent invocation may have committed since the point read.
+        if recent(&rows) {
+            return None;
+        }
+        let (cap, cap_reason) = self.hot_ctl_cap(&rows, now);
+        let mode_switched = cap_reason == "mode_switch";
+        let last_step = |key| {
+            if mode_switched {
+                None
+            } else {
+                hot_time(&rows, key)
+            }
+        };
+        let mut state = State {
+            cap: Some(cap),
+            last_grow_at: last_step("hot_ctl_grow_at"),
+            last_shrink_at: last_step("hot_ctl_shrink_at"),
+            sample: None,
+        };
+        let sample_at = hot_time(&rows, "hot_ctl_sample_at");
+        if let Some(observed_at) = sample_at {
+            state.sample = hot_sample(&rows, observed_at);
+        }
+        let signals = if sample_at.is_none() || state.sample.is_some() {
+            hot_counters(&rows, hotctl::HIT_KEY, &hotctl::MISS_KEYS, true)
+                .map(|counters| Signals { shape, counters })
+        } else {
+            None
+        };
+        let decision = hotctl::decide(
+            hotctl::Inputs { now, signals },
+            &state,
+            &hotctl::Params {
+                fixed_cap: self.cfg.hot_cap_bytes,
+                config: self.cfg.hot_ctl,
+            },
+        );
+        let mut report = self.hot_ctl_report(&rows, shape.evictable_bytes);
+        report.cap_before = report.cap_after;
+        report.target_before = cap;
+        report.reason = decision.reason.as_str();
+        report.step = decision.step.as_str();
+        report.cap_reason = cap_reason;
+        if signals.is_none() {
+            return Some(report);
+        }
+        let mut entries = hot_encode(&decision, now);
+        entries.extend([
+            ("hot_ctl_cap_before", report.cap_before as i64),
+            ("hot_ctl_target_before", report.target_before as i64),
+        ]);
+        let target = decision.target as i64;
+        let applied = if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
+            target
+        } else {
+            0
+        };
+        if rows.get(HOT_CAP_KEYS[0]) != Some(&target) || rows.get(HOT_CAP_KEYS[1]) != Some(&applied)
+        {
+            entries.extend([(HOT_CAP_KEYS[0], target), (HOT_CAP_KEYS[1], applied)]);
+        }
+        let expected_at = rows.get("hot_ctl_at").copied().map(UnixMs);
+        match self.catalog.hot_ctl_store(expected_at, &entries).await {
+            Ok(true) => {}
+            Ok(false) => return None, // A competing tick saved first.
+            Err(_) => {
+                report.reason = "hold_err";
+                report.step = "hold";
+                return Some(report);
+            }
+        }
+        report.target = decision.target;
+        if self.cfg.hot_ctl.mode == HotCtlMode::Adaptive {
+            report.cap_after = decision.target;
+        }
+        report.input_rates = decision
+            .next
+            .sample
+            .and_then(|s| s.rates)
+            .map(|rates| HotCtlRates {
+                hit_bytes_day: rates.hit,
+                miss_bytes_day: rates.miss,
+            });
+        report.at = Some(now.0);
+        report.tau_h = decision.tau_h;
+        report.rho_gib_h = decision.rho_gib_h;
+        report.hit_ratio = decision.hit_ratio;
+        report.hit_floor_breached = decision.hit_floor_breached;
+        report.reads_day = decision.reads_day;
+        report.save_usd_mo = decision.save_usd_mo;
+        Some(report)
+    }
+
     /// The dispatcher's hot-tier check: at most one total per
     /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap.
     /// `GC_MODE` does not gate it: eviction removes no data.
-    async fn evict_check(&self, now: UnixMs) -> Result<bool> {
+    async fn evict_check(&self, now: UnixMs, report: &mut DispatchReport) -> Result<bool> {
         let every_ms = i64::from(EVICT_CHECK_SECS) * 1000;
         if !self.catalog.hot_check_due(now, every_ms).await? {
             return Ok(false);
         }
-        let over = self.catalog.evictable_bytes().await? > self.cfg.hot_cap_bytes;
+        let shape = self.catalog.hot_shape().await?;
+        report.hot_ctl = self.hot_ctl_check(now, shape).await;
+        let over = shape.evictable_bytes > self.effective_cap().await?;
         if over {
             let job = Job::Evict {
                 v: JOB_VERSION,
@@ -819,7 +1282,7 @@ where
 
         // The hot-tier check is an extra, like the re-drive: its failure
         // must not keep the run from being recorded.
-        match self.evict_check(now).await {
+        match self.evict_check(now, &mut report).await {
             Ok(sent) => report.evict_enqueued = sent,
             Err(_) => report.evict_failed = true,
         }
