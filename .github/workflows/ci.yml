@@ -948,6 +948,10 @@ jobs:
       # VELMORA_RELEASE_AT_VERIFY accepts only "off" (also the default
       # when unset or empty) or "on". Replace exactly one shipped
       # RELEASE_AT_VERIFY = "off" line in the prod [vars] table.
+      # Both production Hyperdrive IDs are required and must be distinct.
+      # Check the rendered binding names and IDs without opening a database
+      # connection. An unset CATALOG_BACKEND uses D1; explicit modes are
+      # selected in the committed production [vars] for cutover and rollback.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -955,6 +959,8 @@ jobs:
           VELMORA_S3_HOST: ${{ vars.VELMORA_S3_HOST }}
           VELMORA_S3_HOSTS: ${{ vars.VELMORA_S3_HOSTS }}
           VELMORA_D1_DATABASE_ID: ${{ vars.VELMORA_D1_DATABASE_ID }}
+          VELMORA_HYPERDRIVE_WRITE_ID: ${{ vars.VELMORA_HYPERDRIVE_WRITE_ID }}
+          VELMORA_HYPERDRIVE_READ_ID: ${{ vars.VELMORA_HYPERDRIVE_READ_ID }}
           VELMORA_RECOVERY_COPY: ${{ vars.VELMORA_RECOVERY_COPY }}
           VELMORA_RECOVERY_PREFIX: ${{ vars.VELMORA_RECOVERY_PREFIX }}
           RECOVERY_COPY_PARALLEL_FRESH: ${{ vars.RECOVERY_COPY_PARALLEL_FRESH }}
@@ -970,6 +976,14 @@ jobs:
           host = os.environ.get("VELMORA_S3_HOST", "")
           hosts = os.environ.get("VELMORA_S3_HOSTS", "")
           dbid = os.environ.get("VELMORA_D1_DATABASE_ID", "")
+          hd_write = os.environ.get("VELMORA_HYPERDRIVE_WRITE_ID", "")
+          hd_read = os.environ.get("VELMORA_HYPERDRIVE_READ_ID", "")
+          for name, value in (("VELMORA_HYPERDRIVE_WRITE_ID", hd_write),
+                              ("VELMORA_HYPERDRIVE_READ_ID", hd_read)):
+              if not re.fullmatch(r"[0-9a-f]{32}", value):
+                  sys.exit(f"production variable {name} is missing or not a 32-character lowercase Hyperdrive ID")
+          if hd_write == hd_read:
+              sys.exit("production writer and reader Hyperdrive IDs must be different")
           label = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
           hostname = re.compile(rf"{label}(\.{label})+")
           if len(host) > 253 or not hostname.fullmatch(host):
@@ -1035,6 +1049,8 @@ jobs:
           subs = [
               ('S3_HOST = "velmora-s3.<account>.workers.dev"', f'S3_HOST = "{host}"'),
               ('database_id = "<from wrangler d1 create>"', f'database_id = "{dbid}"'),
+              ('id = "<write Hyperdrive config ID>"', f'id = "{hd_write}"'),
+              ('id = "<read Hyperdrive config ID>"', f'id = "{hd_read}"'),
           ]
           # Keep the recovery copy setting and its optional prefix and
           # parallel-fresh opt-in together in the prod [vars] table.
@@ -1106,11 +1122,19 @@ jobs:
           # written, before the file exists: a refusal leaves no file.
           # No RECORD_LAYOUT at all is "flat" to the Worker.
           try:
-              prod_vars = tomllib.loads(text)["vars"]
+              config = tomllib.loads(text)
+              prod_vars = config["vars"]
               found = prod_vars.get("RECORD_LAYOUT")
               extents = prod_vars.get("MAX_OBJECT_EXTENTS")
           except (tomllib.TOMLDecodeError, KeyError, AttributeError):
               sys.exit("the generated config is not valid TOML with a prod [vars] table")
+          if config.get("hyperdrive") != [
+              {"binding": "CATALOG_PG_W", "id": hd_write},
+              {"binding": "CATALOG_PG_R", "id": hd_read},
+          ]:
+              sys.exit("the generated config does not carry the production writer and reader Hyperdrive bindings")
+          if prod_vars.get("CATALOG_BACKEND") not in (None, "d1", "d1-frozen", "pg", "pg-frozen"):
+              sys.exit("invalid CATALOG_BACKEND in the production config: expected unset, d1, d1-frozen, pg or pg-frozen")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
           if prod_vars.get("RELEASE_AT_VERIFY") != release:

@@ -46,7 +46,18 @@ STEP_KEYS = ["if", "working-directory", "env", "run"]
 HOST = "s3.generator-test.example"
 DBID = "0f0e0d0c-0b0a-4908-8706-050403020100"
 PREFIX = "generator-test/records/"
-REQUIRED = {"VELMORA_S3_HOST": HOST, "VELMORA_D1_DATABASE_ID": DBID}
+HD_WRITE = "0123456789abcdef0123456789abcdef"
+HD_READ = "fedcba9876543210fedcba9876543210"
+HD_FILLS = {
+    'id = "<write Hyperdrive config ID>"': f'id = "{HD_WRITE}"',
+    'id = "<read Hyperdrive config ID>"': f'id = "{HD_READ}"',
+}
+REQUIRED = {
+    "VELMORA_S3_HOST": HOST,
+    "VELMORA_D1_DATABASE_ID": DBID,
+    "VELMORA_HYPERDRIVE_WRITE_ID": HD_WRITE,
+    "VELMORA_HYPERDRIVE_READ_ID": HD_READ,
+}
 
 SWITCH = "VELMORA_RECORD_LAYOUT"
 TENANT_LINE = 'RECORD_LAYOUT = "tenant"'
@@ -198,13 +209,14 @@ def prod_end(lines):
 
 def without_switches(toml_text):
     """What the generator wrote before any switch existed, worked out here
-    and not by the generator: the shipped text with the two placeholders
+    and not by the generator: the shipped text with the production placeholders
     filled and the prod [build] table dropped. Every other byte stays."""
     lines = toml_text.split("\n")
     end = prod_end(lines)
     fills = {
         'S3_HOST = "velmora-s3.<account>.workers.dev"': f'S3_HOST = "{HOST}"',
         'database_id = "<from wrangler d1 create>"': f'database_id = "{DBID}"',
+        **HD_FILLS,
     }
     out, in_build = [], False
     for i, line in enumerate(lines):
@@ -790,6 +802,57 @@ class ReleaseAtVerifyTest(GeneratorCase):
                     self.refused({self.switch: value}, message, doctored)
 
 
+class HyperdriveTest(GeneratorCase):
+    def with_catalog_backend(self, value=None):
+        # Use explicit fixtures even when the shipped config selects a backend.
+        before, header, after = self.shipped.partition("\n[vars]\n")
+        prod_vars, separator, rest = after.partition("\n[")
+        prod_vars = re.sub(r"(?m)^CATALOG_BACKEND[ \t]*=.*(?:\n|$)", "", prod_vars)
+        assignment = "" if value is None else f"CATALOG_BACKEND = {value}\n"
+        return before + header + assignment + prod_vars + separator + rest
+
+    def test_correct_production_bindings_without_backend_switch(self):
+        _, written = self.ok({"CATALOG_BACKEND": "pg"}, self.with_catalog_backend())
+        config = tomllib.loads(written.decode())
+        self.assertEqual(config["hyperdrive"], [
+            {"binding": "CATALOG_PG_W", "id": HD_WRITE},
+            {"binding": "CATALOG_PG_R", "id": HD_READ},
+        ])
+        self.assertNotIn("CATALOG_BACKEND", config["vars"])
+        self.assertNotIn("hyperdrive", config["env"]["dev"])
+        self.assertEqual(config["d1_databases"][0]["binding"], "CATALOG")
+
+    def test_requires_both_valid_ids_without_echoing_bad_input(self):
+        invalid = 'not-an-id\"\nCATALOG_BACKEND = \"pg'
+        for name in ("VELMORA_HYPERDRIVE_WRITE_ID", "VELMORA_HYPERDRIVE_READ_ID"):
+            for value in (None, "", invalid):
+                with self.subTest(name=name, value=value):
+                    self.refused({name: value}, name)
+                    code, out, err, written = self.step.run(self.shipped, {name: value})
+                    self.assertNotIn("not-an-id", out + err)
+        self.refused({"VELMORA_HYPERDRIVE_READ_ID": HD_WRITE}, "must be different")
+
+    def test_refuses_missing_or_miswired_bindings(self):
+        for changed, error in (
+            (self.shipped.replace('id = "<write Hyperdrive config ID>"', '', 1),
+             "expected exactly one prod line"),
+            (self.shipped.replace('binding = "CATALOG_PG_W"', 'binding = "OTHER"', 1),
+             "production writer and reader Hyperdrive bindings"),
+        ):
+            self.refused({}, error, changed)
+
+    def test_preserves_explicit_catalog_backend_modes(self):
+        for mode in ("d1", "d1-frozen", "pg", "pg-frozen"):
+            with self.subTest(mode=mode):
+                _, written = self.ok({}, self.with_catalog_backend(f'"{mode}"'))
+                self.assertEqual(tomllib.loads(written.decode())["vars"]["CATALOG_BACKEND"], mode)
+
+    def test_refuses_invalid_catalog_backend_modes(self):
+        for value in ('"postgres"', '""', '"PG"', '" pg"', '"pg-frozen "', 'true', '1'):
+            with self.subTest(value=value):
+                self.refused({}, "invalid CATALOG_BACKEND", self.with_catalog_backend(value))
+
+
 @unittest.skipUnless(
     os.environ.get("DEPLOY_CONFIG_BASELINE"),
     "set DEPLOY_CONFIG_BASELINE to the ci.yml of the commit to compare with",
@@ -811,7 +874,13 @@ class BaselineTest(GeneratorCase):
             baseline_summary = out.splitlines()[0].removesuffix(suffix)
             for value in NOT_ASKED:
                 got_out, got = self.ok({**older, SWITCH: value})
-                self.assertEqual(got, want, f"{older!r} {value!r}")
+                expected = want
+                # A baseline predating the Hyperdrive bindings preserves
+                # the placeholders verbatim. Account only for the new fills.
+                for old, new in HD_FILLS.items():
+                    expected = expected.replace(("\n" + old + "\n").encode(),
+                                                ("\n" + new + "\n").encode(), 1)
+                self.assertEqual(got, expected, f"{older!r} {value!r}")
                 summary = got_out.splitlines()[0].removesuffix(suffix)
                 self.assertEqual(summary, baseline_summary, f"{older!r} {value!r}")
                 compared += 1
