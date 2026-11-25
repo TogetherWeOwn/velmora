@@ -1016,8 +1016,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         token: u64,
         extent: &ExtentId,
         updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+        verified: Option<(UnixMs, u32)>,
     ) -> Result<bool> {
-        scrub::advance(self, token, extent, updates).await
+        scrub::advance(self, token, extent, updates, verified).await
     }
     async fn scrub_has_loss(&self, extent: &ExtentId, backbones: &[String]) -> Result<Vec<String>> {
         scrub::has_loss(self, extent, backbones).await
@@ -1103,8 +1104,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
     }
-    async fn evict_safety_still_ok(&self, x: &EvictCandidate) -> Result<bool> {
-        hot::evict_safety_still_ok(self, x).await
+    async fn evict_safety_still_ok(&self, x: &EvictCandidate, scrub: bool) -> Result<bool> {
+        hot::evict_safety_still_ok(self, x, scrub).await
     }
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
         hot::record_cache_fill(self, extent, now).await
@@ -1247,7 +1248,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 372, "background inventory entry count");
+        assert_eq!(statements.len(), 374, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

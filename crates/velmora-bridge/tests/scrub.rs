@@ -147,7 +147,11 @@ impl World {
     }
 
     async fn released_unenrolled(&self, key: &str, seed: u8) -> Obj {
-        let plain = pattern(seed, PLAIN);
+        self.released_sized(key, seed, PLAIN).await
+    }
+
+    async fn released_sized(&self, key: &str, seed: u8, len: usize) -> Obj {
+        let plain = pattern(seed, len);
         self.rig
             .put(&self.signer, BUCKET, key, &plain)
             .await
@@ -304,10 +308,24 @@ impl World {
         self.bridge().catalog.articles(&o.extent).await.unwrap()
     }
 
-    /// Copies every article of the object to the server that lacks it,
-    /// as propagation between backbones would.
+    /// The data articles and then any parity articles of the object.
+    async fn all_articles(&self, o: &Obj) -> Vec<ArticleRow> {
+        let stored = self.bridge().catalog.stored_plan(&o.extent).await.unwrap();
+        let size: u64 = self
+            .scalar("SELECT cipher_size FROM extents WHERE id = ?1", &o.extent)
+            .await
+            .parse()
+            .unwrap();
+        let parity = stored.parity_plan(&o.extent, size).unwrap();
+        let mut rows = stored.rows;
+        rows.extend(parity.into_iter().flat_map(|p| p.articles));
+        rows
+    }
+
+    /// Copies every article of the object, parity included, to the
+    /// server that lacks it, as propagation between backbones would.
     async fn mirror(&self, o: &Obj) {
-        for row in self.plan(o).await {
+        for row in self.all_articles(o).await {
             let id = row.message_id.as_str();
             let from = match self.servers[0].is_stored(id).await {
                 true => 0,
@@ -1552,7 +1570,8 @@ async fn write_meter_separates_enrollment_from_independent_copy_checks() {
     assert!(c.scrub_free(token, now).await.unwrap());
     let later = now.plus_secs(100 * DAY_SECS);
     w.set_clocks(&o, "beta", later, later).await;
-    for (stat, full, kind) in [(now, later, "STAT"), (later, now, "BODY")] {
+    // A BODY pass also moves `last_verified_at` (H6): one row more.
+    for (stat, full, kind, expected) in [(now, later, "STAT", 3), (later, now, "BODY", 4)] {
         w.set_clocks(&o, "alpha", stat, full).await;
         let before = db.writes();
         assert_eq!(w.scrub().await.ok, 1);
@@ -1560,7 +1579,7 @@ async fn write_meter_separates_enrollment_from_independent_copy_checks() {
         let rows = spent.table("extents") + spent.table("scrub_copies");
         let overhead = spent.billed() - rows;
         println!("rows written per one-copy {kind} visit: {rows} (+{overhead} per run)");
-        assert_eq!(rows, 3);
+        assert_eq!(rows, expected);
     }
 }
 
@@ -1841,7 +1860,7 @@ async fn an_eviction_begun_before_the_re_pin_keeps_the_safety_copy() {
     assert!(!mine.pinned);
     assert!(c.begin_evict(&mine).await.unwrap(), "the eviction begins");
     assert!(
-        c.evict_safety_still_ok(&mine).await.unwrap(),
+        c.evict_safety_still_ok(&mine, true).await.unwrap(),
         "not yet re-pinned"
     );
     let now = w.bridge().clock.now();
@@ -1855,7 +1874,7 @@ async fn an_eviction_begun_before_the_re_pin_keeps_the_safety_copy() {
         .await
         .unwrap());
     assert!(
-        !c.evict_safety_still_ok(&mine).await.unwrap(),
+        !c.evict_safety_still_ok(&mine, true).await.unwrap(),
         "re-pinned since the begin: the safety copy stays"
     );
     // A listing from before the re-pin cannot begin either.
@@ -2720,4 +2739,531 @@ async fn a_confirmed_loss_stays_confirmed_through_a_read_that_breaks_off() {
     assert_eq!(w.result(&o).await, "repairing");
     assert_eq!(w.safety_state(&o).await, "held");
     assert!(w.has_safety(&o), "the copy is back, read from alpha");
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: parity repair, blob-lifetime races, a bad plan, H6 stamp
+// ---------------------------------------------------------------------------
+
+/// Plaintext of three data articles: their extent gets a parity article.
+const PARITY_PLAIN: usize = 1_500_000;
+
+/// Lost on every backbone, within the extent's parity, with no copy in
+/// R2: the repair read rebuilds the lost article from parity. The extent
+/// is re-pinned from the rebuilt bytes, not said to be unrecoverable.
+#[tokio::test(flavor = "current_thread")]
+async fn a_loss_on_every_backbone_within_its_parity_is_rebuilt_not_lost() {
+    let w = world_with(|cfg| {
+        cfg.packed_plans = true;
+        cfg.parity = true;
+    })
+    .await;
+    let o = w.released_sized("a", 241, PARITY_PLAIN).await;
+    w.align_clocks(&o).await;
+    let all = w.all_articles(&o).await;
+    let data = w.plan(&o).await.len();
+    assert!(all.len() > data, "the extent has parity articles");
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    assert!(!w.bridge().cache.contains(&o.extent.cache_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 1).await;
+    w.hide(1, &o, 1).await;
+
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+    let run = w.scrub().await;
+    assert_eq!((run.repaired, run.unrecoverable), (1, 0), "{:?}", alerts());
+    assert_eq!(w.result(&o).await, "repairing");
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(w.has_safety(&o), "the rebuilt copy is pinned in R2");
+    assert!(
+        alerts()
+            .iter()
+            .any(|a| a.starts_with("scrub-repair ") && a.contains("source=parity")),
+        "{:?}",
+        alerts()
+    );
+    assert!(!alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-unrecoverable ")));
+}
+
+/// The repair watch of a re-pinned parity extent whose safety copy is
+/// gone rebuilds it from parity too.
+#[tokio::test(flavor = "current_thread")]
+async fn the_repair_watch_rebuilds_a_missing_copy_from_parity() {
+    let w = world_with(|cfg| {
+        cfg.packed_plans = true;
+        cfg.parity = true;
+    })
+    .await;
+    let o = w.released_sized("a", 247, PARITY_PLAIN).await;
+    w.align_clocks(&o).await;
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 1).await;
+    w.hide(1, &o, 1).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    // The re-pin cannot write its copy: the watch looks again early.
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    assert_eq!(w.scrub().await.repaired, 1);
+    assert!(!w.has_safety(&o));
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    w.advance_secs(3600);
+    let early = w.scrub().await;
+    assert_eq!(
+        (early.unrecoverable, early.stalled),
+        (0, 0),
+        "{:?}",
+        alerts()
+    );
+    assert!(
+        w.has_safety(&o),
+        "rebuilt from parity and written by the watch"
+    );
+    assert_eq!(w.result(&o).await, "repairing");
+}
+
+/// The eviction job is paused right after its catalogue check, at the
+/// delete of the safety copy. The scrub then confirms a loss on every
+/// backbone and re-pins the extent from that copy, its last intact one.
+/// The delete that follows must not take the copy of the re-pinned
+/// extent. (Before the fix the check passed, and the copy was deleted
+/// after the re-pin.)
+#[tokio::test(flavor = "current_thread")]
+async fn an_eviction_paused_after_its_check_cannot_delete_a_copy_the_scrub_re_pins() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 242).await;
+    assert!(w.has_safety(&o));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+
+    let paused = Rc::new(Cell::new(false));
+    let go = Rc::new(Cell::new(false));
+    {
+        let (paused, go, key) = (paused.clone(), go.clone(), o.extent.safety_key());
+        *w.bridge().safety.before_delete_async.borrow_mut() = Some(Box::new(move |k: String| {
+            Box::pin(async move {
+                if k == key {
+                    paused.set(true);
+                    while !go.get() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        }));
+    }
+    let evict = w.bridge().evict_batch(0);
+    tokio::pin!(evict);
+    let at_delete = async {
+        while !paused.get() {
+            tokio::task::yield_now().await;
+        }
+    };
+    let mid_delete = tokio::select! {
+        r = &mut evict => {
+            r.unwrap();
+            false
+        }
+        () = at_delete => true,
+    };
+    // The eviction is past its check (paused at the delete), or it is
+    // over and kept the copy.
+    let run = w.scrub().await;
+    assert_eq!(run.repaired, 1);
+    assert!(alerts().iter().any(|a| a.contains("source=safety")));
+    go.set(true);
+    if mid_delete {
+        evict.await.unwrap();
+    }
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(
+        w.has_safety(&o),
+        "the re-pinned extent keeps its last intact copy"
+    );
+}
+
+/// An eviction past its check before any loss was on record ends within
+/// one queue invocation. A loss first seen after that check is not
+/// re-pinned before such an eviction can still be deleting: the scrub
+/// waits two invocation lifetimes from the first sighting, whatever the
+/// confirm interval (short here, as in dev).
+#[tokio::test(flavor = "current_thread")]
+async fn a_loss_first_seen_under_a_running_eviction_is_not_re_pinned_before_it_ends() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use velmora_bridge::jobtable::JOB_MAX_AGE_MS;
+    let w = world_with(|cfg| {
+        cfg.hot_cap_bytes = 1;
+        cfg.scrub.confirm_secs = 60;
+    })
+    .await;
+    let o = w.released("a", 248).await;
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+
+    let paused = Rc::new(Cell::new(false));
+    let go = Rc::new(Cell::new(false));
+    {
+        let (paused, go) = (paused.clone(), go.clone());
+        *w.bridge().safety.before_delete_async.borrow_mut() = Some(Box::new(move |_| {
+            Box::pin(async move {
+                paused.set(true);
+                while !go.get() {
+                    tokio::task::yield_now().await;
+                }
+            })
+        }));
+    }
+    let evict = w.bridge().evict_batch(0);
+    tokio::pin!(evict);
+    let at_delete = async {
+        while !paused.get() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        _ = &mut evict => panic!("no loss was on record: the eviction deletes the copy"),
+        () = at_delete => {}
+    }
+    assert_eq!(w.scrub().await.suspect, 1, "first sighting");
+    w.advance_secs(60);
+    let second = w.scrub().await;
+    assert_eq!(
+        (second.suspect, second.repaired),
+        (1, 0),
+        "confirmed, but an eviction from before the first sighting may still delete"
+    );
+    go.set(true);
+    evict.await.unwrap();
+    assert!(!w.has_safety(&o), "the eviction took the copy, as it may");
+    // Once that eviction is surely over, the loss is handled as found:
+    // no copy is left anywhere, which is said.
+    w.bridge().clock.advance_ms(2 * JOB_MAX_AGE_MS);
+    let later = w.scrub().await;
+    assert_eq!((later.repaired, later.unrecoverable), (0, 1));
+}
+
+/// A re-pin from Usenet writes the safety copy after its catalogue
+/// write. The object is deleted and garbage collection finishes while
+/// that PUT is in flight; the copy that then lands must be collected by
+/// a later GC pass, also when the PUT's reply is lost.
+async fn usenet_repair_put_after_gc(lost_reply: bool) {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 243).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    assert!(safety.lose(&key));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let collect = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(w.safety_state(&o).await, "held", "re-pinned before the PUT");
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        assert_eq!(w.safety_state(&o).await, "deleted", "GC ran to its end");
+        if lost_reply {
+            // Both PUTs of the re-pin land and lose their replies.
+            let wire = w.rig.trip().clone();
+            *safety.before_put.borrow_mut() = Some(Box::new(move |_| wire.arm(0, Trip::Lost)));
+            w.rig.trip().arm(0, Trip::Lost);
+        }
+        safety.hold_put_prefix.replace(None);
+    };
+    tokio::select! {
+        () = collect => {}
+        _ = &mut run => panic!("scrub finished without writing the copy"),
+    }
+    assert_eq!(run.await.repaired, 1);
+    assert!(w.has_safety(&o), "the PUT landed after GC");
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(
+        !w.has_safety(&o),
+        "a later GC pass collects the copy written after the first one"
+    );
+    assert_eq!(
+        w.rig
+            .count("gc WHERE action = 'delete_safety' AND done_at IS NULL"),
+        0
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_usenet_repair_copy_written_after_gc_is_collected() {
+    usenet_repair_put_after_gc(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_usenet_repair_copy_whose_put_reply_is_lost_after_gc_is_collected() {
+    usenet_repair_put_after_gc(true).await;
+}
+
+/// The repair watch writes a missing safety copy again after its
+/// liveness check. GC that finishes before that PUT lands must not leave
+/// the copy behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_watch_rewrite_that_lands_after_gc_is_collected() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 244).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    assert!(safety.lose(&key));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    *safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    assert_eq!(w.scrub().await.repaired, 1);
+    *safety.fail_put_prefix.borrow_mut() = None;
+    w.advance_secs(3600);
+
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let collect = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        assert_eq!(w.safety_state(&o).await, "deleted", "GC ran to its end");
+        safety.hold_put_prefix.replace(None);
+    };
+    tokio::select! {
+        () = collect => {}
+        _ = &mut run => panic!("the watch finished without writing the copy"),
+    }
+    run.await;
+    assert!(w.has_safety(&o), "the watch's PUT landed after GC");
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(!w.has_safety(&o), "a later GC pass collects it");
+}
+
+/// A plan whose parity addendum cannot be read: that extent is said and
+/// deferred, its loss evidence kept and no pass recorded, and the run
+/// goes on to the next due extent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_malformed_plan_defers_its_extent_and_the_run_goes_on() {
+    let w = world_with(|cfg| cfg.packed_plans = true).await;
+    let a = w.released("a", 245).await;
+    let b = w.released("b", 246).await;
+    w.advance_secs(31 * DAY_SECS);
+    let now = w.bridge().clock.now();
+    let far = now.plus_secs(60 * DAY_SECS);
+    for name in ["alpha", "beta"] {
+        w.set_clocks(&a, name, now.plus_ms(-2000), far).await;
+        w.set_clocks(&b, name, now.plus_ms(-1000), far).await;
+    }
+    let c = &w.bridge().catalog.sql.inner;
+    c.fixture_exec(
+        "UPDATE scrub_copies SET stat_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'alpha'",
+        &[
+            SqlValue::Text(a.extent.as_str().to_owned()),
+            SqlValue::Int(now.0 - 7_200_000),
+        ],
+    )
+    .await
+    .unwrap();
+    c.fixture_exec(
+        "UPDATE extents SET parity = ?2 WHERE id = ?1",
+        &[
+            SqlValue::Text(a.extent.as_str().to_owned()),
+            SqlValue::Blob(vec![0xff; 7]),
+        ],
+    )
+    .await
+    .unwrap();
+    let result_before = w.result(&a).await;
+
+    let run = w.scrub().await;
+    assert_ne!(
+        run.ended,
+        ScrubEnd::Stopped,
+        "one bad plan does not stop the run"
+    );
+    assert_eq!((run.checked, run.ok), (1, 1), "b is checked");
+    assert_eq!(w.result(&b).await, "ok");
+    assert!(alerts()
+        .iter()
+        .any(|l| l.starts_with("scrub-bad-plan ") && l.contains(a.extent.as_str())));
+    // a: deferred, its loss kept, no pass recorded.
+    assert_eq!(w.result(&a).await, result_before);
+    let loss = w
+        .scalar(
+            "SELECT stat_loss_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = 'alpha'",
+            &a.extent,
+        )
+        .await;
+    assert_eq!(loss, (now.0 - 7_200_000).to_string());
+    let (stat, _) = w.clocks(&a, "alpha").await;
+    assert!(
+        stat > now,
+        "a is due again later, not at the head of the list"
+    );
+    assert!(stat < now.plus_secs(DAY_SECS), "deferred, not passed");
+}
+
+/// H6: a successful scheduled BODY check moves `last_verified_at`
+/// forward, never back; a STAT pass and a failed BODY check do not.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scheduled_body_pass_advances_last_verified_at() {
+    let w = world().await;
+    let o = w.released("a", 249).await;
+    let stamp = || async {
+        w.scalar(
+            "SELECT last_verified_at FROM extents WHERE id = ?1",
+            &o.extent,
+        )
+        .await
+    };
+    let released = stamp().await;
+    assert_ne!(released, "NULL", "verify stamped the release read");
+    // A STAT pass: nothing read, nothing stamped.
+    w.advance_secs(31 * DAY_SECS);
+    assert_eq!(w.scrub().await.ok, 1);
+    assert_eq!(stamp().await, released);
+    // A BODY pass on both backbones.
+    w.advance_secs(60);
+    w.full_checks_now(&o).await;
+    let now = w.bridge().clock.now();
+    let run = w.scrub().await;
+    assert_eq!(run.ok, 1);
+    assert!(run.bytes_read > 0);
+    assert_eq!(stamp().await, now.0.to_string());
+    // Never back: a stamp ahead stays.
+    let ahead = now.0 + 86_400_000;
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET last_verified_at = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Int(ahead),
+            ],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(60);
+    w.full_checks_now(&o).await;
+    assert_eq!(w.scrub().await.ok, 1);
+    assert_eq!(stamp().await, ahead.to_string());
+    // Failed BODY checks stamp nothing.
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET last_verified_at = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Int(now.0),
+            ],
+        )
+        .await
+        .unwrap();
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    w.advance_secs(60);
+    w.full_checks_now(&o).await;
+    let failed = w.scrub().await;
+    assert_eq!(failed.suspect, 1);
+    assert_eq!(stamp().await, now.0.to_string());
+}
+
+/// With a loss on record the eviction keeps the safety copy and its
+/// count (it stays evictable for later), and still evicts the cache
+/// fill. With the scrub off the old rule holds: both go.
+#[tokio::test(flavor = "current_thread")]
+async fn eviction_keeps_and_counts_the_safety_copy_of_an_extent_with_a_loss_on_record() {
+    for scrub in [true, false] {
+        let w = world_with(|cfg| {
+            cfg.hot_cap_bytes = 1;
+            cfg.scrub.on = scrub;
+        })
+        .await;
+        let o = w.released("a", 250).await;
+        let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+        let cipher = w
+            .bridge()
+            .safety
+            .stored(&o.extent.safety_key())
+            .unwrap()
+            .bytes;
+        let meta = BlobMeta {
+            bucket: &extent.bucket_id,
+            extent: &extent.id,
+            cipher_sha256: &extent.cipher_sha256,
+        };
+        w.bridge()
+            .cache
+            .put(&o.extent.cache_key(), cipher, &meta)
+            .await
+            .unwrap();
+        let c = &w.bridge().catalog;
+        c.record_cache_fill(&o.extent, w.bridge().clock.now())
+            .await
+            .unwrap();
+        c.sql
+            .inner
+            .fixture_exec(
+                "UPDATE scrub_copies SET full_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'beta'",
+                &[
+                    SqlValue::Text(o.extent.as_str().to_owned()),
+                    SqlValue::Int(w.bridge().clock.now().0),
+                ],
+            )
+            .await
+            .unwrap();
+        w.bridge().evict_batch(0).await.unwrap();
+        assert!(!w.bridge().cache.contains(&o.extent.cache_key()));
+        assert_eq!(w.has_safety(&o), scrub, "scrub on: kept");
+        let counts = w
+            .scalar(
+                "SELECT hot_safety_bytes || ':' || hot_cache_bytes FROM extents WHERE id = ?1",
+                &o.extent,
+            )
+            .await;
+        let expected = match scrub {
+            true => format!("{}:0", extent.cipher_size),
+            false => "0:0".to_owned(),
+        };
+        assert_eq!(counts, expected);
+    }
 }

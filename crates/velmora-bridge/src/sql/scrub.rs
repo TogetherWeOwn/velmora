@@ -418,14 +418,26 @@ const ADVANCE_STAT: &str =
     "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5, stat_phase_at = ?6 \
              WHERE extent_id = ?1 AND backbone = ?2 AND stat_at = ?3";
 
+// H6: a scheduled BODY check that passed is a full read-back of the plan
+// `?3`, as verify's body pass is (`STAMP_LAST_BODY_VERIFY`). Forward only.
+const STAMP_VERIFIED: &str = "UPDATE extents SET last_verified_at = ?2 \
+    WHERE id = ?1 AND plan_rev = ?3 AND (last_verified_at IS NULL OR last_verified_at < ?2)";
+
 pub(super) async fn advance<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
     extent: &ExtentId,
     updates: &[(ScrubCheck, UnixMs, Option<UnixMs>)],
+    verified: Option<(UnixMs, u32)>,
 ) -> Result<bool> {
-    let mut stmts = Vec::with_capacity(updates.len() + 1);
+    let mut stmts = Vec::with_capacity(updates.len() + 2);
     stmts.push((ADVANCE_GUARD, vec![uint(token)?]));
+    if let Some((at, plan_rev)) = verified {
+        stmts.push((
+            STAMP_VERIFIED,
+            vec![text(extent.as_str()), ms(at), uint(u64::from(plan_rev))?],
+        ));
+    }
     for (check, next, loss) in updates {
         let sql = if check.full {
             ADVANCE_FULL
@@ -691,6 +703,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (ADVANCE_GUARD, "I"),
         (ADVANCE_FULL, "TTIINI"),
         (ADVANCE_STAT, "TTIINI"),
+        (STAMP_VERIFIED, "TII"),
         (HAS_LOSS_PG, "TT"),
         (RETIRE_GUARD, "TI"),
         (RETIRE_COPIES, "T"),

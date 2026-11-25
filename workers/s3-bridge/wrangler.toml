@@ -256,6 +256,9 @@ PERMITS = "do"
 #   SCRUB_CONFIRM_SECS (3600, at least 3600 outside dev): wait before a loss is looked at again, and repaired only if it is still there.
 #   SCRUB_RUN_SECS (240, 30 to 290): wall time a run takes new extents for; under the cron interval, so runs never overlap.
 #   SCRUB_REPAIRS_PER_RUN (8): extents one run re-pins at most; 0 means detect only.
+#   D1_ROLLBACK_RETIRED (unset): 1 once the frozen D1 is no longer a rollback target of a PostgreSQL catalogue. With
+#     CATALOG_BACKEND pg or pg-frozen, SCRUB on without it makes the Worker refuse its configuration: a scrub repair on
+#     PostgreSQL is not replayed into D1 by a rollback. See ops/README.md, Scrub. Not set here.
 
 # off | on (CopyObject only; UploadPartCopy does not read it). On only in a
 # release after the one that added extent references (migration 0005): a

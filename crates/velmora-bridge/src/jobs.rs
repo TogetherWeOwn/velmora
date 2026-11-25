@@ -845,17 +845,32 @@ where
         // did not count goes too. The one exception is the safety copy of
         // a pinned extent, which is not part of the claim.
         // The safety copy only if nothing pinned the extent again since
-        // the begin: the scrub re-pins a released extent and puts its
-        // copy back.
-        if !row.pinned && self.catalog.evict_safety_still_ok(row).await? {
+        // the begin (the scrub re-pins a released extent and puts its
+        // copy back) and, with the scrub on, no loss of it is on record.
+        let kept = !row.pinned
+            && !self
+                .catalog
+                .evict_safety_still_ok(row, self.cfg.scrub.on)
+                .await?;
+        if !row.pinned && !kept {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }
         delete_blob(&self.cache, &row.extent.cache_key()).await?;
-        // `false`: a cold read refilled the cache, or another eviction
-        // took the extent, since `begin_evict`. The counts stand, and
-        // what this drain still has to evict is no longer known.
-        Ok(match self.catalog.finish_evict(row).await? {
-            true => Some(row.evictable_bytes()),
+        // A safety copy that stayed stays counted: the end of the cache
+        // fill's eviction only, as for a pinned extent.
+        let done = match kept {
+            true => EvictCandidate {
+                pinned: true,
+                ..row.clone()
+            },
+            false => row.clone(),
+        };
+        // `false`: a cold read refilled the cache, another eviction took
+        // the extent, or a re-pin moved it, since `begin_evict`. The
+        // counts stand, and what this drain still has to evict is no
+        // longer known.
+        Ok(match self.catalog.finish_evict(&done).await? {
+            true => Some(done.evictable_bytes()),
             false => None,
         })
     }

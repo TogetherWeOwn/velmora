@@ -25,6 +25,11 @@
 //! Every statement that changes `safety_state` bumps the sequence too, so
 //! a listing never survives a state change.
 //!
+//! The job asks once more right before it deletes the safety copy
+//! (`evict_safety_still_ok`). With `SCRUB` on, an extent whose loss the
+//! scrub has on record keeps its safety copy: the re-pin of that loss
+//! may need it, and the eviction then ends the cache fill's count only.
+//!
 //! The counts are not exact, and they are not a bound in either
 //! direction. Each error is limited to one extent's bytes and repairs
 //! itself:
@@ -199,24 +204,48 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
-const EVICT_SAFETY_STILL_OK: &str = concat!(
-    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
-    pinned!()
+macro_rules! evict_safety_still_ok {
+    ($scrub:literal) => {
+        concat!(
+            "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+            pinned!(),
+            $scrub
+        )
+    };
+}
+const EVICT_SAFETY_STILL_OK: &str = evict_safety_still_ok!("");
+/// With `SCRUB` on: and no loss of the extent is on the scrub's record
+/// (a point lookup on the `scrub_copies` key). Only with it on, so that
+/// eviction does not need the scrub's tables before they are applied.
+const EVICT_SAFETY_STILL_OK_SCRUB: &str = evict_safety_still_ok!(
+    " AND NOT EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = ?1 \
+       AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
 );
 
 /// Whether the safety copy of an eviction that `begin_evict` started may
-/// still go: the extent is not pinned and nothing moved its sequence
-/// since the begin (a re-pin by the scrub moves it). Asked right before
-/// the delete, it narrows the window in which a re-pin made after the
-/// begin could lose its copy to the time of one blob delete.
+/// still go: the extent is not pinned, nothing moved its sequence since
+/// the begin (a re-pin by the scrub moves it), and, with `scrub`, the
+/// scrub has no loss of it on record.
+///
+/// The last condition is the fence against a re-pin made after this
+/// check: the scrub re-pins only a loss whose record is older than two
+/// queue invocations (`scrub::REPIN_MIN_LOSS_AGE_MS`), so an eviction
+/// that passed this check without seeing that record deleted within its
+/// invocation, before the re-pin, and the re-pin then finds the copy
+/// gone and writes it again. One that sees the record keeps the copy.
 pub(super) async fn evict_safety_still_ok<S: Sql>(
     c: &SqlCatalog<S>,
     x: &EvictCandidate,
+    scrub: bool,
 ) -> Result<bool> {
+    let sql = match scrub {
+        true => EVICT_SAFETY_STILL_OK_SCRUB,
+        false => EVICT_SAFETY_STILL_OK,
+    };
     let rows = c
         .sql
         .query(
-            EVICT_SAFETY_STILL_OK,
+            sql,
             &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
         )
         .await?;
@@ -464,6 +493,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (BEGIN_EVICT_PINNED.to_owned(), vec![T, I, I, I]),
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
         (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
+        (EVICT_SAFETY_STILL_OK_SCRUB.to_owned(), vec![T, I]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

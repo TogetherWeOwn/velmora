@@ -33,9 +33,20 @@
 //!   posts what a backbone lacks under the stored message-ids and reads
 //!   it back, and the release needs `REQUIRED_BACKBONES` and the minimum
 //!   age again, as for any upload. The bytes come from Usenet (another
-//!   backbone, or parity once the reader rebuilds from it), else from
-//!   the cache copy, else from the safety copy if it is still in R2; each
-//!   is checked against the extent's digest first.
+//!   backbone, or the extent's parity, which the reader rebuilds lost
+//!   articles from), else from the cache copy, else from the safety copy
+//!   if it is still in R2; each is checked against the extent's digest
+//!   first.
+//! - A loss is re-pinned only once its first sighting is at least
+//!   [`REPIN_MIN_LOSS_AGE_MS`] old. Eviction keeps the safety copy of an
+//!   extent with a loss on record, so an eviction that passed its check
+//!   before the loss was recorded has ended (a queue invocation lasts at
+//!   most [`JOB_MAX_AGE_MS`]) before the re-pin, and its delete cannot
+//!   take the copy the re-pin keeps.
+//! - Every safety copy the scrub writes after its last catalogue check
+//!   (after the re-pin, or in the repair watch) is followed by a guarded
+//!   GC row: garbage collection that ended before the PUT landed, or a
+//!   PUT whose reply was lost, cannot leave the copy behind.
 //! - No intact copy anywhere: `unrecoverable`, an alert line, and a
 //!   check again after `SCRUB_CONFIRM_SECS` (a backbone that was down
 //!   may come back).
@@ -87,6 +98,15 @@ pub const INCIDENT_MIN_EXTENTS: u32 = 8;
 /// cause is the backbone, not the articles.
 pub const INCIDENT_PERCENT: u32 = 12;
 
+/// How old the first sighting of a loss must be before it is re-pinned:
+/// two queue invocations. Eviction keeps the safety copy of an extent
+/// with a loss on record (`EVICT_SAFETY_STILL_OK`), and an eviction
+/// that passed its check before the loss was recorded deletes within
+/// one invocation of that check. The second invocation covers the scrub
+/// run that wrote the record after it saw the loss. Production confirm
+/// intervals (at least an hour) are longer; this binds in dev only.
+pub const REPIN_MIN_LOSS_AGE_MS: i64 = 2 * JOB_MAX_AGE_MS;
+
 /// Re-pins a run makes at most for losses on a backbone under an
 /// incident: one, the least that is not none. A loss that lasts on one
 /// backbone (a takedown of one large object) trips the breaker again on
@@ -109,8 +129,7 @@ pub enum RepairSource {
     /// Read from Usenet: articles a backbone lacks came from another.
     Usenet,
     /// Read from Usenet with lost articles rebuilt from the extent's
-    /// parity. The reader reports rebuilt articles once it rebuilds
-    /// ([`rebuilt`]); until then no read is this.
+    /// parity ([`rebuilt`]).
     Parity,
     /// The cache copy (`c/<extent>`).
     Cache,
@@ -129,12 +148,9 @@ impl RepairSource {
     }
 }
 
-/// Articles the reader rebuilt from parity between two of its stats:
-/// the hook of the parity read. The reader on this version does not
-/// rebuild, so it is 0; the reader that does counts them in its stats,
-/// and this is where they are read.
-fn rebuilt(_before: &ColdStats, _after: &ColdStats) -> u32 {
-    0
+/// Articles the reader rebuilt from parity between two of its stats.
+fn rebuilt(before: &ColdStats, after: &ColdStats) -> u32 {
+    after.rebuilt.saturating_sub(before.rebuilt)
 }
 
 /// What one backbone's own check found.
@@ -586,7 +602,9 @@ where
                 candidate.last,
                 Some(ScrubResult::Repairing | ScrubResult::Stalled | ScrubResult::Unrecoverable)
             ) {
-                let plan = self.catalog.articles(&extent.id);
+                // The stored plan with its parity addendum: the watch may
+                // rebuild a lost copy from parity, as the repair read does.
+                let plan = self.catalog.stored_plan(&extent.id);
                 let plan = self.idle(reader, walk.stats, plan).await?;
                 let next = self.watch_repair(reader, walk, candidate, plan).await?;
                 (next, next.is_some())
@@ -600,7 +618,8 @@ where
                 .iter()
                 .map(|check| (check.clone(), next, check.loss_at))
                 .collect();
-            self.advance_checks(reader, walk, extent, &updates).await?;
+            self.advance_checks(reader, walk, extent, &updates, None)
+                .await?;
             return Ok(watched);
         }
         if watch_due {
@@ -641,16 +660,38 @@ where
                     (check.clone(), now.plus_ms(delay), check.loss_at)
                 })
                 .collect();
-            self.advance_checks(reader, walk, extent, &updates).await?;
+            self.advance_checks(reader, walk, extent, &updates, None)
+                .await?;
             self.scrub_record_one(reader, walk, extent, (ScrubResult::Skipped, None))
                 .await?;
             return Ok(false);
         };
-        let parity = stored
-            .parity_plan(&extent.id, extent.cipher_size)
-            .map_err(|_| Halt::Stopped)?;
-        let mut plan = stored.rows;
-        let data_count = plan.len();
+        let parity = match stored.parity_plan(&extent.id, extent.cipher_size) {
+            Ok(parity) => parity,
+            Err(_) => {
+                // A plan this version cannot read is no evidence about the
+                // copies: its checks wait a confirm interval with their
+                // phases and losses as they are, nothing is recorded, and
+                // the run goes on with the next extent.
+                crate::trace::alert(|| {
+                    format!(
+                        "scrub-bad-plan {} its parity addendum cannot be read; \
+                         looked at again after SCRUB_CONFIRM_SECS",
+                        extent.id.as_str()
+                    )
+                });
+                let next = self.clock.now().plus_ms(confirm);
+                let updates: Vec<_> = candidate
+                    .checks
+                    .iter()
+                    .map(|check| (check.clone(), next, check.loss_at))
+                    .collect();
+                self.advance_checks(reader, walk, extent, &updates, None)
+                    .await?;
+                return Ok(false);
+            }
+        };
+        let mut plan = stored.rows.clone();
         if let Some(parity) = parity {
             plan.extend(parity.articles);
         }
@@ -705,7 +746,6 @@ where
             }
             return Ok(true);
         }
-        let data = &plan[..data_count];
         let tripped = walk.breaker.tripped();
         if !tripped.is_empty() {
             for (backbone, full, checked, lacking) in &tripped {
@@ -747,8 +787,10 @@ where
         unread.sort_unstable();
         unread.dedup();
         let repaired = walk.run.repaired;
+        // The stored plan, parity addendum included: the reader rebuilds
+        // what every backbone lost if the parity covers it.
         let found = self
-            .repair_read(reader, walk, extent, data.to_vec(), unread)
+            .repair_read(reader, walk, extent, stored, unread)
             .await?;
         let mut loss = candidate.clone();
         loss.last_scrubbed_at = prior_loss;
@@ -765,9 +807,13 @@ where
         walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
         updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+        verified: Option<UnixMs>,
     ) -> core::result::Result<(), Halt> {
         if !updates.is_empty() {
-            let write = self.catalog.scrub_advance(walk.token, &extent.id, updates);
+            let verified = verified.map(|at| (at, extent.plan_rev));
+            let write = self
+                .catalog
+                .scrub_advance(walk.token, &extent.id, updates, verified);
             if !self.idle(reader, walk.stats, write).await? {
                 return Err(Halt::Stopped);
             }
@@ -789,6 +835,8 @@ where
         let confirm = i64::from(self.cfg.scrub.confirm_secs) * 1000;
         let mut out = CopyChecks::default();
         let mut updates = Vec::with_capacity(candidate.checks.len());
+        // The last scheduled BODY check that passed (H6 `last_verified_at`).
+        let mut verified = None;
         for check in &candidate.checks {
             if walk.unavailable.contains(&check.backbone) {
                 continue;
@@ -832,6 +880,9 @@ where
                         intact,
                     });
                     if intact {
+                        if check.full {
+                            verified = Some(now);
+                        }
                         let interval = intervals[usize::from(check.full)];
                         let next = next_cadence(check.phase_at, now, interval);
                         let mut check = check.clone();
@@ -843,7 +894,13 @@ where
                         if !out.lacking.contains(&check.backbone) {
                             out.lacking.push(check.backbone.clone());
                         }
-                        if check.loss_at.is_some() && !out.confirmed.contains(&check.backbone) {
+                        // Confirmed: seen at an earlier visit, and long
+                        // enough ago that no eviction from before that
+                        // sighting can still delete ([`REPIN_MIN_LOSS_AGE_MS`]).
+                        let settled = check
+                            .loss_at
+                            .is_some_and(|at| at.plus_ms(REPIN_MIN_LOSS_AGE_MS) <= now);
+                        if settled && !out.confirmed.contains(&check.backbone) {
                             out.confirmed.push(check.backbone.clone());
                         }
                         out.prior_loss = out.prior_loss.into_iter().chain(check.loss_at).min();
@@ -867,7 +924,8 @@ where
                 Err(halt) => return Err(halt),
             }
         }
-        self.advance_checks(reader, walk, extent, &updates).await?;
+        self.advance_checks(reader, walk, extent, &updates, verified)
+            .await?;
         Ok(out)
     }
 
@@ -878,7 +936,7 @@ where
         reader: &mut ColdReader<'s, C, N, T>,
         walk: &mut Walk<'_, 's, C, N, T>,
         extent: &ExtentRow,
-        plan: Vec<ArticleRow>,
+        plan: StoredPlan,
         lacking: Vec<String>,
     ) -> core::result::Result<Found, Halt> {
         Self::hang_up_all(reader, walk.stats).await;
@@ -889,16 +947,7 @@ where
             .await
             .map_err(|_| Halt::Busy)?;
         let before = reader.stats();
-        let read = reader
-            .fetch_planned(
-                extent,
-                StoredPlan {
-                    rows: plan,
-                    ..StoredPlan::default()
-                },
-                self.clock.now(),
-            )
-            .await?;
+        let read = reader.fetch_planned(extent, plan, self.clock.now()).await?;
         let after = reader.stats();
         let interrupted = matches!(read, ColdFetch::Interrupted);
         let cipher = match read {
@@ -1298,10 +1347,12 @@ where
             // may have deleted it, and written if it is not there.
             let in_r2 = matches!(source, RepairSource::Safety | RepairSource::Cache);
             let mut there = in_r2 && matches!(self.safety.head(&key).await, Ok(Some(_)));
+            let mut wrote = false;
             for _ in 0..2 {
                 if there {
                     break;
                 }
+                wrote = true;
                 there = self.put_safety(extent, cipher.clone()).await
                     && matches!(self.safety.head(&key).await, Ok(Some(_)));
             }
@@ -1328,6 +1379,9 @@ where
                     .now()
                     .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
                 self.catalog.scrub_defer(token, &extent.id, next).await?;
+            }
+            if wrote {
+                self.collect_if_unreferenced(extent).await?;
             }
             return Ok(());
         }
@@ -1364,6 +1418,18 @@ where
         }
     }
 
+    /// After a safety PUT made past the last catalogue check, whatever its
+    /// answer (a lost reply may hide a write): a guarded `delete_safety`
+    /// row, inserted only if the extent is unreferenced now. Garbage
+    /// collection that ended before the PUT landed then runs again; while
+    /// the extent is referenced nothing is inserted, and a collection
+    /// that begins later finds the copy already there.
+    async fn collect_if_unreferenced(&self, extent: &ExtentRow) -> Result<()> {
+        self.catalog
+            .gc_enqueue_scrub_safety(&extent.id, self.clock.now())
+            .await
+    }
+
     /// Writes verified ciphertext as the extent's safety copy.
     async fn put_safety(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {
         if !digest_ok(extent, &cipher) {
@@ -1388,7 +1454,7 @@ where
         reader: &mut ColdReader<'s, C, N, T>,
         walk: &mut Walk<'_, 's, C, N, T>,
         candidate: &ScrubCandidate,
-        plan: Vec<ArticleRow>,
+        plan: StoredPlan,
     ) -> core::result::Result<Option<UnixMs>, Halt> {
         let extent = &candidate.extent;
         let cfg = &self.cfg.scrub;
@@ -1427,16 +1493,7 @@ where
         };
         let mut rewrote = false;
         if !kept {
-            let read = reader
-                .fetch_planned(
-                    extent,
-                    StoredPlan {
-                        rows: plan,
-                        ..StoredPlan::default()
-                    },
-                    self.clock.now(),
-                )
-                .await;
+            let read = reader.fetch_planned(extent, plan, self.clock.now()).await;
             let cipher = match read? {
                 ColdFetch::Filled(cipher) => {
                     walk.run.bytes_read += extent.cipher_size;
@@ -1460,7 +1517,11 @@ where
             };
             reader.hang_up().await;
             match cipher {
-                Some(cipher) => rewrote = self.put_safety(extent, cipher).await,
+                Some(cipher) => {
+                    rewrote = self.put_safety(extent, cipher).await;
+                    // Written after the liveness check above.
+                    self.collect_if_unreferenced(extent).await?;
+                }
                 None => {
                     walk.run.unrecoverable += 1;
                     crate::trace::alert(|| {

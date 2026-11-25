@@ -1603,11 +1603,15 @@ pub trait Catalog {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Move only the named checks, recording their own loss timestamps.
+    /// `verified`: a scheduled BODY check passed at that time for that
+    /// plan revision, which moves `extents.last_verified_at` forward
+    /// (never back) in the same batch.
     async fn scrub_advance(
         &self,
         _token: u64,
         _extent: &ExtentId,
         _updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+        _verified: Option<(UnixMs, u32)>,
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
@@ -1719,9 +1723,11 @@ pub trait Catalog {
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
     /// Asked right before the safety copy of a started eviction is
     /// deleted: `false` once the extent is pinned again or its sequence
-    /// moved since `begin_evict` (a re-pin). The default keeps the old
-    /// behaviour of a catalogue that cannot tell.
-    async fn evict_safety_still_ok(&self, _x: &EvictCandidate) -> Result<bool> {
+    /// moved since `begin_evict` (a re-pin), and, with `scrub` (`SCRUB`
+    /// is on), while the scrub has a loss of the extent on record: the
+    /// copy may be the one the re-pin of that loss keeps. The default
+    /// keeps the old behaviour of a catalogue that cannot tell.
+    async fn evict_safety_still_ok(&self, _x: &EvictCandidate, _scrub: bool) -> Result<bool> {
         Ok(true)
     }
     /// Counts the extent's cache fill and stamps the read. Called before
