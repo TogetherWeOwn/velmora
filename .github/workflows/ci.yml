@@ -950,9 +950,8 @@ jobs:
       # RELEASE_AT_VERIFY = "off" line in the prod [vars] table.
       # Both production Hyperdrive IDs are required and must be distinct.
       # Check the rendered binding names and IDs without opening a database
-      # connection. The shipped CATALOG_BACKEND is unset, so D1 remains active.
-      # Allow explicit D1 modes for freeze/rollback. PostgreSQL remains blocked
-      # until the PostgreSQL tests become a required release gate.
+      # connection. An unset CATALOG_BACKEND uses D1; explicit modes are
+      # selected in the committed production [vars] for cutover and rollback.
       - name: Generate the production wrangler config
         if: steps.fresh.outputs.fresh == 'true'
         working-directory: workers/s3-bridge
@@ -1134,8 +1133,8 @@ jobs:
               {"binding": "CATALOG_PG_R", "id": hd_read},
           ]:
               sys.exit("the generated config does not carry the production writer and reader Hyperdrive bindings")
-          if prod_vars.get("CATALOG_BACKEND") not in (None, "d1", "d1-frozen"):
-              sys.exit("invalid CATALOG_BACKEND in the production config: expected unset, d1 or d1-frozen")
+          if prod_vars.get("CATALOG_BACKEND") not in (None, "d1", "d1-frozen", "pg", "pg-frozen"):
+              sys.exit("invalid CATALOG_BACKEND in the production config: expected unset, d1, d1-frozen, pg or pg-frozen")
           if found != ("tenant" if layout == "tenant" else None):
               sys.exit("the generated config does not carry the record layout that was asked for")
           if prod_vars.get("RELEASE_AT_VERIFY") != release:

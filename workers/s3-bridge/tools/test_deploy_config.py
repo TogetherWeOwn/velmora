@@ -803,8 +803,16 @@ class ReleaseAtVerifyTest(GeneratorCase):
 
 
 class HyperdriveTest(GeneratorCase):
+    def with_catalog_backend(self, value=None):
+        # Use explicit fixtures even when the shipped config selects a backend.
+        before, header, after = self.shipped.partition("\n[vars]\n")
+        prod_vars, separator, rest = after.partition("\n[")
+        prod_vars = re.sub(r"(?m)^CATALOG_BACKEND[ \t]*=.*(?:\n|$)", "", prod_vars)
+        assignment = "" if value is None else f"CATALOG_BACKEND = {value}\n"
+        return before + header + assignment + prod_vars + separator + rest
+
     def test_correct_production_bindings_without_backend_switch(self):
-        _, written = self.ok({"CATALOG_BACKEND": "pg"})
+        _, written = self.ok({"CATALOG_BACKEND": "pg"}, self.with_catalog_backend())
         config = tomllib.loads(written.decode())
         self.assertEqual(config["hyperdrive"], [
             {"binding": "CATALOG_PG_W", "id": HD_WRITE},
@@ -833,18 +841,16 @@ class HyperdriveTest(GeneratorCase):
         ):
             self.refused({}, error, changed)
 
-    def test_preserves_explicit_d1_modes(self):
-        for mode in ("d1", "d1-frozen"):
+    def test_preserves_explicit_catalog_backend_modes(self):
+        for mode in ("d1", "d1-frozen", "pg", "pg-frozen"):
             with self.subTest(mode=mode):
-                changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = "{mode}"\n', 1)
-                _, written = self.ok({}, changed)
+                _, written = self.ok({}, self.with_catalog_backend(f'"{mode}"'))
                 self.assertEqual(tomllib.loads(written.decode())["vars"]["CATALOG_BACKEND"], mode)
 
-    def test_refuses_postgres_and_invalid_modes_before_ci_promotion(self):
-        for value in ('"pg"', '"pg-frozen"', '"postgres"', '""', 'true'):
+    def test_refuses_invalid_catalog_backend_modes(self):
+        for value in ('"postgres"', '""', '"PG"', '" pg"', '"pg-frozen "', 'true', '1'):
             with self.subTest(value=value):
-                changed = self.shipped.replace('[vars]\n', f'[vars]\nCATALOG_BACKEND = {value}\n', 1)
-                self.refused({}, "invalid CATALOG_BACKEND", changed)
+                self.refused({}, "invalid CATALOG_BACKEND", self.with_catalog_backend(value))
 
 
 @unittest.skipUnless(
