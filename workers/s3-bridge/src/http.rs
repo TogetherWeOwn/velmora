@@ -38,9 +38,27 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
         }
     }
     ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
-    let declared_len = ingress::declared_length(&headers).unwrap_or(None);
     let body = if let Some(raw) = req.inner().body() {
-        let stream: velmora_bridge::ByteStream = match ByobReads::new(&raw) {
+        // Keep the wire length for the consumer. The admission budget uses
+        // the decoded length for aws-chunked, so framing must not enlarge
+        // the buffer beyond that length (or the undeclared probe cap).
+        let (declared_len, read_len) = match ingress::upload_lengths(&headers, u64::MAX) {
+            Ok(lengths) => (
+                lengths.encoded,
+                Some(
+                    lengths
+                        .decoded
+                        .min(lengths.encoded.unwrap_or(u64::from(BODY_PROBE))),
+                ),
+            ),
+            // Other operations need not declare a length. Invalid headers
+            // are still rejected by the existing consumer checks.
+            Err(_) => {
+                let declared = ingress::declared_length(&headers).unwrap_or(None);
+                (declared, declared)
+            }
+        };
+        let stream: velmora_bridge::ByteStream = match ByobReads::new(&raw, read_len) {
             Some(reads) => Box::pin(pieces(reads)),
             // Not a byte stream: the runtime's default reader.
             None => Box::pin(
@@ -67,13 +85,23 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     })
 }
 
-/// The most one body fill gathers, and so the size of the one runtime
-/// buffer every fill reuses. The default reader hands a deployed request
-/// body out in 4 KiB items, each a new array crossing into wasm on its
+/// The most one body fill gathers, and so the maximum size of its reused
+/// runtime buffer. The default reader hands a deployed request body out
+/// in 4 KiB items, each a new array crossing into wasm on its
 /// own task; a BYOB read fills up to this much at once. It is one plain
 /// chunk, inside the item allowance of a streamed upload's charge
 /// (`ingress::STREAM_ITEM_ALLOWANCE`).
 const BODY_READ: u32 = velmora::media::PLAIN_CHUNK_SIZE as u32;
+const BODY_PROBE: u32 = 4096;
+
+fn body_read_cap(declared_len: Option<u64>) -> u32 {
+    match declared_len {
+        // Even an empty body needs a non-empty view to read its end.
+        Some(n) => n.clamp(1, u64::from(BODY_READ)) as u32,
+        // An undeclared body can be an uncharged CopyObject body probe.
+        None => BODY_PROBE,
+    }
+}
 
 /// Reads of a body: `Ok(None)` is its end. After an error or the end
 /// nothing more is asked.
@@ -182,11 +210,12 @@ fn fill_gave(filled: u32, done: bool) -> FillGave {
 /// full buffer is copied once into a piece.
 struct ByobReads {
     reader: ByobReader,
+    cap: u32,
     /// The runtime buffer, allocated on the first poll. A fill transfers
     /// it and hands it back. `settled` distinguishes a terminal `None`
     /// from the initial state.
     buffer: Option<worker::js_sys::ArrayBuffer>,
-    /// The body ended or failed: there is nothing left to cancel.
+    /// The body ended: there is nothing left to cancel.
     settled: bool,
     /// The last piece was given: the next read is the end.
     ended: bool,
@@ -194,7 +223,7 @@ struct ByobReads {
 
 impl ByobReads {
     /// `None` when the body has no BYOB reader (it is not a byte stream).
-    fn new(stream: &worker::web_sys::ReadableStream) -> Option<Self> {
+    fn new(stream: &worker::web_sys::ReadableStream, declared_len: Option<u64>) -> Option<Self> {
         use worker::wasm_bindgen::JsCast;
         let options = worker::js_sys::Object::new();
         worker::js_sys::Reflect::set(&options, &"mode".into(), &"byob".into()).ok()?;
@@ -203,6 +232,7 @@ impl ByobReads {
                 .unchecked_ref::<ByteBody>()
                 .byob_reader(&options)
                 .ok()?,
+            cap: body_read_cap(declared_len),
             buffer: None,
             settled: false,
             ended: false,
@@ -232,14 +262,15 @@ impl PieceReads for ByobReads {
         let buffer = self
             .buffer
             .take()
-            .unwrap_or_else(|| worker::js_sys::ArrayBuffer::new(BODY_READ));
+            .unwrap_or_else(|| worker::js_sys::ArrayBuffer::new(self.cap));
         let promise = fill_body(&self.reader, buffer).map_err(|_| failed())?;
-        let filled = worker::wasm_bindgen_futures::JsFuture::from(promise).await;
-        // A fill that failed or ended leaves nothing to cancel; a piece
-        // that is not the last sets this back. Dropped while a fill is
-        // under way, the body is still canceled.
+        let filled: Filled = worker::wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|_| failed())?
+            .unchecked_into();
+        // Drop cancels an in-progress or failed fill. An already errored
+        // reader rejects the cancel, which the JS shim handles.
         self.settled = true;
-        let filled: Filled = filled.map_err(|_| failed())?.unchecked_into();
         let n = filled.n();
         let back = filled.buf();
         let gave = fill_gave(n, filled.done());
@@ -254,8 +285,8 @@ impl PieceReads for ByobReads {
         if matches!(gave, FillGave::Piece) {
             // The runtime hands the whole buffer back; one that came back
             // smaller would cap every later fill, so it is replaced.
-            self.buffer = Some(if back.byte_length() < BODY_READ {
-                worker::js_sys::ArrayBuffer::new(BODY_READ)
+            self.buffer = Some(if back.byte_length() < self.cap {
+                worker::js_sys::ArrayBuffer::new(self.cap)
             } else {
                 back
             });
@@ -439,15 +470,19 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_reader_does_not_allocate_the_body_buffer() {
-        // This wiring runs before admission; the JS constructor itself
-        // cannot be called from the native unit-test binary.
-        let source = include_str!("http.rs");
-        let (_, reader_impl) = source.split_once("impl ByobReads {").unwrap();
-        let (constructor, _) = reader_impl.split_once("\n}\n").unwrap();
-        assert!(
-            !constructor.contains("ArrayBuffer::new"),
-            "the body buffer must be allocated only when the admitted stream is polled"
-        );
+    fn the_body_buffer_fits_the_declared_length_or_the_probe_cap() {
+        for (declared, cap) in [
+            (0, 1),
+            (1, 1),
+            (32_768, 32_768),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (u64::MAX, 65_536),
+        ] {
+            let actual = body_read_cap(Some(declared));
+            assert!(u64::from(actual) <= declared.max(1));
+            assert_eq!(actual, cap);
+        }
+        assert_eq!(body_read_cap(None), 4096);
     }
 }

@@ -71,10 +71,11 @@ pub const TURN_WAIT_MS: u32 = 5_000;
 /// The body item being decoded is the runtime's. The six chunks of
 /// slack cover it and its copy up to [`STREAM_ITEM_ALLOWANCE`] each; a
 /// longer item is charged on top for as long as it is held
-/// ([`stream_item_charge`]). The Worker reads its request body in items
-/// of at most 64 KiB (one BYOB read into one plain chunk's buffer; the
-/// runtime's default reader gave 4 KiB items), so the fixed charge is all
-/// a request is charged today.
+/// ([`stream_item_charge`]). The Worker's JS buffer is at most the declared
+/// body length (64 KiB maximum, with a one-byte view for a zero length).
+/// If the wire length is undeclared the maximum is 4 KiB, and for an
+/// aws-chunked upload it is also bounded by the declared decoded length.
+/// Each item is therefore within the allowance.
 pub const STREAM_CHARGE_BYTES: u64 = 8 * CIPHER_CHUNK_SIZE;
 
 /// The largest body item the fixed charge of a streamed upload

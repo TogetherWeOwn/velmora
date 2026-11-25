@@ -50,6 +50,7 @@
 #   CRON_RUNS                 cron runs step 7 waits for (remote; default 2)
 #   E2E_PERMITS               local: d1 or do, the PERMITS the Worker runs
 #                             with (default: the dev var in wrangler.toml)
+#   E2E_BODY_PROBE_ONLY       1 runs only the local BYOB body probes
 #   E2E_SLICED                0 skips step 0c (a 99 MiB PutObject) against a
 #                             remote that runs without MAX_PUT_BYTES
 #
@@ -96,6 +97,8 @@ case $HOST in
 esac
 if [[ $MODE == local ]]; then
   [[ -n $PORT ]] || fail "local base URL" "http(s)://127.0.0.1:<port>" "$BASE"
+elif [[ ${E2E_BODY_PROBE_ONLY:-0} == 1 ]]; then
+  fail "E2E_BODY_PROBE_ONLY" "a loopback base URL" "$BASE"
 fi
 
 for tool in aws curl jq openssl python3; do
@@ -138,8 +141,8 @@ cleanup() {
   fi
   stop_group "$WRANGLER_PID"
   stop_group "$FAKESRV_PID"
-  if [[ $DEV_VARS_WRITTEN == 1 ]]; then rm -f "$WORKER_DIR/.dev.vars"; fi
-  rm -rf "$T"
+  if [[ $DEV_VARS_WRITTEN == 1 && -e $WORKER_DIR/.dev.vars ]]; then rm -- "$WORKER_DIR/.dev.vars"; fi
+  rm -r -- "$T"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -266,7 +269,7 @@ if [[ $MODE == local ]]; then
   # answers (or exits, which fails at once).
   start_wrangler() {
     local rc=0
-    setsid npx --yes wrangler@4 dev --env dev --local --test-scheduled \
+    setsid npx --yes wrangler@4 dev "$HERE/body-probe.mjs" --env dev --local --test-scheduled \
       --ip 127.0.0.1 --port "$PORT" --persist-to "$T/state" --show-interactive-dev-session=false \
       "${TLS_ARGS[@]}" >>"$T/wrangler.log" 2>&1 </dev/null &
     WRANGLER_PID=$!
@@ -405,7 +408,7 @@ jq -e '(.access_key_id|type=="string") and (.secret|type=="string")' "$T/key.jso
 KEY_IDS+=("$(jq -r .access_key_id "$T/key.json")")
 jq -r '"[default]\naws_access_key_id=\(.access_key_id)\naws_secret_access_key=\(.secret)"' \
   "$T/key.json" >"$T/aws-credentials"
-rm -f "$T/key.json"
+rm -- "$T/key.json"
 
 export AWS_SHARED_CREDENTIALS_FILE="$T/aws-credentials" AWS_CONFIG_FILE="$T/aws-config"
 export AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true AWS_PAGER=''
@@ -415,6 +418,16 @@ aws configure set default.s3.addressing_style path
 # Multipart stays at the aws-cli defaults: 8 MiB parts, 10 concurrent.
 S3=(aws s3 --endpoint-url "$BASE" --only-show-errors)
 S3API=(aws s3api --endpoint-url "$BASE")
+
+if [[ $MODE == local ]]; then
+  STEP=0-byob
+  log "step $STEP"
+  got=$(python3 -I "$HERE/body_probe.py" "$BASE" "$SB" "$T/wrangler.log" 2>&1) ||
+    fail "local workerd body probes" "exit 0" "$got"
+  log "$got"
+  [[ ${E2E_BODY_PROBE_ONLY:-0} != 1 ]] || exit 0
+  STEP=0-setup
+fi
 
 head -c 1048576 /dev/urandom >"$T/small.bin"
 head -c 100663296 /dev/urandom >"$T/big.bin" # 96 MiB: 12 parts, 10 in flight
@@ -478,10 +491,10 @@ for n in 0 1; do
   for k in "len$n" "len$n-wr"; do
     run_aws "GET w/$k.bin" "${S3API[@]}" get-object --bucket "$SB" --key "w/$k.bin" "$T/got-$k.bin" >/dev/null
     same_bytes "GET w/$k.bin equals the upload" "$T/len$n.bin" "$T/got-$k.bin"
-    rm -f "$T/got-$k.bin"
+    rm -- "$T/got-$k.bin"
   done
 done
-rm -f "$T/len0.bin" "$T/len1.bin"
+rm -- "$T/len0.bin" "$T/len1.bin"
 
 # ---------------------------------------------------------------------------
 # 0c one PutObject above one extent (stored as slices of 8 MiB)
