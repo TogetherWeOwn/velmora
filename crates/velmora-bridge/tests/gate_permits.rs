@@ -43,20 +43,30 @@ fn pooled(id: &str, max_conns: u32, pool: &str, pool_max_conns: u32) -> Provider
 #[derive(Clone)]
 struct Db(Rc<TestSql>, Rc<RefCell<Option<Vec<String>>>>);
 
+impl Db {
+    fn record(&self, sql: &str) {
+        if let Some(trace) = self.1.borrow_mut().as_mut() {
+            trace.push(sql.to_owned());
+        }
+    }
+}
+
 impl Sql for Db {
     fn dialect(&self) -> Dialect {
         self.0.dialect()
     }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
-        if let Some(trace) = self.1.borrow_mut().as_mut() {
-            trace.push(sql.to_owned());
-        }
+        self.record(sql);
         self.0.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.record(sql);
         self.0.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        for (sql, _) in &stmts {
+            self.record(sql);
+        }
         self.0.batch(stmts).await
     }
 }
@@ -110,6 +120,8 @@ struct World {
     /// Requests without a session: each is one billed request.
     posts: Cell<u32>,
     ops: Cell<u32>,
+    /// Gates contacted with a live status request.
+    status_requests: RefCell<Vec<String>>,
     /// No gate can be reached.
     down: Cell<bool>,
     /// Requests to a gate do not arrive while this is set.
@@ -133,6 +145,7 @@ impl World {
             msgs: Cell::new(0),
             posts: Cell::new(0),
             ops: Cell::new(0),
+            status_requests: RefCell::default(),
             down: Cell::new(false),
             late: Cell::new(false),
             stall: Cell::new(false),
@@ -310,6 +323,12 @@ impl Wire {
         }
         self.0.calls.set(self.0.calls.get() + 1);
         self.0.ops.set(self.0.ops.get() + request.ops.len() as u32);
+        if request.ops.iter().any(|op| matches!(op, GateOp::Load)) {
+            self.0
+                .status_requests
+                .borrow_mut()
+                .push(request.gate.clone());
+        }
         // As on the wire: the request and the reply are JSON.
         Ok(serde_json::from_str(&serde_json::to_string(request).unwrap()).unwrap())
     }
@@ -634,19 +653,48 @@ async fn active_load_and_status_match_slot_overlay_where_it_has_rows() {
 #[tokio::test]
 async fn active_load_and_status_do_not_query_permit_slots() {
     let w = World::new();
-    let c = w.catalog(PermitMode::Gate, GateSharding::One, &[]);
-    // Warm the status path so the trace only covers the two catalogue reads.
-    c.provider_status(w.now()).await.unwrap();
+    let providers = [provider("p", 4), provider("q", 2)];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    // Acquire through the live gate before tracing: this warms the gate
+    // and gives the caller a hint with distinct load counters.
+    for (p, class, holder) in [
+        (&providers[0], JOB, "job"),
+        (&providers[0], JOB, "job"),
+        (&providers[0], READ, "reader"),
+        (&providers[1], READ, "reader"),
+    ] {
+        take(&c, &w, p, class, holder).await.unwrap();
+    }
+
+    let calls = w.calls.get();
     *w.db.1.borrow_mut() = Some(Vec::new());
-    c.provider_load(w.now()).await.unwrap();
-    c.provider_status(w.now()).await.unwrap();
+    let load = c.provider_load(w.now()).await.unwrap();
+    assert_eq!(w.calls.get(), calls, "provider_load should use its hint");
+    let status = c.provider_status(w.now()).await.unwrap();
     let trace = w.db.1.borrow_mut().take().unwrap();
-    assert_eq!(trace.len(), 2);
-    assert!(trace.iter().all(|sql| sql.contains("FROM provider_health")));
+    assert_eq!(&*w.status_requests.borrow(), &["permits:all:0"]);
     assert!(
-        trace.iter().all(|sql| !sql.contains("provider_permits")),
+        trace
+            .iter()
+            .all(|sql| !sql.to_ascii_lowercase().contains("provider_permits")),
         "active load/status read slot rows: {trace:?}"
     );
+    for rows in [load, status] {
+        let counters: Vec<_> = rows
+            .iter()
+            .map(|l| {
+                (
+                    l.provider_id.as_str(),
+                    l.held,
+                    l.holders,
+                    l.background_holders,
+                    l.uses,
+                )
+            })
+            .collect();
+        assert_eq!(counters, [("p", 3, 2, 1, 3), ("q", 1, 1, 0, 1)]);
+    }
 }
 
 // ---------------------------------------------------------------------------

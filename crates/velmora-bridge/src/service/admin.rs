@@ -2081,6 +2081,142 @@ async fn status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn absent_provider_load_ranks_and_reports_like_a_zero_row() {
+        use crate::config::{BridgeConfig, Environment, GcMode};
+        use crate::ingress::ByteBudget;
+        use crate::pool::Pool;
+        use crate::ports::{Permit, PermitClass};
+        use crate::sql::SqlCatalog;
+        use crate::testkit::{FakeJobs, FixedClock, MemBlobStore, TestKek, TestSql};
+        use crate::types::{ProviderConfig, Result, Secret, UnixMs};
+
+        struct NoDial;
+        impl NntpConnector for NoDial {
+            type Session = velmora::nntp::NntpClient<velmora::transports::NativeTlsTransport>;
+
+            async fn connect(&self, _: &ProviderConfig, _: &Permit) -> Result<Self::Session> {
+                panic!("status does not dial providers");
+            }
+        }
+
+        let providers = ["busy", "idle"]
+            .into_iter()
+            .map(|id| {
+                serde_json::from_value::<ProviderConfig>(json!({
+                    "id": id, "backbone": "fixture", "host": "fixture.invalid",
+                    "port": 563, "tls": true, "user": "fixture", "pass": "fixture",
+                    "post": true, "read": true, "max_conns": 2,
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let now = UnixMs(1_800_000_000_000);
+        let bridge = Bridge {
+            catalog: SqlCatalog::new(TestSql::with_schema().unwrap()),
+            safety: MemBlobStore::new(),
+            cache: MemBlobStore::new(),
+            nntp: NoDial,
+            jobs: FakeJobs::new(),
+            kek: TestKek::new(),
+            clock: FixedClock::new(now),
+            budget: ByteBudget::new(64 << 20),
+            cfg: BridgeConfig {
+                environment: Environment::Dev,
+                s3_host: "s3.test".into(),
+                s3_hosts: Vec::new(),
+                region: "auto".into(),
+                max_extent_bytes: 16 << 20,
+                max_put_bytes: 16 << 20,
+                slice_bytes: 8 << 20,
+                max_object_extents: 10_000,
+                intent_sweep: false,
+                gc_orphans: false,
+                records: crate::recovery::Layout::flat(),
+                packed_plans: false,
+                parity: false,
+                required_backbones: 1,
+                safety_min_age_secs: 0,
+                release_at_verify: false,
+                verify_delay_secs: 1,
+                post_sockets: 1,
+                cold_sockets: 1,
+                propagation_grace_secs: 21_600,
+                newsgroups: vec!["alt.binaries.test".into()],
+                kek_active: 1,
+                inflight_budget_bytes: 64 << 20,
+                job_budget_bytes: 64 << 20,
+                gc_mode: GcMode::Off,
+                hot_cap_bytes: crate::config::DEFAULT_HOT_CAP_BYTES,
+                hot_ctl: Default::default(),
+                maintenance: Maintenance::Off,
+                server_side_copy: false,
+                get_fanout_bytes: None,
+                grant_refusal_reasons: false,
+                catalogue_id: "main".into(),
+                dev_trust_http: false,
+                verify: Default::default(),
+                providers,
+                admin_token: Secret::new("unused fixture token".into()),
+                admin_read_token: None,
+                admin_host: None,
+                metrics_sample: 0,
+            },
+        };
+        let providers = &bridge.cfg.providers;
+        let c = &bridge.catalog;
+        c.seed_permits(providers).await.unwrap();
+        c.acquire_permit(&providers[0], PermitClass::Read, "reader", now)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let zero = ProviderLoad {
+            provider_id: "idle".into(),
+            held: 0,
+            holders: 0,
+            background_holders: 0,
+            uses: 0,
+            failures: 0,
+            cooldowns: 0,
+            cooldown_until: UnixMs(0),
+            fault: None,
+        };
+        let mut reports = Vec::new();
+        for idle in [Some(&zero), None] {
+            if idle.is_none() {
+                c.sql
+                    .fixture_script("DELETE FROM provider_permits WHERE provider_id = 'idle';")
+                    .unwrap();
+            }
+            let load = c.provider_load(now).await.unwrap();
+            assert_eq!(load.iter().find(|l| l.provider_id == "idle"), idle);
+            assert_eq!(c.provider_status(now).await.unwrap(), load);
+            let pool = Pool::new(providers, load, now);
+            for class in [PermitClass::Read, PermitClass::Background] {
+                let order = pool.order(providers.iter().collect(), class);
+                let ids: Vec<_> = order.iter().map(|p| p.id.as_str()).collect();
+                assert_eq!(ids, ["idle", "busy"]);
+            }
+
+            // Exercise the actual status renderer on this disposable
+            // catalogue without sending an HTTP request.
+            let response = status(&bridge).await.unwrap();
+            assert_eq!(response.status, 200);
+            let RespBody::Bytes(body) = response.body else {
+                panic!("expected a JSON body");
+            };
+            let report: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(report["providers"][0]["held"], 1);
+            let idle_report = &report["providers"][1];
+            assert_eq!(idle_report["id"], "idle");
+            assert_eq!(idle_report["held"], 0);
+            assert_eq!(idle_report["healthy"], true);
+            reports.push(report);
+        }
+        assert_eq!(reports[0], reports[1]);
+    }
+
     /// Only a statement the store failed or was too busy for is asked
     /// again. What the store's adapter says of a value or a result it
     /// could not decode is of the stored row: a `500`, never a retry.
