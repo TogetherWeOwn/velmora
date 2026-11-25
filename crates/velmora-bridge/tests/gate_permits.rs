@@ -653,7 +653,7 @@ async fn active_load_and_status_match_slot_overlay_where_it_has_rows() {
 #[tokio::test]
 async fn active_load_and_status_do_not_query_permit_slots() {
     let w = World::new();
-    let providers = [provider("p", 4), provider("q", 2)];
+    let providers = [provider("p", 4), provider("q", 3)];
     let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
     c.seed_permits(&providers).await.unwrap();
     // Acquire through the live gate before tracing: this warms the gate
@@ -667,20 +667,36 @@ async fn active_load_and_status_do_not_query_permit_slots() {
         take(&c, &w, p, class, holder).await.unwrap();
     }
 
+    // A different caller updates the gate without updating c's hint.
+    let peer = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    take(&peer, &w, &providers[1], JOB, "peer-job")
+        .await
+        .unwrap();
+
     let calls = w.calls.get();
     *w.db.1.borrow_mut() = Some(Vec::new());
     let load = c.provider_load(w.now()).await.unwrap();
+    let load_sql = w.db.1.replace(Some(Vec::new())).unwrap();
     assert_eq!(w.calls.get(), calls, "provider_load should use its hint");
     let status = c.provider_status(w.now()).await.unwrap();
-    let trace = w.db.1.borrow_mut().take().unwrap();
+    let status_sql = w.db.1.borrow_mut().take().unwrap();
     assert_eq!(&*w.status_requests.borrow(), &["permits:all:0"]);
     assert!(
-        trace
+        load_sql
             .iter()
+            .chain(&status_sql)
             .all(|sql| !sql.to_ascii_lowercase().contains("provider_permits")),
-        "active load/status read slot rows: {trace:?}"
+        "active load/status read slot rows: load={load_sql:?}, status={status_sql:?}"
     );
-    for rows in [load, status] {
+    for (method, sql, rows, expected_q) in [
+        ("provider_load", load_sql, load, ("q", 1, 1, 0, 1)),
+        ("provider_status", status_sql, status, ("q", 2, 2, 1, 2)),
+    ] {
+        assert_eq!(sql.len(), 1, "{method} should read health once: {sql:?}");
+        assert!(
+            sql[0].to_ascii_lowercase().contains("from provider_health"),
+            "{method} should read provider health: {sql:?}"
+        );
         let counters: Vec<_> = rows
             .iter()
             .map(|l| {
@@ -693,7 +709,7 @@ async fn active_load_and_status_do_not_query_permit_slots() {
                 )
             })
             .collect();
-        assert_eq!(counters, [("p", 3, 2, 1, 3), ("q", 1, 1, 0, 1)]);
+        assert_eq!(counters, [("p", 3, 2, 1, 3), expected_q], "{method}");
     }
 }
 
