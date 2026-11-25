@@ -87,6 +87,8 @@ pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
 /// The eviction listing while `SCRUB` is on: the same index and order
 /// as `HOT_INDEX_ONLY`'s listing, with a key lookup in `scrub_copies`.
 pub const HOT_SCRUB_CANDIDATES: &str = hot::CANDIDATES_SCRUB;
+/// Its PostgreSQL twin.
+pub const HOT_SCRUB_CANDIDATES_PG: &str = hot::CANDIDATES_SCRUB_PG;
 pub const HOT_INDEX_ONLY: [(&str, &str); 4] = [
     hot::INDEX_ONLY[0],
     hot::INDEX_ONLY[1],
@@ -1099,13 +1101,14 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         hotctl::store(self, expected_at, entries).await
     }
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
-        hot::evict_candidates(self, limit, false).await
+        hot::evict_candidates(self, limit, None).await
     }
     async fn evict_candidates_keeping_scrub_losses(
         &self,
         limit: u32,
+        backbones: &[String],
     ) -> Result<Vec<EvictCandidate>> {
-        hot::evict_candidates(self, limit, true).await
+        hot::evict_candidates(self, limit, Some(backbones)).await
     }
     async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::begin_evict(self, x).await
@@ -1113,7 +1116,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
     }
-    async fn evict_safety_still_ok(&self, x: &EvictCandidate, scrub: bool) -> Result<bool> {
+    async fn evict_safety_still_ok(
+        &self,
+        x: &EvictCandidate,
+        scrub: Option<&[String]>,
+    ) -> Result<bool> {
         hot::evict_safety_still_ok(self, x, scrub).await
     }
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {

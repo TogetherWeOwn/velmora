@@ -111,10 +111,20 @@ const CANDIDATES: &str = concat!(
 
 /// True while the scrub has a loss of the extent `extents.id` on record:
 /// one key lookup in `scrub_copies` per row.
+/// True while the scrub has a loss of the extent `$x` on record on one of
+/// the backbones that count now (`$labels`, a JSON array, as the scrub's
+/// own `HAS_LOSS` reads it): key lookups in `scrub_copies`. A loss on a
+/// backbone that no longer counts is never checked again, so it must not
+/// keep the extent's copies.
 macro_rules! scrub_loss_on_record {
-    () => {
-        "EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = extents.id \
-           AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
+    ($x:literal, $labels:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = ",
+            $x,
+            " AND s.backbone IN (SELECT ",
+            $labels,
+            ") AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
+        )
     };
 }
 
@@ -128,16 +138,16 @@ pub const CANDIDATES_SCRUB: &str = concat!(
     " FROM extents WHERE ",
     evictable!(),
     " AND NOT ",
-    scrub_loss_on_record!(),
+    scrub_loss_on_record!("extents.id", "value FROM json_each(?2)"),
     " ORDER BY last_read_at, id LIMIT ?1"
 );
-const CANDIDATES_SCRUB_PG: &str = concat!(
+pub const CANDIDATES_SCRUB_PG: &str = concat!(
     "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
     pinned!(),
     " FROM extents WHERE ",
     evictable!(),
     " AND NOT ",
-    scrub_loss_on_record!(),
+    scrub_loss_on_record!("extents.id", "jsonb_array_elements_text(CAST(?2 AS jsonb))"),
     " ORDER BY last_read_at ASC NULLS FIRST, id LIMIT ?1"
 );
 
@@ -187,13 +197,17 @@ pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
 pub(super) async fn evict_candidates<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
-    scrub: bool,
+    scrub: Option<&[String]>,
 ) -> Result<Vec<EvictCandidate>> {
+    let mut params = vec![SqlValue::Int(i64::from(limit))];
     let sql = match scrub {
-        true => c.sql.dialect().pick(CANDIDATES_SCRUB, CANDIDATES_SCRUB_PG),
-        false => c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
+        Some(backbones) => {
+            params.push(labels(backbones)?);
+            c.sql.dialect().pick(CANDIDATES_SCRUB, CANDIDATES_SCRUB_PG)
+        }
+        None => c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
     };
-    let rows = c.sql.query(sql, &[SqlValue::Int(i64::from(limit))]).await?;
+    let rows = c.sql.query(sql, &params).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -237,28 +251,38 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
-macro_rules! evict_safety_still_ok {
-    ($scrub:literal) => {
-        concat!(
-            "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
-            pinned!(),
-            $scrub
-        )
-    };
-}
-const EVICT_SAFETY_STILL_OK: &str = evict_safety_still_ok!("");
-/// With `SCRUB` on: and no loss of the extent is on the scrub's record
-/// (a point lookup on the `scrub_copies` key). Only with it on, so that
-/// eviction does not need the scrub's tables before they are applied.
-const EVICT_SAFETY_STILL_OK_SCRUB: &str = evict_safety_still_ok!(
-    " AND NOT EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = ?1 \
-       AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
+const EVICT_SAFETY_STILL_OK: &str = concat!(
+    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    pinned!()
 );
+/// With `SCRUB` on: and no loss of the extent on a counting backbone is
+/// on the scrub's record (`?3`, as for `CANDIDATES_SCRUB`). Only with it
+/// on, so that eviction does not need the scrub's tables before they are
+/// applied.
+const EVICT_SAFETY_STILL_OK_SCRUB: &str = concat!(
+    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    pinned!(),
+    " AND NOT ",
+    scrub_loss_on_record!("?1", "value FROM json_each(?3)")
+);
+const EVICT_SAFETY_STILL_OK_SCRUB_PG: &str = concat!(
+    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    pinned!(),
+    " AND NOT ",
+    scrub_loss_on_record!("?1", "jsonb_array_elements_text(CAST(?3 AS jsonb))")
+);
+
+fn labels(backbones: &[String]) -> Result<SqlValue> {
+    serde_json::to_string(backbones)
+        .map(SqlValue::Text)
+        .map_err(|_| crate::types::BridgeError::Invalid("backbone labels"))
+}
 
 /// Whether the safety copy of an eviction that `begin_evict` started may
 /// still go: the extent is not pinned, nothing moved its sequence since
-/// the begin (a re-pin by the scrub moves it), and, with `scrub`, the
-/// scrub has no loss of it on record.
+/// the begin (a re-pin by the scrub moves it), and, with `scrub` (the
+/// backbones that count now), the scrub has no loss of it on record
+/// there.
 ///
 /// The last condition is the fence against a re-pin made after this
 /// check: the scrub re-pins only a loss whose record is older than two
@@ -269,19 +293,19 @@ const EVICT_SAFETY_STILL_OK_SCRUB: &str = evict_safety_still_ok!(
 pub(super) async fn evict_safety_still_ok<S: Sql>(
     c: &SqlCatalog<S>,
     x: &EvictCandidate,
-    scrub: bool,
+    scrub: Option<&[String]>,
 ) -> Result<bool> {
+    let mut params = vec![text(x.extent.as_str()), int(x.seq.saturating_add(1))?];
     let sql = match scrub {
-        true => EVICT_SAFETY_STILL_OK_SCRUB,
-        false => EVICT_SAFETY_STILL_OK,
+        Some(backbones) => {
+            params.push(labels(backbones)?);
+            c.sql
+                .dialect()
+                .pick(EVICT_SAFETY_STILL_OK_SCRUB, EVICT_SAFETY_STILL_OK_SCRUB_PG)
+        }
+        None => EVICT_SAFETY_STILL_OK,
     };
-    let rows = c
-        .sql
-        .query(
-            sql,
-            &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
-        )
-        .await?;
+    let rows = c.sql.query(sql, &params).await?;
     match rows.into_iter().next() {
         Some(row) => Ok(Cols::new(row).num::<i64>()? == 1),
         None => Ok(false),
@@ -526,8 +550,8 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (BEGIN_EVICT_PINNED.to_owned(), vec![T, I, I, I]),
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
         (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
-        (EVICT_SAFETY_STILL_OK_SCRUB.to_owned(), vec![T, I]),
-        (CANDIDATES_SCRUB_PG.to_owned(), vec![I]),
+        (EVICT_SAFETY_STILL_OK_SCRUB_PG.to_owned(), vec![T, I, T]),
+        (CANDIDATES_SCRUB_PG.to_owned(), vec![I, T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

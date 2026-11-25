@@ -791,13 +791,16 @@ where
         let mut freed = 0u64;
         // With the scrub on, an extent with a loss on its record is not
         // listed: its copies may be what the repair of that loss needs.
-        let rows = match self.cfg.scrub.on {
-            true => {
+        // Only losses on the backbones that count now: the scrub checks
+        // no other, so a loss on a retired one would never clear.
+        let counting = self.scrub_counting();
+        let rows = match &counting {
+            Some(backbones) => {
                 self.catalog
-                    .evict_candidates_keeping_scrub_losses(EVICT_BATCH)
+                    .evict_candidates_keeping_scrub_losses(EVICT_BATCH, backbones)
                     .await?
             }
-            false => self.catalog.evict_candidates(EVICT_BATCH).await?,
+            None => self.catalog.evict_candidates(EVICT_BATCH).await?,
         };
         let mut more = rows.len() >= EVICT_BATCH as usize;
         // One extent that fails must not hold up the ones behind it. It
@@ -807,7 +810,7 @@ where
             if excess == 0 {
                 break;
             }
-            match self.evict_one(row).await {
+            match self.evict_one(row, counting.as_deref()).await {
                 Ok(Some(bytes)) => {
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
@@ -849,7 +852,20 @@ where
     /// freed. `None` when something else changed the extent meanwhile:
     /// either the catalogue refused the eviction (nothing was deleted), or
     /// it could not be finished as begun.
-    async fn evict_one(&self, row: &EvictCandidate) -> Result<Option<u64>> {
+    /// With the scrub on, the backbones whose losses fence eviction: the
+    /// ones the scrub checks (`verify::release_labels`).
+    fn scrub_counting(&self) -> Option<Vec<String>> {
+        self.cfg
+            .scrub
+            .on
+            .then(|| crate::verify::release_labels(&self.cfg.providers))
+    }
+
+    async fn evict_one(
+        &self,
+        row: &EvictCandidate,
+        counting: Option<&[String]>,
+    ) -> Result<Option<u64>> {
         if !self.catalog.begin_evict(row).await? {
             return Ok(None);
         }
@@ -859,11 +875,7 @@ where
         // The safety copy only if nothing pinned the extent again since
         // the begin (the scrub re-pins a released extent and puts its
         // copy back) and, with the scrub on, no loss of it is on record.
-        let kept = !row.pinned
-            && !self
-                .catalog
-                .evict_safety_still_ok(row, self.cfg.scrub.on)
-                .await?;
+        let kept = !row.pinned && !self.catalog.evict_safety_still_ok(row, counting).await?;
         if !row.pinned && !kept {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }

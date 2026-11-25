@@ -609,6 +609,10 @@ pub struct FailSql {
     /// Stalls one matching write at the tripwire until the test releases it.
     pub stall_exec_matching: Cell<Option<&'static str>>,
     pub selected_exec: Tripwire,
+    /// Stalls one read whose text contains the string, after letting the
+    /// given number of such reads through, at the tripwire.
+    pub stall_query_matching: Cell<Option<(&'static str, u32)>>,
+    pub selected_query: Tripwire,
     /// Stalls one batch with a matching first text parameter.
     pub stall_batch_key: Cell<Option<&'static str>>,
     pub selected_batch: Tripwire,
@@ -736,9 +740,18 @@ impl Sql for FailSql {
             return Err(BridgeError::Sql("database down".into()));
         }
         self.interleave(sql);
-        self.trip
-            .guard(sql_down, self.inner.query(sql, params))
-            .await
+        let call = self.trip.guard(sql_down, self.inner.query(sql, params));
+        if let Some((text, pass)) = self.stall_query_matching.get() {
+            if sql.contains(text) {
+                if pass == 0 {
+                    self.stall_query_matching.set(None);
+                    self.selected_query.arm(0, Trip::Stall);
+                    return self.selected_query.guard(sql_down, call).await;
+                }
+                self.stall_query_matching.set(Some((text, pass - 1)));
+            }
+        }
+        call.await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         if self.frozen.get() {
@@ -950,6 +963,8 @@ fn rig_on<N: NntpConnector + 'static>(
                 fail_read_for: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),
                 selected_exec: Tripwire::default(),
+                stall_query_matching: Cell::new(None),
+                selected_query: Tripwire::default(),
                 stall_batch_key: Cell::new(None),
                 selected_batch: Tripwire::default(),
                 before_matching: RefCell::new(None),

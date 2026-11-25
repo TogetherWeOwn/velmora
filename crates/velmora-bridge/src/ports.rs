@@ -1715,11 +1715,13 @@ pub trait Catalog {
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
     /// [`Catalog::evict_candidates`] less the extents whose loss the scrub
-    /// has on record (`SCRUB` on): their copies stay until the loss is
-    /// settled. The default lists them all.
+    /// has on record on one of `backbones`, those that count now (`SCRUB`
+    /// on): their copies stay until the loss is settled. The default
+    /// lists them all.
     async fn evict_candidates_keeping_scrub_losses(
         &self,
         limit: u32,
+        _backbones: &[String],
     ) -> Result<Vec<EvictCandidate>> {
         self.evict_candidates(limit).await
     }
@@ -1733,10 +1735,15 @@ pub trait Catalog {
     /// Asked right before the safety copy of a started eviction is
     /// deleted: `false` once the extent is pinned again or its sequence
     /// moved since `begin_evict` (a re-pin), and, with `scrub` (`SCRUB`
-    /// is on), while the scrub has a loss of the extent on record: the
-    /// copy may be the one the re-pin of that loss keeps. The default
-    /// keeps the old behaviour of a catalogue that cannot tell.
-    async fn evict_safety_still_ok(&self, _x: &EvictCandidate, _scrub: bool) -> Result<bool> {
+    /// is on: the backbones that count now), while the scrub has a loss
+    /// of the extent on record on one of them: the copy may be the one
+    /// the re-pin of that loss keeps. The default keeps the old
+    /// behaviour of a catalogue that cannot tell.
+    async fn evict_safety_still_ok(
+        &self,
+        _x: &EvictCandidate,
+        _scrub: Option<&[String]>,
+    ) -> Result<bool> {
         Ok(true)
     }
     /// Counts the extent's cache fill and stamps the read. Called before
