@@ -19,6 +19,10 @@ from pg_catalog import (
     source_manifest, source_schema, sqlite_source, write_seal,
 )
 
+# The PostgreSQL stages an import applies: COPY runs after the first, and the
+# target is ready only with exactly these recorded.
+CUTOVER_BASELINE = ("0001", "0002", "0003")
+
 
 def verify_dump(stream, manifest):
     digest, n = sha256(), 0
@@ -188,9 +192,11 @@ def mark_ready(db, key):
         lock_w1(db, key)
         require(marker_exists(db), "import claim disappeared before post-COPY completion")
         # Import-mode migration 0002 installs the post schema and restarts
-        # all three identities transactionally. Check the same PG connection.
-        require(db.execute("SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version='0002')").fetchone()[0],
-                "post-COPY migration 0002 is not recorded on the import target")
+        # all three identities transactionally; 0003 replaces the per-row
+        # usage triggers. Check the same PG connection for exactly that ledger.
+        ledger = [v for (v,) in db.execute("SELECT version::text FROM schema_migrations ORDER BY version")]
+        require(ledger == list(CUTOVER_BASELINE),
+                f"post-COPY ledger must be exactly the cutover baseline {'/'.join(CUTOVER_BASELINE)}")
         db.execute(f"INSERT INTO {ident(MARKER)} VALUES (true)")
 
 
@@ -237,14 +243,14 @@ def main():
             started = monotonic()
             with postgres(args.pg_env) as (pg, schema, key):
                 ensure_unclaimed(pg, schema)
-                migrate(args.pg_env, "--to", "0001", "--import-mode")
+                migrate(args.pg_env, "--to", CUTOVER_BASELINE[0], "--import-mode")
                 claim(pg, schema, key, source)
                 timings["pre_and_claim_s"] = monotonic() - started
                 started = monotonic()
                 report["copied"] = copy_data(pg, key, db, source, receipt)
                 timings["binary_copy_s"] = monotonic() - started
                 started = monotonic()
-                migrate(args.pg_env, "--import-mode")
+                migrate(args.pg_env, "--to", CUTOVER_BASELINE[-1], "--import-mode")
                 mark_ready(pg, key)
                 timings["post_and_identities_s"] = monotonic() - started
     report["sqlite_bytes"] = args.sqlite.stat().st_size

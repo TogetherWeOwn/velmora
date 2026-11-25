@@ -55,6 +55,11 @@ async fn create_catalogue(local: &Local, schema: &str) -> PgConnection {
     db.batch_execute(include_str!("../../../s3-bridge/pg/0002_baseline_post.sql"))
         .await
         .unwrap();
+    db.batch_execute(include_str!(
+        "../../../s3-bridge/pg/0003_usage_statement_triggers.sql"
+    ))
+    .await
+    .unwrap();
     conn
 }
 

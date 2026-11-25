@@ -2244,6 +2244,9 @@ pub(crate) mod pg_background_fixture {
         tx.batch_execute(&migration("0002_baseline_post.sql"))
             .await
             .unwrap();
+        tx.batch_execute(&migration("0003_usage_statement_triggers.sql"))
+            .await
+            .unwrap();
         tx
     }
 

@@ -34,7 +34,7 @@ Set `PG_LOAD_CONFIG` to JSON. `mix` weights are relative **write transactions**,
 
 ## Native run
 
-Use Postgres 18 with peer auth on the local `/var/run/postgresql` socket and database `postgres`. Create a schema whose name starts with `velmora_pg_load_`. On that schema's search path apply the catalogue pre-schema, seed `usage_global` rows 1 and 2, then apply the post-schema. With the schema still selected, explicitly arm it for one run:
+Use Postgres 18 with peer auth on the local `/var/run/postgresql` socket and database `postgres`. Create a schema whose name starts with `velmora_pg_load_`. On that schema's search path apply the catalogue pre-schema (`0001`), seed `usage_global` rows 1 and 2, then apply every later stage in order (`0002`, `0003`). With the schema still selected, explicitly arm it for one run:
 
 ```sql
 INSERT INTO meta(k,v) VALUES ('pg_load_fixture_v1',1);

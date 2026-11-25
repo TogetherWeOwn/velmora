@@ -335,6 +335,8 @@ class CopyTests(unittest.TestCase):
         conn, env = self.pg()
         result = self.copy("--pg-env", env, "--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall(),
+                         [("0001",), ("0002",), ("0003",)], "COPY must stop at exactly the cutover baseline")
         self.assertEqual(conn.execute("SELECT extent_id,seq FROM outbox ORDER BY seq").fetchall(), [("z", 1), ("a", 2)])
         self.assertEqual(conn.execute("SELECT k FROM scan_cursors").fetchall(), [("keep",)])
         self.assertEqual(conn.execute("SELECT * FROM restore_state").fetchone(), tuple(BEFORE.values()))
