@@ -73,9 +73,9 @@ pub const TURN_WAIT_MS: u32 = 5_000;
 /// longer item is charged on top for as long as it is held
 /// ([`stream_item_charge`]). The Worker's JS buffer is at most the declared
 /// body length (64 KiB maximum, with a one-byte view for a zero length).
-/// If the wire length is undeclared the maximum is 4 KiB, and for an
-/// aws-chunked upload it is also bounded by the declared decoded length.
-/// Each item is therefore within the allowance.
+/// An aws-chunked upload is also bounded by the declared decoded length,
+/// even when the wire length is omitted. With no declared length of
+/// either kind the maximum is 4 KiB. Each item is within the allowance.
 pub const STREAM_CHARGE_BYTES: u64 = 8 * CIPHER_CHUNK_SIZE;
 
 /// The largest body item the fixed charge of a streamed upload

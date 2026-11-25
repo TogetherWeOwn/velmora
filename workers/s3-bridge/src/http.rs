@@ -41,14 +41,15 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     let body = if let Some(raw) = req.inner().body() {
         // Keep the wire length for the consumer. The admission budget uses
         // the decoded length for aws-chunked, so framing must not enlarge
-        // the buffer beyond that length (or the undeclared probe cap).
+        // the buffer beyond that length. The decoded length still bounds
+        // the buffer when an aws-chunked upload omits its wire length.
         let (declared_len, read_len) = match ingress::upload_lengths(&headers, u64::MAX) {
             Ok(lengths) => (
                 lengths.encoded,
                 Some(
                     lengths
                         .decoded
-                        .min(lengths.encoded.unwrap_or(u64::from(BODY_PROBE))),
+                        .min(lengths.encoded.unwrap_or(lengths.decoded)),
                 ),
             ),
             // Other operations need not declare a length. Invalid headers
@@ -139,8 +140,9 @@ extern "C" {
 
 #[worker::wasm_bindgen::prelude::wasm_bindgen(
     wasm_bindgen = worker::wasm_bindgen,
-    inline_js = "export async function fillBody(reader, buf) {
+    inline_js = "export async function fillBody(reader, buf, singleRead) {
   const cap = buf.byteLength;
+  const target = singleRead ? 1 : cap;
   let off = 0;
   for (;;) {
     const r = await reader.read(new Uint8Array(buf, off, cap - off));
@@ -149,7 +151,7 @@ extern "C" {
     off += r.value.byteLength;
     if (r.done) return { buf, n: off, done: true };
     if (r.value.byteLength === 0) throw new Error('empty read');
-    if (off === cap) return { buf, n: off, done: false };
+    if (off >= target) return { buf, n: off, done: false };
   }
 }
 export function cancelBody(reader) {
@@ -157,18 +159,19 @@ export function cancelBody(reader) {
 }"
 )]
 extern "C" {
-    /// Reads the body into `buf` until it is full or the body ended, in
-    /// JS: a deployed request body gives at most 8 KiB per read (measured:
-    /// 2,060 reads per 16 MiB part into a 64 KiB view), and each read that
-    /// came back into wasm cost a task and a wake. Rejects when the body
-    /// failed or was canceled (a done read without a view).
     /// Cancels the body; a stream that already failed is not an error.
     #[wasm_bindgen(js_name = cancelBody)]
     fn cancel_body(reader: &ByobReader);
+    /// Reads the body in JS until `buf` is full or the body ends; an
+    /// undeclared body probe returns as soon as any bytes arrive. A
+    /// deployed body gives at most 8 KiB per read (measured), and every
+    /// read that came back into wasm cost a task and a wake. Rejects if
+    /// the body failed or was canceled (a done read without a view).
     #[wasm_bindgen(catch, js_name = fillBody)]
     fn fill_body(
         reader: &ByobReader,
         buf: worker::js_sys::ArrayBuffer,
+        single_read: bool,
     ) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
     /// What `fill_body` resolves to.
     type Filled;
@@ -196,7 +199,7 @@ enum FillGave {
 
 /// At the end a read says done and hands the (empty) view back (workerd
 /// from compatibility date 2024-05-13, `internal_stream_byob_return_view`;
-/// ours is later); a fill that is not the end has filled its buffer.
+/// ours is later); a fill that is not the end provides at least one byte.
 fn fill_gave(filled: u32, done: bool) -> FillGave {
     match (filled, done) {
         (0, true) => FillGave::End,
@@ -207,18 +210,19 @@ fn fill_gave(filled: u32, done: bool) -> FillGave {
 }
 
 /// A request body read with a BYOB reader into one runtime buffer; each
-/// full buffer is copied once into a piece.
+/// fill is copied once into a piece.
 struct ByobReads {
     reader: ByobReader,
     cap: u32,
+    /// A probe must not wait for more bytes once it knows the body exists.
+    single_read: bool,
     /// The runtime buffer, allocated on the first poll. A fill transfers
-    /// it and hands it back. `settled` distinguishes a terminal `None`
-    /// from the initial state.
+    /// it and hands it back.
     buffer: Option<worker::js_sys::ArrayBuffer>,
     /// The body ended: there is nothing left to cancel.
     settled: bool,
-    /// The last piece was given: the next read is the end.
-    ended: bool,
+    /// A fill failed or was interrupted: further reads return the error.
+    failed: bool,
 }
 
 impl ByobReads {
@@ -233,9 +237,10 @@ impl ByobReads {
                 .byob_reader(&options)
                 .ok()?,
             cap: body_read_cap(declared_len),
+            single_read: declared_len.is_none(),
             buffer: None,
             settled: false,
-            ended: false,
+            failed: false,
         })
     }
 }
@@ -254,8 +259,11 @@ impl PieceReads for ByobReads {
     async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
         use worker::wasm_bindgen::JsCast;
         let failed = || BridgeError::Invalid("request body stream");
+        if self.failed {
+            return Err(failed());
+        }
         if self.settled {
-            return if self.ended { Ok(None) } else { Err(failed()) };
+            return Ok(None);
         }
         // The upload holds its stream charge before polling. Opening the
         // reader earlier must not allocate a buffer outside that charge.
@@ -263,22 +271,25 @@ impl PieceReads for ByobReads {
             .buffer
             .take()
             .unwrap_or_else(|| worker::js_sys::ArrayBuffer::new(self.cap));
-        let promise = fill_body(&self.reader, buffer).map_err(|_| failed())?;
+        // Do not retry a rejected or interrupted fill. Drop still cancels
+        // it; an already errored reader rejects cancel and JS handles that.
+        self.failed = true;
+        let promise = fill_body(&self.reader, buffer, self.single_read).map_err(|_| failed())?;
         let filled: Filled = worker::wasm_bindgen_futures::JsFuture::from(promise)
             .await
             .map_err(|_| failed())?
             .unchecked_into();
-        // Drop cancels an in-progress or failed fill. An already errored
-        // reader rejects the cancel, which the JS shim handles.
-        self.settled = true;
         let n = filled.n();
         let back = filled.buf();
-        let gave = fill_gave(n, filled.done());
-        if matches!(gave, FillGave::End) {
-            return Ok(None);
-        }
+        let done = filled.done();
+        let gave = fill_gave(n, done);
         if matches!(gave, FillGave::Failed) || n > back.byte_length() {
             return Err(failed());
+        }
+        self.failed = false;
+        self.settled = done;
+        if matches!(gave, FillGave::End) {
+            return Ok(None);
         }
         let piece =
             worker::js_sys::Uint8Array::new_with_byte_offset_and_length(&back, 0, n).to_vec();
@@ -290,9 +301,6 @@ impl PieceReads for ByobReads {
             } else {
                 back
             });
-            self.settled = false;
-        } else {
-            self.ended = true;
         }
         Ok(Some(piece))
     }

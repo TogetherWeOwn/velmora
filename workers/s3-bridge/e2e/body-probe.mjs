@@ -31,8 +31,11 @@ export default class extends Bridge {
     // same request. Construct a workerd byte stream to exercise that case
     // independently of HTTP framing, and the no-Content-Length Copy probe.
     const size = Number(request.headers.get("x-e2e-byob-size"));
-    const payload = request.headers.get("x-e2e-byob-payload");
-    const bytes = payload ? Uint8Array.from(atob(payload), (c) => c.charCodeAt(0)) : new Uint8Array(size);
+    if (!Number.isInteger(size) || size < 0 || size > 65537) throw new Error("body probe size");
+    const crc = request.headers.get("x-e2e-byob-crc32");
+    const bytes = crc === null
+      ? new Uint8Array(size)
+      : new TextEncoder().encode(`${size.toString(16)}\r\n${"x".repeat(size)}\r\n0\r\nx-amz-checksum-crc32:${crc}\r\n\r\n`);
     const body = new ReadableStream({
       type: "bytes",
       start(controller) {

@@ -107,25 +107,26 @@ def main():
         )
         assert report["allocations"] == [cap], f"declared {declared}: allocated again: {report}"
 
-    crc32 = b64encode(zlib.crc32(b"x").to_bytes(4, "big"))
-    framed = b"1\r\nx\r\n0\r\nx-amz-checksum-crc32:" + crc32 + b"\r\n\r\n"
-    framing = {
-        "content-encoding": "aws-chunked",
-        "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-        "x-amz-decoded-content-length": "1",
-        "x-amz-trailer": "x-amz-checksum-crc32",
-        "x-e2e-byob-payload": b64encode(framed).decode("ascii"),
-    }
-    # Valid framing cannot pad one decoded byte to 64 KiB. Check that an
-    # overstated encoded length uses the same cap and still fails, then
-    # check that exact and absent encoded lengths verify normally.
-    for declared in (65536, len(framed), None):
-        key = f"w/byob-aws-chunked-{declared}"
-        status, body, report = probe(key, declared, 0, signed=True, extra_headers=framing)
-        assert report == {"firstRead": {"allocations": [1], "cap": 1}, "allocations": [1]}, (
-            f"aws-chunked encoded={declared}, decoded=1: wanted one 1-byte buffer; got {status} {report}"
+    # Valid framing cannot pad one decoded byte to 64 KiB. An overstated
+    # wire length must still fail; an absent wire length must use the
+    # declared decoded length (up to 64 KiB), not the copy probe cap.
+    for decoded, wire, cap in [(1, 65536, 1), (1, "exact", 1), (1, None, 1), (32768, None, 32768), (65537, None, 65536)]:
+        key = f"w/byob-aws-chunked-{decoded}-{wire}"
+        payload = b"x" * decoded
+        crc32 = b64encode(zlib.crc32(payload).to_bytes(4, "big")).decode("ascii")
+        framing = {
+            "content-encoding": "aws-chunked",
+            "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "x-amz-decoded-content-length": str(decoded),
+            "x-amz-trailer": "x-amz-checksum-crc32",
+            "x-e2e-byob-crc32": crc32,
+        }
+        declared = len(f"1\r\nx\r\n0\r\nx-amz-checksum-crc32:{crc32}\r\n\r\n") if wire == "exact" else wire
+        status, body, report = probe(key, declared, decoded, signed=True, extra_headers=framing)
+        assert report == {"firstRead": {"allocations": [cap], "cap": cap}, "allocations": [cap]}, (
+            f"aws-chunked encoded={wire}, decoded={decoded}: wanted one {cap}-byte buffer; got {status} {report}"
         )
-        if declared == 65536:
+        if wire == 65536:
             assert status == 400 and b"<Code>IncompleteBody</Code>" in body, (
                 f"aws-chunked encoded length mismatch: wanted 400 IncompleteBody, got HTTP {status}"
             )
@@ -133,14 +134,35 @@ def main():
             assert status == 200, f"valid aws-chunked upload: wanted 200, got {status}"
             with send("GET", key) as conn:
                 response = conn.getresponse()
-                assert (response.status, response.read()) == (200, b"x"), "aws-chunked readback mismatch"
-    print("BYOB probe: aws-chunked used a 1-byte buffer; exact body verified, overstated length rejected")
+                assert (response.status, response.read()) == (200, payload), "aws-chunked readback mismatch"
+    print("BYOB probe: aws-chunked used the decoded-length bound; verified readbacks and rejected overstated wire length")
 
     status, body, _ = probe("w/byob-surplus", 1, 2, signed=True)
     assert status == 400 and b"<Code>EntityTooLarge</Code>" in body, (
         f"wanted 400 EntityTooLarge for a surplus byte, got HTTP {status}"
     )
     print("BYOB probe: allocation and surplus checks passed")
+
+    def reject_open_copy(key, operation, query=()):
+        headers = {
+            "transfer-encoding": "chunked",
+            "x-amz-copy-source": f"/{bucket}/w/byob-cap-1",
+        }
+        with send("PUT", key, headers, query=query) as conn:
+            # Send one byte and keep the socket open without a final chunk.
+            conn.send(b"1\r\nx\r\n")
+            conn.sock.settimeout(3)
+            try:
+                response = conn.getresponse()
+                status, body = response.status, response.read()
+            except TimeoutError:
+                raise AssertionError(f"{operation}: no response while the one-byte body stayed open") from None
+            assert status == 400 and b"<Code>InvalidRequest</Code>" in body, (
+                f"{operation}: wanted 400 InvalidRequest while the body stayed open, got HTTP {status}"
+            )
+        print(f"BYOB probe: {operation} refused one byte without waiting for EOF")
+
+    reject_open_copy("w/byob-open-copy", "CopyObject")
 
     def disconnect(key, kind, query=()):
         headers = {"x-e2e-byob": "disconnect", "content-length": "1048576"}
@@ -164,6 +186,7 @@ def main():
         upload_id = ElementTree.fromstring(response.read()).findtext("{*}UploadId")
         assert upload_id, "CreateMultipartUpload: missing upload ID"
     query = [("uploadId", upload_id)]
+    reject_open_copy(key, "UploadPartCopy", [*query, ("partNumber", "2")])
     disconnect(key, "part", [*query, ("partNumber", "1")])
     with send("GET", key, query=query) as conn:
         response = conn.getresponse()
