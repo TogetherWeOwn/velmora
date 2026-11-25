@@ -2955,7 +2955,7 @@ async fn a_loss_first_seen_under_a_running_eviction_is_not_re_pinned_before_it_e
 /// write. The object is deleted and garbage collection finishes while
 /// that PUT is in flight; the copy that then lands must be collected by
 /// a later GC pass, also when the PUT's reply is lost.
-async fn usenet_repair_put_after_gc(lost_reply: bool) {
+async fn usenet_repair_put_after_gc(lost_reply: bool, defer_fails: bool) {
     let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
     let o = w.released("a", 243).await;
     let bridge = w.bridge();
@@ -2990,13 +2990,22 @@ async fn usenet_repair_put_after_gc(lost_reply: bool) {
             *safety.before_put.borrow_mut() = Some(Box::new(move |_| wire.arm(0, Trip::Lost)));
             w.rig.trip().arm(0, Trip::Lost);
         }
+        if defer_fails {
+            // The watch's early look cannot be scheduled.
+            *bridge.catalog.sql.fail_matching.borrow_mut() = Some(("SET scrub_next_at = ?3", 0));
+        }
         safety.hold_put_prefix.replace(None);
     };
     tokio::select! {
         () = collect => {}
         _ = &mut run => panic!("scrub finished without writing the copy"),
     }
-    assert_eq!(run.await.repaired, 1);
+    let run = run.await;
+    *bridge.catalog.sql.fail_matching.borrow_mut() = None;
+    assert_eq!(run.repaired, 1);
+    if defer_fails {
+        assert_eq!(run.ended, ScrubEnd::Stopped, "the reschedule failed");
+    }
     assert!(w.has_safety(&o), "the PUT landed after GC");
     assert_eq!(
         bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
@@ -3015,12 +3024,19 @@ async fn usenet_repair_put_after_gc(lost_reply: bool) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_usenet_repair_copy_written_after_gc_is_collected() {
-    usenet_repair_put_after_gc(false).await;
+    usenet_repair_put_after_gc(false, false).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_usenet_repair_copy_whose_put_reply_is_lost_after_gc_is_collected() {
-    usenet_repair_put_after_gc(true).await;
+    usenet_repair_put_after_gc(true, false).await;
+}
+
+/// The cleanup row is written before the watch is rescheduled: a failed
+/// reschedule cannot leave the copy behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_repair_put_is_collected_even_if_the_watch_cannot_be_rescheduled() {
+    usenet_repair_put_after_gc(true, true).await;
 }
 
 /// The repair watch writes a missing safety copy again after its
@@ -3265,5 +3281,66 @@ async fn eviction_keeps_and_counts_the_safety_copy_of_an_extent_with_a_loss_on_r
             false => "0:0".to_owned(),
         };
         assert_eq!(counts, expected);
+    }
+}
+
+/// A full eviction batch of copies kept for the scrub (a loss of each is
+/// on record, as when a backbone outage leaves many extents suspect)
+/// sits at the head of the eviction order. The extent behind them is
+/// still evicted by the next drain; the kept copies stay.
+#[tokio::test(flavor = "current_thread")]
+async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
+    use velmora_bridge::jobs::EVICT_BATCH;
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let mut kept = Vec::new();
+    for i in 0..EVICT_BATCH {
+        kept.push(w.released_sized(&format!("k{i}"), i as u8, 1000).await);
+    }
+    let free = w.released_sized("free", 251, 1000).await;
+    w.align_clocks(&free).await;
+    let c = &w.bridge().catalog.sql.inner;
+    let now = w.bridge().clock.now();
+    for (i, o) in kept.iter().enumerate() {
+        let id = SqlValue::Text(o.extent.as_str().to_owned());
+        c.fixture_exec(
+            "UPDATE scrub_copies SET stat_loss_at = ?2 WHERE extent_id = ?1",
+            &[id.clone(), SqlValue::Int(now.0)],
+        )
+        .await
+        .unwrap();
+        c.fixture_exec(
+            "UPDATE extents SET last_read_at = ?2 WHERE id = ?1",
+            &[id, SqlValue::Int(1 + i as i64)],
+        )
+        .await
+        .unwrap();
+    }
+    c.fixture_exec(
+        "UPDATE extents SET last_read_at = ?2 WHERE id = ?1",
+        &[
+            SqlValue::Text(free.extent.as_str().to_owned()),
+            SqlValue::Int(1_000),
+        ],
+    )
+    .await
+    .unwrap();
+    w.bridge().jobs.inner.take();
+
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        !w.bridge()
+            .jobs
+            .inner
+            .take()
+            .iter()
+            .any(|s| matches!(s.job, Job::Evict { .. })),
+        "a batch that freed nothing sends no continuation"
+    );
+    // The next drain (the dispatcher's, once the tier is still over its
+    // cap) reaches the extent behind the kept ones.
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&free), "the extent behind them is evicted");
+    for o in &kept {
+        assert!(w.has_safety(o), "a copy with a loss on record stays");
     }
 }

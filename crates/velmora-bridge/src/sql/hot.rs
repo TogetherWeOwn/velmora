@@ -28,7 +28,9 @@
 //! The job asks once more right before it deletes the safety copy
 //! (`evict_safety_still_ok`). With `SCRUB` on, an extent whose loss the
 //! scrub has on record keeps its safety copy: the re-pin of that loss
-//! may need it, and the eviction then ends the cache fill's count only.
+//! may need it. The eviction then ends the cache fill's count only and
+//! moves the extent's read stamp to now, so a batch of such extents at
+//! the head of the order cannot hold up the ones behind them.
 //!
 //! The counts are not exact, and they are not a bound in either
 //! direction. Each error is limited to one extent's bytes and repairs
@@ -274,6 +276,33 @@ pub(super) async fn finish_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) 
     Ok(changed == 1)
 }
 
+/// An eviction that kept the safety copy (`evict_safety_still_ok` said
+/// no while no re-pin moved the sequence): the cache fill stops being
+/// counted, the safety copy stays counted, and `last_read_at` moves to
+/// now, so the next listing reaches the extents behind it.
+const FINISH_EVICT_KEPT: &str =
+    "UPDATE extents SET hot_cache_bytes = 0, last_read_at = ?3, evict_seq = evict_seq + 1 \
+         WHERE id = ?1 AND evict_seq = ?2";
+
+pub(super) async fn finish_evict_kept<S: Sql>(
+    c: &SqlCatalog<S>,
+    x: &EvictCandidate,
+    now: UnixMs,
+) -> Result<bool> {
+    let changed = c
+        .sql
+        .exec(
+            FINISH_EVICT_KEPT,
+            &[
+                text(x.extent.as_str()),
+                int(x.seq.saturating_add(1))?,
+                ms(now),
+            ],
+        )
+        .await?;
+    Ok(changed == 1)
+}
+
 /// Counts the extent's cache fill and stamps the read that caused it.
 /// Called before the write (so that a request cancelled right after the
 /// write leaves a counted blob) and again after it (so that an eviction
@@ -494,6 +523,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
         (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
         (EVICT_SAFETY_STILL_OK_SCRUB.to_owned(), vec![T, I]),
+        (FINISH_EVICT_KEPT.to_owned(), vec![T, I, I]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

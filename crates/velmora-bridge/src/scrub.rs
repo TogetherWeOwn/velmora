@@ -1356,6 +1356,11 @@ where
                 there = self.put_safety(extent, cipher.clone()).await
                     && matches!(self.safety.head(&key).await, Ok(Some(_)));
             }
+            // Right after the PUTs, before any other write can fail.
+            let collected = match wrote {
+                true => self.collect_if_unreferenced(extent).await,
+                false => Ok(()),
+            };
             walk.run.repaired += 1;
             crate::trace::alert(|| {
                 format!(
@@ -1380,9 +1385,7 @@ where
                     .plus_ms(i64::try_from(confirm * 1000).unwrap_or(i64::MAX));
                 self.catalog.scrub_defer(token, &extent.id, next).await?;
             }
-            if wrote {
-                self.collect_if_unreferenced(extent).await?;
-            }
+            collected?;
             return Ok(());
         }
         // A refusal or a failed safety GET is not permission to delete:

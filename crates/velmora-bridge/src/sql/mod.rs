@@ -1104,6 +1104,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
     }
+    async fn finish_evict_kept(&self, x: &EvictCandidate, now: UnixMs) -> Result<bool> {
+        hot::finish_evict_kept(self, x, now).await
+    }
     async fn evict_safety_still_ok(&self, x: &EvictCandidate, scrub: bool) -> Result<bool> {
         hot::evict_safety_still_ok(self, x, scrub).await
     }
@@ -1248,7 +1251,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 374, "background inventory entry count");
+        assert_eq!(statements.len(), 375, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

@@ -1721,6 +1721,17 @@ pub trait Catalog {
     /// Ends an eviction after the blob deletes. `false` when a hot copy
     /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Ends an eviction that kept the safety copy (the scrub has a loss
+    /// of the extent on record): only the cache fill stops being counted,
+    /// and the extent's read stamp moves to `now`, so it leaves the head
+    /// of the eviction order. `false` as for [`Catalog::finish_evict`].
+    async fn finish_evict_kept(&self, x: &EvictCandidate, _now: UnixMs) -> Result<bool> {
+        let cache_only = EvictCandidate {
+            pinned: true,
+            ..x.clone()
+        };
+        self.finish_evict(&cache_only).await
+    }
     /// Asked right before the safety copy of a started eviction is
     /// deleted: `false` once the extent is pinned again or its sequence
     /// moved since `begin_evict` (a re-pin), and, with `scrub` (`SCRUB`
