@@ -39,26 +39,7 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
     }
     ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
     let body = if let Some(raw) = req.inner().body() {
-        // Keep the wire length for the consumer. The admission budget uses
-        // the decoded length for aws-chunked, so framing must not enlarge
-        // the buffer beyond that length. The decoded length still bounds
-        // the buffer when an aws-chunked upload omits its wire length.
-        let (declared_len, read_len) = match ingress::upload_lengths(&headers, u64::MAX) {
-            Ok(lengths) => (
-                lengths.encoded,
-                Some(
-                    lengths
-                        .decoded
-                        .min(lengths.encoded.unwrap_or(lengths.decoded)),
-                ),
-            ),
-            // Other operations need not declare a length. Invalid headers
-            // are still rejected by the existing consumer checks.
-            Err(_) => {
-                let declared = ingress::declared_length(&headers).unwrap_or(None);
-                (declared, declared)
-            }
-        };
+        let (declared_len, read_len) = body_lengths(&method, &headers);
         let stream: velmora_bridge::ByteStream = match ByobReads::new(&raw, read_len) {
             Some(reads) => Box::pin(pieces(reads)),
             // Not a byte stream: the runtime's default reader.
@@ -94,6 +75,34 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
 /// (`ingress::STREAM_ITEM_ALLOWANCE`).
 const BODY_READ: u32 = velmora::media::PLAIN_CHUNK_SIZE as u32;
 const BODY_PROBE: u32 = 4096;
+
+/// Wire length for the consumer and length to size the BYOB reader.
+/// A reader length of `None` is a single-read body-presence probe.
+fn body_lengths(method: &Method, headers: &[(String, String)]) -> (Option<u64>, Option<u64>) {
+    let wire_len = || ingress::declared_length(headers).unwrap_or(None);
+    // The two object PUT handlers dispatch to CopyObject or UploadPartCopy
+    // on presence of this header. Those operations only probe for a body
+    // and take no body charge; upload framing must not select their reader.
+    if matches!(method, Method::Put)
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-copy-source"))
+    {
+        return (wire_len(), None);
+    }
+    match ingress::upload_lengths(headers, u64::MAX) {
+        // The admission budget uses the decoded length for aws-chunked,
+        // including when the wire length was omitted.
+        Ok(ingress::UploadLengths { encoded, decoded }) => {
+            (encoded, Some(decoded.min(encoded.unwrap_or(decoded))))
+        }
+        // Invalid headers are still rejected by existing consumer checks.
+        Err(_) => {
+            let wire = wire_len();
+            (wire, wire)
+        }
+    }
+}
 
 fn body_read_cap(declared_len: Option<u64>) -> u32 {
     match declared_len {
@@ -475,6 +484,19 @@ mod tests {
     #[test]
     fn one_read_fits_the_item_allowance() {
         assert!(u64::from(BODY_READ) <= velmora_bridge::ingress::STREAM_ITEM_ALLOWANCE);
+    }
+
+    #[test]
+    fn copy_uses_a_body_presence_probe_regardless_of_upload_framing() {
+        let mut headers = vec![
+            ("content-encoding".into(), "aws-chunked".into()),
+            ("x-amz-decoded-content-length".into(), "65536".into()),
+        ];
+        assert_eq!(body_lengths(&Method::Put, &headers), (None, Some(65_536)));
+        headers.push(("X-Amz-Copy-Source".into(), "/bucket/key".into()));
+        assert_eq!(body_lengths(&Method::Put, &headers), (None, None));
+        headers.push(("Content-Length".into(), "0".into()));
+        assert_eq!(body_lengths(&Method::Put, &headers), (Some(0), None));
     }
 
     #[test]

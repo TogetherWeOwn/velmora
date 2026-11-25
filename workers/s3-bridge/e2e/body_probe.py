@@ -143,24 +143,32 @@ def main():
     )
     print("BYOB probe: allocation and surplus checks passed")
 
+    copy_timeouts = []
+    for_copy = {"x-amz-copy-source": f"/{bucket}/w/byob-cap-1"}
+    copy_framing = {
+        "content-encoding": "aws-chunked",
+        "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        "x-amz-decoded-content-length": "65536",
+        "x-amz-trailer": "x-amz-checksum-crc32",
+    }
+
     def reject_open_copy(key, operation, query=()):
-        headers = {
-            "transfer-encoding": "chunked",
-            "x-amz-copy-source": f"/{bucket}/w/byob-cap-1",
-        }
-        with send("PUT", key, headers, query=query) as conn:
-            # Send one byte and keep the socket open without a final chunk.
-            conn.send(b"1\r\nx\r\n")
-            conn.sock.settimeout(3)
-            try:
-                response = conn.getresponse()
-                status, body = response.status, response.read()
-            except TimeoutError:
-                raise AssertionError(f"{operation}: no response while the one-byte body stayed open") from None
-            assert status == 400 and b"<Code>InvalidRequest</Code>" in body, (
-                f"{operation}: wanted 400 InvalidRequest while the body stayed open, got HTTP {status}"
-            )
-        print(f"BYOB probe: {operation} refused one byte without waiting for EOF")
+        for name, framing in ((operation, {}), (f"{operation} with aws-chunked headers", copy_framing)):
+            headers = {"transfer-encoding": "chunked", **for_copy, **framing}
+            with send("PUT", key, headers, query=query) as conn:
+                # Send one byte and keep the socket open without a final chunk.
+                conn.send(b"1\r\nx\r\n")
+                conn.sock.settimeout(3)
+                try:
+                    response = conn.getresponse()
+                    status, body = response.status, response.read()
+                except TimeoutError:
+                    copy_timeouts.append(f"{name}: no response while the one-byte body stayed open")
+                    continue
+                assert status == 400 and b"<Code>InvalidRequest</Code>" in body, (
+                    f"{name}: wanted 400 InvalidRequest while the body stayed open, got HTTP {status}"
+                )
+            print(f"BYOB probe: {name} refused one byte without waiting for EOF")
 
     reject_open_copy("w/byob-open-copy", "CopyObject")
 
@@ -196,6 +204,7 @@ def main():
         response = conn.getresponse()
         assert response.status == 204, f"AbortMultipartUpload: wanted 204, got {response.status}"
     print("BYOB probe: disconnected UploadPart mid-fill; reader cancelled, no part published")
+    assert not copy_timeouts, "; ".join(copy_timeouts)
 
 
 if __name__ == "__main__":
