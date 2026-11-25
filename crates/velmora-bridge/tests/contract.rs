@@ -273,7 +273,8 @@ fn config_loads_from_documented_vars() {
         ConfigError::Invalid("S3_HOST".into())
     );
 
-    let cfg = load(&with_secrets(prod, &prod_providers())).unwrap();
+    let prod = with_secrets(prod, &prod_providers());
+    let cfg = load(&prod).unwrap();
     assert_eq!(cfg.environment, Environment::Prod);
     assert_eq!(cfg.s3_host, PROD_HOST_FIXTURE);
     assert_eq!(cfg.required_backbones, 2);
@@ -299,7 +300,12 @@ fn config_loads_from_documented_vars() {
     assert_eq!(cfg.gc_mode, GcMode::Off);
     assert_eq!(cfg.hot_cap_bytes, 100 * 1024 * 1024 * 1024);
     assert_eq!(cfg.hot_cap_bytes, DEFAULT_HOT_CAP_BYTES);
-    assert_eq!(cfg.maintenance, Maintenance::Off);
+    let expected_maintenance = match prod["MAINTENANCE"].as_str() {
+        "off" => Maintenance::Off,
+        "restore" => Maintenance::Restore,
+        value => panic!("undocumented MAINTENANCE value: {value:?}"),
+    };
+    assert_eq!(cfg.maintenance, expected_maintenance);
     assert!(cfg.server_side_copy);
     assert!(cfg.packed_plans);
     // No parity until it is turned on.

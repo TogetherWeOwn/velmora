@@ -5,8 +5,9 @@
 //! stores and a real NNTP client talking to the in-process fake server,
 //! with the variables of the production `[vars]` of `wrangler.toml`
 //! (VERIFY_MODE, PACKED_PLANS, REQUIRED_BACKBONES, SAFETY_MIN_AGE_SECS,
-//! MAX_PUT_BYTES, ...). Every port is wrapped by a meter that charges what
-//! crosses it to the operation or stage that is running:
+//! MAX_PUT_BYTES, ...) and local overrides (including `MAINTENANCE=off`).
+//! Every port is wrapped by a meter that charges what crosses it to the
+//! operation or stage that is running:
 //!
 //! - D1: calls (round trips), statements, batches, rows returned, and rows
 //!   written as D1 bills them (the meter of `tests/rows_written.rs`). The
@@ -527,6 +528,8 @@ fn overrides(server: &TestNntpServer) -> Vec<(&'static str, String)> {
         ("ENVIRONMENT", "dev".into()),
         ("S3_HOST", HOST.into()),
         ("NEWSGROUPS", GROUP.into()),
+        // The benchmark measures successful writes even during a production restore.
+        ("MAINTENANCE", "off".into()),
         // Production runs light verification (a deployment variable).
         ("VERIFY_MODE", "light".into()),
         // Production has GC off; the sweep stage is measured on a
