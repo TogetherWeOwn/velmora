@@ -182,8 +182,9 @@ fn fill_gave(filled: u32, done: bool) -> FillGave {
 /// full buffer is copied once into a piece.
 struct ByobReads {
     reader: ByobReader,
-    /// The runtime buffer; a fill transfers it and hands it back. `None`
-    /// after the end or a failure, and while a fill is under way.
+    /// The runtime buffer, allocated on the first poll. A fill transfers
+    /// it and hands it back. `settled` distinguishes a terminal `None`
+    /// from the initial state.
     buffer: Option<worker::js_sys::ArrayBuffer>,
     /// The body ended or failed: there is nothing left to cancel.
     settled: bool,
@@ -202,7 +203,7 @@ impl ByobReads {
                 .unchecked_ref::<ByteBody>()
                 .byob_reader(&options)
                 .ok()?,
-            buffer: Some(worker::js_sys::ArrayBuffer::new(BODY_READ)),
+            buffer: None,
             settled: false,
             ended: false,
         })
@@ -223,10 +224,15 @@ impl PieceReads for ByobReads {
     async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
         use worker::wasm_bindgen::JsCast;
         let failed = || BridgeError::Invalid("request body stream");
-        // No buffer: the body ended with the last piece, or failed.
-        let Some(buffer) = self.buffer.take() else {
+        if self.settled {
             return if self.ended { Ok(None) } else { Err(failed()) };
-        };
+        }
+        // The upload holds its stream charge before polling. Opening the
+        // reader earlier must not allocate a buffer outside that charge.
+        let buffer = self
+            .buffer
+            .take()
+            .unwrap_or_else(|| worker::js_sys::ArrayBuffer::new(BODY_READ));
         let promise = fill_body(&self.reader, buffer).map_err(|_| failed())?;
         let filled = worker::wasm_bindgen_futures::JsFuture::from(promise).await;
         // A fill that failed or ended leaves nothing to cancel; a piece
@@ -430,5 +436,18 @@ mod tests {
     #[test]
     fn one_read_fits_the_item_allowance() {
         assert!(u64::from(BODY_READ) <= velmora_bridge::ingress::STREAM_ITEM_ALLOWANCE);
+    }
+
+    #[test]
+    fn opening_the_reader_does_not_allocate_the_body_buffer() {
+        // This wiring runs before admission; the JS constructor itself
+        // cannot be called from the native unit-test binary.
+        let source = include_str!("http.rs");
+        let (_, reader_impl) = source.split_once("impl ByobReads {").unwrap();
+        let (constructor, _) = reader_impl.split_once("\n}\n").unwrap();
+        assert!(
+            !constructor.contains("ArrayBuffer::new"),
+            "the body buffer must be allocated only when the admitted stream is polled"
+        );
     }
 }
