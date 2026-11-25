@@ -31,7 +31,9 @@ LIMIT = 2**53 - 1
 
 
 def migrations(db):
-    files = sorted((BRIDGE / "migrations").glob("*.sql"))
+    # The cutover copy protocol targets the 0001/0002 PostgreSQL baseline,
+    # which is frozen at D1 0027. Later migrations apply only after cutover.
+    files = sorted(p for p in (BRIDGE / "migrations").glob("*.sql") if int(p.name[:4]) <= 27)
     assert [int(p.name[:4]) for p in files] == [*range(1, 23), 25, 26, 27]
     for path in files:
         db.executescript(path.read_text())

@@ -267,6 +267,15 @@ macro_rules! open_row {
     };
 }
 
+const ENQUEUE_SCRUB_SAFETY: &str = concat!(
+    "INSERT INTO gc(extent_id, action, due_at) \
+     SELECT e.id, 'delete_safety', ?2 FROM extents e \
+     JOIN buckets b ON b.id = e.bucket_id \
+     WHERE e.id = ?1 AND e.generation_id IS NOT NULL \
+       AND b.disposable = 1 AND NOT ",
+    in_use!()
+);
+
 /// The old row may already have deleted its blob, even if it is still
 /// open. Insert a new row with its own ID so completing the old delete
 /// cannot close this one. `gc_begin` rechecks the references at execution.
@@ -275,20 +284,12 @@ pub(super) async fn gc_enqueue_scrub_safety<S: Sql>(
     extent: &ExtentId,
     now: UnixMs,
 ) -> Result<()> {
-    let insert = concat!(
-        "INSERT INTO gc(extent_id, action, due_at) \
-         SELECT e.id, 'delete_safety', ?2 FROM extents e \
-         JOIN buckets b ON b.id = e.bucket_id \
-         WHERE e.id = ?1 AND e.generation_id IS NOT NULL \
-           AND b.disposable = 1 AND NOT ",
-        in_use!()
-    );
     let params = [text(extent.as_str()), ms(now)];
     // Scrub will not visit a retired extent again. Retry once on error;
     // if the first insert committed but lost its reply, both rows are
     // safe to run: each rechecks references before an idempotent delete.
-    if c.sql.exec(insert, &params).await.is_err() {
-        c.sql.exec(insert, &params).await?;
+    if c.sql.exec(ENQUEUE_SCRUB_SAFETY, &params).await.is_err() {
+        c.sql.exec(ENQUEUE_SCRUB_SAFETY, &params).await?;
     }
     Ok(())
 }
@@ -871,6 +872,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (CLAIM_IN_BUCKET.to_owned(), vec![T, I, I, T]),
         (GUARD_BUCKET_FOUND_CLEAN_PG.to_owned(), vec![T, I]),
         (GC_DUE.to_owned(), vec![I, I, I]),
+        (ENQUEUE_SCRUB_SAFETY.to_owned(), vec![T, I]),
         (MARK_KEY_GC_DONE.to_owned(), vec![I, I]),
         (GC_OPEN_QUERY.to_owned(), vec![T, I, T]),
         (CLEAR_DELETED_CACHE.to_owned(), vec![T]),

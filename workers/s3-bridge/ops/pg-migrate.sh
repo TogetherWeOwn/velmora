@@ -18,6 +18,7 @@ import time
 
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
+CUTOVER_BASELINE = '0002'
 W1 = 7413000001
 MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
@@ -96,7 +97,7 @@ def sql_files(root):
     return result
 
 
-def coverage(files, d1):
+def coverage(files, d1, *, require_all=True):
     covered = set()
     for name, body in files.values():
         for selection, expected in re.findall(
@@ -127,11 +128,13 @@ def coverage(files, d1):
                 die(f'duplicate D1 coverage: {version}')
             covered.add(version)
     missing = d1.keys() - covered
-    if missing:
+    if require_all and missing:
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
     if not covered:
         die('no D1 migration coverage found')
-    print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
+    if require_all:
+        print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
+    return covered
 
 
 def lock_key(raw, setting):
@@ -380,6 +383,13 @@ def compare(actual, d1, migrations):
                 if idx == 'extents_evictable':
                     keys[0] = ('last_read_at', False, True)
                 index_sql = db.execute('SELECT sql FROM sqlite_master WHERE name=?', (idx,)).fetchone()[0]
+                if any(col is None for col, _, _ in keys):
+                    if (idx != 'scrub_copies_due' or keys != [('backbone', False, False),
+                            (None, False, False), ('extent_id', False, False)] or not re.fullmatch(
+                            r'CREATE INDEX scrub_copies_due ON scrub_copies\(backbone, MIN\(stat_at, full_at\), extent_id\)',
+                            index_sql, re.I)):
+                        die(f'new D1 index expression on {idx} requires an explicit translation')
+                    keys[1] = (predicate('LEAST(stat_at, full_at)'), False, False)
                 where = re.split(r'\bWHERE\b', index_sql, maxsplit=1, flags=re.I)[-1] if index_sql else None
                 if where == index_sql:
                     where = None
@@ -389,13 +399,18 @@ def compare(actual, d1, migrations):
             for key, seq, target, src, dst, update, delete, match in db.execute(
                 'SELECT * FROM pragma_foreign_key_list(?)', (table,)
             ):
-                if (update, delete, match) != ('NO ACTION', 'NO ACTION', 'NONE'):
+                if (table, target, src, dst, update, delete, match) == (
+                        'scrub_copies', 'extents', 'extent_id', 'id', 'NO ACTION', 'CASCADE', 'NONE'):
+                    on_delete = 'c'
+                elif (update, delete, match) == ('NO ACTION', 'NO ACTION', 'NONE'):
+                    on_delete = 'a'
+                else:
                     die(f'new D1 foreign-key actions on {table} require an explicit translation')
-                fks[key].append((seq, target, src, dst))
+                fks[key].append((seq, target, src, dst, on_delete))
             for rows in fks.values():
                 rows.sort()
                 expected['foreign_keys'].add((table, rows[0][1], tuple(r[2] for r in rows),
-                                              tuple(r[3] for r in rows), 'a', 'a', 's', True))
+                                              tuple(r[3] for r in rows), 'a', rows[0][4], 's', True))
         elif typ == 'trigger':
             timing, event, updates = re.search(
                 r'\b(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([a-z_0-9,\s]+?))?\s+ON\b', sql, re.I
@@ -418,7 +433,10 @@ def compare(actual, d1, migrations):
                          for r in (actual['columns'] or ())}
     explicit = {r[1] for r in expected['indexes'] if not r[1].startswith('<')}
     actual['indexes'] = {(t, '<pk>' if pk else '<unique>' if uq and i not in explicit else i,
-                          pk, uq, valid, method, tuple(map(tuple, keys)), predicate(where))
+                          pk, uq, valid, method,
+                          tuple((predicate(key) if i == 'scrub_copies_due' and pos == 1 else key,
+                                 desc, nulls) for pos, (key, desc, nulls) in enumerate(keys)),
+                          predicate(where))
                          for t, i, pk, uq, valid, method, keys, where in (actual['indexes'] or ())}
     actual['foreign_keys'] = {tuple(r[:2]) + (tuple(r[2]), tuple(r[3])) + tuple(r[4:])
                               for r in (actual['foreign_keys'] or ())}
@@ -483,12 +501,15 @@ def test_triggers(run, begin, history, complete, d1):
 
 
 def main():
-    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --verify | --test] '
+    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE '
+                                     '[--to NNNN | --verify | --verify-cutover-baseline | --test] '
                                      '[--import-mode | --activate], or %(prog)s --check-migrations')
     p.add_argument('env_file', nargs='?')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--to')
     mode.add_argument('--verify', action='store_true')
+    mode.add_argument('--verify-cutover-baseline', action='store_true',
+                      help='verify only the immutable PostgreSQL 0001/0002 cutover schema')
     mode.add_argument('--test', action='store_true')
     mode.add_argument('--check-migrations', action='store_true')
     activation = p.add_mutually_exclusive_group()
@@ -509,12 +530,21 @@ def main():
             p.error('--check-migrations does not take a connection file or other flags')
         coverage(files, d1)
         return
-    if not args.env_file or ((args.verify or args.test) and (args.activate or args.import_mode)):
-        p.error('provide a connection file; --verify and --test do not change migration or activation state')
-    target = max(files) if args.to is None else args.to
+    if not args.env_file or ((args.verify or args.verify_cutover_baseline or args.test)
+                             and (args.activate or args.import_mode)):
+        p.error('verification and testing require a connection file and do not allow activation or import flags')
+    latest = CUTOVER_BASELINE if args.import_mode else max(files)
+    target = latest if args.to is None else args.to
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
+    if args.import_mode and target > CUTOVER_BASELINE:
+        p.error('--import-mode applies only the cutover baseline (0001/0002)')
     coverage(files, d1)
+    if args.verify_cutover_baseline:
+        files = {v: body for v, body in files.items() if v <= CUTOVER_BASELINE}
+        migrations = {v: migration for v, migration in migrations.items() if v in files}
+        covered = coverage(files, d1, require_all=False)
+        d1 = {v: body for v, body in d1.items() if v in covered}
     env, schema, lock, migration_lock = connection(args.env_file)
     print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
     prefix = f'''SET search_path TO "{schema}", pg_temp;
@@ -565,7 +595,7 @@ SET client_min_messages = error;
     verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
                   + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
                   + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
-    if args.verify:
+    if args.verify or args.verify_cutover_baseline:
         compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
         return
     if args.test:

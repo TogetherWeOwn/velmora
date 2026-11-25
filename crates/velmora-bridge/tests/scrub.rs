@@ -88,6 +88,13 @@ async fn server() -> TestNntpServer {
 }
 
 async fn world_with(tune: impl FnOnce(&mut velmora_bridge::config::BridgeConfig)) -> World {
+    world_on(false, tune).await
+}
+
+async fn world_on(
+    sqlite_only: bool,
+    tune: impl FnOnce(&mut velmora_bridge::config::BridgeConfig),
+) -> World {
     velmora_bridge::trace::log_alerts(note_alert);
     ALERTS.with(|a| a.borrow_mut().clear());
     let servers = [server().await, server().await];
@@ -98,7 +105,11 @@ async fn world_with(tune: impl FnOnce(&mut velmora_bridge::config::BridgeConfig)
     cfg.required_backbones = 2;
     cfg.scrub.on = true;
     tune(&mut cfg);
-    let rig = rig_with(TcpConnector::default(), cfg);
+    let rig = if sqlite_only {
+        rig_with(TcpConnector::default(), cfg)
+    } else {
+        rig_with_selected(TcpConnector::default(), cfg)
+    };
     rig.bridge
         .catalog
         .seed_permits(&rig.bridge.cfg.providers)
@@ -214,7 +225,8 @@ impl World {
             .unwrap();
         c.scrub_free(token, now).await.unwrap();
         c.sql
-            .exec(
+            .inner
+            .fixture_exec(
                 "UPDATE scrub_copies SET stat_at = ?2, full_at = ?3, stat_phase_at = ?2, full_phase_at = ?3 WHERE extent_id = ?1",
                 &[
                     SqlValue::Text(o.extent.as_str().to_owned()),
@@ -227,7 +239,7 @@ impl World {
     }
 
     async fn set_clocks(&self, o: &Obj, backbone: &str, stat_at: UnixMs, full_at: UnixMs) {
-        self.bridge().catalog.sql.exec(
+        self.bridge().catalog.sql.inner.fixture_exec(
             "UPDATE scrub_copies SET stat_at = ?3, full_at = ?4, stat_phase_at = ?3, full_phase_at = ?4 WHERE extent_id = ?1 AND backbone = ?2",
             &[SqlValue::Text(o.extent.as_str().to_owned()), SqlValue::Text(backbone.to_owned()), SqlValue::Int(stat_at.0), SqlValue::Int(full_at.0)],
         ).await.unwrap();
@@ -246,7 +258,8 @@ impl World {
             .bridge()
             .catalog
             .sql
-            .query(
+            .inner
+            .fixture_query(
                 "SELECT stat_at, full_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = ?2",
                 &[
                     SqlValue::Text(o.extent.as_str().to_owned()),
@@ -339,7 +352,8 @@ impl World {
             .bridge()
             .catalog
             .sql
-            .query(sql, &[SqlValue::Text(extent.as_str().to_string())])
+            .inner
+            .fixture_query(sql, &[SqlValue::Text(extent.as_str().to_string())])
             .await
             .unwrap();
         match rows.first().and_then(|r| r.first()) {
@@ -348,6 +362,19 @@ impl World {
             Some(SqlValue::Null) | None => "NULL".to_string(),
             Some(other) => panic!("unexpected {other:?}"),
         }
+    }
+
+    async fn scrub_failures(&self, o: &Obj) -> Vec<String> {
+        let rows = self.bridge().catalog.sql.inner.fixture_query(
+            "SELECT backbone FROM verifications WHERE extent_id = ?1 AND provider_id = 'scrub' ORDER BY backbone",
+            &[SqlValue::Text(o.extent.as_str().into())],
+        ).await.unwrap();
+        rows.into_iter()
+            .map(|row| match &row[..] {
+                [SqlValue::Text(backbone)] => backbone.clone(),
+                _ => panic!("unexpected verification row"),
+            })
+            .collect()
     }
 
     async fn stage(&self, o: &Obj) -> String {
@@ -589,9 +616,7 @@ async fn a_copy_pass_cannot_clear_or_confirm_another_backbones_loss() {
         .await;
     w.hide(1, &o, 1).await;
     assert_eq!(w.scrub().await.repaired, 1);
-    assert_eq!(w.scalar(
-        "SELECT group_concat(backbone) FROM verifications WHERE extent_id = ?1 AND provider_id = 'scrub'", &o.extent,
-    ).await, "alpha,beta");
+    assert_eq!(w.scrub_failures(&o).await, ["alpha", "beta"]);
     assert_eq!(
         w.scalar(
             "SELECT stat_loss_at FROM scrub_copies WHERE extent_id = ?1 AND backbone = 'beta'",
@@ -696,7 +721,7 @@ async fn clean_checks_clear_only_the_observed_backbones_incident() {
     let later = now.plus_secs(DAY_SECS);
     w.set_clocks(&o, "alpha", now, later).await;
     w.set_clocks(&o, "beta", later, later).await;
-    w.bridge().catalog.sql.exec(
+    w.bridge().catalog.sql.inner.fixture_exec(
         r#"UPDATE scrub_state SET last_incident = '["alpha","beta"]', incident_clean_by = '[["alpha",7],["beta",7]]'"#,
         &[],
     ).await.unwrap();
@@ -711,7 +736,7 @@ async fn enrollment_preserves_a_legacy_pending_loss_as_full_work() {
     let w = world().await;
     let o = w.released_unenrolled("legacy-loss", 12).await;
     let now = w.bridge().clock.now();
-    w.bridge().catalog.sql.exec(
+    w.bridge().catalog.sql.inner.fixture_exec(
         "UPDATE extents SET scrub_result='suspect', last_scrubbed_at=?2, scrub_next_at=?2 WHERE id=?1",
         &[SqlValue::Text(o.extent.as_str().into()), SqlValue::Int(now.0)],
     ).await.unwrap();
@@ -798,7 +823,8 @@ async fn a_single_body_failure_does_not_upgrade_a_stat_incident() {
     w.bridge()
         .catalog
         .sql
-        .exec(
+        .inner
+        .fixture_exec(
             r#"UPDATE scrub_state SET last_incident = '["beta"]', incident_clean = 7"#,
             &[],
         )
@@ -1004,7 +1030,7 @@ async fn a_loss_with_no_intact_copy_anywhere_is_unrecoverable_and_alerted() {
 /// A busy backbone cannot complete its check or block later healthy work.
 #[tokio::test(flavor = "current_thread")]
 async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
-    let w = world_with(|cfg| {
+    let w = world_on(true, |cfg| {
         for p in &mut cfg.providers {
             p.max_conns = 1;
             p.drill_conns = 0;
@@ -1031,7 +1057,7 @@ async fn a_provider_without_a_free_slot_defers_only_its_own_check() {
         .await
         .unwrap();
     assert!(held.is_some());
-    let db = &w.bridge().catalog.sql.inner;
+    let db = w.bridge().catalog.sql.inner.sqlite();
     db.meter_writes().unwrap();
     let before = db.writes();
     let beta_due = w.clocks(&o, "beta").await;
@@ -1337,7 +1363,8 @@ async fn an_extent_of_a_deleted_object_is_skipped_and_not_re_pinned() {
     // Once GC has marked it deleted, remove its indexed schedules.
     catalog
         .sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE extents SET safety_state = 'deleted' WHERE id = ?1",
             &[SqlValue::Text(o.extent.as_str().into())],
         )
@@ -1360,21 +1387,33 @@ async fn an_extent_of_a_deleted_object_is_skipped_and_not_re_pinned() {
 async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
     let w = world().await;
     let c = &w.bridge().catalog;
-    c.sql.exec(
+    let db = &c.sql.inner;
+    let seed = db.fixture(
         "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) \
          INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
          SELECT printf('fixture-%05d', x), ?1, 'committed', 1, 65, zeroblob(48), zeroblob(16), zeroblob(32), zeroblob(32), 'released', 0 FROM n",
-        &[SqlValue::Text(w.bucket.id.as_str().to_owned())],
-    ).await.unwrap();
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at) \
+         SELECT 'fixture-' || lpad(CAST(x AS text), 5, '0'), ?1, 'committed', 1, 65, \
+           decode(repeat('00', 48), 'hex'), decode(repeat('00', 16), 'hex'), \
+           decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), 'released', 0 \
+         FROM generate_series(1, 20000) x",
+    );
+    db.fixture_exec(seed, &[SqlValue::Text(w.bucket.id.as_str().to_owned())])
+        .await
+        .unwrap();
     c.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at,stat_phase_at,full_phase_at) \
          SELECT id, 'alpha', 0, 100, 0, 100 FROM extents",
             &[],
         )
         .await
         .unwrap();
-    c.sql.inner.reset_read_stats();
+    if db.dialect() == Dialect::Sqlite {
+        let sqlite = db.sqlite();
+        sqlite.reset_read_stats();
+    }
     let due = c
         .scrub_due(&["alpha".into()], UnixMs(0), u32::MAX)
         .await
@@ -1382,12 +1421,60 @@ async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
     assert_eq!(due.len(), 8);
     assert_eq!(due[0].extent.id.as_str(), "fixture-00001");
     assert_eq!(due[7].extent.id.as_str(), "fixture-00008");
-    let reads = c.sql.inner.read_stats();
-    assert_eq!((reads.queries, reads.rows), (2, 8));
-    assert!(
-        reads.vm_steps < 1000,
-        "an index page, not a scan: {reads:?}"
-    );
+    if db.dialect() == Dialect::Sqlite {
+        let sqlite = db.sqlite();
+        let reads = sqlite.read_stats();
+        assert_eq!((reads.queries, reads.rows), (2, 8));
+        assert!(
+            reads.vm_steps < 1000,
+            "an index page, not a scan: {reads:?}"
+        );
+    }
+    #[cfg(feature = "testkit-pg")]
+    if let Some(pg) = db.postgres() {
+        let client = pg.client().await.unwrap();
+        client
+            .batch_execute(
+                "UPDATE extents SET scrub_enrolled = 1 WHERE id < 'fixture-00201'; \
+             UPDATE extents SET scrub_next_at = 0 WHERE id < 'fixture-00201'; \
+             UPDATE extents SET safety_state = 'held' WHERE id >= 'fixture-00401'; \
+             ANALYZE extents; ANALYZE scrub_copies;",
+            )
+            .await
+            .unwrap();
+        let binds: [&[&(dyn tokio_postgres::types::ToSql + Sync)]; 4] = [
+            &[&"alpha", &0i64, &8i64],
+            &[&0i64, &8i64],
+            &[&"", &128i64],
+            &[&"", &128i64],
+        ];
+        for ((query, args), index) in velmora_bridge::sql::scrub_range_queries(Dialect::Postgres)
+            .into_iter()
+            .zip(binds)
+            .zip([
+                "scrub_copies_due",
+                "extents_scrub_watch",
+                "extents_scrub_pending",
+                "extents_scrub_enrolled",
+            ])
+        {
+            let query = velmora_bridge::pg::normalize_statement(query).unwrap();
+            let rows = client
+                .query(&format!("EXPLAIN {query}"), args)
+                .await
+                .unwrap();
+            let plan = rows
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan.contains(index) && plan.contains("Index Cond:"),
+                "{plan}"
+            );
+            assert!(!plan.contains("Seq Scan"), "{plan}");
+        }
+    }
 }
 
 /// What a healthy check costs the catalogue in rows written, as D1
@@ -1397,13 +1484,13 @@ async fn due_work_is_bounded_even_when_twenty_thousand_copies_are_due() {
 /// to the next, so a run of more extents does not take more of them.
 #[tokio::test(flavor = "current_thread")]
 async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
-    let w = world().await;
+    let w = world_on(true, |_| {}).await;
     let mut objs = Vec::new();
     for i in 0..4u8 {
         objs.push(w.released(&format!("k{i}"), 60 + i).await);
     }
     w.advance_secs(31 * DAY_SECS);
-    let db = &w.bridge().catalog.sql.inner;
+    let db = w.bridge().catalog.sql.inner.sqlite();
     db.meter_writes().unwrap();
     let before = db.writes();
     let run = w.scrub().await;
@@ -1426,10 +1513,10 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
     // Everything else is the run's provider slots, kept across extents.
     assert_eq!(spent.billed(), extents + copies + state + slots);
     let one = {
-        let w = world().await;
+        let w = world_on(true, |_| {}).await;
         let _ = w.released("a", 70).await;
         w.advance_secs(31 * DAY_SECS);
-        let db = &w.bridge().catalog.sql.inner;
+        let db = w.bridge().catalog.sql.inner.sqlite();
         db.meter_writes().unwrap();
         let before = db.writes();
         assert_eq!(w.scrub().await.ok, 1);
@@ -1441,12 +1528,12 @@ async fn a_healthy_check_writes_its_result_and_the_run_its_slots() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn write_meter_separates_enrollment_from_independent_copy_checks() {
-    let w = world().await;
+    let w = world_on(true, |_| {}).await;
     let o = w.released_unenrolled("meter", 71).await;
     let c = &w.bridge().catalog;
     let now = w.bridge().clock.now();
     let interval = i64::from(DAY_SECS) * 1000;
-    let db = &c.sql.inner;
+    let db = c.sql.inner.sqlite();
     db.meter_writes().unwrap();
     let token = c.scrub_take(now, now.plus_secs(60)).await.unwrap().unwrap();
     let before = db.writes();
@@ -1496,7 +1583,8 @@ async fn under_an_incident_one_re_pin_a_run_and_unrecoverable_is_still_said() {
     w.bridge()
         .catalog
         .sql
-        .exec("UPDATE scrub_state SET last_incident = 'beta'", &[])
+        .inner
+        .fixture_exec("UPDATE scrub_state SET last_incident = 'beta'", &[])
         .await
         .unwrap();
     w.advance_secs(3600);
@@ -1625,7 +1713,8 @@ async fn incidents_on_two_backbones_block_both() {
     w.bridge()
         .catalog
         .sql
-        .exec("UPDATE scrub_state SET last_incident = '[\"alpha\"]'", &[])
+        .inner
+        .fixture_exec("UPDATE scrub_state SET last_incident = '[\"alpha\"]'", &[])
         .await
         .unwrap();
     w.advance_secs(31 * DAY_SECS);
@@ -1700,7 +1789,8 @@ async fn the_re_pin_is_refused_unless_released_done_and_live() {
     // Released, but its outbox row is not `done`.
     let o = w.released_unenrolled("a", 112).await;
     c.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE outbox SET stage = 'verify' WHERE extent_id = ?1",
             &[SqlValue::Text(o.extent.as_str().to_string())],
         )
@@ -1856,7 +1946,8 @@ async fn a_lasting_incident_is_not_cleared_by_short_runs() {
     w.bridge()
         .catalog
         .sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE scrub_state SET last_incident = '[\"beta\"]', incident_clean = 7",
             &[],
         )
@@ -1907,7 +1998,7 @@ async fn the_read_gets_the_slot_the_stat_session_held() {
 /// All scheduler listings use bounded ranges on their actual indexes.
 #[tokio::test(flavor = "current_thread")]
 async fn scheduler_queries_use_indexed_ranges_without_sorting() {
-    let w = world().await;
+    let w = world_on(true, |_| {}).await;
     use SqlValue::{Int, Text};
     let cases = [
         (
@@ -1921,12 +2012,19 @@ async fn scheduler_queries_use_indexed_ranges_without_sorting() {
             vec![Text(String::new()), Int(128)],
         ),
     ];
-    for (query, (index, bind)) in velmora_bridge::sql::scrub_range_queries()
+    for (query, (index, bind)) in velmora_bridge::sql::scrub_range_queries(Dialect::Sqlite)
         .into_iter()
         .zip(cases)
     {
         let sql = format!("EXPLAIN QUERY PLAN {query}");
-        let plan = w.bridge().catalog.sql.query(&sql, &bind).await.unwrap();
+        let plan = w
+            .bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_query(&sql, &bind)
+            .await
+            .unwrap();
         let text = format!("{plan:?}");
         assert!(text.contains("SEARCH ") && text.contains(index), "{text}");
         assert!(
@@ -1995,7 +2093,8 @@ async fn a_held_extent_whose_posting_is_done_is_not_re_pinned() {
     let o = w.released("a", 200).await;
     let c = &w.bridge().catalog;
     c.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1 WHERE id = ?1",
             &[SqlValue::Text(o.extent.as_str().to_string())],
         )
@@ -2023,7 +2122,8 @@ async fn the_re_pin_counts_the_copy_it_puts_back() {
     let o = w.released("a", 201).await;
     let c = &w.bridge().catalog;
     c.sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
             &[SqlValue::Text(o.extent.as_str().to_string())],
         )
@@ -2251,7 +2351,8 @@ async fn a_cache_sourced_copy_is_written_first_and_kept_when_refused() {
     w.bridge()
         .catalog
         .sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE outbox SET stage = 'verify' WHERE extent_id = ?1",
             &[SqlValue::Text(o.extent.as_str().to_string())],
         )
@@ -2515,7 +2616,8 @@ async fn clean_checks_count_across_runs() {
     w.bridge()
         .catalog
         .sql
-        .exec(
+        .inner
+        .fixture_exec(
             "UPDATE scrub_state SET last_incident = '[\"beta\"]', incident_clean = 7",
             &[],
         )
@@ -2534,7 +2636,8 @@ async fn a_run_that_fails_at_its_start_keeps_the_incidents() {
     w.bridge()
         .catalog
         .sql
-        .exec("UPDATE scrub_state SET last_incident = '[\"beta\"]'", &[])
+        .inner
+        .fixture_exec("UPDATE scrub_state SET last_incident = '[\"beta\"]'", &[])
         .await
         .unwrap();
     *w.bridge().catalog.sql.fail_matching.borrow_mut() =
@@ -2560,14 +2663,7 @@ async fn a_backbone_that_does_not_serve_what_it_says_it_holds_is_read_in_full() 
     assert_eq!(first.suspect, 1, "a loss, not ok");
     w.advance_secs(3600);
     assert_eq!(w.scrub().await.repaired, 1);
-    let failed = w
-        .scalar(
-            "SELECT group_concat(backbone) FROM verifications WHERE extent_id = ?1 \
-               AND provider_id = 'scrub'",
-            &o.extent,
-        )
-        .await;
-    assert_eq!(failed, "alpha");
+    assert_eq!(w.scrub_failures(&o).await, ["alpha"]);
     assert!(alerts().iter().any(|a| a.contains("lacking=[alpha]")));
 }
 

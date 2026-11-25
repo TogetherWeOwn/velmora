@@ -34,6 +34,18 @@ pub(crate) const STAGES: &[(&str, &str)] = &[
         "0003_usage_statement_triggers.sql",
         include_str!("../../../workers/s3-bridge/pg/0003_usage_statement_triggers.sql"),
     ),
+    (
+        "0004_scrub.sql",
+        include_str!("../../../workers/s3-bridge/pg/0004_scrub.sql"),
+    ),
+    (
+        "0005_scrub_cadence.sql",
+        include_str!("../../../workers/s3-bridge/pg/0005_scrub_cadence.sql"),
+    ),
+    (
+        "0006_scrub_indexes.sql",
+        include_str!("../../../workers/s3-bridge/pg/0006_scrub_indexes.sql"),
+    ),
 ];
 const SEED: &str = "INSERT INTO usage_global(id) VALUES (1),(2)";
 

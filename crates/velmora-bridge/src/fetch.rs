@@ -2889,6 +2889,7 @@ mod tests {
             room: std::rc::Rc::new(ByteBudget::new(0)),
             reserve: None,
             lacked: 0,
+            background: false,
         };
         let mut out = [None, None];
         let mut full = [false, false];

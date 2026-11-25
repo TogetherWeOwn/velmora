@@ -64,6 +64,7 @@ use crate::fetch::{
     ask_articles_together, cold_step_bytes, read_articles, ColdFetch, ColdReader, ColdStats,
 };
 use crate::jobtable::JOB_MAX_AGE_MS;
+use crate::plan::StoredPlan;
 use crate::pool::Pool;
 use crate::ports::PermitClass;
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
@@ -888,7 +889,16 @@ where
             .await
             .map_err(|_| Halt::Busy)?;
         let before = reader.stats();
-        let read = reader.fetch_planned(extent, plan).await?;
+        let read = reader
+            .fetch_planned(
+                extent,
+                StoredPlan {
+                    rows: plan,
+                    ..StoredPlan::default()
+                },
+                self.clock.now(),
+            )
+            .await?;
         let after = reader.stats();
         let interrupted = matches!(read, ColdFetch::Interrupted);
         let cipher = match read {
@@ -896,7 +906,7 @@ where
                 walk.run.bytes_read += extent.cipher_size;
                 Some(cipher)
             }
-            ColdFetch::Unavailable | ColdFetch::Interrupted => None,
+            ColdFetch::Unavailable | ColdFetch::Unrecoverable | ColdFetch::Interrupted => None,
             ColdFetch::Busy => return Err(Halt::Busy),
         };
         walk.run.refetched += after.refetched.saturating_sub(before.refetched);
@@ -1417,13 +1427,22 @@ where
         };
         let mut rewrote = false;
         if !kept {
-            let read = reader.fetch_planned(extent, plan).await;
+            let read = reader
+                .fetch_planned(
+                    extent,
+                    StoredPlan {
+                        rows: plan,
+                        ..StoredPlan::default()
+                    },
+                    self.clock.now(),
+                )
+                .await;
             let cipher = match read? {
                 ColdFetch::Filled(cipher) => {
                     walk.run.bytes_read += extent.cipher_size;
                     Some(cipher)
                 }
-                ColdFetch::Unavailable => {
+                ColdFetch::Unavailable | ColdFetch::Unrecoverable => {
                     reader.hang_up().await;
                     match self.cache.get(&extent.id.cache_key(), None).await {
                         Ok(Some(bytes)) if digest_ok(extent, &bytes) => Some(bytes),

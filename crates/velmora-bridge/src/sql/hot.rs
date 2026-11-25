@@ -199,6 +199,11 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
+const EVICT_SAFETY_STILL_OK: &str = concat!(
+    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    pinned!()
+);
+
 /// Whether the safety copy of an eviction that `begin_evict` started may
 /// still go: the extent is not pinned and nothing moved its sequence
 /// since the begin (a re-pin by the scrub moves it). Asked right before
@@ -211,10 +216,7 @@ pub(super) async fn evict_safety_still_ok<S: Sql>(
     let rows = c
         .sql
         .query(
-            concat!(
-                "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
-                pinned!()
-            ),
+            EVICT_SAFETY_STILL_OK,
             &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
         )
         .await?;
@@ -461,6 +463,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (CANDIDATES_PG.to_owned(), vec![I]),
         (BEGIN_EVICT_PINNED.to_owned(), vec![T, I, I, I]),
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
+        (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

@@ -8,24 +8,42 @@ use std::collections::{BTreeMap, HashMap};
 
 use sha2::{Digest, Sha256};
 
-use super::objects::{extent_row, ms, text, uint, Cols, Stmt, EXTENT_COLS};
+use super::objects::{extent_cols, extent_row, ms, text, uint, Cols, Stmt};
 use super::uploads::guarded;
 use super::SqlCatalog;
-use crate::ports::{Guard, Sql, SqlValue};
+use crate::ports::{Dialect, Guard, Sql, SqlValue};
 use crate::types::{
     BridgeError, ExtentId, Result, ScrubCandidate, ScrubCheck, ScrubResult, ScrubRun, ScrubState,
     UnixMs,
 };
 
 const ENROLL_PAGE: i64 = 128;
-const PENDING_SQL: &str = "SELECT id, COALESCE(released_at, created_at), \
-       CASE WHEN scrub_result IN ('suspect', 'unrecoverable', 'deferred') \
-            THEN COALESCE(scrub_next_at, last_scrubbed_at, created_at) END \
-     FROM extents INDEXED BY extents_scrub_pending \
-    WHERE safety_state = 'released' AND scrub_enrolled = 0 AND id > ?1 ORDER BY id LIMIT ?2";
-const BACKFILL_SQL: &str =
-    "SELECT id, COALESCE(released_at, created_at), NULL FROM extents INDEXED BY extents_scrub_enrolled \
-    WHERE scrub_enrolled = 1 AND safety_state <> 'deleted' AND id > ?1 ORDER BY id LIMIT ?2";
+const EXTENT_COLS: &str = extent_cols!();
+
+macro_rules! pending_sql {
+    ($index:literal) => {
+        concat!(
+            "SELECT id, COALESCE(released_at, created_at), \
+             CASE WHEN scrub_result IN ('suspect', 'unrecoverable', 'deferred') \
+                  THEN COALESCE(scrub_next_at, last_scrubbed_at, created_at) END \
+             FROM extents", $index,
+            " WHERE safety_state = 'released' AND scrub_enrolled = 0 AND id > ?1 ORDER BY id LIMIT ?2"
+        )
+    };
+}
+const PENDING: &str = pending_sql!(" INDEXED BY extents_scrub_pending");
+const PENDING_PG: &str = pending_sql!("");
+
+macro_rules! backfill_sql {
+    ($null:literal, $index:literal) => {
+        concat!(
+            "SELECT id, COALESCE(released_at, created_at), ", $null, " FROM extents", $index,
+            " WHERE scrub_enrolled = 1 AND safety_state <> 'deleted' AND id > ?1 ORDER BY id LIMIT ?2"
+        )
+    };
+}
+const BACKFILL: &str = backfill_sql!("NULL", " INDEXED BY extents_scrub_enrolled");
+const BACKFILL_PG: &str = backfill_sql!("CAST(NULL AS bigint)", "");
 
 /// The run that holds the lease is the one with token `?2`.
 macro_rules! run_holds {
@@ -34,20 +52,57 @@ macro_rules! run_holds {
     };
 }
 
+const TAKE: &str = "UPDATE scrub_state SET lease_token = lease_token + 1, lease_until = ?2 \
+              WHERE id = 1 AND (lease_until IS NULL OR lease_until < ?1) RETURNING lease_token";
+const STATE: &str = "SELECT lease_token, lease_until, runs, checked, ok, suspect, repaired, unrecoverable, stalled, \
+               incidents, bytes_read, last_run_at, last_unrecoverable_at, last_incident_at, \
+               last_incident, incident_clean, incident_clean_by, incident_body_by FROM scrub_state WHERE id = 1";
+const ENROLL_STATE: &str = "SELECT cadence_backbones, cadence_after, cadence_epoch FROM scrub_state WHERE id = 1 AND lease_token = ?1";
+const ENROLL_PROGRESS: &str = "UPDATE scrub_state SET cadence_backbones = ?1, cadence_after = ?3, cadence_epoch = ?4 WHERE id = 1 AND lease_token = ?2";
+
+macro_rules! enroll_copies {
+    ($projection:literal, $items:literal, $extent:literal) => {
+        concat!(
+            "INSERT INTO scrub_copies(extent_id, backbone, stat_at, full_at, stat_phase_at, full_phase_at) \
+             SELECT e.id, ?1, ", $projection, " FROM ", $items, " JOIN extents e ON e.id = ", $extent,
+            " WHERE e.safety_state <> 'deleted' AND (e.safety_state = 'released' OR e.scrub_enrolled = 1) AND ",
+            run_holds!(), " ON CONFLICT(extent_id, backbone) DO NOTHING"
+        )
+    };
+}
+const ENROLL_COPIES: &str = enroll_copies!(
+    "json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]'), \
+     json_extract(j.value, '$[1]'), json_extract(j.value, '$[3]')",
+    "json_each(?3) j CROSS",
+    "json_extract(j.value, '$[0]')"
+);
+const ENROLL_COPIES_PG: &str = enroll_copies!(
+    "CAST(j.value ->> 1 AS bigint), CAST(j.value ->> 2 AS bigint), \
+     CAST(j.value ->> 1 AS bigint), CAST(j.value ->> 3 AS bigint)",
+    "jsonb_array_elements(CAST(?3 AS jsonb)) j",
+    "j.value ->> 0"
+);
+
+macro_rules! enroll_extents {
+    ($items:literal) => {
+        concat!(
+            "UPDATE extents SET scrub_enrolled = 1 WHERE safety_state = 'released' \
+             AND scrub_enrolled = 0 AND id IN (SELECT value FROM ",
+            $items,
+            ") AND ",
+            run_holds!()
+        )
+    };
+}
+const ENROLL_EXTENTS: &str = enroll_extents!("json_each(?1)");
+const ENROLL_EXTENTS_PG: &str = enroll_extents!("jsonb_array_elements_text(CAST(?1 AS jsonb))");
+
 pub(super) async fn take<S: Sql>(
     c: &SqlCatalog<S>,
     now: UnixMs,
     until: UnixMs,
 ) -> Result<Option<u64>> {
-    let rows = c
-        .sql
-        .query(
-            "UPDATE scrub_state SET lease_token = lease_token + 1, lease_until = ?2 \
-              WHERE id = 1 AND (lease_until IS NULL OR lease_until < ?1) \
-              RETURNING lease_token",
-            &[ms(now), ms(until)],
-        )
-        .await?;
+    let rows = c.sql.query(TAKE, &[ms(now), ms(until)]).await?;
     match rows.into_iter().next() {
         Some(row) => Ok(Some(Cols::new(row).num()?)),
         None => Ok(None),
@@ -55,15 +110,7 @@ pub(super) async fn take<S: Sql>(
 }
 
 pub(super) async fn state<S: Sql>(c: &SqlCatalog<S>) -> Result<ScrubState> {
-    let rows = c
-        .sql
-        .query(
-            "SELECT lease_token, lease_until, runs, checked, ok, suspect, repaired, unrecoverable, stalled, \
-               incidents, bytes_read, last_run_at, last_unrecoverable_at, last_incident_at, \
-               last_incident, incident_clean, incident_clean_by, incident_body_by FROM scrub_state WHERE id = 1",
-            &[],
-        )
-        .await?;
+    let rows = c.sql.query(STATE, &[]).await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(ScrubState::default());
     };
@@ -134,11 +181,14 @@ pub(super) async fn enroll<S: Sql>(
     labels.sort_unstable();
     labels.dedup();
     let labels_json = json(&labels)?;
+    let dialect = c.sql.dialect();
     let mut state = Cols::new(
-        c.sql.query(
-            "SELECT cadence_backbones, cadence_after, cadence_epoch FROM scrub_state WHERE id = 1 AND lease_token = ?1",
-            &[uint(token)?],
-        ).await?.into_iter().next().ok_or(BridgeError::Invalid("scrub lease"))?,
+        c.sql
+            .query(ENROLL_STATE, &[uint(token)?])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(BridgeError::Invalid("scrub lease"))?,
     );
     let previous = state.opt_text()?.map(SqlValue::Text);
     let changed = previous.as_ref() != Some(&labels_json);
@@ -160,14 +210,20 @@ pub(super) async fn enroll<S: Sql>(
     };
     let pending = ids(c
         .sql
-        .query(PENDING_SQL, &[text(""), SqlValue::Int(ENROLL_PAGE)])
+        .query(
+            dialect.pick(PENDING, PENDING_PG),
+            &[text(""), SqlValue::Int(ENROLL_PAGE)],
+        )
         .await?)?;
     let mut advance = changed;
     let mut work: BTreeMap<_, _> = pending.iter().cloned().collect();
     if let Some(cursor) = &after {
         let page = ids(c
             .sql
-            .query(BACKFILL_SQL, &[text(cursor), SqlValue::Int(ENROLL_PAGE)])
+            .query(
+                dialect.pick(BACKFILL, BACKFILL_PG),
+                &[text(cursor), SqlValue::Int(ENROLL_PAGE)],
+            )
             .await?)?;
         after = if page.len() as i64 == ENROLL_PAGE {
             page.last().map(|(id, _)| id.clone())
@@ -196,24 +252,12 @@ pub(super) async fn enroll<S: Sql>(
         let entries = json(&entries)?;
         for label in &labels {
             stmts.push((
-                concat!(
-                    "INSERT INTO scrub_copies(extent_id, backbone, stat_at, full_at, stat_phase_at, full_phase_at) \
-                 SELECT e.id, ?1, json_extract(j.value, '$[1]'), json_extract(j.value, '$[2]'), \
-                    json_extract(j.value, '$[1]'), json_extract(j.value, '$[3]') \
-                 FROM json_each(?3) j CROSS JOIN extents e ON e.id = json_extract(j.value, '$[0]') \
-                 WHERE e.safety_state <> 'deleted' AND (e.safety_state = 'released' OR e.scrub_enrolled = 1) AND ",
-                    run_holds!(),
-                    " ON CONFLICT(extent_id, backbone) DO NOTHING"
-                ),
+                dialect.pick(ENROLL_COPIES, ENROLL_COPIES_PG),
                 vec![text(label), uint(token)?, entries.clone()],
             ));
         }
         stmts.push((
-            concat!(
-                "UPDATE extents SET scrub_enrolled = 1 WHERE safety_state = 'released' \
-             AND scrub_enrolled = 0 AND id IN (SELECT value FROM json_each(?1)) AND ",
-                run_holds!()
-            ),
+            dialect.pick(ENROLL_EXTENTS, ENROLL_EXTENTS_PG),
             vec![
                 json(&pending.iter().map(|(id, _)| id).collect::<Vec<_>>())?,
                 uint(token)?,
@@ -222,8 +266,13 @@ pub(super) async fn enroll<S: Sql>(
     }
     if advance {
         stmts.push((
-            "UPDATE scrub_state SET cadence_backbones = ?1, cadence_after = ?3, cadence_epoch = ?4 WHERE id = 1 AND lease_token = ?2",
-            vec![labels_json, uint(token)?, after.as_deref().map_or(SqlValue::Null, text), ms(epoch)],
+            ENROLL_PROGRESS,
+            vec![
+                labels_json,
+                uint(token)?,
+                after.as_deref().map_or(SqlValue::Null, text),
+                ms(epoch),
+            ],
         ));
     }
     if !stmts.is_empty() {
@@ -232,30 +281,48 @@ pub(super) async fn enroll<S: Sql>(
     Ok(pending.len() as i64 == ENROLL_PAGE || after.is_some())
 }
 
-pub(crate) fn due_sql() -> String {
-    format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, scrub_next_at, stat_at, full_at, \
-           stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
-         FROM scrub_copies s INDEXED BY scrub_copies_due CROSS JOIN extents e ON e.id = s.extent_id \
-         WHERE s.backbone = ?1 AND MIN(stat_at, full_at) <= ?2 \
-         ORDER BY MIN(stat_at, full_at), s.extent_id LIMIT ?3"
-    )
-}
+const DUE: &str = concat!(
+    "SELECT ",
+    extent_cols!(),
+    ", scrub_result, last_scrubbed_at, scrub_next_at, stat_at, full_at, \
+       stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
+     FROM scrub_copies s INDEXED BY scrub_copies_due CROSS JOIN extents e ON e.id = s.extent_id \
+     WHERE s.backbone = ?1 AND MIN(stat_at, full_at) <= ?2 \
+     ORDER BY MIN(stat_at, full_at), s.extent_id LIMIT ?3"
+);
+// LIMIT the schedule before joining to extents. The cascading FK ensures
+// that this cannot drop a schedule that the SQLite join would have skipped.
+const DUE_PG: &str = concat!(
+    "SELECT ", extent_cols!(), ", scrub_result, last_scrubbed_at, scrub_next_at, stat_at, full_at, \
+       stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
+     FROM (SELECT extent_id, stat_at, full_at, stat_loss_at, full_loss_at, stat_phase_at, full_phase_at \
+           FROM scrub_copies WHERE backbone = ?1 AND LEAST(stat_at, full_at) <= ?2 \
+           ORDER BY LEAST(stat_at, full_at), extent_id LIMIT ?3) s \
+     JOIN extents e ON e.id = s.extent_id \
+     ORDER BY LEAST(stat_at, full_at), s.extent_id"
+);
 
-fn watch_sql() -> String {
-    format!(
-        "SELECT {EXTENT_COLS}, scrub_result, last_scrubbed_at, scrub_next_at \
-         FROM extents INDEXED BY extents_scrub_watch WHERE scrub_next_at <= ?1 \
-         ORDER BY scrub_next_at, id LIMIT ?2"
-    )
+macro_rules! watch_sql {
+    ($index:literal) => {
+        concat!(
+            "SELECT ",
+            extent_cols!(),
+            ", scrub_result, last_scrubbed_at, scrub_next_at \
+             FROM extents",
+            $index,
+            " WHERE scrub_next_at <= ?1 ORDER BY scrub_next_at, id LIMIT ?2"
+        )
+    };
 }
+const WATCH: &str = watch_sql!(" INDEXED BY extents_scrub_watch");
+const WATCH_PG: &str = watch_sql!("");
 
-pub(crate) fn range_queries() -> [String; 4] {
+pub(super) fn range_queries(dialect: Dialect) -> [&'static str; 4] {
     [
-        due_sql(),
-        watch_sql(),
-        PENDING_SQL.into(),
-        BACKFILL_SQL.into(),
+        dialect.pick(DUE, DUE_PG),
+        dialect.pick(WATCH, WATCH_PG),
+        dialect.pick(PENDING, PENDING_PG),
+        dialect.pick(BACKFILL, BACKFILL_PG),
     ]
 }
 
@@ -288,19 +355,19 @@ pub(super) async fn due<S: Sql>(
 ) -> Result<Vec<ScrubCandidate>> {
     let limit = limit.min(crate::scrub::SCRUB_PAGE);
     let page = SqlValue::Int(i64::from(limit));
+    let [due, watch, ..] = range_queries(c.sql.dialect());
     let mut grouped = HashMap::new();
-    for row in c.sql.query(&watch_sql(), &[ms(now), page.clone()]).await? {
+    for row in c.sql.query(watch, &[ms(now), page.clone()]).await? {
         let (candidate, _) = parse_candidate(row)?;
         let watch_at = candidate.watch_at.ok_or_else(|| {
             BridgeError::Sql("row decode: due repair watch has no deadline".into())
         })?;
         grouped.insert(candidate.extent.id.clone(), (watch_at, candidate));
     }
-    let sql = due_sql();
     for backbone in backbones {
         for row in c
             .sql
-            .query(&sql, &[text(backbone), ms(now), page.clone()])
+            .query(due, &[text(backbone), ms(now), page.clone()])
             .await?
         {
             let (candidate, mut extra) = parse_candidate(row)?;
@@ -342,6 +409,15 @@ pub(super) async fn due<S: Sql>(
         .collect())
 }
 
+const ADVANCE_GUARD: &str = "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT \
+    EXISTS (SELECT 1 FROM scrub_state WHERE id = 1 AND lease_token = ?1)";
+const ADVANCE_FULL: &str =
+    "UPDATE scrub_copies SET full_at = ?4, full_loss_at = ?5, full_phase_at = ?6 \
+             WHERE extent_id = ?1 AND backbone = ?2 AND full_at = ?3";
+const ADVANCE_STAT: &str =
+    "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5, stat_phase_at = ?6 \
+             WHERE extent_id = ?1 AND backbone = ?2 AND stat_at = ?3";
+
 pub(super) async fn advance<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
@@ -349,17 +425,12 @@ pub(super) async fn advance<S: Sql>(
     updates: &[(ScrubCheck, UnixMs, Option<UnixMs>)],
 ) -> Result<bool> {
     let mut stmts = Vec::with_capacity(updates.len() + 1);
-    stmts.push((
-        concat!("INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ", run_holds!()),
-        vec![text(extent.as_str()), uint(token)?],
-    ));
+    stmts.push((ADVANCE_GUARD, vec![uint(token)?]));
     for (check, next, loss) in updates {
         let sql = if check.full {
-            "UPDATE scrub_copies SET full_at = ?4, full_loss_at = ?5, full_phase_at = ?6 \
-             WHERE extent_id = ?1 AND backbone = ?2 AND full_at = ?3"
+            ADVANCE_FULL
         } else {
-            "UPDATE scrub_copies SET stat_at = ?4, stat_loss_at = ?5, stat_phase_at = ?6 \
-             WHERE extent_id = ?1 AND backbone = ?2 AND stat_at = ?3"
+            ADVANCE_STAT
         };
         stmts.push((
             sql,
@@ -376,6 +447,14 @@ pub(super) async fn advance<S: Sql>(
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
 
+const HAS_LOSS: &str = "SELECT s.backbone FROM json_each(?2) j CROSS JOIN scrub_copies s \
+    ON s.extent_id = ?1 AND s.backbone = j.value \
+    WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL ORDER BY j.key";
+const HAS_LOSS_PG: &str = "SELECT s.backbone FROM \
+    jsonb_array_elements_text(CAST(?2 AS jsonb)) WITH ORDINALITY j(value, ordinal) \
+    JOIN scrub_copies s ON s.extent_id = ?1 AND s.backbone = j.value \
+    WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL ORDER BY j.ordinal";
+
 pub(super) async fn has_loss<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
@@ -384,39 +463,54 @@ pub(super) async fn has_loss<S: Sql>(
     let rows = c
         .sql
         .query(
-            "SELECT s.backbone FROM json_each(?2) j CROSS JOIN scrub_copies s \
-         ON s.extent_id = ?1 AND s.backbone = j.value \
-         WHERE s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL",
+            c.sql.dialect().pick(HAS_LOSS, HAS_LOSS_PG),
             &[text(extent.as_str()), json(&backbones)?],
         )
         .await?;
     rows.into_iter().map(|row| Cols::new(row).text()).collect()
 }
 
+const RETIRE_GUARD: &str = concat!(
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
+    run_holds!(),
+    " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND safety_state = 'deleted')"
+);
+const RETIRE_COPIES: &str = "DELETE FROM scrub_copies WHERE extent_id = ?1";
+const RETIRE_EXTENT: &str =
+    "UPDATE extents SET scrub_enrolled = 0, scrub_next_at = NULL WHERE id = ?1";
+
 pub(super) async fn retire<S: Sql>(
     c: &SqlCatalog<S>,
     token: u64,
     extent: &ExtentId,
 ) -> Result<bool> {
-    let guard = concat!(
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
-        run_holds!(),
-        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND safety_state = 'deleted')"
-    );
     let key = text(extent.as_str());
     let stmts = vec![
-        (guard, vec![key.clone(), uint(token)?]),
-        (
-            "DELETE FROM scrub_copies WHERE extent_id = ?1",
-            vec![key.clone()],
-        ),
-        (
-            "UPDATE extents SET scrub_enrolled = 0, scrub_next_at = NULL WHERE id = ?1",
-            vec![key],
-        ),
+        (RETIRE_GUARD, vec![key.clone(), uint(token)?]),
+        (RETIRE_COPIES, vec![key.clone()]),
+        (RETIRE_EXTENT, vec![key]),
     ];
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
+
+const RECORD: &str = concat!(
+    "UPDATE extents SET scrub_result = ?3, last_scrubbed_at = ?4, scrub_next_at = ?5 \
+     WHERE id = ?1 AND safety_state IN ('released', 'held', 'releasing') AND ",
+    run_holds!()
+);
+const LIVE: &str = concat!("SELECT ", live_ref!("?1"));
+const DROP_DUE: &str = concat!(
+    "UPDATE extents SET scrub_next_at = NULL WHERE id = ?1 AND ",
+    run_holds!()
+);
+const FREE: &str = "UPDATE scrub_state SET lease_until = NULL WHERE id = 1 AND lease_token = ?1";
+const BLOCK: &str =
+    "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0, incident_clean_by = NULL, \
+               incident_body_by = ?3 WHERE id = 1 AND lease_token = ?1";
+const DEFER: &str = concat!(
+    "UPDATE extents SET scrub_next_at = ?3 WHERE id = ?1 AND ",
+    run_holds!()
+);
 
 pub(super) async fn record<S: Sql>(
     c: &SqlCatalog<S>,
@@ -426,15 +520,10 @@ pub(super) async fn record<S: Sql>(
     now: UnixMs,
     next_at: Option<UnixMs>,
 ) -> Result<bool> {
-    let sql = concat!(
-        "UPDATE extents SET scrub_result = ?3, last_scrubbed_at = ?4, scrub_next_at = ?5 \
-          WHERE id = ?1 AND safety_state IN ('released', 'held', 'releasing') AND ",
-        run_holds!()
-    );
     let changed = c
         .sql
         .exec(
-            sql,
+            RECORD,
             &[
                 text(extent.as_str()),
                 uint(token)?,
@@ -448,13 +537,7 @@ pub(super) async fn record<S: Sql>(
 }
 
 pub(super) async fn live<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<bool> {
-    let rows = c
-        .sql
-        .query(
-            concat!("SELECT ", live_ref!("?1")),
-            &[text(extent.as_str())],
-        )
-        .await?;
+    let rows = c.sql.query(LIVE, &[text(extent.as_str())]).await?;
     match rows.into_iter().next() {
         Some(row) => Ok(Cols::new(row).num::<i64>()? != 0),
         None => Ok(false),
@@ -466,25 +549,15 @@ pub(super) async fn drop_due<S: Sql>(
     token: u64,
     extent: &ExtentId,
 ) -> Result<bool> {
-    let sql = concat!(
-        "UPDATE extents SET scrub_next_at = NULL WHERE id = ?1 AND ",
-        run_holds!()
-    );
     let changed = c
         .sql
-        .exec(sql, &[text(extent.as_str()), uint(token)?])
+        .exec(DROP_DUE, &[text(extent.as_str()), uint(token)?])
         .await?;
     Ok(changed == 1)
 }
 
 pub(super) async fn free<S: Sql>(c: &SqlCatalog<S>, token: u64, _now: UnixMs) -> Result<bool> {
-    let changed = c
-        .sql
-        .exec(
-            "UPDATE scrub_state SET lease_until = NULL WHERE id = 1 AND lease_token = ?1",
-            &[uint(token)?],
-        )
-        .await?;
+    let changed = c.sql.exec(FREE, &[uint(token)?]).await?;
     Ok(changed == 1)
 }
 
@@ -496,11 +569,7 @@ pub(super) async fn block<S: Sql>(
 ) -> Result<bool> {
     let changed = c
         .sql
-        .exec(
-            "UPDATE scrub_state SET last_incident = ?2, incident_clean = 0, incident_clean_by = NULL, \
-               incident_body_by = ?3 WHERE id = 1 AND lease_token = ?1",
-            &[uint(token)?, json(&blocked)?, json(&body)?],
-        )
+        .exec(BLOCK, &[uint(token)?, json(&blocked)?, json(&body)?])
         .await?;
     Ok(changed == 1)
 }
@@ -511,16 +580,58 @@ pub(super) async fn defer<S: Sql>(
     extent: &ExtentId,
     next_at: UnixMs,
 ) -> Result<bool> {
-    let sql = concat!(
-        "UPDATE extents SET scrub_next_at = ?3 WHERE id = ?1 AND ",
-        run_holds!()
-    );
     let changed = c
         .sql
-        .exec(sql, &[text(extent.as_str()), uint(token)?, ms(next_at)])
+        .exec(DEFER, &[text(extent.as_str()), uint(token)?, ms(next_at)])
         .await?;
     Ok(changed == 1)
 }
+
+// A repair cannot resurrect a deleted or overwritten generation.
+const REPIN_GUARD: &str = concat!(
+    "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
+    run_holds!(),
+    " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND safety_state = 'released') \
+      OR NOT EXISTS (SELECT 1 FROM outbox WHERE extent_id = ?1 AND stage = 'done') OR NOT ",
+    live_ref!("?1")
+);
+const REPIN_EXTENT: &str = "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1, \
+               hot_safety_bytes = cipher_size, scrub_result = 'repairing', \
+               last_scrubbed_at = ?2, scrub_next_at = ?3 WHERE id = ?1";
+const REPIN_OUTBOX: &str =
+    "UPDATE outbox SET stage = 'verify', next_at = ?2, cursor = 0, attempts = 0, \
+    last_error = NULL, updated_at = ?2, lease_token = lease_token + 1, lease_owner = NULL, \
+    lease_until = NULL WHERE extent_id = ?1 AND stage = 'done'";
+
+macro_rules! repin_verifications {
+    ($items:literal) => {
+        concat!(
+            "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, plan_rev, \
+             articles_ok, articles_present, articles_total, result, kind) \
+             SELECT e.id, j.value, 'scrub', ?3, e.plan_rev, 0, 0, COALESCE(e.article_count, 0), \
+               'missing', 'body' FROM extents e, ", $items, " j WHERE e.id = ?1 \
+             ON CONFLICT(extent_id, backbone, verified_at) DO NOTHING"
+        )
+    };
+}
+const REPIN_VERIFICATIONS: &str = repin_verifications!("json_each(?2)");
+const REPIN_VERIFICATIONS_PG: &str =
+    repin_verifications!("jsonb_array_elements_text(CAST(?2 AS jsonb))");
+
+macro_rules! repin_copies {
+    ($min:literal, $items:literal) => {
+        concat!(
+            "UPDATE scrub_copies SET stat_loss_at = NULL, full_loss_at = NULL, full_at = ",
+            $min,
+            "(full_at, ?3) WHERE extent_id = ?1 AND backbone IN (SELECT value FROM ",
+            $items,
+            ")"
+        )
+    };
+}
+const REPIN_COPIES: &str = repin_copies!("MIN", "json_each(?2)");
+const REPIN_COPIES_PG: &str =
+    repin_copies!("LEAST", "jsonb_array_elements_text(CAST(?2 AS jsonb))");
 
 pub(super) async fn repin<S: Sql>(
     c: &SqlCatalog<S>,
@@ -529,39 +640,18 @@ pub(super) async fn repin<S: Sql>(
     (now, next_at): (UnixMs, UnixMs),
     unread: &[String],
 ) -> Result<bool> {
-    // Fires unless this run holds the lease, the extent is released, its
-    // posting is done, and a live generation references it: an extent of
-    // a deleted or overwritten object is not brought back.
-    let guard = concat!(
-        "INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT ",
-        run_holds!(),
-        " OR NOT EXISTS (SELECT 1 FROM extents WHERE id = ?1 AND safety_state = 'released') \
-          OR NOT EXISTS (SELECT 1 FROM outbox WHERE extent_id = ?1 AND stage = 'done') \
-          OR NOT ",
-        live_ref!("?1")
-    );
+    let dialect = c.sql.dialect();
     let mut stmts: Vec<Stmt> = vec![
-        (guard, vec![text(extent.as_str()), uint(token)?]),
+        (REPIN_GUARD, vec![text(extent.as_str()), uint(token)?]),
         // Pinned again: no eviction listing from before can begin on it
         // (`evict_seq`), and the copy it holds is counted.
         (
-            "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1, \
-               hot_safety_bytes = cipher_size, scrub_result = 'repairing', \
-               last_scrubbed_at = ?2, scrub_next_at = ?3 \
-             WHERE id = ?1",
+            REPIN_EXTENT,
             vec![text(extent.as_str()), ms(now), ms(next_at)],
         ),
         // Back to verify, at once, from the first backbone, with its
         // attempts counted afresh. Any lease on the row is dead.
-        (
-            concat!(
-                "UPDATE outbox SET stage = 'verify', next_at = ?2, cursor = 0, attempts = 0, \
-                   last_error = NULL, updated_at = ?2, ",
-                "lease_token = lease_token + 1, lease_owner = NULL, lease_until = NULL",
-                " WHERE extent_id = ?1 AND stage = 'done'"
-            ),
-            vec![text(extent.as_str()), ms(now)],
-        ),
+        (REPIN_OUTBOX, vec![text(extent.as_str()), ms(now)]),
     ];
     if !unread.is_empty() {
         // No provider served the bytes: a failed full read of the current
@@ -571,25 +661,66 @@ pub(super) async fn repin<S: Sql>(
         let labels =
             serde_json::to_string(unread).map_err(|_| BridgeError::Invalid("backbone labels"))?;
         stmts.push((
-            "INSERT INTO verifications(extent_id, backbone, provider_id, verified_at, plan_rev, \
-               articles_ok, articles_present, articles_total, result, kind) \
-             SELECT e.id, j.value, 'scrub', ?3, e.plan_rev, 0, 0, COALESCE(e.article_count, 0), \
-               'missing', 'body' FROM extents e, json_each(?2) j WHERE e.id = ?1 \
-             ON CONFLICT(extent_id, backbone, verified_at) DO NOTHING",
+            dialect.pick(REPIN_VERIFICATIONS, REPIN_VERIFICATIONS_PG),
             vec![text(extent.as_str()), text(&labels), ms(now)],
         ));
         // The existing verify job now owns these failures. If the repair
         // releases, require a fresh finding before another re-pin, and
         // still give the repaired copy its own scheduled BODY pass.
         stmts.push((
-            "UPDATE scrub_copies SET stat_loss_at = NULL, full_loss_at = NULL, \
-             full_at = MIN(full_at, ?3) WHERE extent_id = ?1 \
-             AND backbone IN (SELECT value FROM json_each(?2))",
+            dialect.pick(REPIN_COPIES, REPIN_COPIES_PG),
             vec![text(extent.as_str()), text(&labels), ms(next_at)],
         ));
     }
     Ok(guarded(c, stmts).await? == Guard::Applied(()))
 }
+
+#[cfg(all(feature = "pg-test-record", not(target_arch = "wasm32")))]
+pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
+    super::pg_manifest(&[
+        (TAKE, "II"),
+        (STATE, ""),
+        (ENROLL_STATE, "I"),
+        (PENDING_PG, "TI"),
+        (BACKFILL_PG, "TI"),
+        (ENROLL_COPIES_PG, "TIT"),
+        (ENROLL_EXTENTS_PG, "TI"),
+        (ENROLL_PROGRESS, "TINI"),
+        (DUE_PG, "TII"),
+        (WATCH_PG, "II"),
+        (ADVANCE_GUARD, "I"),
+        (ADVANCE_FULL, "TTIINI"),
+        (ADVANCE_STAT, "TTIINI"),
+        (HAS_LOSS_PG, "TT"),
+        (RETIRE_GUARD, "TI"),
+        (RETIRE_COPIES, "T"),
+        (RETIRE_EXTENT, "T"),
+        (RECORD, "TITIN"),
+        (LIVE, "T"),
+        (DROP_DUE, "TI"),
+        (FREE, "I"),
+        (BLOCK, "ITT"),
+        (DEFER, "TII"),
+        (REPIN_GUARD, "TI"),
+        (REPIN_EXTENT, "TII"),
+        (REPIN_OUTBOX, "TI"),
+        (REPIN_VERIFICATIONS_PG, "TTI"),
+        (REPIN_COPIES_PG, "TTI"),
+        (END, "IIIIIIIIIINNINN"),
+    ])
+    .into_iter()
+    .map(|(sql, params)| (sql.to_owned(), params))
+    .collect()
+}
+
+const END: &str = "UPDATE scrub_state SET lease_until = NULL, runs = runs + 1, \
+    checked = checked + ?3, ok = ok + ?4, suspect = suspect + ?5, repaired = repaired + ?6, \
+    unrecoverable = unrecoverable + ?7, stalled = stalled + ?8, incidents = incidents + ?9, \
+    bytes_read = bytes_read + ?10, last_run_at = ?1, \
+    last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
+    last_incident_at = CASE WHEN CAST(?11 AS TEXT) IS NOT NULL THEN ?1 ELSE last_incident_at END, \
+    last_incident = ?12, incident_clean = ?13, incident_clean_by = ?14, incident_body_by = ?15 \
+    WHERE id = 1 AND lease_token = ?2";
 
 /// Adds a run's totals and frees the lease, and stores the backbones no
 /// loss is repaired on (`last_incident`, a JSON array; NULL = none), as
@@ -605,15 +736,7 @@ pub(super) async fn end<S: Sql>(
     let changed = c
         .sql
         .exec(
-            "UPDATE scrub_state SET lease_until = NULL, runs = runs + 1, \
-               checked = checked + ?3, ok = ok + ?4, suspect = suspect + ?5, \
-               repaired = repaired + ?6, unrecoverable = unrecoverable + ?7, \
-               stalled = stalled + ?8, incidents = incidents + ?9, \
-               bytes_read = bytes_read + ?10, last_run_at = ?1, \
-               last_unrecoverable_at = CASE WHEN ?7 > 0 THEN ?1 ELSE last_unrecoverable_at END, \
-               last_incident_at = CASE WHEN ?11 IS NOT NULL THEN ?1 ELSE last_incident_at END, \
-               last_incident = ?12, incident_clean = ?13, incident_clean_by = ?14, incident_body_by = ?15 \
-             WHERE id = 1 AND lease_token = ?2",
+            END,
             &[
                 ms(now),
                 uint(token)?,
@@ -639,7 +762,11 @@ pub(super) async fn end<S: Sql>(
                 } else {
                     json(&run.incident_clean_by)?
                 },
-                if run.incident_body_by.is_empty() { SqlValue::Null } else { json(&run.incident_body_by)? },
+                if run.incident_body_by.is_empty() {
+                    SqlValue::Null
+                } else {
+                    json(&run.incident_body_by)?
+                },
             ],
         )
         .await?;

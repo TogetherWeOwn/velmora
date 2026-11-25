@@ -140,8 +140,9 @@ fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
 
 /// The scrub's due query, word for word as it runs (for a test of its
 /// query plan).
-pub fn scrub_range_queries() -> [String; 4] {
-    scrub::range_queries()
+#[doc(hidden)]
+pub fn scrub_range_queries(dialect: crate::ports::Dialect) -> [&'static str; 4] {
+    scrub::range_queries(dialect)
 }
 
 /// The catalogue over any [`Sql`] backend.
@@ -1246,7 +1247,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 341, "background inventory entry count");
+        assert_eq!(statements.len(), 372, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }
@@ -1263,6 +1264,7 @@ pub fn pg_background_statements() -> Vec<(String, Vec<SqlValue>)> {
         usage::pg_statements(),
         hot::pg_statements(),
         hotctl::pg_statements(),
+        scrub::pg_statements(),
         health::pg_statements(),
         permits::pg_statements(),
         crate::gate::pg_statements(),
