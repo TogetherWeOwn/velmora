@@ -1714,6 +1714,15 @@ pub trait Catalog {
     ) -> Result<bool>;
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
+    /// [`Catalog::evict_candidates`] less the extents whose loss the scrub
+    /// has on record (`SCRUB` on): their copies stay until the loss is
+    /// settled. The default lists them all.
+    async fn evict_candidates_keeping_scrub_losses(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<EvictCandidate>> {
+        self.evict_candidates(limit).await
+    }
     /// Starts an eviction in one statement that re-checks the extent:
     /// `true` only if it is exactly as listed (sequence, byte counts,
     /// pinned or not). With `x.pinned` only the cache fill is claimed.
@@ -1721,17 +1730,6 @@ pub trait Catalog {
     /// Ends an eviction after the blob deletes. `false` when a hot copy
     /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
-    /// Ends an eviction that kept the safety copy (the scrub has a loss
-    /// of the extent on record): only the cache fill stops being counted,
-    /// and the extent's read stamp moves to `now`, so it leaves the head
-    /// of the eviction order. `false` as for [`Catalog::finish_evict`].
-    async fn finish_evict_kept(&self, x: &EvictCandidate, _now: UnixMs) -> Result<bool> {
-        let cache_only = EvictCandidate {
-            pinned: true,
-            ..x.clone()
-        };
-        self.finish_evict(&cache_only).await
-    }
     /// Asked right before the safety copy of a started eviction is
     /// deleted: `false` once the extent is pinned again or its sequence
     /// moved since `begin_evict` (a re-pin), and, with `scrub` (`SCRUB`

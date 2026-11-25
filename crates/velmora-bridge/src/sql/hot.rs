@@ -27,10 +27,10 @@
 //!
 //! The job asks once more right before it deletes the safety copy
 //! (`evict_safety_still_ok`). With `SCRUB` on, an extent whose loss the
-//! scrub has on record keeps its safety copy: the re-pin of that loss
-//! may need it. The eviction then ends the cache fill's count only and
-//! moves the extent's read stamp to now, so a batch of such extents at
-//! the head of the order cannot hold up the ones behind them.
+//! scrub has on record is not listed (`CANDIDATES_SCRUB`), so it cannot
+//! hold the head of the order, and keeps its safety copy if the loss was
+//! recorded after it was listed: the re-pin of that loss may need it.
+//! That eviction ends the cache fill's count only.
 //!
 //! The counts are not exact, and they are not a bound in either
 //! direction. Each error is limited to one extent's bytes and repairs
@@ -109,6 +109,38 @@ const CANDIDATES: &str = concat!(
     " ORDER BY last_read_at, id LIMIT ?1"
 );
 
+/// True while the scrub has a loss of the extent `extents.id` on record:
+/// one key lookup in `scrub_copies` per row.
+macro_rules! scrub_loss_on_record {
+    () => {
+        "EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = extents.id \
+           AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
+    };
+}
+
+/// With `SCRUB` on: the candidates less the extents with a loss on the
+/// scrub's record. Their copies stay until the loss is settled (the
+/// re-pin of a confirmed loss may need either), and they do not hold the
+/// head of the order. The order and the index are those of `CANDIDATES`.
+pub const CANDIDATES_SCRUB: &str = concat!(
+    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+    pinned!(),
+    " FROM extents WHERE ",
+    evictable!(),
+    " AND NOT ",
+    scrub_loss_on_record!(),
+    " ORDER BY last_read_at, id LIMIT ?1"
+);
+const CANDIDATES_SCRUB_PG: &str = concat!(
+    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+    pinned!(),
+    " FROM extents WHERE ",
+    evictable!(),
+    " AND NOT ",
+    scrub_loss_on_record!(),
+    " ORDER BY last_read_at ASC NULLS FIRST, id LIMIT ?1"
+);
+
 /// The periodic statements with the index each must be answered from
 /// alone, without touching the table or sorting. Tests hold them to it.
 pub const INDEX_ONLY: [(&str, &str); 3] = [
@@ -155,14 +187,13 @@ pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
 pub(super) async fn evict_candidates<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
+    scrub: bool,
 ) -> Result<Vec<EvictCandidate>> {
-    let rows = c
-        .sql
-        .query(
-            c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
-            &[SqlValue::Int(i64::from(limit))],
-        )
-        .await?;
+    let sql = match scrub {
+        true => c.sql.dialect().pick(CANDIDATES_SCRUB, CANDIDATES_SCRUB_PG),
+        false => c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
+    };
+    let rows = c.sql.query(sql, &[SqlValue::Int(i64::from(limit))]).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -271,33 +302,6 @@ pub(super) async fn finish_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) 
         .exec(
             sql,
             &[text(x.extent.as_str()), int(x.seq.saturating_add(1))?],
-        )
-        .await?;
-    Ok(changed == 1)
-}
-
-/// An eviction that kept the safety copy (`evict_safety_still_ok` said
-/// no while no re-pin moved the sequence): the cache fill stops being
-/// counted, the safety copy stays counted, and `last_read_at` moves to
-/// now, so the next listing reaches the extents behind it.
-const FINISH_EVICT_KEPT: &str =
-    "UPDATE extents SET hot_cache_bytes = 0, last_read_at = ?3, evict_seq = evict_seq + 1 \
-         WHERE id = ?1 AND evict_seq = ?2";
-
-pub(super) async fn finish_evict_kept<S: Sql>(
-    c: &SqlCatalog<S>,
-    x: &EvictCandidate,
-    now: UnixMs,
-) -> Result<bool> {
-    let changed = c
-        .sql
-        .exec(
-            FINISH_EVICT_KEPT,
-            &[
-                text(x.extent.as_str()),
-                int(x.seq.saturating_add(1))?,
-                ms(now),
-            ],
         )
         .await?;
     Ok(changed == 1)
@@ -523,7 +527,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
         (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
         (EVICT_SAFETY_STILL_OK_SCRUB.to_owned(), vec![T, I]),
-        (FINISH_EVICT_KEPT.to_owned(), vec![T, I, I]),
+        (CANDIDATES_SCRUB_PG.to_owned(), vec![I]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

@@ -3246,12 +3246,15 @@ async fn a_scheduled_body_pass_advances_last_verified_at() {
     assert_eq!(stamp().await, now.0.to_string());
 }
 
-/// With a loss on record the eviction keeps the safety copy and its
-/// count (it stays evictable for later), and still evicts the cache
-/// fill. With the scrub off the old rule holds: both go.
+/// With the scrub on, an extent with a loss on record is not listed for
+/// eviction: both copies stay, counted. One whose loss is recorded after
+/// the listing, right before the safety delete, keeps its safety copy
+/// (still counted) and loses only the cache fill. With the scrub off the
+/// old rule holds: both go.
 #[tokio::test(flavor = "current_thread")]
-async fn eviction_keeps_and_counts_the_safety_copy_of_an_extent_with_a_loss_on_record() {
-    for scrub in [true, false] {
+async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record() {
+    // (scrub on, loss recorded only after the listing)
+    for (scrub, late) in [(true, false), (true, true), (false, false)] {
         let w = world_with(|cfg| {
             cfg.hot_cap_bytes = 1;
             cfg.scrub.on = scrub;
@@ -3279,38 +3282,56 @@ async fn eviction_keeps_and_counts_the_safety_copy_of_an_extent_with_a_loss_on_r
         c.record_cache_fill(&o.extent, w.bridge().clock.now())
             .await
             .unwrap();
-        c.sql
-            .inner
-            .fixture_exec(
-                "UPDATE scrub_copies SET full_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'beta'",
-                &[
-                    SqlValue::Text(o.extent.as_str().to_owned()),
-                    SqlValue::Int(w.bridge().clock.now().0),
-                ],
-            )
-            .await
-            .unwrap();
+        let loss = format!(
+            "UPDATE scrub_copies SET full_loss_at = {} WHERE extent_id = '{}' AND backbone = 'beta'",
+            w.bridge().clock.now().0,
+            o.extent.as_str()
+        );
+        if late {
+            *c.sql.before_matching.borrow_mut() = Some((
+                "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2",
+                0,
+                loss,
+            ));
+        } else {
+            c.sql.inner.fixture_script(&loss).unwrap();
+        }
         w.bridge().evict_batch(0).await.unwrap();
-        assert!(!w.bridge().cache.contains(&o.extent.cache_key()));
-        assert_eq!(w.has_safety(&o), scrub, "scrub on: kept");
+        assert!(
+            c.sql.before_matching.borrow().is_none(),
+            "the loss was recorded"
+        );
         let counts = w
             .scalar(
                 "SELECT hot_safety_bytes || ':' || hot_cache_bytes FROM extents WHERE id = ?1",
                 &o.extent,
             )
             .await;
-        let expected = match scrub {
-            true => format!("{}:0", extent.cipher_size),
-            false => "0:0".to_owned(),
+        let size = extent.cipher_size;
+        let (safety, cache, expected) = match (scrub, late) {
+            (true, false) => (true, true, format!("{size}:{size}")),
+            (true, true) => (true, false, format!("{size}:0")),
+            (false, _) => (false, false, "0:0".to_owned()),
         };
-        assert_eq!(counts, expected);
+        assert_eq!(
+            w.has_safety(&o),
+            safety,
+            "safety copy, scrub={scrub} late={late}"
+        );
+        assert_eq!(
+            w.bridge().cache.contains(&o.extent.cache_key()),
+            cache,
+            "cache fill, scrub={scrub} late={late}"
+        );
+        assert_eq!(counts, expected, "scrub={scrub} late={late}");
     }
 }
 
-/// A full eviction batch of copies kept for the scrub (a loss of each is
-/// on record, as when a backbone outage leaves many extents suspect)
-/// sits at the head of the eviction order. The extent behind them is
-/// still evicted by the next drain; the kept copies stay.
+/// A full eviction batch of extents with a loss on record (as when a
+/// backbone outage leaves many extents suspect) is at the head of the
+/// eviction order. The extent behind them is evicted by the same drain,
+/// their copies stay, and their read stamps (what the adaptive cap
+/// measures) are not touched.
 #[tokio::test(flavor = "current_thread")]
 async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
     use velmora_bridge::jobs::EVICT_BATCH;
@@ -3350,6 +3371,7 @@ async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
     w.bridge().jobs.inner.take();
 
     w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&free), "the extent behind them is evicted");
     assert!(
         !w.bridge()
             .jobs
@@ -3357,15 +3379,41 @@ async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
             .take()
             .iter()
             .any(|s| matches!(s.job, Job::Evict { .. })),
-        "a batch that freed nothing sends no continuation"
+        "nothing more is listed: no continuation over the same rows"
     );
-    // The next drain (the dispatcher's, once the tier is still over its
-    // cap) reaches the extent behind the kept ones.
-    w.bridge().evict_batch(0).await.unwrap();
-    assert!(!w.has_safety(&free), "the extent behind them is evicted");
-    for o in &kept {
+    for (i, o) in kept.iter().enumerate() {
         assert!(w.has_safety(o), "a copy with a loss on record stays");
+        let read = w
+            .scalar("SELECT last_read_at FROM extents WHERE id = ?1", &o.extent)
+            .await;
+        assert_eq!(read, (1 + i).to_string(), "its read stamp is untouched");
     }
+}
+
+/// The eviction listing with the scrub on reads the same covering index,
+/// in order, as the listing without it: no table scan, no sort.
+#[tokio::test(flavor = "current_thread")]
+async fn the_scrub_eviction_listing_reads_only_its_index() {
+    let w = world_on(true, |_| {}).await;
+    let plan: Vec<String> = w.bridge().catalog.sql.with_conn(|c| {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            velmora_bridge::sql::HOT_SCRUB_CANDIDATES.replace("?1", "10")
+        );
+        let mut stmt = c.prepare(&sql).unwrap();
+        let rows = stmt.query_map((), |r| r.get::<_, String>(3)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    });
+    let plan = plan.join(" | ");
+    assert!(
+        plan.contains("USING COVERING INDEX extents_evictable"),
+        "{plan}"
+    );
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    assert!(
+        !plan.contains("SCAN s"),
+        "a key lookup in scrub_copies: {plan}"
+    );
 }
 
 /// Re-pins `o` from Usenet (beta lacks article 0) without its safety

@@ -789,7 +789,16 @@ where
             return Ok(0);
         }
         let mut freed = 0u64;
-        let rows = self.catalog.evict_candidates(EVICT_BATCH).await?;
+        // With the scrub on, an extent with a loss on its record is not
+        // listed: its copies may be what the repair of that loss needs.
+        let rows = match self.cfg.scrub.on {
+            true => {
+                self.catalog
+                    .evict_candidates_keeping_scrub_losses(EVICT_BATCH)
+                    .await?
+            }
+            false => self.catalog.evict_candidates(EVICT_BATCH).await?,
+        };
         let mut more = rows.len() >= EVICT_BATCH as usize;
         // One extent that fails must not hold up the ones behind it. It
         // stays counted, and the first error makes the job retry.
@@ -819,9 +828,9 @@ where
         if let Some(e) = failed {
             return Err(e);
         }
-        // A batch that freed nothing (every copy in it kept for the
-        // scrub, now at the back of the order) ends the drain: the next
-        // one starts behind them.
+        // A batch that freed nothing (every copy in it kept for a loss
+        // the scrub recorded after the listing) ends the drain; the next
+        // listing leaves those extents out.
         if excess > 0 && more && freed > 0 {
             // The next step runs once: it has to claim this record. If the
             // send is lost, the dispatcher starts a new drain once the
@@ -863,22 +872,19 @@ where
         // the extent, or a re-pin moved it, since `begin_evict`. The
         // counts stand, and what this drain still has to evict is no
         // longer known.
-        if kept {
-            // The safety copy stays counted, and the extent goes to the
-            // back of the eviction order: a batch of kept copies at its
-            // head cannot hold up the extents behind them.
-            let done = EvictCandidate {
+        // A safety copy that stayed stays counted: the end of the cache
+        // fill's eviction only, as for a pinned extent. (One kept for a
+        // loss recorded after the listing is not listed again while the
+        // loss is on record.)
+        let done = match kept {
+            true => EvictCandidate {
                 pinned: true,
                 ..row.clone()
-            };
-            let finished = self
-                .catalog
-                .finish_evict_kept(row, self.clock.now())
-                .await?;
-            return Ok(finished.then(|| done.evictable_bytes()));
-        }
-        Ok(match self.catalog.finish_evict(row).await? {
-            true => Some(row.evictable_bytes()),
+            },
+            false => row.clone(),
+        };
+        Ok(match self.catalog.finish_evict(&done).await? {
+            true => Some(done.evictable_bytes()),
             false => None,
         })
     }

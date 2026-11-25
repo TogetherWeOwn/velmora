@@ -84,6 +84,9 @@ pub mod usage;
 
 pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
 /// Hot-tier statements that must use covering partial indexes.
+/// The eviction listing while `SCRUB` is on: the same index and order
+/// as `HOT_INDEX_ONLY`'s listing, with a key lookup in `scrub_copies`.
+pub const HOT_SCRUB_CANDIDATES: &str = hot::CANDIDATES_SCRUB;
 pub const HOT_INDEX_ONLY: [(&str, &str); 4] = [
     hot::INDEX_ONLY[0],
     hot::INDEX_ONLY[1],
@@ -1096,16 +1099,19 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         hotctl::store(self, expected_at, entries).await
     }
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
-        hot::evict_candidates(self, limit).await
+        hot::evict_candidates(self, limit, false).await
+    }
+    async fn evict_candidates_keeping_scrub_losses(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<EvictCandidate>> {
+        hot::evict_candidates(self, limit, true).await
     }
     async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::begin_evict(self, x).await
     }
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
-    }
-    async fn finish_evict_kept(&self, x: &EvictCandidate, now: UnixMs) -> Result<bool> {
-        hot::finish_evict_kept(self, x, now).await
     }
     async fn evict_safety_still_ok(&self, x: &EvictCandidate, scrub: bool) -> Result<bool> {
         hot::evict_safety_still_ok(self, x, scrub).await
