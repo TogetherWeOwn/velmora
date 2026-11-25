@@ -41,13 +41,16 @@ fn pooled(id: &str, max_conns: u32, pool: &str, pool_max_conns: u32) -> Provider
 
 /// One database for the catalogue callers and the gates.
 #[derive(Clone)]
-struct Db(Rc<TestSql>);
+struct Db(Rc<TestSql>, Rc<RefCell<Option<Vec<String>>>>);
 
 impl Sql for Db {
     fn dialect(&self) -> Dialect {
         self.0.dialect()
     }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if let Some(trace) = self.1.borrow_mut().as_mut() {
+            trace.push(sql.to_owned());
+        }
         self.0.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
@@ -119,7 +122,7 @@ struct World {
 impl World {
     fn new() -> Rc<Self> {
         Rc::new(World {
-            db: Db(Rc::new(TestSql::with_schema().unwrap())),
+            db: Db(Rc::new(TestSql::with_schema().unwrap()), Rc::default()),
             now: Cell::new(T0),
             stores: RefCell::default(),
             gates: RefCell::default(),
@@ -557,11 +560,93 @@ async fn load_is_what_the_gate_handed_out() {
     let p = load.iter().find(|l| l.provider_id == "p").unwrap();
     assert_eq!((p.held, p.holders, p.background_holders), (3, 2, 1));
     assert_eq!(p.uses, 3);
-    let q = load.iter().find(|l| l.provider_id == "q").unwrap();
-    assert_eq!((q.held, q.holders, q.background_holders), (0, 0, 0));
+    // No hint or health row for q; the pool counts it as zero load.
+    assert!(!load.iter().any(|l| l.provider_id == "q"));
     c.release_permit(&a).await.unwrap();
     let load = c.provider_load(w.now()).await.unwrap();
     assert_eq!(load.iter().find(|l| l.provider_id == "p").unwrap().held, 2);
+}
+
+#[tokio::test]
+async fn active_load_and_status_match_slot_overlay_where_it_has_rows() {
+    let w = World::new();
+    let providers = [
+        provider("slots-with-hint", 2),
+        provider("hint-only", 2),
+        provider("both", 2),
+        provider("slots-without-hint", 2),
+    ];
+    let old = w.old_catalog();
+    old.seed_permits(&providers).await.unwrap();
+    w.db.0
+        .fixture_script(
+            "INSERT INTO provider_health \
+        (provider_id, failures, cooldowns, cooldown_until, last_failure_reason) VALUES \
+        ('both', 2, 1, 1762992060123, 'connect_refused'), \
+        ('health-only', 1, 0, 0, 'session_failed'), \
+        ('stale-reason', 0, 0, 0, 'connect_refused');",
+        )
+        .unwrap();
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    for p in &providers[..3] {
+        take(&c, &w, p, JOB, "job").await.unwrap();
+        take(&c, &w, p, READ, "reader").await.unwrap();
+    }
+
+    // Reference: the old full read, with the four load fields replaced by
+    // the gate's values. A slot-only provider the gate has not heard of
+    // has all zeroes after the overlay, the same as an absent row in Pool.
+    let mut expected = old.provider_load(w.now()).await.unwrap();
+    let inactive = w.catalog(PermitMode::Catalog, GateSharding::One, &providers);
+    assert_eq!(inactive.provider_load(w.now()).await.unwrap(), expected);
+    assert_eq!(inactive.provider_status(w.now()).await.unwrap(), expected);
+    expected.retain(|l| l.provider_id != "slots-without-hint");
+    for l in &mut expected {
+        if providers[..3].iter().any(|p| p.id == l.provider_id) {
+            (l.held, l.holders, l.background_holders, l.uses) = (2, 2, 1, 2);
+        }
+    }
+    assert_eq!(
+        expected
+            .iter()
+            .map(|l| l.provider_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "both",
+            "health-only",
+            "hint-only",
+            "slots-with-hint",
+            "stale-reason"
+        ]
+    );
+    assert_eq!(expected[0].fault, Some(ProviderFault::ConnectRefused));
+    assert_eq!(expected[4].fault, None);
+
+    // Drop one provider's slots after warming the gate: its hint now has
+    // no catalogue row at all but must still contribute to provider load.
+    w.db.0
+        .fixture_script("DELETE FROM provider_permits WHERE provider_id = 'hint-only';")
+        .unwrap();
+    assert_eq!(c.provider_load(w.now()).await.unwrap(), expected);
+    assert_eq!(c.provider_status(w.now()).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn active_load_and_status_do_not_query_permit_slots() {
+    let w = World::new();
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &[]);
+    // Warm the status path so the trace only covers the two catalogue reads.
+    c.provider_status(w.now()).await.unwrap();
+    *w.db.1.borrow_mut() = Some(Vec::new());
+    c.provider_load(w.now()).await.unwrap();
+    c.provider_status(w.now()).await.unwrap();
+    let trace = w.db.1.borrow_mut().take().unwrap();
+    assert_eq!(trace.len(), 2);
+    assert!(trace.iter().all(|sql| sql.contains("FROM provider_health")));
+    assert!(
+        trace.iter().all(|sql| !sql.contains("provider_permits")),
+        "active load/status read slot rows: {trace:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2390,9 +2475,9 @@ async fn the_load_a_gate_told_is_used_by_a_call_whose_clock_is_behind() {
         assert_eq!(load[0].held, 1, "{behind} ms behind");
     }
     let load = c.provider_load(UnixMs(w.now().0 - HINT_MS)).await.unwrap();
-    assert_eq!(load[0].held, 0, "too far ahead to go by");
+    assert!(load.is_empty(), "too far ahead to go by");
     let load = c.provider_load(UnixMs(w.now().0 + HINT_MS)).await.unwrap();
-    assert_eq!(load[0].held, 0, "too old to go by");
+    assert!(load.is_empty(), "too old to go by");
 }
 
 /// Names that are not ASCII are counted at their stored size, and

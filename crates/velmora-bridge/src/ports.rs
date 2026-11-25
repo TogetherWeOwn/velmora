@@ -1467,7 +1467,8 @@ pub trait Catalog {
 
     // provider pool
     /// Held slots, slots ever handed out and health, per provider that
-    /// has a permit or a health row.
+    /// has a health row or an entry in the active source of permit load
+    /// (gate hint or catalogue slots). An absent provider has zero load.
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>>;
     /// [`Self::provider_load`] for the operator's status: what is held
     /// at this moment, where `provider_load` may go by what its caller
