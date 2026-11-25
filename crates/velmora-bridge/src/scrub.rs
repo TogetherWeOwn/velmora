@@ -981,7 +981,23 @@ where
         full: Option<&ExtentRow>,
     ) -> core::result::Result<Presence, Halt> {
         let now = self.clock.now();
-        let pool = Pool::load(&self.catalog, &self.cfg.providers, now).await?;
+        // The run's sessions sit unused while the pool is read: they are
+        // ended if the first of their slots would run out first, as in
+        // `idle`. No socket outlives its slot.
+        let pool = {
+            let limit = stats.iter().map(ProviderSession::idle_ms).min();
+            let mut load = core::pin::pin!(Pool::load(&self.catalog, &self.cfg.providers, now));
+            match (limit, self.budget.sleeper()) {
+                (Some(ms), Some(sleep)) => match select(load.as_mut(), sleep(ms)).await {
+                    Either::Left((out, _)) => out,
+                    Either::Right(_) => {
+                        ProviderSession::close_all(core::mem::take(stats)).await;
+                        load.await
+                    }
+                },
+                _ => load.await,
+            }
+        }?;
         let rows: Vec<&ArticleRow> = plan.iter().collect();
         // As verify asks: the providers that still retain the oldest
         // article first; the others only when none does. A provider past
@@ -1330,16 +1346,29 @@ where
         // Usenet still holds the bytes meanwhile.
         let key = extent.id.safety_key();
         if source == RepairSource::Cache && !self.put_safety(extent, cipher.clone()).await {
+            // A lost reply may hide a write.
+            self.collect_if_unreferenced(extent).await?;
             walk.run.suspect += 1;
             return self
                 .scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
                 .await;
         }
-        if self
+        let repinned = match self
             .catalog
             .scrub_repin(token, &extent.id, (now, next), &unread)
-            .await?
+            .await
         {
+            Ok(repinned) => repinned,
+            Err(e) => {
+                // Not known to be pinned: the cache-sourced copy written
+                // above is not to outlive an extent GC collects.
+                if source == RepairSource::Cache {
+                    let _ = self.collect_if_unreferenced(extent).await;
+                }
+                return Err(e.into());
+            }
+        };
+        if repinned {
             // Read from Usenet: the copy is written (one in R2 may be
             // there with other bytes). Already in R2 (the safety copy just
             // read, or the cache copy written before the re-pin): it is
@@ -1490,35 +1519,48 @@ where
         let Ok(_charge) = self.budget.charge_job(bytes).await else {
             return Err(Halt::Busy);
         };
-        let kept = match self.safety.get(&extent.id.safety_key(), None).await {
-            Ok(Some(bytes)) => digest_ok(extent, &bytes),
-            _ => false,
+        // A store that did not answer is not a missing copy: no
+        // `unrecoverable` on it (`unknown`).
+        let (kept, mut unknown) = match self.safety.get(&extent.id.safety_key(), None).await {
+            Ok(Some(bytes)) => (digest_ok(extent, &bytes), false),
+            Ok(None) => (false, false),
+            Err(_) => (false, true),
         };
         let mut rewrote = false;
         if !kept {
             let read = reader.fetch_planned(extent, plan, self.clock.now()).await;
-            let cipher = match read? {
+            let (cipher, interrupted) = match read? {
                 ColdFetch::Filled(cipher) => {
                     walk.run.bytes_read += extent.cipher_size;
-                    Some(cipher)
+                    (Some(cipher), false)
                 }
-                ColdFetch::Unavailable | ColdFetch::Unrecoverable => {
-                    reader.hang_up().await;
-                    match self.cache.get(&extent.id.cache_key(), None).await {
-                        Ok(Some(bytes)) if digest_ok(extent, &bytes) => Some(bytes),
-                        _ => None,
-                    }
-                }
+                ColdFetch::Unavailable | ColdFetch::Unrecoverable => (None, false),
                 ColdFetch::Busy => return Err(Halt::Busy),
-                ColdFetch::Interrupted => {
-                    let next = after(u64::from(cfg.confirm_secs));
-                    self.catalog
-                        .scrub_defer(walk.token, &extent.id, next)
-                        .await?;
-                    return Ok(Some(next));
-                }
+                // The read broke off: Usenet may well hold it, and the
+                // cache is still asked.
+                ColdFetch::Interrupted => (None, true),
             };
             reader.hang_up().await;
+            let cipher = match cipher {
+                Some(cipher) => Some(cipher),
+                None => match self.cache.get(&extent.id.cache_key(), None).await {
+                    Ok(Some(bytes)) if digest_ok(extent, &bytes) => Some(bytes),
+                    Ok(_) => None,
+                    Err(_) => {
+                        unknown = true;
+                        None
+                    }
+                },
+            };
+            if cipher.is_none() && (interrupted || unknown) {
+                // Nothing is known to be lost: looked at again after the
+                // confirm interval.
+                let next = after(u64::from(cfg.confirm_secs));
+                self.catalog
+                    .scrub_defer(walk.token, &extent.id, next)
+                    .await?;
+                return Ok(Some(next));
+            }
             match cipher {
                 Some(cipher) => {
                     rewrote = self.put_safety(extent, cipher).await;

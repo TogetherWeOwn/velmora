@@ -1629,10 +1629,15 @@ async fn the_stat_session_never_takes_a_drill_slot_the_reader_needs() {
     })
     .await;
     let o = w.released("a", 90).await;
+    let b = w.released("b", 92).await;
     w.advance_secs(31 * DAY_SECS);
+    // `a` is due for STAT, `b` for a full read in the same run.
+    w.full_checks_now(&b).await;
     let run = w.scrub().await;
-    assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert_eq!((run.checked, run.ok, run.ended), (2, 2, ScrubEnd::Idle));
+    assert!(run.bytes_read > 0, "the full read ran");
     assert_eq!(w.result(&o).await, "ok");
+    assert_eq!(w.result(&b).await, "ok");
 }
 
 /// A re-pinned extent whose watch found no intact copy anywhere stays
@@ -2005,13 +2010,23 @@ async fn the_read_gets_the_slot_the_stat_session_held() {
     .await;
     let o = w.released("a", 190).await;
     let p = w.released("b", 191).await;
+    let q = w.released("c", 192).await;
     w.advance_secs(31 * DAY_SECS);
-    // The second extent's `STAT` needs the slot the read of the first
-    // kept: the read's sessions are ended for it.
+    // STAT, then a full read, then STAT again, on the same constrained
+    // providers: each needs the slot the one before it kept.
+    let now = w.bridge().clock.now();
+    let far = now.plus_secs(60 * DAY_SECS);
+    for name in ["alpha", "beta"] {
+        w.set_clocks(&o, name, now.plus_ms(-3000), far).await;
+        w.set_clocks(&p, name, far, now.plus_ms(-2000)).await;
+        w.set_clocks(&q, name, now.plus_ms(-1000), far).await;
+    }
     let run = w.scrub().await;
-    assert_eq!((run.checked, run.ok, run.ended), (2, 2, ScrubEnd::Idle));
-    assert_eq!(w.result(&o).await, "ok");
-    assert_eq!(w.result(&p).await, "ok");
+    assert_eq!((run.checked, run.ok, run.ended), (3, 3, ScrubEnd::Idle));
+    assert!(run.bytes_read > 0, "the full read ran");
+    for x in [&o, &p, &q] {
+        assert_eq!(w.result(x).await, "ok");
+    }
 }
 
 /// All scheduler listings use bounded ranges on their actual indexes.
@@ -2218,7 +2233,11 @@ async fn the_scrub_never_takes_the_read_reserve() {
     .await;
     let o = w.released("a", 203).await;
     w.advance_secs(31 * DAY_SECS);
+    // A full read too, not only STAT.
     let now = w.bridge().clock.now();
+    for name in ["alpha", "beta"] {
+        w.set_clocks(&o, name, now, now).await;
+    }
     for p in w.bridge().cfg.providers.clone() {
         let held = w
             .bridge()
@@ -2233,6 +2252,10 @@ async fn the_scrub_never_takes_the_read_reserve() {
     let run = w.scrub().await;
     *w.bridge().catalog.sql.fail_matching.borrow_mut() = None;
     assert_eq!((run.checked, run.ok, run.ended), (1, 1, ScrubEnd::Idle));
+    assert!(
+        run.bytes_read > 0,
+        "the full read ran without the read reserve"
+    );
     assert_eq!(w.result(&o).await, "ok");
 }
 
@@ -3343,4 +3366,146 @@ async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
     for o in &kept {
         assert!(w.has_safety(o), "a copy with a loss on record stays");
     }
+}
+
+/// Re-pins `o` from Usenet (beta lacks article 0) without its safety
+/// copy: the PUT is refused, so its watch looks again early.
+async fn repinned_without_its_copy(w: &World, o: &Obj) {
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    assert_eq!(w.scrub().await.repaired, 1);
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    assert!(!w.has_safety(o));
+    assert_eq!(w.safety_state(o).await, "held");
+}
+
+/// The watch's safety GET fails while Usenet and the cache have nothing:
+/// that is no proof the copy is gone. Not `unrecoverable`; looked at
+/// again, and said once the stores answer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_safety_read_in_the_watch_is_not_called_unrecoverable() {
+    let w = world().await;
+    let o = w.released("a", 252).await;
+    repinned_without_its_copy(&w, &o).await;
+    w.hide(0, &o, 0).await;
+    w.advance_secs(3600);
+    w.bridge().safety.fail_next_get.set(true);
+    let run = w.scrub().await;
+    assert!(
+        !w.bridge().safety.fail_next_get.get(),
+        "the watch read the safety store"
+    );
+    assert_eq!(run.unrecoverable, 0, "{:?}", alerts());
+    assert!(!alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-unrecoverable ")));
+    assert_eq!(
+        w.next_at(&o).await,
+        Some(w.bridge().clock.now().0 + 3_600_000),
+        "looked at again after the confirm interval"
+    );
+    // With every store answering, nothing intact anywhere is said.
+    w.advance_secs(3600);
+    assert_eq!(w.scrub().await.unrecoverable, 1);
+}
+
+/// The watch's Usenet read breaks off, and the cache holds an intact
+/// copy: the safety copy is written from the cache, not deferred.
+#[tokio::test(flavor = "current_thread")]
+async fn an_interrupted_watch_read_restores_the_copy_from_the_cache() {
+    let w = world().await;
+    let o = w.released("a", 253).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    repinned_without_its_copy(&w, &o).await;
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(3600);
+    for s in &w.servers {
+        s.drop_next_bodies(1000).await;
+    }
+    let run = w.scrub().await;
+    for s in &w.servers {
+        s.drop_next_bodies(0).await;
+    }
+    assert_eq!((run.unrecoverable, run.stalled), (0, 0));
+    assert!(w.has_safety(&o), "written from the cache");
+    assert_eq!(w.result(&o).await, "repairing");
+}
+
+/// A cache-sourced repair PUT that lands while GC finishes, and whose
+/// reply is lost: the copy is collected by a later GC pass.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cache_repair_put_with_a_lost_reply_after_gc_is_collected() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 254).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    let cipher = safety.stored(&key).unwrap().bytes;
+    assert!(safety.lose(&key));
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    bridge
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let run = w.scrub();
+    tokio::pin!(run);
+    let collect = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        assert_eq!(w.safety_state(&o).await, "deleted", "GC ran to its end");
+        w.rig.trip().arm(0, Trip::Lost);
+        safety.hold_put_prefix.replace(None);
+    };
+    tokio::select! {
+        () = collect => {}
+        _ = &mut run => panic!("scrub finished without writing the cached copy"),
+    }
+    assert_eq!(run.await.repaired, 0);
+    assert!(w.has_safety(&o), "the PUT landed; its reply was lost");
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(!w.has_safety(&o), "a later GC pass collects it");
 }
