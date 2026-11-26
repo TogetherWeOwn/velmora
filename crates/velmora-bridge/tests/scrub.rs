@@ -4572,3 +4572,92 @@ async fn a_kept_cache_only_extent_gets_a_safety_copy_back_soon() {
     w.scrub().await;
     assert!(w.has_safety(&o), "the re-verify wrote a safety copy");
 }
+
+/// Puts an intact cache fill of `o` in place and counts it.
+async fn cache_fill(w: &World, o: &Obj, name: &str, cipher: Vec<u8>) {
+    let extent = w.rig.live(&w.bucket, name).await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.bridge()
+        .catalog
+        .record_cache_fill(&o.extent, w.bridge().clock.now())
+        .await
+        .unwrap();
+}
+
+/// A pinned extent's cache fill that eviction keeps (no safety copy in
+/// place) does not end the drain: the extents behind it in the order
+/// still go.
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_cache_fill_does_not_end_the_drain() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let a = w.released("a", 41).await;
+    let b = w.released("b", 42).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&a.extent.safety_key())
+        .unwrap()
+        .bytes;
+    repinned_without_its_copy(&w, &a).await;
+    cache_fill(&w, &a, "a", cipher).await;
+    // `b` was read after `a`: it comes after it in the order.
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET last_read_at = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(b.extent.as_str().to_owned()),
+                SqlValue::Int(w.bridge().clock.now().0 + 1_000),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(w.has_safety(&b));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().cache.contains(&a.extent.cache_key()),
+        "kept: the only R2 copy"
+    );
+    assert!(!w.has_safety(&b), "the drain went on past the kept fill");
+}
+
+/// A Usenet repair whose safety PUTs fail leaves no object with other
+/// bytes under the safety key: eviction would take it for the copy and
+/// delete a later intact cache fill.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wrong_safety_object_is_not_taken_for_the_copy() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 43).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    assert!(w.bridge().safety.corrupt(&key, |b| b[10] ^= 1));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    assert_eq!(w.scrub().await.repaired, 1);
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(!w.has_safety(&o), "the object with other bytes is gone");
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-bad-safety-copy ") && a.contains(o.extent.as_str())));
+    cache_fill(&w, &o, "a", cipher).await;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the intact cache fill stays"
+    );
+}

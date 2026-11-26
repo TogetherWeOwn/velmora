@@ -838,15 +838,19 @@ where
                 break;
             }
             match self.evict_one(row, counting.as_deref()).await {
-                Ok(Some(bytes)) => {
+                Ok(Evicted::Freed(bytes)) => {
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
                 }
+                // Kept on purpose: the extents behind it still go, or a
+                // kept extent at the head of the order would end every
+                // drain there.
+                Ok(Evicted::Kept) => {}
                 // Another eviction job is at work on the same list, or a
                 // read just refilled the extent. Stop here rather than
                 // evict past the low watermark together; if the tier is
                 // still over the cap, the dispatcher starts a new drain.
-                Ok(None) => {
+                Ok(Evicted::Contended) => {
                     more = false;
                     break;
                 }
@@ -872,10 +876,12 @@ where
         Ok(freed)
     }
 
-    /// Evicts one extent's evictable R2 copies and returns the bytes it
-    /// freed. `None` when something else changed the extent meanwhile:
-    /// either the catalogue refused the eviction (nothing was deleted), or
-    /// it could not be finished as begun.
+    /// Evicts one extent's evictable R2 copies: the bytes it freed,
+    /// [`Evicted::Kept`] when a copy may be the one a repair needs
+    /// (nothing is deleted), or [`Evicted::Contended`] when something else
+    /// changed the extent meanwhile: either the catalogue refused the
+    /// eviction (nothing was deleted), or it could not be finished as
+    /// begun.
     /// With the scrub on, the backbones whose losses fence eviction: the
     /// ones the scrub checks (`verify::release_labels`).
     fn scrub_counting(&self) -> Option<Vec<String>> {
@@ -889,9 +895,15 @@ where
         &self,
         row: &EvictCandidate,
         counting: Option<&[String]>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Evicted> {
+        if row.pinned && self.safety.head(&row.extent.safety_key()).await?.is_none() {
+            // A pinned extent whose safety copy is not in place (a repair
+            // that could not write it yet): its cache fill may be the only
+            // R2 copy. Whatever the scrub switch says, it stays.
+            return Ok(Evicted::Kept);
+        }
         if !self.catalog.begin_evict(row).await? {
-            return Ok(None);
+            return Ok(Evicted::Contended);
         }
         // Both keys go whatever the counts say, so a copy the catalogue
         // did not count goes too. The one exception is the safety copy of
@@ -906,13 +918,7 @@ where
             // only one left). Nothing is deleted and nothing is finished:
             // the counts stand, and the next listing leaves the extent
             // out while the loss is on record.
-            return Ok(None);
-        }
-        if row.pinned && self.safety.head(&row.extent.safety_key()).await?.is_none() {
-            // A pinned extent whose safety copy is not in place (a repair
-            // that could not write it yet): its cache fill may be the only
-            // R2 copy. Whatever the scrub switch says, it stays.
-            return Ok(None);
+            return Ok(Evicted::Kept);
         }
         if !row.pinned {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
@@ -922,8 +928,8 @@ where
         // took the extent, since `begin_evict`. The counts stand, and
         // what this drain still has to evict is no longer known.
         Ok(match self.catalog.finish_evict(row).await? {
-            true => Some(row.evictable_bytes()),
-            false => None,
+            true => Evicted::Freed(row.evictable_bytes()),
+            false => Evicted::Contended,
         })
     }
 
@@ -1441,4 +1447,14 @@ where
         }
         Ok(())
     }
+}
+
+/// What one eviction did (`evict_one`).
+enum Evicted {
+    /// The bytes it freed.
+    Freed(u64),
+    /// Kept on purpose, nothing deleted: the drain goes on past it.
+    Kept,
+    /// Another job or a read changed the extent: the drain stops.
+    Contended,
 }

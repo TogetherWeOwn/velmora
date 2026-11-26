@@ -1580,7 +1580,14 @@ where
             if !there {
                 // Pinned without its copy: verify cannot post from it. The
                 // watch looks again after the confirm interval, not at the
-                // bound.
+                // bound. An object left under the key that is not the
+                // extent's (never read on a Usenet repair) goes, or
+                // eviction would take it for the copy.
+                if let Ok(Some(bytes)) = self.safety.get(&key, None).await {
+                    if !digest_ok(extent, &bytes) {
+                        self.drop_wrong_safety(extent).await;
+                    }
+                }
                 crate::trace::alert(|| {
                     format!(
                         "scrub-repair-copy-missing {} the safety copy could not be written",
@@ -1619,7 +1626,10 @@ where
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
                 return Ok((RepairSource::Safety, Some(bytes)));
             }
-            Ok(_) => true,
+            // Other bytes under the key: no copy, and gone before any
+            // re-pin, or eviction would take it for one.
+            Ok(Some(_)) => self.drop_wrong_safety(extent).await,
+            Ok(None) => true,
             Err(_) => false,
         };
         match self.cache.get(&extent.id.cache_key(), None).await {
@@ -1627,6 +1637,20 @@ where
             Ok(_) if safety_answered => Ok((RepairSource::Usenet, None)),
             _ => Err(()),
         }
+    }
+
+    /// Deletes a safety object whose bytes are not the extent's. Every
+    /// object under a safety key is then an intact copy: eviction keeps a
+    /// pinned extent's cache fill only until one is in place, by `HEAD`.
+    /// `false`: the delete failed.
+    async fn drop_wrong_safety(&self, extent: &ExtentRow) -> bool {
+        crate::trace::alert(|| {
+            format!(
+                "scrub-bad-safety-copy {} its bytes are not the extent's; deleted",
+                extent.id.as_str()
+            )
+        });
+        self.safety.delete(&extent.id.safety_key()).await.is_ok()
     }
 
     /// The PUT intents whose PUT can no longer land (the invocation that
@@ -1736,7 +1760,11 @@ where
         // A store that did not answer is not a missing copy: no
         // `unrecoverable` on it (`unknown`).
         let (kept, mut unknown) = match self.safety.get(&extent.id.safety_key(), None).await {
-            Ok(Some(bytes)) => (digest_ok(extent, &bytes), false),
+            Ok(Some(bytes)) if digest_ok(extent, &bytes) => (true, false),
+            // Other bytes under the key: no copy, and gone, or eviction
+            // would take it for one. Not gone: as a store that did not
+            // answer.
+            Ok(Some(_)) => (false, !self.drop_wrong_safety(extent).await),
             Ok(None) => (false, false),
             Err(_) => (false, true),
         };
