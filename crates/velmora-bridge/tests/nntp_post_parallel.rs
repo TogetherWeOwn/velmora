@@ -950,7 +950,8 @@ async fn a_socket_that_lost_its_permit_mid_post_stops() {
         rig.bridge.clock.advance_secs(30);
         calls_then.set(rig.bridge.nntp.calls().len());
         // Bounded: a job that never renews fails the test, not hangs it.
-        for _ in 0..1_000_000 {
+        let deadline = std::time::Instant::now() + WAIT_TIMEOUT;
+        while std::time::Instant::now() < deadline {
             if rig.bridge.catalog.renewals.get() != renewals {
                 renewed_in_flight.set(true);
                 break;
@@ -1110,7 +1111,8 @@ async fn a_job_that_lost_its_address_stops() {
         rig.bridge.catalog.revoke_permits();
         rig.bridge.clock.advance_secs(30);
         calls_then.set(rig.bridge.nntp.calls().len());
-        for _ in 0..1_000_000 {
+        let deadline = std::time::Instant::now() + WAIT_TIMEOUT;
+        while std::time::Instant::now() < deadline {
             if rig.bridge.catalog.renewals.get() != renewals {
                 break;
             }

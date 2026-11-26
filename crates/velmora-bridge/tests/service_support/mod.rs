@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
@@ -303,8 +304,8 @@ impl StreamSeen {
     }
 }
 
-/// How long a held call waits, in turns of the executor.
-pub const HOLD_TURNS: u32 = 100_000;
+/// Bound test interleavings by real time: either side may be waiting on SQL I/O.
+pub const HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Something that happens in the middle of an operation on a store.
 pub type Hook = RefCell<Option<Box<dyn FnOnce(&str)>>>;
@@ -355,7 +356,12 @@ impl BlobStore for Blobs {
             let prefix = self.hold_put_prefix.borrow();
             prefix.as_deref().is_some_and(|p| key.starts_with(p))
         };
+        let deadline = Instant::now() + HOLD_TIMEOUT;
         while holds(key) {
+            assert!(
+                Instant::now() < deadline,
+                "the held put call was never let go: {key}"
+            );
             self.held.set(true);
             tokio::task::yield_now().await;
         }
@@ -485,16 +491,18 @@ impl BlobStore for Blobs {
         };
         self.list_held.set(true);
         // Bounded: a test that never lets go fails instead of hanging.
-        for _ in 0..HOLD_TURNS {
-            if !self.list_held.get() {
-                return match early {
-                    Some(keys) => keys,
-                    None => self.inner.list(prefix, start_after, limit).await,
-                };
-            }
+        let deadline = Instant::now() + HOLD_TIMEOUT;
+        while self.list_held.get() {
+            assert!(
+                Instant::now() < deadline,
+                "the held list call was never let go"
+            );
             tokio::task::yield_now().await;
         }
-        panic!("the held list call was never let go");
+        match early {
+            Some(keys) => keys,
+            None => self.inner.list(prefix, start_after, limit).await,
+        }
     }
 }
 

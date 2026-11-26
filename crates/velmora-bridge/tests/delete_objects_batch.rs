@@ -895,7 +895,12 @@ async fn an_unanswered_batch_does_not_delete_a_write_that_came_after() {
         rig.trip().arm(signed_calls + 3 + 1 + 1, Trip::Lost);
         let mut delete = Box::pin(delete_objects(&rig, &signer, &keys));
         let mut answer = None;
+        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
         while answer.is_none() && !rig.trip().tripped() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "batch delete neither finished nor reached the trip point (seed {seed})"
+            );
             answer = std::future::poll_fn(|cx| match delete.as_mut().poll(cx) {
                 Poll::Ready(resp) => Poll::Ready(Some(resp)),
                 Poll::Pending => Poll::Ready(None),

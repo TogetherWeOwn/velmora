@@ -3411,7 +3411,12 @@ async fn a_delete_does_not_settle_a_record_stored_above_its_tombstone() {
         .replace(Some(TOMBSTONE_PREFIX.to_owned()));
     let first = delete(&rig, &signer, "k");
     let failed_put = async {
+        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
         while !safety.held.get() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the delete never reached the held tombstone put"
+            );
             tokio::task::yield_now().await;
         }
         assert!(tombstones(&rig).is_empty(), "the tombstone is not stored");
