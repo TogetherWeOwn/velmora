@@ -5446,3 +5446,94 @@ async fn kept_fills_are_promoted_after_the_excess_runs_out() {
         assert!(w.has_safety(o), "k{i}: promoted");
     }
 }
+
+/// A step HEADs only the kept fills it gets to: with twenty to write and
+/// a share of eight, the first step stops within its first batch of HEADs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_heads_only_the_kept_fills_it_gets_to() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    for i in 0..20u8 {
+        let name = format!("k{i}");
+        let o = w.released(&name, 120 + i).await;
+        cache_only(&w, &o, &name).await;
+    }
+    cfg_mut(&mut w).providers[1].release = false;
+    let cache = &w.bridge().cache;
+    let before = cache.heads.get();
+    w.bridge().evict_batch(0).await.unwrap();
+    let heads = cache.heads.get() - before;
+    assert!(heads <= 16, "{heads} cache HEADs for a share of 8");
+}
+
+/// A drain over the cap that finds a promotion marker writes those fills,
+/// then evicts from the head of the order: the oldest copy goes first.
+#[tokio::test(flavor = "current_thread")]
+async fn a_drain_after_a_promotion_marker_evicts_the_oldest_copy_first() {
+    let mut w = world().await;
+    let old = w.released("a", 130).await;
+    let new = w.released("b", 131).await;
+    let c = &w.bridge().catalog;
+    let read = |o: &Obj, at: i64| {
+        let id = o.extent.as_str().to_owned();
+        async move {
+            c.sql
+                .inner
+                .fixture_exec(
+                    "UPDATE extents SET last_read_at = ?2 WHERE id = ?1",
+                    &[SqlValue::Text(id), SqlValue::Int(at)],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let now = w.bridge().clock.now().0;
+    read(&old, now - 2_000).await;
+    read(&new, now - 1_000).await;
+    // A marker left past the oldest copy.
+    c.set_evict_cursor(&EvictCursor::Promote(Box::new(EvictCursor::After(
+        now - 2_000,
+        old.extent.as_str().to_owned(),
+    ))))
+    .await
+    .unwrap();
+    let size: u64 = w
+        .scalar("SELECT cipher_size FROM extents WHERE id = ?1", &old.extent)
+        .await
+        .parse()
+        .unwrap();
+    // Over the cap by less than one copy.
+    cfg_mut(&mut w).hot_cap_bytes = 2 * size - 1;
+    w.bridge().jobs.inner.take();
+    w.bridge().evict_batch(0).await.unwrap();
+    drain_steps(&w).await;
+    assert!(!w.has_safety(&old), "the oldest copy went");
+    assert!(w.has_safety(&new), "the newer one stays");
+}
+
+/// A promotion step that came during a pause leaves its marker: once
+/// eviction resumes, the dispatcher's check starts a step for it though
+/// the tier is under its cap.
+#[tokio::test(flavor = "current_thread")]
+async fn the_dispatcher_resumes_promotions_a_pause_deferred() {
+    let mut w = world().await;
+    let o = w.released("a", 132).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge()
+        .catalog
+        .set_evict_cursor(&EvictCursor::Promote(Box::new(EvictCursor::Start)))
+        .await
+        .unwrap();
+    cfg_mut(&mut w).eviction_paused = true;
+    w.bridge().jobs.inner.take();
+    assert_eq!(w.bridge().evict_batch(0).await.unwrap(), 0);
+    cfg_mut(&mut w).eviction_paused = false;
+    cfg_mut(&mut w).hot_cap_bytes = u64::MAX / 4;
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.dispatch().await.unwrap();
+    drain_steps(&w).await;
+    assert!(w.has_safety(&o), "the deferred fill was written");
+}

@@ -227,6 +227,8 @@ fn sql_down() -> BridgeError {
 pub struct Blobs {
     pub inner: MemBlobStore,
     pub trip: Tripwire,
+    /// `head` calls so far.
+    pub heads: Cell<u64>,
     /// The next GET on this store fails without removing the blob.
     pub fail_next_get: Cell<bool>,
     pub fail_put: Cell<bool>,
@@ -543,6 +545,7 @@ impl BlobStore for Blobs {
         answer
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.heads.set(self.heads.get() + 1);
         if self.fail_head.borrow().as_deref() == Some(key) {
             return Err(BridgeError::Blob("store: head failed".into()));
         }

@@ -821,6 +821,9 @@ where
         // on where the step before left the listing. Each step reads one
         // bounded window, however many rows in it may not go, and moves
         // the cursor past it even when none could.
+        // A step that writes the fills a marker names evicts nothing: its
+        // window starts at the marker, not where the oldest copies are.
+        let promote_only = pending.is_some();
         let cursor = match (pending, remaining) {
             (Some(inner), _) => inner,
             (None, 0) => EvictCursor::Start,
@@ -841,9 +844,9 @@ where
         let mut promoted = 0;
         let mut again = None;
         // Whether each kept fill is still in the cache: HEADs, a few at a
-        // time rather than one after another.
-        let mut present = Vec::with_capacity(window.unproven.len());
-        for chunk in window.unproven.chunks(EVICT_HEADS_AT_ONCE) {
+        // time rather than one after another, and only as far as the step
+        // gets.
+        'chunks: for chunk in window.unproven.chunks(EVICT_HEADS_AT_ONCE) {
             let heads = chunk.iter().map(|kept| async move {
                 match kept.row.cache_bytes {
                     0 => Ok(true),
@@ -854,36 +857,34 @@ where
                         .map(|head| head.is_some()),
                 }
             });
-            for head in futures_util::future::join_all(heads).await {
-                present.push(head?);
-            }
-        }
-        for (kept, present) in window.unproven.iter().zip(present) {
-            if kept.row.cache_bytes == 0 {
-                continue;
-            }
-            // A fill the cache's lifecycle rule took is no longer counted,
-            // and its bytes are no longer part of what this drain has to
-            // free: they would make it take other copies.
-            if !present {
-                excess = excess.saturating_sub(self.forget_gone_fill(&kept.row).await?);
-                continue;
-            }
-            if !kept.promote || kept.row.safety_bytes > 0 {
-                continue;
-            }
-            if promoted == EVICT_PROMOTE_PER_STEP {
-                again = Some((kept.resume.clone(), 0));
-                break;
-            }
-            match self.promote_cache_fill(&kept.row).await? {
-                Promoted::Written => promoted += 1,
-                // Nothing to write (no fill left, other bytes, not
-                // released): not the step's share, and not waited for.
-                Promoted::Nothing => {}
-                Promoted::Busy => {
-                    again = Some((kept.resume.clone(), EVICT_PROMOTE_BUSY_SECS));
-                    break;
+            let present = futures_util::future::join_all(heads).await;
+            for (kept, present) in chunk.iter().zip(present) {
+                if kept.row.cache_bytes == 0 {
+                    continue;
+                }
+                // A fill the cache's lifecycle rule took is no longer
+                // counted, and its bytes are no longer part of what this
+                // drain has to free: they would make it take other copies.
+                if !present? {
+                    excess = excess.saturating_sub(self.forget_gone_fill(&kept.row).await?);
+                    continue;
+                }
+                if !kept.promote || kept.row.safety_bytes > 0 {
+                    continue;
+                }
+                if promoted == EVICT_PROMOTE_PER_STEP {
+                    again = Some((kept.resume.clone(), 0));
+                    break 'chunks;
+                }
+                match self.promote_cache_fill(&kept.row).await? {
+                    Promoted::Written => promoted += 1,
+                    // Nothing to write (no fill left, other bytes, not
+                    // released): not the step's share, and not waited for.
+                    Promoted::Nothing => {}
+                    Promoted::Busy => {
+                        again = Some((kept.resume.clone(), EVICT_PROMOTE_BUSY_SECS));
+                        break 'chunks;
+                    }
                 }
             }
         }
@@ -905,7 +906,7 @@ where
             // the first fill not yet written. With nothing left to free,
             // the cursor itself says so, and the next step starts as a
             // drain does but writes those fills first.
-            let next = if excess == 0 {
+            let next = if excess == 0 || promote_only {
                 self.catalog
                     .set_evict_cursor(&EvictCursor::Promote(Box::new(resume)))
                     .await?;
@@ -922,6 +923,18 @@ where
                 }
             };
             self.jobs.send(&next, delay).await?;
+            return Ok(0);
+        }
+        if promote_only {
+            // The fills the marker named are written. Eviction itself
+            // starts over at the head of the order, so that the oldest
+            // copies go first: a fresh drain, if the tier is over its cap.
+            self.catalog.set_evict_cursor(&EvictCursor::Start).await?;
+            let next = Job::Evict {
+                v: JOB_VERSION,
+                remaining: 0,
+            };
+            self.jobs.send(&next, 0).await?;
             return Ok(0);
         }
         self.catalog.set_evict_cursor(&window.next).await?;
@@ -1439,7 +1452,11 @@ where
         let shape = self.catalog.hot_shape().await?;
         report.hot_ctl = self.hot_ctl_check(now, shape).await;
         let over = shape.evictable_bytes > self.effective_cap().await?;
-        if over && !self.cfg.eviction_paused {
+        // Over the cap, or with kept fills still to be written (a step
+        // that came during a pause left its marker): a drain starts.
+        if !self.cfg.eviction_paused
+            && (over || matches!(self.catalog.evict_cursor().await?, EvictCursor::Promote(_)))
+        {
             let job = Job::Evict {
                 v: JOB_VERSION,
                 remaining: 0,
