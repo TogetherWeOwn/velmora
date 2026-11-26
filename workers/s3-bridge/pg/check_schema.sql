@@ -57,7 +57,7 @@ SELECT json_build_object(
         t.tgtype, ARRAY(SELECT a.attname FROM unnest(t.tgattr) WITH ORDINALITY k(attnum, ord)
                         JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum ORDER BY k.ord),
         p.proname, encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex'), pg_get_triggerdef(t.oid),
-        p.pronamespace = r.relnamespace))
+        p.pronamespace = r.relnamespace, t.tgoldtable, t.tgnewtable))
         FROM tbl r JOIN pg_trigger t ON t.tgrelid = r.oid AND NOT t.tgisinternal
         JOIN pg_proc p ON p.oid = t.tgfoid),
     'tx_guard', EXISTS (SELECT FROM tbl t JOIN pg_constraint c ON c.conrelid = t.oid

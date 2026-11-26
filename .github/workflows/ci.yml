@@ -417,6 +417,17 @@ jobs:
           persist-credentials: false
       - name: Check D1 baseline migration coverage
         run: workers/s3-bridge/ops/pg-migrate.sh --check-migrations
+      # Fresh and import-mode migrations, the D1 parity gate (--verify) and
+      # the shared SQLite/PostgreSQL trigger fixture (--test), each in a
+      # disposable schema of the service database.
+      - name: Migrate, verify and run the trigger fixture on PostgreSQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGUSER: postgres
+          PGDATABASE: velmora_test
+          VELMORA_TEST_PG_MIGRATE: "1"
+        run: python3 -I workers/s3-bridge/tools/test_pg_migrate.py -v
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --no-self-update

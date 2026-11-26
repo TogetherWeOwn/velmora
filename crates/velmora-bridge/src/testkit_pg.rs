@@ -18,9 +18,53 @@ use crate::types::{BridgeError, Result};
 
 use super::ARM_USAGE;
 
-const PRE: &str = include_str!("../../../workers/s3-bridge/pg/0001_baseline_pre.sql");
-const POST: &str = include_str!("../../../workers/s3-bridge/pg/0002_baseline_post.sql");
+/// Every shipped PostgreSQL stage, in order. The fresh-test seed runs
+/// between the first two, as `pg-migrate.sh` does. A test checks that this
+/// list matches the stage files.
+pub(crate) const STAGES: &[(&str, &str)] = &[
+    (
+        "0001_baseline_pre.sql",
+        include_str!("../../../workers/s3-bridge/pg/0001_baseline_pre.sql"),
+    ),
+    (
+        "0002_baseline_post.sql",
+        include_str!("../../../workers/s3-bridge/pg/0002_baseline_post.sql"),
+    ),
+    (
+        "0003_usage_statement_triggers.sql",
+        include_str!("../../../workers/s3-bridge/pg/0003_usage_statement_triggers.sql"),
+    ),
+];
 const SEED: &str = "INSERT INTO usage_global(id) VALUES (1),(2)";
+
+/// The stages through `last` (a `NNNN` version), with the fresh seed.
+fn schema_script(last: &str) -> Result<String> {
+    if !STAGES.iter().any(|(name, _)| name.starts_with(last)) || last.len() != 4 {
+        return Err(BridgeError::Sql(format!(
+            "pg testkit: unknown stage {last}"
+        )));
+    }
+    let mut script = String::new();
+    for (index, (name, sql)) in STAGES.iter().enumerate() {
+        if name[..4] > *last {
+            break;
+        }
+        // The testkit applies every stage in one transaction, where a
+        // concurrent index build is not allowed.
+        if sql.starts_with("-- velmora: no-transaction\n") {
+            script.push_str(&sql.replace("INDEX CONCURRENTLY", "INDEX"));
+        } else {
+            script.push_str(sql);
+        }
+        script.push('\n');
+        if index == 0 {
+            script.push_str(SEED);
+            script.push_str(";\n");
+        }
+    }
+    Ok(script)
+}
+
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 pub const URL_VAR: &str = "VELMORA_TEST_PG_URL";
@@ -194,6 +238,18 @@ pub struct TestPostgres {
 
 impl TestPostgres {
     pub(super) fn new(armed: bool, _record: bool) -> Result<Self> {
+        let last = &STAGES[STAGES.len() - 1].0[..4];
+        Self::through(last, armed, _record)
+    }
+
+    /// A schema with the stages through `last` only, to compare a
+    /// superseded stage's behaviour with the shipped one.
+    pub fn through_stage(last: &str, armed: bool) -> Result<Self> {
+        Self::through(last, armed, false)
+    }
+
+    fn through(last: &str, armed: bool, _record: bool) -> Result<Self> {
+        let script = schema_script(last)?;
         let url = std::env::var(URL_VAR)
             .map_err(|_| BridgeError::Sql(format!("pg testkit: {URL_VAR} must be UTF-8")))?;
         let base: Config = url
@@ -243,7 +299,7 @@ impl TestPostgres {
             let arm = if armed { ARM_USAGE } else { "" };
             client.batch_execute(&format!(
                 "BEGIN; CREATE SCHEMA {setup_schema}; SET LOCAL search_path = {setup_schema}, pg_temp; \
-                 {PRE}\n{SEED};\n{POST}\n{arm}; COMMIT;"
+                 {script}{arm}; COMMIT;"
             )).await.map_err(|error| pg_error("apply baseline", error))
         })?;
         Ok(Self {
@@ -354,6 +410,34 @@ mod tests {
             .parse()
             .unwrap_or_else(|_| panic!("invalid PostgreSQL test configuration"));
         (config.get_ssl_mode() == SslMode::Disable).then_some(config)
+    }
+
+    #[test]
+    fn stages_are_every_shipped_postgres_stage_in_order() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/s3-bridge/pg");
+        let mut shipped: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| {
+                name.len() > 9
+                    && name.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+                    && name.as_bytes()[4] == b'_'
+                    && name.ends_with(".sql")
+            })
+            .collect();
+        shipped.sort();
+        let listed: Vec<&str> = STAGES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            listed, shipped,
+            "testkit_pg::STAGES must list every pg/NNNN_*.sql stage"
+        );
+        let fresh = schema_script("0003").unwrap();
+        let seed = fresh.find(SEED).unwrap();
+        assert!(seed > fresh.find(STAGES[0].1).unwrap() && seed < fresh.find(STAGES[1].1).unwrap());
+        assert!(fresh.contains(STAGES[2].1));
+        assert!(!schema_script("0002").unwrap().contains(STAGES[2].1));
+        assert!(schema_script("0009").is_err());
     }
 
     #[test]

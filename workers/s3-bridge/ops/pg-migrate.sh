@@ -33,6 +33,24 @@ ERRORS = {
     'VL017': 'not all requested migrations have been applied',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
 }
+# Declared engine difference (0003): these D1 per-row usage triggers are
+# PostgreSQL statement triggers. Each entry is the column list (KEEP_COLUMNS:
+# the D1 trigger's own) and the OLD and NEW transition table names. Every
+# other trigger must stay per-row and have no transition tables.
+KEEP_COLUMNS = object()
+STATEMENT_TRIGGERS = {
+    'usage_extents_insert': ((), None, 'new_rows'),
+    'usage_extents_update': ((), 'old_rows', 'new_rows'),
+    'usage_extents_delete': ((), 'old_rows', None),
+    'usage_generations_insert': ((), None, 'new_rows'),
+    'usage_generations_update': ((), 'old_rows', 'new_rows'),
+    'usage_generations_delete': ((), 'old_rows', None),
+    'usage_outbox_insert': ((), None, 'new_rows'),
+    'usage_outbox_delete': ((), 'old_rows', None),
+    # Fires before usage_outbox_stage (name order) for the same statement.
+    'usage_outbox_failure': (KEEP_COLUMNS, None, None),
+    'usage_outbox_stage': ((), 'old_rows', 'new_rows'),
+}
 MARKER = "to_regclass(format('%I._velmora_import_incomplete', current_schema()))"
 USAGE = "has_schema_privilege('kofra_app', current_schema(), 'USAGE')"
 SEEDS = '(SELECT count(*) FROM usage_global WHERE id IN (1, 2)) = 2'
@@ -383,8 +401,16 @@ def compare(actual, d1, migrations):
                 r'\b(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([a-z_0-9,\s]+?))?\s+ON\b', sql, re.I
             ).groups()
             kind = 1 + (2 if timing.upper() == 'BEFORE' else 0) + {'INSERT': 4, 'DELETE': 8, 'UPDATE': 16}[event.upper()]
-            expected['triggers'].add((table, name, 'O', kind, tuple(re.findall(r'\w+', updates or ''))))
+            columns, transition = tuple(re.findall(r'\w+', updates or '')), (None, None)
+            if name in STATEMENT_TRIGGERS:
+                declared, *transition = STATEMENT_TRIGGERS[name]
+                kind &= ~1
+                columns = columns if declared is KEEP_COLUMNS else declared
+            expected['triggers'].add((table, name, 'O', kind, columns, *transition))
 
+    unknown = STATEMENT_TRIGGERS.keys() - {r[1] for r in expected['triggers']}
+    if unknown:
+        die('declared statement triggers are not D1 triggers: ' + ', '.join(sorted(unknown)))
     expected['columns'].add(('outbox', 'seq', 'bigint', True, 'd', None, None))
     expected['indexes'].add(('outbox', 'outbox_seq_key', False, True, True, 'btree', (('seq', False, False),), None))
     actual['tables'] = set(actual['tables'] or ())
@@ -397,7 +423,7 @@ def compare(actual, d1, migrations):
     actual['foreign_keys'] = {tuple(r[:2]) + (tuple(r[2]), tuple(r[3])) + tuple(r[4:])
                               for r in (actual['foreign_keys'] or ())}
     actual_triggers = actual['triggers'] or ()
-    actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) for r in actual_triggers}
+    actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) + tuple(r[9:11]) for r in actual_triggers}
     expected_bodies = pg_trigger_bodies(migrations)
     actual_bodies = {r[1]: (r[5], r[6], trigger_condition(list(sql_tokens(r[7])))) for r in actual_triggers if r[8]}
     actual['checks'] = {(t, predicate(expr), valid) for t, expr, valid in (actual['checks'] or ())}
@@ -434,6 +460,17 @@ def test_triggers(run, begin, history, complete, d1):
     db.executescript('ALTER TABLE outbox ADD COLUMN seq INTEGER; '
                      'CREATE TABLE wp2_usage_trace(step TEXT,target TEXT,values_ TEXT);')
     db.executescript(fixture)
+    # SQLite applies a multi-row statement's rows in its plan's order, PG
+    # in ascending hour order. A marked mixed-hour statement must visit
+    # outbox rows in key order, which the fixture makes the hour order.
+    ordered = re.findall(r'^-- velmora: sqlite-key-order\n(.*?);$', fixture, re.M | re.S)
+    for statement in ordered:
+        plan = [row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + statement)]
+        if len(plan) != 1 or not re.fullmatch(
+                r'SEARCH outbox USING (?:COVERING )?INDEX sqlite_autoindex_outbox_1 \(extent_id=\?\)', plan[0]):
+            die(f'fixture statement is not applied in key order by SQLite: {plan}')
+    if len(ordered) < 2:
+        die('fixture lost its key-order mixed-hour statements')
     expected = {(s, t): v for s, t, v in db.execute('SELECT * FROM wp2_usage_trace')}
     actual = {(s, t): v for s, t, v in json.loads(run(begin + history + complete + sql + '\nROLLBACK;\n',
                                                    report='trigger tests'))}
@@ -441,7 +478,8 @@ def test_triggers(run, begin, history, complete, d1):
         mismatches = [f'{s}/{t}: SQLite={expected.get((s,t))}, PG={actual.get((s,t))}'
                       for s, t in sorted(expected.keys() | actual.keys()) if expected.get((s,t)) != actual.get((s,t))]
         die('trigger parity differences (synthetic fixture):\n' + '\n'.join(mismatches))
-    print(f'Trigger tests passed: 8 refusals, insert/adopt and {len(expected)} SQLite parity checkpoints; rolled back')
+    print(f'Trigger tests passed: 8 refusals, insert/adopt and {len(expected)} SQLite parity checkpoints '
+          f'({len(ordered)} key-order mixed-hour statements); rolled back')
 
 
 def main():
