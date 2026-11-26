@@ -437,6 +437,19 @@ async fn timed_rollback(db: &Client, sql: &str) -> (u64, Duration) {
     (changed, elapsed)
 }
 
+/// The fastest of three timed, rolled-back runs: other tests share the
+/// database, and their load only ever adds time. A quadratic plan stays
+/// quadratic in every run.
+async fn fastest_rollback(db: &Client, sql: &str) -> (u64, Duration) {
+    let mut best = timed_rollback(db, sql).await;
+    for _ in 0..2 {
+        let run = timed_rollback(db, sql).await;
+        assert_eq!(run.0, best.0, "{sql}");
+        best.1 = best.1.min(run.1);
+    }
+    best
+}
+
 /// PL/pgSQL caches each trigger query with the transition-table size of
 /// its first firing in the session. A pooled session's first event is
 /// usually one row, so every changed trigger must stay linear after a
@@ -519,8 +532,8 @@ async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_sessi
     let mut report = Vec::new();
     for (warm, bulk) in &shapes {
         assert_eq!(exec(&db, warm).await, 1, "{warm}");
-        let (small_rows, small) = timed_rollback(&db, &bulk(2_000)).await;
-        let (large_rows, large) = timed_rollback(&db, &bulk(20_000)).await;
+        let (small_rows, small) = fastest_rollback(&db, &bulk(2_000)).await;
+        let (large_rows, large) = fastest_rollback(&db, &bulk(20_000)).await;
         assert_eq!(
             (small_rows, large_rows),
             (2_000, 20_000),
