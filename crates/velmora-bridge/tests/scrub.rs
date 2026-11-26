@@ -5297,3 +5297,41 @@ async fn a_promotion_waits_for_the_jobs_memory() {
     }
     assert!(w.has_safety(&o), "written by the later step");
 }
+
+/// A kept fill the cache's lifecycle rule took is no longer counted, or
+/// its bytes would make the drain take other copies: for a released
+/// extent kept for want of a release, and for one whose safety copy was
+/// given up (`deleted`).
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_fill_the_lifecycle_took_is_no_longer_counted() {
+    for state in ["released", "deleted"] {
+        let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+        let o = w.released("a", 74).await;
+        cache_only(&w, &o, "a").await;
+        if state == "deleted" {
+            w.bridge()
+                .catalog
+                .sql
+                .inner
+                .fixture_exec(
+                    "UPDATE extents SET safety_state = 'deleted', release_evidence = NULL, \
+                     evict_seq = evict_seq + 1 WHERE id = ?1",
+                    &[SqlValue::Text(o.extent.as_str().to_owned())],
+                )
+                .await
+                .unwrap();
+        }
+        cfg_mut(&mut w).providers[1].release = false;
+        assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+        w.bridge().evict_batch(0).await.unwrap();
+        assert_eq!(
+            w.scalar(
+                "SELECT hot_cache_bytes FROM extents WHERE id = ?1",
+                &o.extent
+            )
+            .await,
+            "0",
+            "{state}: the fill that is gone is not counted"
+        );
+    }
+}

@@ -832,7 +832,17 @@ where
         let mut promoted = 0;
         let mut again = None;
         for kept in &window.unproven {
-            if kept.row.safety_bytes > 0 || kept.row.cache_bytes == 0 {
+            if kept.row.cache_bytes == 0 {
+                continue;
+            }
+            if !kept.promote {
+                // Kept, not written: a fill the cache's lifecycle rule
+                // took is no longer counted, or its bytes would make the
+                // drain take other copies.
+                self.forget_gone_fill(&kept.row).await?;
+                continue;
+            }
+            if kept.row.safety_bytes > 0 {
                 continue;
             }
             if promoted == EVICT_PROMOTE_PER_STEP {
@@ -856,6 +866,7 @@ where
             let kept: Vec<ExtentId> = window
                 .unproven
                 .iter()
+                .filter(|x| x.promote)
                 .map(|x| x.row.extent.clone())
                 .collect();
             self.catalog
@@ -994,6 +1005,10 @@ where
             return Ok(Promoted::Busy);
         };
         let Some(bytes) = self.cache.get(&kept.extent.cache_key(), None).await? else {
+            // The lifecycle rule took it: no longer counted.
+            self.catalog
+                .hot_forget(&kept.extent, kept.seq, false, true)
+                .await?;
             return Ok(Promoted::Nothing);
         };
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1031,6 +1046,17 @@ where
             });
         }
         Ok(Promoted::Written)
+    }
+
+    /// A kept fill that is gone from the cache (the lifecycle rule took
+    /// it) is no longer counted, if the row is as listed.
+    async fn forget_gone_fill(&self, kept: &EvictCandidate) -> Result<()> {
+        if self.cache.head(&kept.extent.cache_key()).await?.is_none() {
+            self.catalog
+                .hot_forget(&kept.extent, kept.seq, false, true)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn evict_one(

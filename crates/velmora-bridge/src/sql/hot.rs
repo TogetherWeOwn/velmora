@@ -406,10 +406,11 @@ pub(super) async fn evict_window<S: Sql>(
             // Only a released extent's fill is promoted: `deleted` names a
             // safety copy given up (a restore without one, a drill), not
             // an extent out of service, so its fill is kept, unwritten.
-            if state == "released" && !loss {
+            if !candidate.pinned && !loss {
                 out.unproven.push(crate::types::EvictKept {
                     row: candidate.clone(),
                     resume: resume.clone(),
+                    promote: state == "released",
                 });
             }
             continue;

@@ -1327,8 +1327,8 @@ pub struct EvictWindow {
     pub next: EvictCursor,
     /// False once the window reached the end of the order.
     pub more: bool,
-    /// The released extents in it kept for want of a release under the
-    /// backbones that count now, in order.
+    /// The unpinned extents in it kept for want of a release under the
+    /// backbones that count now (with no loss on record), in order.
     pub unproven: Vec<EvictKept>,
 }
 
@@ -1338,6 +1338,9 @@ pub struct EvictKept {
     pub row: EvictCandidate,
     /// The cursor from which a later step reads this row again.
     pub resume: EvictCursor,
+    /// Released: its fill is written to the safety store. Otherwise (its
+    /// safety copy was given up) it is only kept.
+    pub promote: bool,
 }
 
 /// An extent's ciphertext as the catalogue records it: what a blob must
