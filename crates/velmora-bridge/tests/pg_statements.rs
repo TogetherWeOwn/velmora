@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::types::Type;
 use velmora_bridge::pg::{is_postgres_read_only, normalize_statement, WRITE_RESULTS};
 use velmora_bridge::sql::{pg_background_statements, pg_datapath_statements};
-use velmora_bridge::testkit::TestSql;
+use velmora_bridge::testkit::{TestPostgres, TestSql};
 use velmora_bridge::{BridgeError, Sql, SqlValue};
 
 const COVERAGE_DIR: &str = "VELMORA_PG_STATEMENTS_DIR";
@@ -262,7 +262,9 @@ async fn postgres_testkit_preserves_private_type_lookup_statements() {
     if !TestSql::postgres_selected() {
         return;
     }
-    let db = TestSql::with_schema_unrecorded().unwrap();
+    // Type lookups happen on the typed transport only: one-message writes
+    // read text and never look a type up.
+    let db = TestSql::Postgres(Box::new(TestPostgres::with_typed_writes().unwrap()));
     db.fixture_script(
         "CREATE TYPE testkit_enum_one AS ENUM ('value');
          CREATE TYPE testkit_enum_two AS ENUM ('value');",

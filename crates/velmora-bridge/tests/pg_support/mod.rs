@@ -34,9 +34,20 @@ pub fn unique(prefix: &str) -> String {
     format!("{prefix}_{:x}_{nanos:x}_{n:x}", std::process::id())
 }
 
+/// The test server, which must be a cleartext loopback server: these tests
+/// and their proxy speak PostgreSQL without TLS.
 pub fn base_config() -> Option<Config> {
     let url = std::env::var(URL_VAR).ok()?;
-    Some(url.parse().expect("a valid PostgreSQL test configuration"))
+    let config: Config = url.parse().expect("a valid PostgreSQL test configuration");
+    let loopback = matches!(config.get_hosts(),
+        [Host::Tcp(host)] if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+    assert!(
+        loopback
+            && config.get_hostaddrs().is_empty()
+            && config.get_ssl_mode() == tokio_postgres::config::SslMode::Disable,
+        "the write transport tests need a numeric loopback host with sslmode=disable"
+    );
+    Some(config)
 }
 
 pub async fn connect(config: &Config) -> Client {

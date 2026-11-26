@@ -252,16 +252,24 @@ pub struct TestPostgres {
 impl TestPostgres {
     pub(super) fn new(armed: bool, _record: bool) -> Result<Self> {
         let last = &STAGES[STAGES.len() - 1].0[..4];
-        Self::through(last, armed, _record)
+        Self::through(last, armed, _record, write_tx())
     }
 
     /// A schema with the stages through `last` only, to compare a
     /// superseded stage's behaviour with the shipped one.
     pub fn through_stage(last: &str, armed: bool) -> Result<Self> {
-        Self::through(last, armed, false)
+        Self::through(last, armed, false, write_tx())
     }
 
-    fn through(last: &str, armed: bool, _record: bool) -> Result<Self> {
+    /// A schema whose catalogue writes use the typed transport, for tests
+    /// of the pooled session's driver state (type lookups, prepared
+    /// statements) that the one-message transport never creates.
+    pub fn with_typed_writes() -> Result<Self> {
+        let last = &STAGES[STAGES.len() - 1].0[..4];
+        Self::through(last, true, false, WriteTx::Pipeline)
+    }
+
+    fn through(last: &str, armed: bool, _record: bool, catalog_write_tx: WriteTx) -> Result<Self> {
         let script = schema_script(last)?;
         let url = std::env::var(URL_VAR)
             .map_err(|_| BridgeError::Sql(format!("pg testkit: {URL_VAR} must be UTF-8")))?;
@@ -300,7 +308,7 @@ impl TestPostgres {
                 config: connector.config.clone(),
                 pool: Some(Arc::default()),
             },
-            write_tx(),
+            catalog_write_tx,
         );
         #[cfg(feature = "pg-test-record")]
         let catalog = if _record {
