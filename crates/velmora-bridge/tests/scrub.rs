@@ -5335,3 +5335,55 @@ async fn a_kept_fill_the_lifecycle_took_is_no_longer_counted() {
         );
     }
 }
+
+/// The same for a kept extent that has its safety copy: its fill that the
+/// lifecycle rule took is no longer counted either.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gone_fill_of_a_kept_extent_with_its_safety_copy_is_no_longer_counted() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 75).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    cache_fill(&w, &o, "a", cipher).await;
+    cfg_mut(&mut w).providers[1].release = false;
+    assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(w.has_safety(&o), "kept");
+    assert_eq!(
+        w.scalar(
+            "SELECT hot_cache_bytes FROM extents WHERE id = ?1",
+            &o.extent
+        )
+        .await,
+        "0"
+    );
+}
+
+/// Bytes of a gone fill are not part of what the drain has to free: when
+/// they were all of the tier's excess, the drain leaves an evictable copy
+/// alone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_gone_fill_does_not_make_the_drain_take_another_copy() {
+    let mut w = world().await;
+    let kept = w.released("a", 76).await;
+    cache_only(&w, &kept, "a").await;
+    set_evidence(&w, &kept, &[("alpha", "body")]).await;
+    let other = w.released("b", 77).await;
+    let size: u64 = w
+        .scalar(
+            "SELECT cipher_size FROM extents WHERE id = ?1",
+            &other.extent,
+        )
+        .await
+        .parse()
+        .unwrap();
+    // Over the cap only by the fill that is no longer there.
+    cfg_mut(&mut w).hot_cap_bytes = 2 * size - 1;
+    assert!(w.bridge().cache.lose(&kept.extent.cache_key()));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(w.has_safety(&other), "the evictable copy stays");
+}

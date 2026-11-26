@@ -835,14 +835,15 @@ where
             if kept.row.cache_bytes == 0 {
                 continue;
             }
-            if !kept.promote {
-                // Kept, not written: a fill the cache's lifecycle rule
-                // took is no longer counted, or its bytes would make the
-                // drain take other copies.
-                self.forget_gone_fill(&kept.row).await?;
+            // A fill the cache's lifecycle rule took is no longer counted,
+            // and its bytes are no longer part of what this drain has to
+            // free: they would make it take other copies.
+            let gone = self.forget_gone_fill(&kept.row).await?;
+            if gone > 0 {
+                excess = excess.saturating_sub(gone);
                 continue;
             }
-            if kept.row.safety_bytes > 0 {
+            if !kept.promote || kept.row.safety_bytes > 0 {
                 continue;
             }
             if promoted == EVICT_PROMOTE_PER_STEP {
@@ -1049,14 +1050,22 @@ where
     }
 
     /// A kept fill that is gone from the cache (the lifecycle rule took
-    /// it) is no longer counted, if the row is as listed.
-    async fn forget_gone_fill(&self, kept: &EvictCandidate) -> Result<()> {
-        if self.cache.head(&kept.extent.cache_key()).await?.is_none() {
-            self.catalog
-                .hot_forget(&kept.extent, kept.seq, false, true)
-                .await?;
+    /// it) is no longer counted, if the row is as listed. The bytes no
+    /// longer counted (0 when the fill is there or the row moved).
+    async fn forget_gone_fill(&self, kept: &EvictCandidate) -> Result<u64> {
+        if self.cache.head(&kept.extent.cache_key()).await?.is_some() {
+            return Ok(0);
         }
-        Ok(())
+        Ok(
+            match self
+                .catalog
+                .hot_forget(&kept.extent, kept.seq, false, true)
+                .await?
+            {
+                true => kept.cache_bytes,
+                false => 0,
+            },
+        )
     }
 
     async fn evict_one(
