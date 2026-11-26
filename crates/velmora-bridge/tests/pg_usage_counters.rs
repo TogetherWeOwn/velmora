@@ -440,12 +440,66 @@ async fn timed_rollback(db: &Client, sql: &str) -> (u64, Duration) {
 /// The fastest of three timed, rolled-back runs: other tests share the
 /// database, and their load only ever adds time. A quadratic plan stays
 /// quadratic in every run.
-async fn fastest_rollback(db: &Client, sql: &str) -> (u64, Duration) {
-    let mut best = timed_rollback(db, sql).await;
-    for _ in 0..2 {
+async fn fastest_rollback(db: &Client, sql: &str, replan: bool) -> (u64, Duration) {
+    let mut best = (0, Duration::MAX);
+    for i in 0..3 {
+        if replan {
+            exec(db, "DISCARD PLANS").await;
+        }
         let run = timed_rollback(db, sql).await;
+        if i == 0 {
+            best.0 = run.0;
+        }
         assert_eq!(run.0, best.0, "{sql}");
         best.1 = best.1.min(run.1);
+    }
+    best
+}
+
+/// The same statement with this table's usage triggers disabled (fastest
+/// of three, rolled back): what the statement costs without counters.
+async fn fastest_without_usage_triggers(db: &Client, sql: &str) -> Duration {
+    let (table, triggers): (&str, &[&str]) = if sql.contains(" extents ") {
+        (
+            "extents",
+            &[
+                "usage_extents_insert",
+                "usage_extents_update",
+                "usage_extents_delete",
+            ],
+        )
+    } else if sql.contains(" outbox ") {
+        (
+            "outbox",
+            &[
+                "usage_outbox_insert",
+                "usage_outbox_delete",
+                "usage_outbox_failure",
+                "usage_outbox_stage",
+            ],
+        )
+    } else {
+        (
+            "generations",
+            &[
+                "usage_generations_insert",
+                "usage_generations_update",
+                "usage_generations_delete",
+            ],
+        )
+    };
+    let disable: Vec<String> = triggers
+        .iter()
+        .map(|t| format!("DISABLE TRIGGER {t}"))
+        .collect();
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        exec(db, "BEGIN").await;
+        exec(db, &format!("ALTER TABLE {table} {}", disable.join(", "))).await;
+        let started = Instant::now();
+        exec(db, sql).await;
+        best = best.min(started.elapsed());
+        exec(db, "ROLLBACK").await;
     }
     best
 }
@@ -454,7 +508,8 @@ async fn fastest_rollback(db: &Client, sql: &str) -> (u64, Duration) {
 /// its first firing in the session. A pooled session's first event is
 /// usually one row, so every changed trigger must stay linear after a
 /// single-row firing on the same connection: 10x the rows may take at most
-/// 30x the time (quadratic is 100x), and 20,000 rows at most 4 s.
+/// 30x the time (quadratic is 100x), 20,000 rows at most 4 s, and the
+/// counters at most twice what the statement costs with them disabled.
 #[tokio::test]
 async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_session() {
     if !TestSql::postgres_selected() {
@@ -530,23 +585,52 @@ async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_sessi
         ),
     ];
     let mut report = Vec::new();
-    for (warm, bulk) in &shapes {
-        assert_eq!(exec(&db, warm).await, 1, "{warm}");
-        let (small_rows, small) = fastest_rollback(&db, &bulk(2_000)).await;
-        let (large_rows, large) = fastest_rollback(&db, &bulk(20_000)).await;
-        assert_eq!(
-            (small_rows, large_rows),
-            (2_000, 20_000),
-            "{}",
-            bulk(20_000)
-        );
-        report.push(format!("{:?} -> {:?}: {}", small, large, bulk(20_000)));
-        assert!(
+    // A trigger query keeps the transition-table size of the firing that
+    // parsed it until the plan cache is reset, and any namespace change in
+    // the database resets it (other sessions creating schemas, for one).
+    // Measure both: plans parsed by the single-row firing ("cached"), where
+    // a join of the transition tables can run as a nested loop, and plans
+    // parsed by the bulk statement itself ("replanned"), where such a join
+    // is estimated at about N*M/200 rows and crosses the JIT thresholds.
+    for (mode, replan) in [("cached", false), ("replanned", true)] {
+        for (warm, bulk) in &shapes {
+            // Rolled back too: the session keeps the cached plans.
+            assert_eq!(timed_rollback(&db, warm).await.0, 1, "{warm}");
+            let (small_rows, small) = fastest_rollback(&db, &bulk(2_000), replan).await;
+            let (large_rows, large) = fastest_rollback(&db, &bulk(20_000), replan).await;
+            assert_eq!(
+                (small_rows, large_rows),
+                (2_000, 20_000),
+                "{}",
+                bulk(20_000)
+            );
+            report.push(format!(
+                "{mode}: {:?} -> {:?}: {}",
+                small,
+                large,
+                bulk(20_000)
+            ));
+            assert!(
             large < Duration::from_secs(4)
                 && large.as_secs_f64() < 30.0 * small.as_secs_f64().max(0.01),
-            "not linear on a warm session: 2,000 rows {small:?}, 20,000 rows {large:?}: {}",
+            "not linear on a warm session ({mode}): 2,000 rows {small:?}, 20,000 rows {large:?}: {}",
             bulk(20_000)
         );
+            // A fixed cost that grows with the plan's estimate (JIT
+            // compilation of a blind join) inflates both sizes alike, so
+            // also bound the counters' share: at most twice what the
+            // statement costs on its own. Disabling the triggers resets
+            // the plan cache, so this runs after the timed runs above.
+            let bare = fastest_without_usage_triggers(&db, &bulk(20_000)).await;
+            report.push(format!(
+                "{mode}: 20,000 rows without usage triggers {bare:?}"
+            ));
+            assert!(
+                large.as_secs_f64() < 3.0 * bare.as_secs_f64().max(0.005),
+                "usage triggers cost more than twice the statement ({mode}): {large:?} with, {bare:?} without: {}",
+                bulk(20_000)
+            );
+        }
     }
     eprintln!("warm-session usage triggers:\n{}", report.join("\n"));
 }
