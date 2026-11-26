@@ -1791,10 +1791,9 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
                 .collect::<Vec<_>>(),
         );
     }
-    // With 519 small plans, ten per budget, two placement values, and one
-    // oversized plan that can split one small run, packing needs at most 55.
+    // The helper also checks that each non-final run in a value is full.
     assert!(
-        plan_runs.len() <= 55,
+        plan_runs.len() <= 54,
         "runs were split too early: {plan_runs:?}"
     );
     assert_plan_runs_are_bounded_and_packed(
