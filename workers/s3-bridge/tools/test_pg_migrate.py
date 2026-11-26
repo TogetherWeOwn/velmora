@@ -133,9 +133,13 @@ class MigrationParser(unittest.TestCase):
         second = "\n-- between statements\n/* block */\nCREATE TABLE parser_second (value TEXT);"
         _, raw = namespace['lint_migration'](first + second, False, 'parser_comments.sql')
         self.assertEqual(raw, [first, second])
-        with self.assertRaisesRegex(AssertionError, "belongs to the migration runner"):
-            namespace['lint_migration']("SELECT set_config('velmora.migration_apply', 'off', true);",
-                                        False, 'parser_flag.sql')
+        for flag in ("SELECT set_config('velmora.migration_apply', 'off', true);",
+                     "SET LOCAL velmora . migration_apply = off;", 'SET "velmora".migration_apply = off;'):
+            with self.subTest(flag), self.assertRaisesRegex(AssertionError, "belongs to the migration runner"):
+                namespace['lint_migration'](flag, False, 'parser_flag.sql')
+        # Comments and unrelated names that merely contain the word are fine.
+        harmless = "-- velmora.migration_apply\nCREATE INDEX CONCURRENTLY IF NOT EXISTS migration_apply_idx ON t (id);"
+        self.assertEqual(namespace['lint_migration'](harmless, True, 'parser_flag.sql')[1], [harmless])
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).

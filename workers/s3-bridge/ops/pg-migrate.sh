@@ -284,8 +284,10 @@ def lint_migration(sql, no_tx, name):
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
-    if 'migration_apply' in sql.lower():
-        die(f'{name}: velmora.migration_apply belongs to the migration runner')
+    for statement in statements:
+        # Comments are already gone; literals, bodies and (quoted) names remain.
+        if 'velmora.migration_apply' in ''.join(statement).lower().replace('"', ''):
+            die(f'{name}: velmora.migration_apply belongs to the migration runner')
     for statement in statements:
         head = [token.upper() for token in statement[:7]]
         if head[0] in {'ABORT', 'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'START'} or head[:2] == ['PREPARE', 'TRANSACTION']:
