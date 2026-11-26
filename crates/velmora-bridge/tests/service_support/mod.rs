@@ -599,6 +599,9 @@ pub struct FailSql {
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+    /// Fails every read whose text contains the string and whose first
+    /// parameter is this text.
+    pub fail_read_for: RefCell<Option<(&'static str, String)>>,
     /// Stalls one matching write at the tripwire until the test releases it.
     pub stall_exec_matching: Cell<Option<&'static str>>,
     pub selected_exec: Tripwire,
@@ -719,6 +722,13 @@ impl Sql for FailSql {
         }
         self.over_budget()?;
         if self.refused(sql) {
+            return Err(BridgeError::Sql("database down".into()));
+        }
+        let failed = matches!(
+            (self.fail_read_for.borrow().as_ref(), params.first()),
+            (Some((text, key)), Some(SqlValue::Text(first))) if sql.contains(*text) && first == key
+        );
+        if failed {
             return Err(BridgeError::Sql("database down".into()));
         }
         self.interleave(sql);
@@ -932,6 +942,7 @@ fn rig_on<N: NntpConnector + 'static>(
                 refuse_publishes: Cell::new(0),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
+                fail_read_for: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),
                 selected_exec: Tripwire::default(),
                 stall_batch_key: Cell::new(None),

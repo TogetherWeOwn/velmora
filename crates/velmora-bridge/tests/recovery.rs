@@ -816,6 +816,8 @@ enum Removed {
     OtherBucket,
     /// It is published already (only an operator removes such a record).
     Present,
+    /// Nothing, and the catalogue fails every probe of its generation.
+    ProbeFails,
 }
 
 /// A record (N) is removed while the step is still staging the record
@@ -855,7 +857,7 @@ async fn removal_during_the_prior_record(case: Removed) {
     let record_id = ExtentId::new(refused.id.as_str().to_owned());
     let digest = sha2::Sha256::digest(&sealed).into();
     match case {
-        Removed::Unpublished => wipe(&rig),
+        Removed::Unpublished | Removed::ProbeFails => wipe(&rig),
         Removed::OtherBucket => {
             wipe(&rig);
             let again = rig.bucket("vault-again", true).await;
@@ -914,6 +916,12 @@ async fn removal_during_the_prior_record(case: Removed) {
         // way together and done before N-1 is staged.
         store.slow_reads.set(true);
         let sql = &rig.bridge.catalog.sql;
+        if let Removed::ProbeFails = case {
+            *sql.fail_read_for.borrow_mut() = Some((
+                "FROM generations WHERE id = ?1), ",
+                refused.id.as_str().to_owned(),
+            ));
+        }
         sql.stall_batch_key.set(Some(prior_extent));
         let remove = async {
             for _ in 0..HOLD_TURNS {
@@ -933,10 +941,11 @@ async fn removal_during_the_prior_record(case: Removed) {
             remove,
         )
         .await;
-        let report = step.unwrap();
+        let report = step.unwrap_or_else(|e| panic!("{case:?} read-ahead={enabled}: {e:?}"));
         store.slow_reads.set(false);
+        *sql.fail_read_for.borrow_mut() = None;
         assert!(store.stored(&name).is_none());
-        if let Removed::Unpublished | Removed::OtherBucket = case {
+        if let Removed::Unpublished | Removed::OtherBucket | Removed::ProbeFails = case {
             assert_eq!(report.published, 1, "read-ahead={enabled}: {report:?}");
             assert!(rig.live(&vault, "refused").await.is_none());
         }
@@ -969,6 +978,13 @@ async fn removal_of_a_record_of_a_bucket_made_again_matches_the_sequential_path(
 #[tokio::test(flavor = "current_thread")]
 async fn removal_of_a_published_record_matches_the_sequential_path() {
     removal_during_the_prior_record(Removed::Present).await;
+}
+
+/// The store's answer that the record is gone decides first: main never
+/// asks the catalogue about a record its GET does not find.
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_record_whose_probe_fails_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::ProbeFails).await;
 }
 
 /// A replay over a catalogue that has the objects already asks the

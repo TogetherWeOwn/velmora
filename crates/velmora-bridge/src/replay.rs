@@ -718,7 +718,8 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // itself, never what was read ahead, is asked whether it still
         // has the record, at the same time as the catalogue is asked
         // about it. A record that is gone then is skipped whatever the
-        // catalogue says of it, before anything is counted or written,
+        // catalogue says of it, also when the probe failed, before
+        // anything is counted or written,
         // as main skips a record its GET at the turn does not find. Off,
         // the record was read just now, as on main. A failed HEAD fails
         // the step, except for a record the catalogue has: that one is
@@ -729,12 +730,17 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 self.safety.head(&cursor.name),
             )
             .await;
+            // Gone first: main asks the catalogue nothing about a
+            // record its GET does not find, so a failed probe of such a
+            // record fails nothing.
+            if let Ok(None) = there {
+                return Ok(Replayed::Gone);
+            }
             let probe = probe?;
             match there {
-                Ok(None) => return Ok(Replayed::Gone),
-                Ok(Some(_)) => {}
                 Err(_) if probe == ReplayProbe::Present => {}
                 Err(e) => return Err(e),
+                Ok(_) => {}
             }
             probe
         } else {
