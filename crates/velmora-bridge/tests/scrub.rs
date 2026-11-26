@@ -3696,14 +3696,16 @@ async fn a_slow_pool_read_ends_the_retained_sessions_before_their_slots_run_out(
         );
         // The pool read outlasts the slot of the kept session.
         w.advance_secs(PERMIT_SECS + 60);
-        for _ in 0..2_000 {
+        // Bounded by time, not executor turns: ending the session is
+        // catalogue I/O, which on PostgreSQL takes real round trips.
+        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
+        while held().await != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kept session is ended while the pool read is pending"
+            );
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            held().await,
-            "0",
-            "the kept session is ended while the pool read is pending"
-        );
         sql.selected_query.release();
     };
     tokio::select! {
