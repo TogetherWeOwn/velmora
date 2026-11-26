@@ -5562,3 +5562,58 @@ async fn a_step_that_fails_mid_promotion_leaves_its_fills_to_a_later_one() {
     drain_steps(&w).await;
     assert!(w.has_safety(&o), "written by the later step");
 }
+
+/// A continuation that fails after the first step wrote part of a
+/// window's kept fills, whose claim the failure used up (a second
+/// delivery does nothing): the marker it left lets the dispatcher's check
+/// finish the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_continuation_after_partial_promotion_is_finished_later() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let mut objs = Vec::new();
+    for i in 0..12u8 {
+        let name = format!("k{i}");
+        let o = w.released(&name, 140 + i).await;
+        cache_only(&w, &o, &name).await;
+        objs.push(o);
+    }
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge().jobs.inner.take();
+    w.bridge().evict_batch(0).await.unwrap();
+    let written = objs.iter().filter(|o| w.has_safety(o)).count();
+    assert_eq!(written, 8, "the first step wrote its share");
+    let next: Vec<Job> = w
+        .bridge()
+        .jobs
+        .inner
+        .take()
+        .into_iter()
+        .map(|s| s.job)
+        .collect();
+    let Some(step @ Job::Evict { remaining, .. }) = next.first().cloned() else {
+        panic!("a continuation was queued: {next:?}")
+    };
+    assert!(remaining > 0, "a drain step, not a new drain");
+    // The continuation fails at its cache checks, after its claim.
+    w.bridge().cache.trip.arm(0, Trip::Fail);
+    assert!(w.bridge().evict_batch(remaining).await.is_err());
+    w.bridge().cache.trip.disarm();
+    // A second delivery finds its claim used.
+    w.bridge().run_job(&step).await;
+    assert_eq!(
+        objs.iter().filter(|o| w.has_safety(o)).count(),
+        8,
+        "nothing more yet"
+    );
+    cfg_mut(&mut w).hot_cap_bytes = u64::MAX / 4;
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.jobs.inner.take();
+    assert!(bridge.dispatch().await.unwrap().evict_enqueued);
+    drain_steps(&w).await;
+    for (i, o) in objs.iter().enumerate() {
+        assert!(w.has_safety(o), "k{i}: written");
+    }
+}
