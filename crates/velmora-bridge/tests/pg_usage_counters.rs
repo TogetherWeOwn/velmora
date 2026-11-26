@@ -368,8 +368,10 @@ fn sql_words(sql: &str) -> Vec<String> {
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix("--") {
             rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+            text.push(' ');
         } else if let Some(after) = rest.strip_prefix("/*") {
             rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+            text.push(' ');
         } else {
             let c = rest.chars().next().unwrap();
             if c != '"' {
@@ -387,7 +389,7 @@ fn sql_words(sql: &str) -> Vec<String> {
 
 #[test]
 fn sql_words_reads_quoted_and_qualified_targets() {
-    let words = sql_words("WITH a AS (UPDATE \"cat\".\"outbox\" /* hidden1 */ SET x = 1) -- hidden2\nUPDATE ONLY outbox SET y = 2");
+    let words = sql_words("WITH a AS (UPDATE/**/\"cat\".\"outbox\" /* hidden1 */ SET x = 1) -- hidden2\nUPDATE ONLY outbox SET y = 2; MERGE/* hidden3 */INTO t");
     let updates: Vec<_> = words
         .windows(2)
         .filter(|w| w[0] == "UPDATE")
@@ -395,6 +397,7 @@ fn sql_words_reads_quoted_and_qualified_targets() {
         .collect();
     assert_eq!(updates, ["CAT.OUTBOX", "ONLY"]);
     assert!(!words.iter().any(|w| w.starts_with("HIDDEN")), "{words:?}");
+    assert!(words.windows(2).any(|w| w[0] == "MERGE" && w[1] == "INTO"));
 }
 
 async fn bucket_rows(db: &Client) -> Vec<Vec<i64>> {
