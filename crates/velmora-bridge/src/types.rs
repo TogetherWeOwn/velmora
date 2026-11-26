@@ -1332,6 +1332,21 @@ pub struct EvictWindow {
     pub unproven: Vec<ExtentId>,
 }
 
+/// The answer right before a started eviction deletes the safety copy
+/// (`Catalog::evict_safety_still_ok`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictCheck {
+    /// Unchanged since the begin and not fenced: the copies go.
+    Delete,
+    /// Unchanged since the begin, but the scrub has a loss of it on
+    /// record: both copies stay and the drain goes on past it.
+    Keep,
+    /// Its sequence moved since the begin (a re-pin, a refill, another
+    /// job): nothing is deleted, and the drain's target is no longer
+    /// known.
+    Moved,
+}
+
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses
 /// it if anything here has changed since.
 #[derive(Clone, Debug, PartialEq, Eq)]

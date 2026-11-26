@@ -19,9 +19,9 @@ use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, Restor
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
-    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
-    ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
+    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, EvictCheck,
+    ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow,
+    HotStats, IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
     ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
     ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
     UploadId, UploadListQuery, UploadPartRow, UploadRow, UploadState, VerificationRow,
@@ -1764,6 +1764,12 @@ pub trait Catalog {
     async fn scrub_watch_soon(&self, _extents: &[ExtentId], _at: UnixMs) -> Result<()> {
         Ok(())
     }
+    /// The scrub deleted the safety object of `extent` (its bytes were not
+    /// the extent's): a released extent's safety copy is no longer
+    /// counted in the hot tier.
+    async fn scrub_safety_gone(&self, _extent: &ExtentId) -> Result<()> {
+        Ok(())
+    }
     /// Where the current drain's listing is ([`Catalog::evict_window`]).
     async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
         Ok(crate::types::EvictCursor::Start)
@@ -1780,18 +1786,19 @@ pub trait Catalog {
     /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
     /// Asked right before the safety copy of a started eviction is
-    /// deleted: `false` once the extent is pinned again or its sequence
-    /// moved since `begin_evict` (a re-pin), and, with `scrub` (`SCRUB`
-    /// is on: the backbones that count now), while the scrub has a loss
-    /// of the extent on record on one of them: the copy may be the one
-    /// the re-pin of that loss keeps. The default keeps the old
-    /// behaviour of a catalogue that cannot tell.
+    /// deleted: [`EvictCheck::Moved`] once its sequence moved since
+    /// `begin_evict` (a re-pin, a refill, another job), and, with `scrub`
+    /// (`SCRUB` is on: the backbones that count now),
+    /// [`EvictCheck::Keep`] while the scrub has a loss of the extent on
+    /// record on one of them: the copy may be the one the re-pin of that
+    /// loss keeps. The default keeps the old behaviour of a catalogue
+    /// that cannot tell.
     async fn evict_safety_still_ok(
         &self,
         _x: &EvictCandidate,
         _scrub: Option<&[String]>,
-    ) -> Result<bool> {
-        Ok(true)
+    ) -> Result<EvictCheck> {
+        Ok(EvictCheck::Delete)
     }
     /// Counts the extent's cache fill and stamps the read. Called before
     /// and after the cache write.

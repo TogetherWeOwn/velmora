@@ -42,9 +42,9 @@ use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
-    BlobStoreKind, DispatchReport, EvictCandidate, EvictCursor, EvictRule, ExtentId, FailClass,
-    GcRow, GcStep, GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job, JobOutcome,
-    Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
+    BlobStoreKind, DispatchReport, EvictCandidate, EvictCheck, EvictCursor, EvictRule, ExtentId,
+    FailClass, GcRow, GcStep, GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job,
+    JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
 use crate::verify::release_labels;
 
@@ -911,14 +911,20 @@ where
         // The safety copy only if nothing pinned the extent again since
         // the begin (the scrub re-pins a released extent and puts its
         // copy back) and, with the scrub on, no loss of it is on record.
-        if !row.pinned && !self.catalog.evict_safety_still_ok(row, counting).await? {
+        if !row.pinned {
             // Re-pinned since the begin, or, with the scrub on, a loss of
             // the extent was recorded after the listing: either R2 copy
             // may be what the repair needs (the cache fill can be the
             // only one left). Nothing is deleted and nothing is finished:
             // the counts stand, and the next listing leaves the extent
-            // out while the loss is on record.
-            return Ok(Evicted::Kept);
+            // out while the loss is on record. A moved sequence (a re-pin,
+            // a refill, another job) ends the drain as a refused claim
+            // does; a loss alone is passed over.
+            match self.catalog.evict_safety_still_ok(row, counting).await? {
+                EvictCheck::Delete => {}
+                EvictCheck::Keep => return Ok(Evicted::Kept),
+                EvictCheck::Moved => return Ok(Evicted::Contended),
+            }
         }
         if !row.pinned {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;

@@ -16,6 +16,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import tempfile
+import time
 import unittest
 
 BRIDGE = Path(__file__).resolve().parents[1]
@@ -106,6 +107,37 @@ class PgMigrate(unittest.TestCase):
         applied = self.migrate("--import-mode").stdout
         self.assertIn("0002_baseline_post.sql: applied", applied)
         self.assertIn("0003_usage_statement_triggers.sql: applied", applied)
+        self.assertEqual(self.ledger(), STAGES)
+        self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+
+    def test_a_concurrent_index_stage_waits_out_a_long_writer(self):
+        # A writer transaction older than the build, longer than the
+        # migrator's 3 s lock timeout: CREATE INDEX CONCURRENTLY waits for
+        # it, and must not fail and leave an INVALID index.
+        no_tx = [f.name[:4] for f in sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+                 if f.read_text().startswith("-- velmora: no-transaction\n")]
+        self.assertTrue(no_tx, "a shipped stage builds its indexes concurrently")
+        before = STAGES[STAGES.index(no_tx[0]) - 1]
+        self.migrate("--to", "0001")
+        self.migrate("--to", before)
+        holder = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=libpq_env())
+        holder.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
+                           "BEGIN; LOCK TABLE extents IN ROW EXCLUSIVE MODE; SELECT pg_sleep(6); COMMIT;\n")
+        holder.stdin.close()
+        self.addCleanup(holder.wait)
+        for _ in range(100):
+            held = psql(f"SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                        f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{self.schema}' "
+                        f"AND c.relname = 'extents' AND l.mode = 'RowExclusiveLock' AND l.granted").stdout
+            if held.strip() == "1":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the writer never took its lock")
+        applied = self.migrate()
+        self.assertEqual(holder.wait(), 0, holder.stderr.read())
+        self.assertIn(f"{no_tx[0]}_", applied.stdout)
         self.assertEqual(self.ledger(), STAGES)
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
 

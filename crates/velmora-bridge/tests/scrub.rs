@@ -1892,10 +1892,11 @@ async fn an_eviction_begun_before_the_re_pin_keeps_the_safety_copy() {
     let mine = listed.into_iter().find(|x| x.extent == o.extent).unwrap();
     assert!(!mine.pinned);
     assert!(c.begin_evict(&mine).await.unwrap(), "the eviction begins");
-    assert!(
+    assert_eq!(
         c.evict_safety_still_ok(&mine, Some(&["alpha".to_owned(), "beta".to_owned()]))
             .await
             .unwrap(),
+        EvictCheck::Delete,
         "not yet re-pinned"
     );
     let now = w.bridge().clock.now();
@@ -1908,10 +1909,11 @@ async fn an_eviction_begun_before_the_re_pin_keeps_the_safety_copy() {
         .scrub_repin(token, &o.extent, (now, now.plus_secs(60)), &[])
         .await
         .unwrap());
-    assert!(
-        !c.evict_safety_still_ok(&mine, Some(&["alpha".to_owned(), "beta".to_owned()]))
+    assert_eq!(
+        c.evict_safety_still_ok(&mine, Some(&["alpha".to_owned(), "beta".to_owned()]))
             .await
             .unwrap(),
+        EvictCheck::Moved,
         "re-pinned since the begin: the safety copy stays"
     );
     // A listing from before the re-pin cannot begin either.
@@ -2301,7 +2303,7 @@ async fn the_eviction_job_keeps_the_safety_copy_of_an_extent_re_pinned_under_it(
     // Right before the eviction asks whether the copy may still go, the
     // scrub re-pins the extent.
     *w.bridge().catalog.sql.before_matching.borrow_mut() = Some((
-        "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
         0,
         format!(
             "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1 WHERE id = '{}'",
@@ -3338,7 +3340,7 @@ async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record
         );
         if late {
             *c.sql.before_matching.borrow_mut() = Some((
-                "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2",
+                "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
                 0,
                 loss,
             ));
@@ -4660,4 +4662,87 @@ async fn a_wrong_safety_object_is_not_taken_for_the_copy() {
         w.bridge().cache.contains(&o.extent.cache_key()),
         "the intact cache fill stays"
     );
+}
+
+/// A refill between the begin and the pre-delete check (the sequence
+/// moved) ends the drain, as a refused claim does: what it still has to
+/// evict is no longer known. A loss alone is passed over.
+#[tokio::test(flavor = "current_thread")]
+async fn a_moved_sequence_at_the_pre_delete_check_ends_the_drain() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let a = w.released("a", 44).await;
+    let b = w.released("b", 45).await;
+    let c = &w.bridge().catalog;
+    c.sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET last_read_at = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(b.extent.as_str().to_owned()),
+                SqlValue::Int(w.bridge().clock.now().0 + 1_000),
+            ],
+        )
+        .await
+        .unwrap();
+    *c.sql.before_matching.borrow_mut() = Some((
+        "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        0,
+        format!(
+            "UPDATE extents SET hot_cache_bytes = cipher_size, evict_seq = evict_seq + 1 \
+             WHERE id = '{}'",
+            a.extent.as_str()
+        ),
+    ));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(c.sql.before_matching.borrow().is_none(), "the check ran");
+    assert!(w.has_safety(&a), "moved: nothing deleted");
+    assert!(w.has_safety(&b), "the drain ended at the moved extent");
+}
+
+/// The scrub deletes a released extent's safety object whose bytes are
+/// not the extent's, and only then says so; the deleted object is no
+/// longer counted. A delete that fails is said as such, and nothing
+/// changes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deleted_wrong_safety_object_is_uncounted_and_a_failed_delete_is_said() {
+    for fails in [true, false] {
+        let w = world().await;
+        let o = w.released("a", 46).await;
+        let key = o.extent.safety_key();
+        assert!(w.bridge().safety.corrupt(&key, |b| b[10] ^= 1));
+        if fails {
+            *w.bridge().safety.fail_delete.borrow_mut() = Some(key.clone());
+        }
+        w.advance_secs(31 * DAY_SECS);
+        w.hide(0, &o, 1).await;
+        w.hide(1, &o, 1).await;
+        w.scrub().await;
+        w.advance_secs(3600);
+        w.scrub().await;
+        let counted = w
+            .scalar(
+                "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+                &o.extent,
+            )
+            .await;
+        let lines: Vec<String> = alerts()
+            .into_iter()
+            .filter(|a| a.starts_with("scrub-bad-safety-copy ") && a.contains(o.extent.as_str()))
+            .collect();
+        assert!(!lines.is_empty(), "fails={fails}: {lines:?}");
+        assert_eq!(w.safety_state(&o).await, "released", "fails={fails}");
+        if fails {
+            assert!(
+                lines.iter().all(|l| l.ends_with("the delete failed")),
+                "{lines:?}"
+            );
+            assert!(w.bridge().safety.contains(&key));
+            assert_ne!(counted, "0", "still there: still counted");
+        } else {
+            assert!(lines.iter().all(|l| l.ends_with("; deleted")), "{lines:?}");
+            assert!(!w.bridge().safety.contains(&key));
+            assert_eq!(counted, "0", "gone: no longer counted");
+            assert_eq!(w.result(&o).await, "unrecoverable");
+        }
+    }
 }

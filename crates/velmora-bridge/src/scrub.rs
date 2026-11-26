@@ -1642,15 +1642,23 @@ where
     /// Deletes a safety object whose bytes are not the extent's. Every
     /// object under a safety key is then an intact copy: eviction keeps a
     /// pinned extent's cache fill only until one is in place, by `HEAD`.
-    /// `false`: the delete failed.
+    /// The deleted object is no longer counted. `false`: the delete or the
+    /// count failed.
     async fn drop_wrong_safety(&self, extent: &ExtentRow) -> bool {
+        let deleted = self.safety.delete(&extent.id.safety_key()).await.is_ok();
+        let uncounted = deleted && self.catalog.scrub_safety_gone(&extent.id).await.is_ok();
         crate::trace::alert(|| {
             format!(
-                "scrub-bad-safety-copy {} its bytes are not the extent's; deleted",
-                extent.id.as_str()
+                "scrub-bad-safety-copy {} its bytes are not the extent's; {}",
+                extent.id.as_str(),
+                match (deleted, uncounted) {
+                    (true, true) => "deleted",
+                    (true, false) => "deleted, still counted",
+                    (false, _) => "the delete failed",
+                }
             )
         });
-        self.safety.delete(&extent.id.safety_key()).await.is_ok()
+        deleted && uncounted
     }
 
     /// The PUT intents whose PUT can no longer land (the invocation that

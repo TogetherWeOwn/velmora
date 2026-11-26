@@ -26,8 +26,8 @@
 //! a listing never survives a state change.
 //!
 //! The job asks once more right before it deletes the safety copy
-//! (`evict_safety_still_ok`); a no there (a re-pin, or a scrub loss
-//! recorded after the listing) deletes nothing.
+//! (`evict_safety_still_ok`): a moved sequence (a re-pin, a refill) or a
+//! scrub loss recorded after the listing deletes nothing.
 //!
 //! The job lists bounded windows of the eviction order (`evict_window`):
 //! a row that would delete an extent's last R2 copy may go only while the
@@ -207,6 +207,13 @@ pub const EVICT_WINDOW_SCRUB_AFTER_PG: &str = evict_window!(
 // fill that the cache bucket's lifecycle rule may expire.
 const WATCH_SOON: &str = "UPDATE extents SET scrub_next_at = ?2 \
     WHERE id = ?1 AND scrub_next_at IS NULL AND safety_state = 'released'";
+
+// The scrub deleted a released extent's safety object (its bytes were
+// not the extent's): it is no longer counted, so it adds no phantom bytes
+// to the tier's total. The sequence moves, so an eviction listed before
+// cannot claim the bytes either.
+const SAFETY_GONE: &str = "UPDATE extents SET hot_safety_bytes = 0, evict_seq = evict_seq + 1 \
+    WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes > 0";
 
 const EVICT_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'evict'";
 const SET_EVICT_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict', ?1)";
@@ -395,6 +402,13 @@ pub(super) async fn scrub_watch_soon<S: Sql>(
     Ok(())
 }
 
+/// A released extent's safety object is gone: no longer counted
+/// ([`SAFETY_GONE`]).
+pub(super) async fn scrub_safety_gone<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<()> {
+    c.sql.exec(SAFETY_GONE, &[text(extent.as_str())]).await?;
+    Ok(())
+}
+
 pub(super) async fn evict_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<EvictCursor> {
     let rows = c.sql.query(EVICT_CURSOR, &[]).await?;
     Ok(match rows.into_iter().next() {
@@ -445,25 +459,30 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
     Ok(changed == 1)
 }
 
+/// No row: the sequence moved. `0`: pinned (or, with `SCRUB` on, a loss
+/// on record), so nothing goes. `1`: the copies go.
 const EVICT_SAFETY_STILL_OK: &str = concat!(
-    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
-    pinned!()
+    "SELECT CASE WHEN ",
+    pinned!(),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
 );
 /// With `SCRUB` on: and no loss of the extent on a counting backbone is
 /// on the scrub's record (`?3`, as for `CANDIDATES_SCRUB`). Only with it
 /// on, so that eviction does not need the scrub's tables before they are
 /// applied.
 const EVICT_SAFETY_STILL_OK_SCRUB: &str = concat!(
-    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    "SELECT CASE WHEN ",
     pinned!(),
-    " AND NOT ",
-    scrub_loss_on_record!("?1", "value FROM json_each(?3)")
+    " OR ",
+    scrub_loss_on_record!("?1", "value FROM json_each(?3)"),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
 );
 const EVICT_SAFETY_STILL_OK_SCRUB_PG: &str = concat!(
-    "SELECT COUNT(*) FROM extents WHERE id = ?1 AND evict_seq = ?2 AND NOT ",
+    "SELECT CASE WHEN ",
     pinned!(),
-    " AND NOT ",
-    scrub_loss_on_record!("?1", "jsonb_array_elements_text(CAST(?3 AS jsonb))")
+    " OR ",
+    scrub_loss_on_record!("?1", "jsonb_array_elements_text(CAST(?3 AS jsonb))"),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
 );
 
 fn labels(backbones: &[String]) -> Result<SqlValue> {
@@ -488,7 +507,8 @@ pub(super) async fn evict_safety_still_ok<S: Sql>(
     c: &SqlCatalog<S>,
     x: &EvictCandidate,
     scrub: Option<&[String]>,
-) -> Result<bool> {
+) -> Result<crate::types::EvictCheck> {
+    use crate::types::EvictCheck;
     let mut params = vec![text(x.extent.as_str()), int(x.seq.saturating_add(1))?];
     let sql = match scrub {
         Some(backbones) => {
@@ -501,8 +521,11 @@ pub(super) async fn evict_safety_still_ok<S: Sql>(
     };
     let rows = c.sql.query(sql, &params).await?;
     match rows.into_iter().next() {
-        Some(row) => Ok(Cols::new(row).num::<i64>()? == 1),
-        None => Ok(false),
+        Some(row) => Ok(match Cols::new(row).num::<i64>()? {
+            1 => EvictCheck::Delete,
+            _ => EvictCheck::Keep,
+        }),
+        None => Ok(EvictCheck::Moved),
     }
 }
 
@@ -750,6 +773,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (EVICT_WINDOW_SCRUB_PG.to_owned(), vec![I, T]),
         (EVICT_WINDOW_SCRUB_AFTER_PG.to_owned(), vec![I, I, T, T]),
         (WATCH_SOON.to_owned(), vec![T, I]),
+        (SAFETY_GONE.to_owned(), vec![T]),
         (EVICT_CURSOR.to_owned(), vec![]),
         (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),

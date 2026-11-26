@@ -555,6 +555,8 @@ SET client_min_messages = error;
             reason = ERRORS.get(state) or (f'SQLSTATE {state}' if state else 'psql connection or client failure')
             die(f'{report or "database operation"}: {reason}')
 
+    MIGRATOR_LOCK_TIMEOUT = "SET lock_timeout = '3s';\n"
+    CIC_LOCK_TIMEOUT = "SET lock_timeout = '10min';\n"
     # Cast the complete signed literal, including the sign of BIGINT_MIN.
     begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock('{lock}'::bigint);\n"
     # Never wait for the migration key with an open snapshot: an in-progress
@@ -623,10 +625,14 @@ $$;
         if no_tx:
             # Release W1 before CIC may wait for old snapshots; keep only the
             # session migrator lock until the ledger transaction commits.
-            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
+            # CIC waits out older transactions through lock waits, and app
+            # transactions may run 30 s: a 3 s lock_timeout would fail the
+            # build and leave an INVALID index. CIC takes only SHARE UPDATE
+            # EXCLUSIVE, which blocks no DML, so it may wait longer.
+            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n' + CIC_LOCK_TIMEOUT
         batch += sql + '\n'
         if no_tx:
-            batch += migration_tx + check(BAD_INDEX, 'VL015')
+            batch += MIGRATOR_LOCK_TIMEOUT + migration_tx + check(BAD_INDEX, 'VL015')
         if version == '0002' and args.import_mode:
             batch += RESTART_IDENTITIES
         if version == '0001':
