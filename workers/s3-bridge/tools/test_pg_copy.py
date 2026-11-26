@@ -301,6 +301,22 @@ class CopyTests(unittest.TestCase):
         with self.assertRaisesRegex(Failure, "does not match"):
             verify("wrong-worker", F1, cf("restore", [post, pre]))
 
+    def test_cutover_checkout_must_ship_exactly_the_baseline(self):
+        check = runpy.run_path(str(OPS / "pg-copy.py"))["require_cutover_checkout"]
+        check()  # this checkout
+        stages = self.path / "pg"
+        stages.mkdir()
+        for name in ("0001_baseline_pre.sql", "0002_baseline_post.sql", "0003_usage_statement_triggers.sql"):
+            (stages / name).write_text("SELECT 1;\n")
+        check(stages)
+        (stages / "0004_later.sql").write_text("SELECT 1;\n")
+        with self.assertRaisesRegex(Failure, "ships PostgreSQL stages 0001/0002/0003/0004"):
+            check(stages)
+        (stages / "0004_later.sql").unlink()
+        (stages / "0003_usage_statement_triggers.sql").unlink()
+        with self.assertRaisesRegex(Failure, "exactly 0001/0002/0003"):
+            check(stages)
+
     def pg(self):
         if not os.environ.get("WP5_TEST_PG_SOCKET"):
             self.skipTest("set WP5_TEST_PG_SOCKET to an isolated local PG socket directory")

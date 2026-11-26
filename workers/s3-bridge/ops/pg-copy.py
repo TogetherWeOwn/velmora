@@ -22,6 +22,17 @@ from pg_catalog import (
 # The PostgreSQL stages an import applies: COPY runs after the first, and the
 # target is ready only with exactly these recorded.
 CUTOVER_BASELINE = ("0001", "0002", "0003")
+PG_STAGES = Path(__file__).resolve().parent.parent / "pg"
+
+
+def require_cutover_checkout(stages=PG_STAGES):
+    # Activation (pg-verify.py --activate) verifies every stage this checkout
+    # ships. Stop before the claim if that is not exactly the baseline COPY
+    # imports, rather than leave a fenced target that cannot be activated.
+    shipped = tuple(sorted(f.name[:4] for f in stages.glob("[0-9][0-9][0-9][0-9]_*.sql")))
+    require(shipped == CUTOVER_BASELINE,
+            f"this checkout ships PostgreSQL stages {'/'.join(shipped)}; "
+            f"the cutover imports and activates exactly {'/'.join(CUTOVER_BASELINE)}")
 
 
 def verify_dump(stream, manifest):
@@ -241,6 +252,7 @@ def main():
                       f1_attempt_id=receipt["f1_attempt_id"], d1_uuid=receipt["d1_uuid"])
         if args.apply:
             started = monotonic()
+            require_cutover_checkout()
             with postgres(args.pg_env) as (pg, schema, key):
                 ensure_unclaimed(pg, schema)
                 migrate(args.pg_env, "--to", CUTOVER_BASELINE[0], "--import-mode")

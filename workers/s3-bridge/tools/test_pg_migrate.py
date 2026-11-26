@@ -4,7 +4,11 @@ the shared trigger fixture.
 
 Set VELMORA_TEST_PG_MIGRATE=1 and the standard PGHOST, PGPORT, PGUSER and
 PGDATABASE for an administrator of a disposable, local, trust-authenticated
-database. Each test creates and drops its own schema.
+cluster (the CI service, or an initdb of your own). Use no cluster that
+serves anything else: roles.sql changes the kofra_* roles cluster-wide
+(pg_read_all_data for kofra_ro, session defaults for kofra_app), and
+dropping a test schema does not undo that. Each test creates and drops its
+own schema. Only those four libpq variables (and PGPASSWORD) reach psql.
 """
 
 import os
@@ -20,8 +24,16 @@ ROLES = ("kofra_migrate", "kofra_app", "kofra_ro")
 STAGES = ["0001", "0002", "0003"]
 
 
+def libpq_env():
+    # No PGHOSTADDR, PGSERVICE or other PG* setting can redirect psql.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env.update({k: os.environ[k] for k in ("PGHOST", "PGPORT", "PGUSER", "PGDATABASE", "PGPASSWORD")
+                if k in os.environ})
+    return env
+
+
 def psql(sql, *, user=None, schema=None, check=True):
-    env = dict(os.environ)
+    env = libpq_env()
     if user:
         env["PGUSER"] = user
     prefix = f'SET search_path TO "{schema}", pg_temp;\n' if schema else ""
@@ -33,7 +45,7 @@ def psql(sql, *, user=None, schema=None, check=True):
 
 
 @unittest.skipUnless(os.environ.get("VELMORA_TEST_PG_MIGRATE") == "1",
-                     "set VELMORA_TEST_PG_MIGRATE=1 and PG* for a disposable local database")
+                     "set VELMORA_TEST_PG_MIGRATE=1 and PG* for a disposable local cluster that serves nothing else")
 class PgMigrate(unittest.TestCase):
     def setUp(self):
         host = os.environ.get("PGHOST", "")
@@ -46,7 +58,8 @@ class PgMigrate(unittest.TestCase):
         psql(f"CREATE SCHEMA {self.schema}")
         self.addCleanup(psql, f"DROP SCHEMA {self.schema} CASCADE")
         roles = subprocess.run(["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-v", f"schema={self.schema}",
-                                "-f", str(BRIDGE / "pg" / "roles.sql")], capture_output=True, text=True)
+                                "-f", str(BRIDGE / "pg" / "roles.sql")], capture_output=True, text=True,
+                               env=libpq_env())
         self.assertEqual(roles.returncode, 0, roles.stderr)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

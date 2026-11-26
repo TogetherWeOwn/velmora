@@ -32,6 +32,18 @@ fn stage_under_test() -> String {
     std::env::var("VELMORA_TEST_PG_USAGE_STAGE").unwrap_or_else(|_| LATEST.into())
 }
 
+/// A session whose open transaction the server ends after 1 s idle. A test
+/// that panics inside a transaction cannot roll it back, and the schema
+/// drop (3 s lock timeout) runs while the test runtime is blocked; the
+/// server-side timeout releases the locks first.
+async fn session(pg: &TestPostgres) -> Client {
+    let db = pg.client().await.unwrap();
+    db.batch_execute("SET idle_in_transaction_session_timeout = '1s'")
+        .await
+        .unwrap();
+    db
+}
+
 fn sqlstate(sql: &str, error: &tokio_postgres::Error) -> String {
     // Synthetic SQL only; never echo a server message.
     let code = error.code().map_or("none", |code| code.code());
@@ -226,7 +238,7 @@ async fn run_bulk(db: &Client, statement: &Bulk, rows_expected: u64) -> Duration
 /// each of them.
 async fn bulk_workload(n: i64) -> Duration {
     let pg = TestPostgres::through_stage(&stage_under_test(), true).unwrap();
-    let db = pg.client().await.unwrap();
+    let db = session(&pg).await;
     let key = |i: i64| format!("k{i:07}");
     let covered = n / 2 + 1; // keys k0000000 ..= k{n/2}
     let (h0, h1) = (T0 / HOUR, T0 / HOUR + 1);
@@ -348,6 +360,43 @@ async fn bulk_workload(n: i64) -> Duration {
     elapsed
 }
 
+/// Upper-case words of `sql` without comments or identifier quotes, so a
+/// quoted or schema-qualified table name reads like a bare one.
+fn sql_words(sql: &str) -> Vec<String> {
+    let mut text = String::new();
+    let mut rest = sql;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            let c = rest.chars().next().unwrap();
+            if c != '"' {
+                text.push(c);
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    text.to_uppercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn sql_words_reads_quoted_and_qualified_targets() {
+    let words = sql_words("WITH a AS (UPDATE \"cat\".\"outbox\" /* hidden1 */ SET x = 1) -- hidden2\nUPDATE ONLY outbox SET y = 2");
+    let updates: Vec<_> = words
+        .windows(2)
+        .filter(|w| w[0] == "UPDATE")
+        .map(|w| w[1].clone())
+        .collect();
+    assert_eq!(updates, ["CAT.OUTBOX", "ONLY"]);
+    assert!(!words.iter().any(|w| w.starts_with("HIDDEN")), "{words:?}");
+}
+
 async fn bucket_rows(db: &Client) -> Vec<Vec<i64>> {
     rows(
         db,
@@ -384,7 +433,7 @@ async fn failure_trigger_is_statement_level_and_exact() {
         return;
     }
     let pg = TestPostgres::through_stage(&stage_under_test(), true).unwrap();
-    let db = pg.client().await.unwrap();
+    let db = session(&pg).await;
 
     // Every usage trigger is a statement trigger. Only the failure trigger
     // has a column list, so only it sees SET targets, and it fires before
@@ -438,25 +487,25 @@ async fn failure_trigger_is_statement_level_and_exact() {
         "FAIL is in the manifest"
     );
     for sql in &all {
-        let upper = sql
-            .to_uppercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            upper.matches("UPDATE OUTBOX").count() <= 1,
-            "two outbox updates in: {sql}"
-        );
-        assert!(
-            !upper
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|word| word == "MERGE"),
-            "MERGE in: {sql}"
-        );
-        assert!(
-            !(upper.contains("INTO OUTBOX") && upper.contains("DO UPDATE")),
-            "outbox upsert in: {sql}"
-        );
+        let words = sql_words(sql);
+        let target = |i: usize| {
+            let next = words.get(i + 1).map(String::as_str);
+            let name = if next == Some("ONLY") {
+                words.get(i + 2)
+            } else {
+                words.get(i + 1)
+            };
+            name.map(|n| n.rsplit('.').next().unwrap() == "OUTBOX")
+                .unwrap_or(false)
+        };
+        let updates = (0..words.len())
+            .filter(|&i| words[i] == "UPDATE" && target(i))
+            .count();
+        assert!(updates <= 1, "two outbox updates in: {sql}");
+        assert!(!words.iter().any(|w| w == "MERGE"), "MERGE in: {sql}");
+        let inserts = (0..words.len()).any(|i| words[i] == "INTO" && target(i));
+        let upsert = words.windows(2).any(|w| w[0] == "DO" && w[1] == "UPDATE");
+        assert!(!(inserts && upsert), "outbox upsert in: {sql}");
     }
 
     let n = 2_000;
@@ -868,16 +917,17 @@ async fn statement_counters_equal_row_counters_after_every_statement() {
         .iter()
         .flat_map(|p| (0..2).map(move |i| format!("{p}{i}")))
         .collect();
-    let seeds = std::env::var("VELMORA_TEST_USAGE_SEEDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6u64);
+    let seeds = std::env::var("VELMORA_TEST_USAGE_SEEDS").map_or(6u64, |v| {
+        v.parse()
+            .expect("VELMORA_TEST_USAGE_SEEDS must be a number")
+    });
+    assert!(seeds > 0, "VELMORA_TEST_USAGE_SEEDS must be at least 1");
     let mut statements = 0;
     for seed in 1..=seeds {
         let sqlite = RusqliteSql::with_schema().unwrap();
         let old = TestPostgres::through_stage(ROW_TRIGGERS, true).unwrap();
         let new = TestPostgres::through_stage(&stage_under_test(), true).unwrap();
-        let (old_db, new_db) = (old.client().await.unwrap(), new.client().await.unwrap());
+        let (old_db, new_db) = (session(&old).await, session(&new).await);
         let setup = "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) VALUES \
                      ('bA','bA','o',{B},1,0), ('ba','ba','o',{B},1,0), ('bm','bm','o',{B},1,0); \
                      UPDATE usage_global SET cur_x = 'eM0', cur_o = 'em1', cur_g = 'gM1' WHERE id = 2";
