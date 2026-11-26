@@ -1599,6 +1599,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
     const MANY_BYTES: u64 = 40_000_000;
     let mut plan_bytes = 0;
     let mut many_bytes = 0;
+    let mut plan_lengths = Vec::with_capacity(ids.len());
     for (i, id) in ids.iter().enumerate() {
         let cipher_size = if i == MANY { MANY_BYTES } else { 164 };
         let (plan, _) = velmora_bridge::plan::plan_seeded(
@@ -1610,6 +1611,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
             |span| Some([span.start as u8; 32]),
         )
         .unwrap();
+        plan_lengths.push(plan.len());
         if i == MANY {
             many_bytes = plan.len();
         } else {
@@ -1650,18 +1652,66 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
     const SIZES: &str = "length(e.plan)";
     const PLANS: &str = "e.cipher_size, e.plan";
 
-    // Every plan reads: all of them are asked for, ten at a time, the
-    // extents 500 at a time.
+    // Every plan reads: all of them are asked for, in byte-bounded runs, and
+    // the 500 placements and then 20 placements stay separate values.
     fx.sql().queries.borrow_mut().clear();
     let before = fx.dump().await;
     let published = fx.replay(&g).await;
     assert_eq!(asked(&fx, SIZES), [500, 20]);
-    // The five before the large plan, the large plan alone, the other
-    // 494 of the first value, and the 20 of the second.
-    let mut expected = vec![5, 1];
-    expected.extend([10; 49]);
-    expected.extend([4, 10, 10]);
-    assert_eq!(asked(&fx, PLANS), expected);
+
+    // SQL does not promise row order without ORDER BY. Check the actual plan
+    // query inputs rather than assuming the database returned the large plan
+    // at its construction-time position.
+    let mut plan_runs = Vec::new();
+    for (_, params) in fx
+        .sql()
+        .queries
+        .borrow()
+        .iter()
+        .filter(|(sql, _)| sql.contains(PLANS))
+    {
+        let value: Vec<String> = match &params[0] {
+            SqlValue::Text(json) => serde_json::from_str(json).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        plan_runs.push(
+            value
+                .into_iter()
+                .map(|id| {
+                    ids.iter()
+                        .position(|candidate| candidate.as_str() == id)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    // With 519 small plans, ten per budget, two placement values, and one
+    // oversized plan that can split one small run, packing needs at most 55.
+    assert!(
+        plan_runs.len() <= 55,
+        "runs were split too early: {plan_runs:?}"
+    );
+    let mut seen = plan_runs
+        .iter()
+        .flat_map(|run| run.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(seen.len(), ids.len());
+    seen.sort_unstable();
+    assert_eq!(seen, (0..ids.len()).collect::<Vec<_>>());
+    let budget = plan_bytes * 10;
+    let mut large_run = None;
+    for run in &plan_runs {
+        let run_lengths: Vec<usize> = run.iter().map(|&index| plan_lengths[index]).collect();
+        let total: usize = run_lengths.iter().sum();
+        assert!(
+            total <= budget || (run.len() == 1 && run_lengths[0] == many_bytes),
+            "plan run exceeds byte budget: {run_lengths:?}"
+        );
+        if run_lengths.contains(&many_bytes) {
+            large_run = Some(run.len());
+        }
+    }
+    assert_eq!(large_run, Some(1));
 
     // The same record with the plan of its last extent damaged, in a
     // catalogue as it was before: found in the last run.
