@@ -426,10 +426,28 @@ async fn bulk_statements_write_each_usage_row_once() {
     eprintln!("usage bulk workload, 12 statements of 100,000 rows: {elapsed:?}");
 }
 
-/// Time one statement inside a rolled-back transaction; return the rows it
-/// changed and the elapsed time.
-async fn timed_rollback(db: &Client, sql: &str) -> (u64, Duration) {
+/// Time one statement inside a rolled-back transaction, after `prep` (not
+/// timed) in the same transaction; return the rows it changed and the
+/// elapsed time.
+async fn timed_rollback(db: &Client, prep: &str, sql: &str) -> (u64, Duration) {
+    timed_rollback_replanned(db, prep, sql, false).await
+}
+
+/// [`timed_rollback`]; with `replan`, the plan cache is reset after `prep`,
+/// so the timed statement parses the trigger queries itself.
+async fn timed_rollback_replanned(
+    db: &Client,
+    prep: &str,
+    sql: &str,
+    replan: bool,
+) -> (u64, Duration) {
     exec(db, "BEGIN").await;
+    if !prep.is_empty() {
+        exec(db, prep).await;
+    }
+    if replan {
+        exec(db, "DISCARD PLANS").await;
+    }
     let started = Instant::now();
     let changed = exec(db, sql).await;
     let elapsed = started.elapsed();
@@ -438,23 +456,109 @@ async fn timed_rollback(db: &Client, sql: &str) -> (u64, Duration) {
 }
 
 /// The fastest of three timed, rolled-back runs: other tests share the
-/// database, and their load only ever adds time. A quadratic plan stays
-/// quadratic in every run.
-async fn fastest_rollback(db: &Client, sql: &str) -> (u64, Duration) {
-    let mut best = timed_rollback(db, sql).await;
-    for _ in 0..2 {
-        let run = timed_rollback(db, sql).await;
+/// database, and their load only ever adds time. Each run starts from a
+/// reset plan cache. With `replan` the bulk statement itself parses the
+/// trigger queries; without it the single-row `warm` firing (rolled back)
+/// parses them first, right before the run, so a plan-cache reset by
+/// another session cannot swap a bulk-sized plan into a "cached" run.
+async fn fastest_rollback(
+    db: &Client,
+    warm: &str,
+    prep: &str,
+    sql: &str,
+    replan: bool,
+) -> (u64, Duration) {
+    let mut best = (0, Duration::MAX);
+    for i in 0..3 {
+        exec(db, "DISCARD PLANS").await;
+        if !replan {
+            assert_eq!(timed_rollback(db, "", warm).await.0, 1, "{warm}");
+        }
+        let run = timed_rollback_replanned(db, prep, sql, replan).await;
+        if i == 0 {
+            best.0 = run.0;
+        }
         assert_eq!(run.0, best.0, "{sql}");
         best.1 = best.1.min(run.1);
     }
     best
 }
 
+/// The same statement with this table's usage triggers disabled (fastest
+/// of three, rolled back, after `prep` with them enabled): what the
+/// statement costs without counters.
+async fn fastest_without_usage_triggers(db: &Client, prep: &str, sql: &str) -> Duration {
+    let (table, triggers): (&str, &[&str]) = if sql.contains(" extents ") {
+        (
+            "extents",
+            &[
+                "usage_extents_insert",
+                "usage_extents_update",
+                "usage_extents_delete",
+            ],
+        )
+    } else if sql.contains(" outbox ") {
+        (
+            "outbox",
+            &[
+                "usage_outbox_insert",
+                "usage_outbox_delete",
+                "usage_outbox_failure",
+                "usage_outbox_stage",
+            ],
+        )
+    } else {
+        (
+            "generations",
+            &[
+                "usage_generations_insert",
+                "usage_generations_update",
+                "usage_generations_delete",
+            ],
+        )
+    };
+    let disable: Vec<String> = triggers
+        .iter()
+        .map(|t| format!("DISABLE TRIGGER {t}"))
+        .collect();
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        exec(db, "BEGIN").await;
+        if !prep.is_empty() {
+            exec(db, prep).await;
+        }
+        exec(db, &format!("ALTER TABLE {table} {}", disable.join(", "))).await;
+        let started = Instant::now();
+        exec(db, sql).await;
+        best = best.min(started.elapsed());
+        exec(db, "ROLLBACK").await;
+    }
+    best
+}
+
+/// One bulk shape: a single-row firing with an event, untimed preparation
+/// in the same transaction, and the timed statement, over the first n rows.
+struct Shape {
+    warm: String,
+    prep: Box<dyn Fn(i64) -> String>,
+    bulk: Box<dyn Fn(i64) -> String>,
+}
+
+fn shape(warm: &str, bulk: impl Fn(i64) -> String + 'static) -> Shape {
+    Shape {
+        warm: warm.to_owned(),
+        prep: Box::new(|_| String::new()),
+        bulk: Box::new(bulk),
+    }
+}
+
 /// PL/pgSQL caches each trigger query with the transition-table size of
-/// its first firing in the session. A pooled session's first event is
-/// usually one row, so every changed trigger must stay linear after a
-/// single-row firing on the same connection: 10x the rows may take at most
-/// 30x the time (quadratic is 100x), and 20,000 rows at most 4 s.
+/// the firing that parsed it, and a pooled session's first event is usually
+/// one row. Every changed trigger must stay linear with plans parsed by a
+/// single-row firing and with plans parsed by the bulk statement: 10x the
+/// rows may take at most 30x the time (quadratic is 100x), 20,000 rows at
+/// most 4 s, and the counters at most twice what the statement costs with
+/// them disabled.
 #[tokio::test]
 async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_session() {
     if !TestSql::postgres_selected() {
@@ -485,68 +589,107 @@ async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_sessi
     .await;
     let below = |n: i64| format!("'k{n:07}'");
     let gbelow = |n: i64| format!("'g{n:07}'");
-    // (single-row firing that has an event, bulk statement over the first n rows)
-    type Shape = (&'static str, Box<dyn Fn(i64) -> String>);
-    let shapes: Vec<Shape> = vec![
-        (
+    let h = T0 + HOUR;
+    // verify->done of a released extent at this update: a release, which
+    // looks up each extent.
+    let released = move |key: &str| {
+        format!(
+            "UPDATE outbox SET stage = 'verify' WHERE extent_id {key}; \
+             UPDATE extents SET safety_state = 'released', released_at = {h} WHERE id {key}"
+        )
+    };
+    let shapes = vec![
+        shape(
             "UPDATE extents SET safety_state = 'released' WHERE id = 'k0020000'",
-            Box::new(move |n| {
-                format!("UPDATE extents SET safety_state = 'released' WHERE id < {}", below(n))
-            }),
+            move |n| format!("UPDATE extents SET safety_state = 'released' WHERE id < {}", below(n)),
         ),
-        (
+        shape(
             "UPDATE generations SET state = 'superseded' WHERE id = 'g0020000'",
-            Box::new(move |n| {
-                format!("UPDATE generations SET state = 'superseded' WHERE id < {}", gbelow(n))
-            }),
+            move |n| format!("UPDATE generations SET state = 'superseded' WHERE id < {}", gbelow(n)),
         ),
-        (
+        shape(
             "UPDATE outbox SET stage = 'verify', updated_at = 1762992000000 WHERE extent_id = 'k0020001'",
-            Box::new(move |n| {
+            move |n| {
                 format!(
-                    "UPDATE outbox SET stage = 'verify', updated_at = {} WHERE extent_id < {}",
-                    T0 + HOUR,
+                    "UPDATE outbox SET stage = 'verify', updated_at = {h} WHERE extent_id < {}",
                     below(n)
                 )
-            }),
+            },
         ),
-        (
+        shape(
             "UPDATE outbox SET last_error = 'boom', updated_at = 1762992000000 WHERE extent_id = 'k0020002'",
-            Box::new(move |n| {
+            move |n| {
                 format!(
-                    "UPDATE outbox SET last_error = 'boom', updated_at = {} WHERE extent_id < {}",
-                    T0 + HOUR,
+                    "UPDATE outbox SET last_error = 'boom', updated_at = {h} WHERE extent_id < {}",
+                    below(n)
+                )
+            },
+        ),
+        Shape {
+            warm: format!(
+                "{}; UPDATE outbox SET stage = 'done', updated_at = {h} WHERE extent_id = 'k0020004'",
+                released("= 'k0020004'")
+            ),
+            prep: Box::new(move |n| released(&format!("< {}", below(n)))),
+            bulk: Box::new(move |n| {
+                format!(
+                    "UPDATE outbox SET stage = 'done', updated_at = {h} WHERE extent_id < {}",
                     below(n)
                 )
             }),
-        ),
-        (
-            "DELETE FROM outbox WHERE extent_id = 'k0020003'",
-            Box::new(move |n| format!("DELETE FROM outbox WHERE extent_id < {}", below(n))),
-        ),
-        (
-            "DELETE FROM generations WHERE id = 'g0020003'",
-            Box::new(move |n| format!("DELETE FROM generations WHERE id < {}", gbelow(n))),
-        ),
+        },
+        shape("DELETE FROM outbox WHERE extent_id = 'k0020003'", move |n| {
+            format!("DELETE FROM outbox WHERE extent_id < {}", below(n))
+        }),
+        shape("DELETE FROM generations WHERE id = 'g0020003'", move |n| {
+            format!("DELETE FROM generations WHERE id < {}", gbelow(n))
+        }),
     ];
+    // The release shape reaches the per-extent lookup: every row is a
+    // release.
+    let release = &shapes[4];
+    exec(&db, "BEGIN").await;
+    exec(&db, &(release.prep)(2_000)).await;
+    let before = global(&db, 1, "releases_total").await;
+    exec(&db, &(release.bulk)(2_000)).await;
+    assert_eq!(global(&db, 1, "releases_total").await[0] - before[0], 2_000);
+    exec(&db, "ROLLBACK").await;
+
     let mut report = Vec::new();
-    for (warm, bulk) in &shapes {
-        assert_eq!(exec(&db, warm).await, 1, "{warm}");
-        let (small_rows, small) = fastest_rollback(&db, &bulk(2_000)).await;
-        let (large_rows, large) = fastest_rollback(&db, &bulk(20_000)).await;
-        assert_eq!(
-            (small_rows, large_rows),
-            (2_000, 20_000),
-            "{}",
-            bulk(20_000)
-        );
-        report.push(format!("{:?} -> {:?}: {}", small, large, bulk(20_000)));
-        assert!(
-            large < Duration::from_secs(4)
-                && large.as_secs_f64() < 30.0 * small.as_secs_f64().max(0.01),
-            "not linear on a warm session: 2,000 rows {small:?}, 20,000 rows {large:?}: {}",
-            bulk(20_000)
-        );
+    // A trigger query keeps the transition-table size of the firing that
+    // parsed it until the plan cache is reset, and any namespace change in
+    // the database resets it (other sessions creating schemas, for one).
+    // Measure both: plans parsed by the single-row firing ("cached"), where
+    // a join of the transition tables can run as a nested loop, and plans
+    // parsed by the bulk statement itself ("replanned"), where such a join
+    // is estimated at about N*M/200 rows and crosses the JIT thresholds.
+    for (mode, replan) in [("cached", false), ("replanned", true)] {
+        for s in &shapes {
+            let (small_rows, small) =
+                fastest_rollback(&db, &s.warm, &(s.prep)(2_000), &(s.bulk)(2_000), replan).await;
+            let (large_rows, large) =
+                fastest_rollback(&db, &s.warm, &(s.prep)(20_000), &(s.bulk)(20_000), replan).await;
+            let sql = (s.bulk)(20_000);
+            assert_eq!((small_rows, large_rows), (2_000, 20_000), "{sql}");
+            report.push(format!("{mode}: {small:?} -> {large:?}: {sql}"));
+            assert!(
+                large < Duration::from_secs(4)
+                    && large.as_secs_f64() < 30.0 * small.as_secs_f64().max(0.01),
+                "not linear on a warm session ({mode}): 2,000 rows {small:?}, 20,000 rows {large:?}: {sql}"
+            );
+            // A fixed cost that grows with the plan's estimate (JIT
+            // compilation of a blind join) inflates both sizes alike, so
+            // also bound the counters' share: at most twice what the
+            // statement costs on its own.
+            let bare = fastest_without_usage_triggers(&db, &(s.prep)(20_000), &sql).await;
+            report.push(format!(
+                "{mode}: 20,000 rows without usage triggers {bare:?}"
+            ));
+            assert!(
+                large.as_secs_f64() < 3.0 * bare.as_secs_f64().max(0.005),
+                "usage triggers cost more than twice the statement ({mode}): {large:?} with, {bare:?} without: {sql}"
+            );
+        }
     }
     eprintln!("warm-session usage triggers:\n{}", report.join("\n"));
 }

@@ -34,14 +34,16 @@ DROP FUNCTION trg_usage_outbox_insert();
 DROP FUNCTION trg_usage_outbox_delete();
 DROP FUNCTION trg_usage_outbox_update();
 
--- Plans: PL/pgSQL caches each query with the transition-table size of its
--- first firing in the session, which is usually one row. A cached inner
--- join of two transition tables can then run as a nested loop, O(N^2) for a
--- later bulk statement. So no query here joins new_rows to old_rows with an
--- inner join: per-row deltas are summed from a UNION ALL of both tables (no
--- join), and pairing by key is a FULL JOIN, which PostgreSQL executes only as
--- a hash or merge join, never as a nested loop. A FULL JOIN that a WHERE
--- clause could reduce to an inner join is kept in a MATERIALIZED CTE.
+-- Plans: no query here joins new_rows to old_rows. PostgreSQL has no
+-- statistics for transition tables, so a join of the two is planned blind:
+-- PL/pgSQL may cache it with the first firing's size (usually one row) and
+-- run it as a nested loop, O(N^2); and any join estimates about N*M/200
+-- rows, which inflates the cost past the JIT thresholds (about 0.2 s of
+-- compilation per query) and turns per-row index probes into full scans.
+-- Instead, per-row deltas are summed over new_rows UNION ALL old_rows, and
+-- rows are paired by key with GROUP BY over the same UNION ALL (one side
+-- per table, as the key is unique). Both are linear in the rows changed
+-- whatever plan is chosen, and their estimates grow with N, not N^2.
 --
 -- Coverage: usage row u counts changed row r when u.all_* = 1 or r's key
 -- <= u.cur_* (byte order: every key column and variable is COLLATE "C").
@@ -114,13 +116,27 @@ DECLARE
     first_id TEXT COLLATE "C";
     unpaired BOOLEAN;
 BEGIN
-    SELECT min(n.id) FILTER (WHERE
-               (n.safety_state IN ('held', 'releasing')) <> (o.safety_state IN ('held', 'releasing'))
-               OR (n.safety_state = 'released') <> (o.safety_state = 'released')
-               OR n.cipher_size <> o.cipher_size),
-           bool_or(n.id IS NULL OR o.id IS NULL)
+    SELECT min(g.id) FILTER (WHERE g.n_rows = 1 AND g.o_rows = 1
+               AND (g.n_pinned <> g.o_pinned OR g.n_released <> g.o_released OR g.n_size <> g.o_size)),
+           bool_or(g.n_rows <> 1 OR g.o_rows <> 1)
       INTO first_id, unpaired
-      FROM new_rows n FULL JOIN old_rows o ON o.id = n.id;
+      FROM (SELECT d.id,
+                   count(*) FILTER (WHERE d.side = 1) AS n_rows,
+                   count(*) FILTER (WHERE d.side = -1) AS o_rows,
+                   bool_or(d.pinned) FILTER (WHERE d.side = 1) AS n_pinned,
+                   bool_or(d.pinned) FILTER (WHERE d.side = -1) AS o_pinned,
+                   bool_or(d.released) FILTER (WHERE d.side = 1) AS n_released,
+                   bool_or(d.released) FILTER (WHERE d.side = -1) AS o_released,
+                   max(d.cipher_size) FILTER (WHERE d.side = 1) AS n_size,
+                   max(d.cipher_size) FILTER (WHERE d.side = -1) AS o_size
+              FROM (SELECT n.id, 1 AS side, n.safety_state IN ('held', 'releasing') AS pinned,
+                           n.safety_state = 'released' AS released, n.cipher_size
+                      FROM new_rows n
+                    UNION ALL
+                    SELECT o.id, -1, o.safety_state IN ('held', 'releasing'),
+                           o.safety_state = 'released', o.cipher_size
+                      FROM old_rows o) d
+             GROUP BY d.id) g;
     IF unpaired THEN
         RAISE EXCEPTION 'usage counters require a stable extents.id' USING ERRCODE = 'VL002';
     END IF;
@@ -198,18 +214,29 @@ LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
     unpaired BOOLEAN;
 BEGIN
-    SELECT bool_or(n.id IS NULL OR o.id IS NULL) INTO unpaired
-      FROM new_rows n FULL JOIN old_rows o ON o.id = n.id;
+    SELECT bool_or(g.n_rows <> 1 OR g.o_rows <> 1) INTO unpaired
+      FROM (SELECT d.id, count(*) FILTER (WHERE d.side = 1) AS n_rows,
+                   count(*) FILTER (WHERE d.side = -1) AS o_rows
+              FROM (SELECT n.id, 1 AS side FROM new_rows n
+                    UNION ALL
+                    SELECT o.id, -1 FROM old_rows o) d
+             GROUP BY d.id) g;
     IF unpaired THEN
         RAISE EXCEPTION 'usage counters require a stable generations.id' USING ERRCODE = 'VL002';
     END IF;
-    -- Which buckets a pair touches depends on the pair (the D1 WHEN), so
-    -- this pairs rows by key, in a FULL JOIN that the outer filter cannot
-    -- turn into an inner join.
-    WITH p AS MATERIALIZED (
-        SELECT n.id, o.bucket_id AS o_bucket, o.size AS o_size, o.state = 'live' AS o_live,
-               n.bucket_id AS n_bucket, n.size AS n_size, n.state = 'live' AS n_live
-          FROM new_rows n FULL JOIN old_rows o ON o.id = n.id
+    -- Which buckets a pair touches depends on the pair (the D1 WHEN).
+    WITH p AS (
+        SELECT d.id,
+               max(d.bucket_id) FILTER (WHERE d.side = -1) AS o_bucket,
+               max(d.size) FILTER (WHERE d.side = -1) AS o_size,
+               bool_or(d.live) FILTER (WHERE d.side = -1) AS o_live,
+               max(d.bucket_id) FILTER (WHERE d.side = 1) AS n_bucket,
+               max(d.size) FILTER (WHERE d.side = 1) AS n_size,
+               bool_or(d.live) FILTER (WHERE d.side = 1) AS n_live
+          FROM (SELECT n.id, 1 AS side, n.bucket_id, n.size, n.state = 'live' AS live FROM new_rows n
+                UNION ALL
+                SELECT o.id, -1, o.bucket_id, o.size, o.state = 'live' FROM old_rows o) d
+         GROUP BY d.id
     ), e AS (
         SELECT u.id AS kind, p.o_bucket AS bucket_id, -1 AS objects, -p.o_size AS bytes
           FROM p JOIN usage_global u ON u.id IN (1, 2) AND (u.all_g = 1 OR p.id <= u.cur_g)
@@ -331,10 +358,20 @@ DECLARE
     a_post BIGINT; a_verify BIGINT; a_release BIGINT; a_done BIGINT; a_cancelled BIGINT; a_dead BIGINT;
     t_posts BIGINT; t_verifies BIGINT; t_releases BIGINT; t_dead BIGINT; t_failures BIGINT;
 BEGIN
-    SELECT min(n.extent_id) FILTER (WHERE n.stage <> o.stage OR (failures AND n.last_error IS NOT NULL)),
-           bool_or(n.extent_id IS NULL OR o.extent_id IS NULL)
+    SELECT min(k.extent_id) FILTER (WHERE k.n_rows = 1 AND k.o_rows = 1
+               AND (k.ns <> k.os OR (failures AND k.last_error IS NOT NULL))),
+           bool_or(k.n_rows <> 1 OR k.o_rows <> 1)
       INTO first_id, unpaired
-      FROM new_rows n FULL JOIN old_rows o ON o.extent_id = n.extent_id;
+      FROM (SELECT d.extent_id,
+                   count(*) FILTER (WHERE d.side = 1) AS n_rows,
+                   count(*) FILTER (WHERE d.side = -1) AS o_rows,
+                   max(d.stage) FILTER (WHERE d.side = 1) AS ns,
+                   max(d.stage) FILTER (WHERE d.side = -1) AS os,
+                   max(d.last_error) FILTER (WHERE d.side = 1) AS last_error
+              FROM (SELECT n.extent_id, 1 AS side, n.stage, n.last_error FROM new_rows n
+                    UNION ALL
+                    SELECT o.extent_id, -1, o.stage, NULL FROM old_rows o) d
+             GROUP BY d.extent_id) k;
     IF unpaired THEN
         RAISE EXCEPTION 'usage counters require a stable outbox.extent_id' USING ERRCODE = 'VL002';
     END IF;
@@ -370,11 +407,18 @@ BEGIN
                    count(*) FILTER (WHERE (e.os = 'release' AND e.ns = 'done') OR e.released) AS releases,
                    count(*) FILTER (WHERE e.ns = 'dead' AND e.os <> 'dead') AS dead,
                    count(*) FILTER (WHERE e.ns = e.os) AS failed
-              FROM (WITH p AS MATERIALIZED (
-                        -- Events are per pair: a FULL JOIN (hash or merge
-                        -- only), kept apart from the filter below.
-                        SELECT n.extent_id, n.updated_at, n.stage AS ns, o.stage AS os, n.last_error
-                          FROM new_rows n FULL JOIN old_rows o ON o.extent_id = n.extent_id)
+              FROM (WITH p AS (
+                        -- Events are per pair: paired by key (see the top).
+                        SELECT d.extent_id,
+                               max(d.updated_at) FILTER (WHERE d.side = 1) AS updated_at,
+                               max(d.stage) FILTER (WHERE d.side = 1) AS ns,
+                               max(d.stage) FILTER (WHERE d.side = -1) AS os,
+                               max(d.last_error) FILTER (WHERE d.side = 1) AS last_error
+                          FROM (SELECT n.extent_id, 1 AS side, n.updated_at, n.stage, n.last_error
+                                  FROM new_rows n
+                                UNION ALL
+                                SELECT o.extent_id, -1, NULL, o.stage, NULL FROM old_rows o) d
+                         GROUP BY d.extent_id)
                     SELECT p.updated_at / 3600000 AS event_hour, p.ns, p.os,
                            CASE WHEN p.os = 'verify' AND p.ns = 'done'
                                 THEN EXISTS (SELECT 1 FROM extents x WHERE x.id = p.extent_id
