@@ -11,9 +11,11 @@ dropping a test schema does not undo that. Each test creates and drops its
 own schema. Only those four libpq variables (and PGPASSWORD) reach psql.
 """
 
+import ast
 import contextlib
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import shutil
@@ -90,6 +92,30 @@ def delayed_pg():
         finally:
             proxy.shutdown()
             thread.join()
+
+
+class MigrationParser(unittest.TestCase):
+    def test_lint_preserves_leading_comments_in_server_statement(self):
+        source = MIGRATE.read_text()
+        python = source.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tree = ast.parse(python)
+        wanted = []
+        names = {'SQL_TOKEN', 'sql_tokens_with_spans', 'sql_tokens', 'lint_migration'}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == 'SQL_TOKEN' for target in node.targets):
+                wanted.append(node)
+            elif isinstance(node, ast.FunctionDef) and node.name in names:
+                wanted.append(node)
+
+        def die(message):
+            raise AssertionError(message)
+
+        namespace = {'re': re, 'die': die, 'ValueError': ValueError}
+        exec(compile(ast.Module(body=wanted, type_ignores=[]), str(MIGRATE), 'exec'), namespace)
+        sql = "-- leading line comment\n/* leading block comment */\nCREATE TABLE parser_comments (value TEXT);"
+        _, raw = namespace['lint_migration'](sql, False, 'parser_comments.sql')
+        self.assertEqual(raw, [sql])
 
 
 @unittest.skipUnless(os.environ.get("VELMORA_TEST_PG_MIGRATE") == "1",

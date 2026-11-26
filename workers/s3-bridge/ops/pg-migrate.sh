@@ -248,18 +248,16 @@ def sql_tokens(sql):
 
 def lint_migration(sql, no_tx, name):
     statements, source_statements, pending = [], [], []
-    source_start = None
+    segment_start = 0
     try:
-        for token, start, end in sql_tokens_with_spans(sql):
+        for token, _, end in sql_tokens_with_spans(sql):
             if token == ';':
                 if pending:
                     statements.append(pending)
-                    source_statements.append(sql[source_start:end])
+                    source_statements.append(sql[segment_start:end])
                 pending = []
-                source_start = None
+                segment_start = end
             else:
-                if source_start is None:
-                    source_start = start
                 pending.append(token)
     except ValueError as e:
         die(f'{name}: {e}')
