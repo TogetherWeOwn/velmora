@@ -21,7 +21,8 @@ import unittest
 BRIDGE = Path(__file__).resolve().parents[1]
 MIGRATE = BRIDGE / "ops" / "pg-migrate.sh"
 ROLES = ("kofra_migrate", "kofra_app", "kofra_ro")
-STAGES = ["0001", "0002", "0003"]
+# Every shipped stage: both modes apply them all.
+STAGES = sorted(f.name[:4] for f in (BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
 
 
 def libpq_env():

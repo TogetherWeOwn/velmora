@@ -18,7 +18,6 @@ import time
 
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
-CUTOVER_BASELINE = '0002'
 W1 = 7413000001
 MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
@@ -97,7 +96,7 @@ def sql_files(root):
     return result
 
 
-def coverage(files, d1, *, require_all=True):
+def coverage(files, d1):
     covered = set()
     for name, body in files.values():
         for selection, expected in re.findall(
@@ -128,13 +127,11 @@ def coverage(files, d1, *, require_all=True):
                 die(f'duplicate D1 coverage: {version}')
             covered.add(version)
     missing = d1.keys() - covered
-    if require_all and missing:
+    if missing:
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
     if not covered:
         die('no D1 migration coverage found')
-    if require_all:
-        print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
-    return covered
+    print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
 
 
 def lock_key(raw, setting):
@@ -501,15 +498,12 @@ def test_triggers(run, begin, history, complete, d1):
 
 
 def main():
-    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE '
-                                     '[--to NNNN | --verify | --verify-cutover-baseline | --test] '
+    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --verify | --test] '
                                      '[--import-mode | --activate], or %(prog)s --check-migrations')
     p.add_argument('env_file', nargs='?')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--to')
     mode.add_argument('--verify', action='store_true')
-    mode.add_argument('--verify-cutover-baseline', action='store_true',
-                      help='verify only the immutable PostgreSQL 0001/0002 cutover schema')
     mode.add_argument('--test', action='store_true')
     mode.add_argument('--check-migrations', action='store_true')
     activation = p.add_mutually_exclusive_group()
@@ -530,21 +524,12 @@ def main():
             p.error('--check-migrations does not take a connection file or other flags')
         coverage(files, d1)
         return
-    if not args.env_file or ((args.verify or args.verify_cutover_baseline or args.test)
-                             and (args.activate or args.import_mode)):
-        p.error('verification and testing require a connection file and do not allow activation or import flags')
-    latest = CUTOVER_BASELINE if args.import_mode else max(files)
-    target = latest if args.to is None else args.to
+    if not args.env_file or ((args.verify or args.test) and (args.activate or args.import_mode)):
+        p.error('provide a connection file; --verify and --test do not change migration or activation state')
+    target = max(files) if args.to is None else args.to
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
-    if args.import_mode and target > CUTOVER_BASELINE:
-        p.error('--import-mode applies only the cutover baseline (0001/0002)')
     coverage(files, d1)
-    if args.verify_cutover_baseline:
-        files = {v: body for v, body in files.items() if v <= CUTOVER_BASELINE}
-        migrations = {v: migration for v, migration in migrations.items() if v in files}
-        covered = coverage(files, d1, require_all=False)
-        d1 = {v: body for v, body in d1.items() if v in covered}
     env, schema, lock, migration_lock = connection(args.env_file)
     print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
     prefix = f'''SET search_path TO "{schema}", pg_temp;
@@ -570,8 +555,6 @@ SET client_min_messages = error;
             reason = ERRORS.get(state) or (f'SQLSTATE {state}' if state else 'psql connection or client failure')
             die(f'{report or "database operation"}: {reason}')
 
-    MIGRATOR_LOCK_TIMEOUT = "SET lock_timeout = '3s';\n"
-    CIC_LOCK_TIMEOUT = "SET lock_timeout = '10min';\n"
     # Cast the complete signed literal, including the sign of BIGINT_MIN.
     begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock('{lock}'::bigint);\n"
     # Never wait for the migration key with an open snapshot: an in-progress
@@ -597,7 +580,7 @@ SET client_min_messages = error;
     verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
                   + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
                   + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
-    if args.verify or args.verify_cutover_baseline:
+    if args.verify:
         compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
         return
     if args.test:
@@ -640,14 +623,10 @@ $$;
         if no_tx:
             # Release W1 before CIC may wait for old snapshots; keep only the
             # session migrator lock until the ledger transaction commits.
-            # CIC waits out older transactions through lock waits, and app
-            # transactions may run 30 s: a 3 s lock_timeout would fail the
-            # build and leave an INVALID index. CIC takes only SHARE UPDATE
-            # EXCLUSIVE, which blocks no DML, so it may wait longer.
-            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n' + CIC_LOCK_TIMEOUT
+            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
         batch += sql + '\n'
         if no_tx:
-            batch += MIGRATOR_LOCK_TIMEOUT + migration_tx + check(BAD_INDEX, 'VL015')
+            batch += migration_tx + check(BAD_INDEX, 'VL015')
         if version == '0002' and args.import_mode:
             batch += RESTART_IDENTITIES
         if version == '0001':

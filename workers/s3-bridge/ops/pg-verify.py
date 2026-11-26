@@ -161,9 +161,8 @@ def main():
         start = monotonic()
         tables, seq_hash = compare(db, pg, source, receipt, args.chunk_rows)
         checked = monotonic()
-        # The source export predates post-cutover DDL. This check is
-        # read-only and does not acquire W1.
-        migrate(args.pg_env, "--verify-cutover-baseline")
+        # WP2 --verify is read-only and does not acquire W1.
+        migrate(args.pg_env, "--verify")
         if args.activate:
             for table, info in tables.items():
                 require(pg_count(pg, table) == info["postgres"]["count"], f"{table} changed before activation")

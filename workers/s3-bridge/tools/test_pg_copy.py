@@ -31,8 +31,8 @@ LIMIT = 2**53 - 1
 
 
 def migrations(db):
-    # The cutover copy protocol targets the 0001/0002 PostgreSQL baseline,
-    # which is frozen at D1 0027. Later migrations apply only after cutover.
+    # The source of a cutover is D1 frozen at 0027 (the PostgreSQL
+    # 0001-0003 baseline). Later D1 migrations apply only after cutover.
     files = sorted(p for p in (BRIDGE / "migrations").glob("*.sql") if int(p.name[:4]) <= 27)
     assert [int(p.name[:4]) for p in files] == [*range(1, 23), 25, 26, 27]
     for path in files:
@@ -68,8 +68,37 @@ def fixture(db):
     db.commit()
 
 
+BASELINE = ("0001", "0002", "0003")
+_CHECKOUT = []
+
+
+def cutover_ops():
+    """`ops/` of a cutover checkout: this tree with only the baseline
+    PostgreSQL stages and D1 through 0027, as the cutover runs from the
+    commit before later stages ship (pg-copy.py refuses any other)."""
+    if not _CHECKOUT:
+        root = Path(tempfile.mkdtemp(prefix="velmora-cutover-checkout-"))
+        shutil.copytree(OPS, root / "ops", ignore=shutil.ignore_patterns("__pycache__"))
+        (root / "pg").mkdir()
+        for f in (BRIDGE / "pg").iterdir():
+            if not f.name[:4].isdigit() or f.name[:4] in BASELINE:
+                shutil.copy2(f, root / "pg" / f.name)
+        (root / "migrations").mkdir()
+        for f in (BRIDGE / "migrations").glob("*.sql"):
+            if int(f.name[:4]) <= 27:
+                shutil.copy2(f, root / "migrations" / f.name)
+        _CHECKOUT.append(root)
+    return _CHECKOUT[0] / "ops"
+
+
+def tearDownModule():
+    for root in _CHECKOUT:
+        shutil.rmtree(root)
+
+
 def run(name, *args):
-    return subprocess.run([sys.executable, str(OPS / name), *map(str, args)], capture_output=True, text=True)
+    return subprocess.run([sys.executable, str(cutover_ops() / name), *map(str, args)],
+                          capture_output=True, text=True)
 
 
 class CopyTests(unittest.TestCase):
@@ -305,7 +334,10 @@ class CopyTests(unittest.TestCase):
 
     def test_cutover_checkout_must_ship_exactly_the_baseline(self):
         check = runpy.run_path(str(OPS / "pg-copy.py"))["require_cutover_checkout"]
-        check()  # this checkout
+        # This checkout ships the scrub stages after the baseline: no cutover
+        # runs from it.
+        with self.assertRaisesRegex(Failure, "the cutover imports and activates exactly 0001/0002/0003"):
+            check()
         stages = self.path / "pg"
         stages.mkdir()
         for name in ("0001_baseline_pre.sql", "0002_baseline_post.sql", "0003_usage_statement_triggers.sql"):
@@ -414,7 +446,7 @@ class CopyTests(unittest.TestCase):
 
     def test_claim_refuses_active_or_nonempty(self):
         conn, env = self.pg()
-        migrate = OPS / "pg-migrate.sh"
+        migrate = cutover_ops() / "pg-migrate.sh"
         result = subprocess.run(["bash", str(migrate), str(env), "--to", "0001", "--import-mode"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         conn.execute("INSERT INTO tx_guard VALUES (1)")

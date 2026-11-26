@@ -66,17 +66,15 @@ DDL; it is not the import activation procedure.
    including `usage_global` ids 1 and 2. Populate `outbox.seq` in source
    `rowid` order. Copy foreign-key parents before children; constraints are
    live, secondary indexes and triggers are not.
-3. Run `ops/pg-migrate.sh "$CONNECTION_FILE" --to 0002 --import-mode` after
-   COPY has committed. Import mode stops at the frozen cutover baseline (D1
-   through `0027`). The post-stage requires the marker, both usage rows and an
+3. Run `ops/pg-migrate.sh "$CONNECTION_FILE" --import-mode` after COPY has
+   committed. The post-stage requires the marker, both usage rows and an
    inaccessible app schema. It restarts the `gc.id`, `usage_recounts.id` and
    `outbox.seq` identities above the copied values in the same transaction.
-4. Verify source data counts and digests outside this tool. The import verifier
-   uses `--verify-cutover-baseline`, which checks the frozen schema and identity
-   positions without taking either advisory lock or activating the app. The
-   import verifier removes the marker and grants the app schema `USAGE` in one
-   locked transaction. After activation, use the normal migrator to apply
-   later stages; normal `--verify` requires all shipped migrations.
+4. Verify source data counts and digests outside this tool. `--verify` also
+   works while the verifier holds the writer lock on another connection; it
+   checks identity positions without acquiring either advisory lock or
+   activating the app. The import verifier removes the marker and grants the
+   app schema `USAGE` in one locked transaction.
 
 ## Adding migrations
 
