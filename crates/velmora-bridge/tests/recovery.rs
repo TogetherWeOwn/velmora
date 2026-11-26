@@ -103,11 +103,25 @@ fn import(rig: &Rig) {
 
 /// Everything the catalogue says, for "nothing changed" checks.
 fn dump(rig: &Rig) -> String {
+    dump_rows(rig, false)
+}
+
+fn dump_rows(rig: &Rig, rebuilt: bool) -> String {
     let mut out = String::new();
     for t in TABLES {
+        // A fresh rebuild allocates new internal identities for the
+        // posting and GC jobs; compare their actual work and state.
+        let columns = match (rebuilt, t) {
+            (true, "outbox") => {
+                "extent_id, generation_id, stage, attempts, next_at, lease_token, lease_owner, \
+                 lease_until, cursor, last_error, updated_at, sent_at"
+            }
+            (true, "gc") => "extent_id, action, due_at, done_at",
+            _ => "*",
+        };
         for row in fixture_rows(
             &rig.bridge.catalog.sql,
-            &format!("SELECT * FROM {t} ORDER BY 1, 2"),
+            &format!("SELECT {columns} FROM {t} ORDER BY 1, 2"),
             &[],
         ) {
             out.push_str(&format!("{t}|{row:?}\n"));
@@ -581,13 +595,19 @@ async fn export_plus_replay_restores_later_writes() {
 // Total loss: the records alone rebuild the catalogue
 // ---------------------------------------------------------------------------
 
+fn read_ahead_config() -> velmora_bridge::config::BridgeConfig {
+    let mut cfg = config(Vec::new());
+    cfg.replay_read_ahead = true;
+    cfg
+}
+
 /// A call asks the store ahead for the records it lists and for what
 /// their extents have there. The step then works with those answers:
 /// no record is read twice, the report is the one of a replay that
 /// takes one record and one extent a call, and so is the catalogue.
 #[tokio::test(flavor = "current_thread")]
 async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
-    let rig = rig();
+    let rig = rig_with_selected(NoNntp, read_ahead_config());
     let (_, signer) = rig.standard(BUCKET).await;
     for i in 0..40 {
         let key = format!("k{i:02}");
@@ -616,7 +636,7 @@ async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
     };
     let (slow, calls) = replay(&rig, UnixMs(0), one).await;
     assert!(calls > 60, "{calls} calls");
-    let by_one = dump(&rig);
+    let by_one = dump_rows(&rig, true);
 
     wipe(&rig);
     let store = &rig.bridge.safety;
@@ -647,7 +667,7 @@ async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
     assert_eq!(format!("{fast:?}"), format!("{slow:?}"));
     assert_eq!(fast.manifests, 51, "{fast:?}");
     assert_eq!((fast.tombstones, fast.deleted), (10, 10), "{fast:?}");
-    assert_eq!(dump(&rig), by_one);
+    assert_eq!(dump_rows(&rig, true), by_one);
 
     // Calls that end inside a run of records that was asked ahead, and
     // inside a record.
@@ -656,7 +676,7 @@ async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
         let limits = ReplayLimits { records, extents };
         let (cut, _) = replay(&rig, UnixMs(0), limits).await;
         assert_eq!(format!("{cut:?}"), format!("{slow:?}"), "{limits:?}");
-        assert_eq!(dump(&rig), by_one, "{limits:?}");
+        assert_eq!(dump_rows(&rig, true), by_one, "{limits:?}");
     }
 }
 
@@ -664,7 +684,7 @@ async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
 /// again, and the replay is the one of a store that never failed.
 #[tokio::test(flavor = "current_thread")]
 async fn a_read_that_fails_ahead_is_asked_again_by_the_step() {
-    let rig = rig();
+    let rig = rig_with(NoNntp, read_ahead_config());
     let (bucket, signer) = rig.standard(BUCKET).await;
     for i in 0..20 {
         let key = format!("k{i:02}");
@@ -706,7 +726,7 @@ async fn a_read_that_fails_ahead_is_asked_again_by_the_step() {
 /// no row of it is written.
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_removed_after_it_was_read_is_not_published() {
-    let rig = rig();
+    let rig = rig_with(NoNntp, read_ahead_config());
     let (bucket, signer) = rig.standard(BUCKET).await;
     for i in 0..20 {
         let key = format!("k{i:02}");
@@ -737,7 +757,7 @@ async fn a_record_removed_after_it_was_read_is_not_published() {
 /// is old, and the step asks again.
 #[tokio::test(flavor = "current_thread")]
 async fn an_old_answer_that_a_record_is_there_is_asked_again() {
-    let rig = rig();
+    let rig = rig_with(NoNntp, read_ahead_config());
     let (bucket, signer) = rig.standard(BUCKET).await;
     for i in 0..20 {
         let key = format!("k{i:02}");
@@ -767,7 +787,7 @@ async fn an_old_answer_that_a_record_is_there_is_asked_again() {
 /// the step leaves them out, and so do the reads ahead.
 #[tokio::test(flavor = "current_thread")]
 async fn nothing_is_asked_ahead_about_the_extents_of_a_superseded_record() {
-    let rig = rig();
+    let rig = rig_with(NoNntp, read_ahead_config());
     let (_, signer) = rig.standard(BUCKET).await;
     for round in 0..6 {
         for i in 0..10 {
@@ -2993,7 +3013,7 @@ async fn a_pinned_copy_released_after_the_export_is_found() {
 /// whose copy is gone is the one reported.
 #[tokio::test(flavor = "current_thread")]
 async fn copies_the_catalogue_does_not_hold_hide_no_missing_one() {
-    let rig = rig();
+    let rig = rig_with(NoNntp, read_ahead_config());
     let (bucket, signer) = rig.standard(BUCKET).await;
     let mut held = Vec::new();
     for i in 0..12 {

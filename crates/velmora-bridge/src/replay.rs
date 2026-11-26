@@ -116,8 +116,8 @@ const HELD_MISSING_LISTED: usize = 100;
 impl Default for ReplayLimits {
     fn default() -> Self {
         ReplayLimits {
-            records: 250,
-            extents: 1000,
+            records: 50,
+            extents: 100,
         }
     }
 }
@@ -347,8 +347,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     /// is an error and changes nothing that the same cursor would not
     /// redo.
     pub async fn replay_step(&self, cursor: ReplayCursor) -> Result<ReplayReport> {
-        self.replay_step_within(cursor, ReplayLimits::default())
-            .await
+        let limits = if self.cfg.replay_read_ahead {
+            ReplayLimits {
+                records: 250,
+                extents: 1_000,
+            }
+        } else {
+            ReplayLimits::default()
+        };
+        self.replay_step_within(cursor, limits).await
     }
 
     /// [`Self::replay_step`] with explicit limits (both at least 1).
@@ -393,22 +400,51 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             buckets: HashMap::new(),
             there: None,
         };
+        let more = if self.cfg.replay_read_ahead {
+            self.replay_runs_ahead(store, &names, &mut cursor, &mut call, report)
+                .await?
+        } else {
+            self.replay_run(store, &names, &mut cursor, &mut call, report)
+                .await?
+        };
+        if more || names.len() as u64 == u64::from(limits.records) {
+            return Ok(Some(cursor));
+        }
+        Ok(Some(ReplayCursor {
+            phase: ReplayPhase::Tombstones,
+            after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
+            // A count in a record that is not listed any more is of nothing.
+            extent: 0,
+            name: String::new(),
+            ..cursor
+        }))
+    }
+
+    async fn replay_runs_ahead(
+        &self,
+        store: &Ahead<'_, B>,
+        names: &[Listed],
+        cursor: &mut ReplayCursor,
+        call: &mut Call,
+        report: &mut ReplayReport,
+    ) -> Result<bool> {
         // Extents asked ahead so far: no more than the call can handle.
+        let extents = call.budget;
         let mut asked = self
             .ahead_manifests(
                 store,
                 names.get(..AHEAD_RECORDS.min(names.len())).unwrap_or(&[]),
-                Some(&cursor),
-                limits.extents,
+                Some(cursor),
+                extents,
             )
             .await;
         for (run, next) in names
             .chunks(AHEAD_RECORDS)
             .zip(names.chunks(AHEAD_RECORDS).skip(1).map(Some).chain([None]))
         {
-            let left = limits.extents.saturating_sub(asked);
+            let left = extents.saturating_sub(asked);
             let (more, ahead) = {
-                let step = pin!(self.replay_run(store, run, &mut cursor, &mut call, report));
+                let step = pin!(self.replay_run(store, run, cursor, call, report));
                 let ahead = pin!(async move {
                     match next {
                         Some(next) if left > 0 => {
@@ -430,21 +466,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             };
             asked += ahead;
             if more {
-                return Ok(Some(cursor));
+                return Ok(true);
             }
         }
-        if names.len() as u64 == u64::from(limits.records) {
-            return Ok(Some(cursor));
-        }
-        Ok(Some(ReplayCursor {
-            phase: ReplayPhase::Tombstones,
-            after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
-            // A count in a record that is not listed any more is of
-            // nothing.
-            extent: 0,
-            name: String::new(),
-            ..cursor
-        }))
+        Ok(false)
     }
 
     /// The step for the records of `run`, one after the other. `true` =
@@ -467,7 +492,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         }))
         .buffered(STORE_READS));
         for listed in run {
-            let asked = there.next().await;
+            let asked = if self.cfg.replay_read_ahead {
+                there.next().await
+            } else {
+                None
+            };
             let flat = &listed.flat;
             // The name the cursor counts extents in: the one it holds,
             // or, when it holds none (a cursor of an older build, which
@@ -627,7 +656,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 ids.iter().skip(skip).map(move |id| (id, &listed.layout))
             })
             .take(extents);
-        stream::iter(wanted.map(|(id, layout)| self.probe(keep, id, layout)))
+        stream::iter(wanted.map(|(id, layout)| self.probe_replay_extent(keep, id, layout)))
             .buffered(STORE_READS)
             .take_while(|_| std::future::ready(!store.full()))
             .count()
@@ -666,14 +695,20 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     }
 
     /// What the store has of one extent: whether its pinned copy is
-    /// there, and its article plan record. The two are asked at once.
-    async fn probe<S: BlobStore>(
+    /// there, and its article plan record. When read-ahead is enabled,
+    /// the two are asked at once.
+    async fn probe_replay_extent<S: BlobStore>(
         &self,
         store: &S,
         extent: &ExtentId,
         layout: &Layout,
     ) -> Result<(bool, PlanRead)> {
         let key = extent.safety_key();
+        if !self.cfg.replay_read_ahead {
+            let pinned = store.head(&key).await?.is_some();
+            let plan = read_article_plan(store, &self.kek, extent, layout).await?;
+            return Ok((pinned, plan));
+        }
         let (pinned, plan) = future::join(
             store.head(&key),
             read_article_plan(store, &self.kek, extent, layout),
@@ -723,8 +758,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             None => {
                 let named = self.catalog.bucket_by_name(&bucket.name).await?;
                 let id = named.map(|b| b.id);
-                if let Some(id) = &id {
-                    buckets.insert(bucket.name.clone(), id.clone());
+                if self.cfg.replay_read_ahead {
+                    if let Some(id) = &id {
+                        buckets.insert(bucket.name.clone(), id.clone());
+                    }
                 }
                 id
             }
@@ -744,7 +781,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // refuses it. So the store itself is asked whether it still has
         // the record, a moment before the first row of the record is
         // written: a record that is gone leaves nothing behind.
-        if probe != ReplayProbe::Present {
+        if self.cfg.replay_read_ahead && probe != ReplayProbe::Present {
             let there = match *there {
                 Some(there) => there,
                 None => self.safety.head(&cursor.name).await?.is_some(),
@@ -807,26 +844,25 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 }
             };
             let end = total.min(at + *budget).min(first + run.len());
-            let mut rows = Vec::with_capacity(end - at);
-            for index in at..end {
-                rows.push(match record {
+            // Take results in record order and stage the chunk only
+            // after every answer. With read-ahead off, validate and
+            // read each extent before starting the next one.
+            let reads_at_once = if self.cfg.replay_read_ahead {
+                STORE_READS
+            } else {
+                1
+            };
+            let mut probes = pin!(stream::iter((at..end).map(|index| async move {
+                let row = match record {
                     StoredGeneration::Single(m) => m.extent(index),
                     StoredGeneration::Segmented(head) => head.extent(&run[index - first]),
-                }?);
-            }
-            // What the store has of each extent, asked for several
-            // extents at a time and taken in the order of the record:
-            // the report and the rows are those of one extent after
-            // the other. Nothing is written before every answer of the
-            // chunk is there, and a store that cannot be reached fails
-            // the call as before.
-            let probes: Vec<(bool, PlanRead)> =
-                stream::iter(rows.iter().map(|row| self.probe(store, &row.id, layout)))
-                    .buffered(STORE_READS)
-                    .try_collect()
-                    .await?;
+                }?;
+                let found = self.probe_replay_extent(store, &row.id, layout).await?;
+                Ok::<_, BridgeError>((row, found))
+            }))
+            .buffered(reads_at_once));
             let mut chunk = Vec::with_capacity(end - at);
-            for (mut row, (safety_present, read)) in rows.into_iter().zip(probes) {
+            while let Some((mut row, (safety_present, read))) = probes.try_next().await? {
                 // A plan in an existing catalogue row is kept; this one
                 // fills the gap when the row or its plan is missing.
                 let state = if safety_present {
@@ -973,13 +1009,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             .await?;
         let now = self.clock.now();
         let store = &Ahead::new(&self.safety);
-        // The record under the first name of every id, asked ahead.
-        let keep = &store.keeping();
-        stream::iter(names.iter().map(|listed| keep.get(&listed.name, None)))
-            .buffered(STORE_READS)
-            .take_while(|_| std::future::ready(!store.full()))
-            .for_each(|_| std::future::ready(()))
-            .await;
+        if self.cfg.replay_read_ahead {
+            // The record under the first name of every id, asked ahead.
+            let keep = &store.keeping();
+            stream::iter(names.iter().map(|listed| keep.get(&listed.name, None)))
+                .buffered(STORE_READS)
+                .take_while(|_| std::future::ready(!store.full()))
+                .for_each(|_| std::future::ready(()))
+                .await;
+        }
         for listed in &names {
             let flat = &listed.flat;
             // As for a generation: the first name of the id that opens.
@@ -1103,7 +1141,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // copies of extents the catalogue does not hold lie in between,
         // costs time and changes nothing.
         let mut listed: HashSet<String> = HashSet::new();
-        if let Some(last) = ids.last().map(ExtentId::safety_key) {
+        if let Some(last) = ids
+            .last()
+            .filter(|_| self.cfg.replay_read_ahead)
+            .map(ExtentId::safety_key)
+        {
             let mut at = ExtentId::new(cursor.after.clone()).safety_key();
             for _ in 0..HELD_PAGES {
                 let keys = self.safety.list(PINNED_PREFIX, &at, HELD_PAGE).await?;
@@ -1118,12 +1160,17 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             }
         }
         let listed = &listed;
-        // Several at a time, taken in the order of the ids.
+        // Several at a time when enabled, taken in the order of the ids.
+        let reads_at_once = if self.cfg.replay_read_ahead {
+            STORE_READS
+        } else {
+            1
+        };
         let present: Vec<bool> = stream::iter(ids.iter().map(|id| async move {
             let key = id.safety_key();
             Ok::<_, BridgeError>(listed.contains(&key) || self.safety.head(&key).await?.is_some())
         }))
-        .buffered(STORE_READS)
+        .buffered(reads_at_once)
         .try_collect()
         .await?;
         for (id, present) in ids.iter().zip(present) {

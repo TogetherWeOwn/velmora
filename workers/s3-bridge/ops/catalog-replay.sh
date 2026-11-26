@@ -46,7 +46,7 @@ case "$SINCE$MARGIN" in *[!0-9]*) echo "catalog-replay: times are whole millisec
 }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -r -- "$WORK"' EXIT
 {
   printf 'authorization: Bearer '
   tr -d '\r\n' <"$VELMORA_ADMIN_TOKEN_FILE"
