@@ -752,36 +752,6 @@ async fn a_record_removed_after_it_was_read_is_not_published() {
     assert!(rig.live(&bucket, "k08").await.is_some());
 }
 
-/// The step asks whether a record is still there a few records before
-/// it comes to it. When the records in between took long, that answer
-/// is old, and the step asks again.
-#[tokio::test(flavor = "current_thread")]
-async fn an_old_answer_that_a_record_is_there_is_asked_again() {
-    let rig = rig_with(NoNntp, read_ahead_config());
-    let (bucket, signer) = rig.standard(BUCKET).await;
-    for i in 0..20 {
-        let key = format!("k{i:02}");
-        rig.put(&signer, BUCKET, &key, key.as_bytes())
-            .await
-            .expect(200);
-        tick(&rig);
-    }
-    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
-    let record = format!("m/{}", generation.id.as_str());
-    wipe(&rig);
-    let store = &rig.bridge.safety;
-    // The record goes right after the store said it was there, and the
-    // step comes to it three seconds later.
-    let clock = rig.bridge.clock.clone();
-    *store.lose_after_head.borrow_mut() =
-        Some((record.clone(), Box::new(move || clock.advance_ms(3000))));
-    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
-    assert!(store.lose_after_head.borrow().is_none());
-    assert_eq!(report.published, 19, "{report:?}");
-    assert!(rig.live(&bucket, "k07").await.is_none());
-    assert_eq!(rig.count("extents"), 19);
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
     let rig = rig_with(NoNntp, read_ahead_config());
@@ -806,38 +776,78 @@ async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
     );
 }
 
-/// Neither replay mode fences the removal of a refused record once
-/// it has observed the record. The old authoritative GET and the opt-in
-/// presence check both allow the same published outcome in that window.
+/// A refused writer removes record N while the step is still staging
+/// record N-1, after the records were read ahead. Presence is decided
+/// at N's own turn in both modes, so neither publishes N, and both
+/// leave the same rows.
 #[tokio::test(flavor = "current_thread")]
-async fn removal_after_replay_observes_a_record_matches_the_sequential_path() {
-    let mut outcomes = Vec::new();
-    for read_ahead in [false, true] {
-        let mut cfg = config(Vec::new());
-        cfg.replay_read_ahead = read_ahead;
-        let rig = rig_with(NoNntp, cfg);
-        let (bucket, signer) = rig.standard(BUCKET).await;
-        rig.put(&signer, BUCKET, "refused", b"record contents")
-            .await
-            .expect(200);
-        let (generation, _) = rig.live(&bucket, "refused").await.unwrap();
-        let name = Layout::flat().generation_key(&generation.id);
+async fn removal_during_the_prior_record_matches_the_sequential_path() {
+    let mut rig = rig();
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "prior", b"keep").await.expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "refused", b"remove")
+        .await
+        .expect(200);
+    let (_, extents) = rig.live(&bucket, "prior").await.unwrap();
+    let prior_extent: &'static str = Box::leak(extents[0].id.as_str().to_owned().into_boxed_str());
+    let (refused, _) = rig.live(&bucket, "refused").await.unwrap();
+    let name = Layout::flat().generation_key(&refused.id);
+    let sealed = rig.bridge.safety.get(&name, None).await.unwrap().unwrap();
+    let record_id = ExtentId::new(refused.id.as_str().to_owned());
+    let digest = sha2::Sha256::digest(&sealed).into();
+
+    let mut catalogues = Vec::new();
+    for enabled in [false, true] {
         wipe(&rig);
+        std::rc::Rc::get_mut(&mut rig.bridge)
+            .unwrap()
+            .cfg
+            .replay_read_ahead = enabled;
         let store = &rig.bridge.safety;
-        if read_ahead {
-            *store.lose_after_head.borrow_mut() = Some((name.clone(), Box::new(|| {})));
-        } else {
-            *store.lose_after_get.borrow_mut() = Some(name.clone());
-        }
-        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        store
+            .put(
+                &name,
+                sealed.clone(),
+                &BlobMeta {
+                    bucket: &bucket.id,
+                    extent: &record_id,
+                    cipher_sha256: &digest,
+                },
+            )
+            .await
+            .unwrap();
+        // Reads answer a turn later, so the reads ahead of N are under
+        // way together and done before N-1 is staged.
+        store.slow_reads.set(true);
+        let sql = &rig.bridge.catalog.sql;
+        sql.stall_batch_key.set(Some(prior_extent));
+        let remove = async {
+            for _ in 0..HOLD_TURNS {
+                if sql.stall_batch_key.get().is_none() {
+                    store.inner.lose(&name);
+                    sql.selected_batch.release();
+                    // The tripwire observes the release on its next poll.
+                    tokio::task::yield_now().await;
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the prior record never reached its staging batch");
+        };
+        let (step, ()) = futures_util::future::join(
+            rig.bridge.replay_step(ReplayCursor::start(UnixMs(0))),
+            remove,
+        )
+        .await;
+        let report = step.unwrap();
+        assert_eq!(report.published, 1, "read-ahead={enabled}: {report:?}");
         assert!(store.stored(&name).is_none());
-        outcomes.push((
-            report.published,
-            report.unreadable,
-            rig.live(&bucket, "refused").await.is_some(),
-        ));
+        assert!(rig.live(&bucket, "refused").await.is_none());
+        assert!(rig.live(&bucket, "prior").await.is_some());
+        catalogues.push(dump_rows(&rig, true));
     }
-    assert_eq!(outcomes, vec![(1, Vec::new(), true); 2]);
+    assert_eq!(catalogues[0], catalogues[1]);
 }
 
 /// A replay over a catalogue that has the objects already asks the

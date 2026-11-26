@@ -69,9 +69,8 @@ use crate::types::{
 };
 
 /// How much one call does. A record costs two blob reads (the record,
-/// and whether it is still there shortly before the step comes to it)
-/// and up to
-/// seven catalogue calls, an extent two blob reads (three when its
+/// and, with read-ahead on, whether it is still there when the step
+/// comes to it) and up to seven catalogue calls, an extent two blob reads (three when its
 /// plan is looked for in a second layout) and a share of a catalogue
 /// batch. With the default that is about 3,500 blob reads and 2,000
 /// catalogue calls, a little over half of a Worker invocation's
@@ -95,12 +94,6 @@ pub struct ReplayLimits {
 /// A Worker invocation holds six connections open at most and queues
 /// the rest, so more than that is not faster there.
 pub const STORE_READS: usize = 6;
-
-/// How old the answer may be that a record is still in the store, when
-/// the step comes to the record. The step asks for the records of a
-/// run [`STORE_READS`] at a time, each while it works on the ones
-/// before it; after a record that took longer than this, it asks again.
-const THERE_MS: i64 = 2_000;
 
 /// Where the pinned copies are stored: [`ExtentId::safety_key`].
 const PINNED_PREFIX: &str = "x/";
@@ -399,7 +392,6 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             budget: limits.extents,
             reads: 0,
             buckets: HashMap::new(),
-            there: None,
         };
         let more = if self.cfg.replay_read_ahead {
             self.replay_runs_ahead(store, &names, &mut cursor, &mut call, report)
@@ -484,20 +476,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         call: &mut Call,
         report: &mut ReplayReport,
     ) -> Result<bool> {
-        // Whether the store still has each record, asked of the store
-        // itself, a few records before the step comes to it, with the
-        // time of the question.
-        let mut there = pin!(stream::iter(run.iter().map(|listed| async move {
-            let asked = self.clock.now();
-            (asked, self.safety.head(&listed.name).await)
-        }))
-        .buffered(STORE_READS));
         for listed in run {
-            let asked = if self.cfg.replay_read_ahead {
-                there.next().await
-            } else {
-                None
-            };
             let flat = &listed.flat;
             // The name the cursor counts extents in: the one it holds,
             // or, when it holds none (a cursor of an older build, which
@@ -548,20 +527,6 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // count is not used in another when this one is gone
                 // by the next call.
                 cursor.name.clone_from(name);
-                // The answer for this name, when it is new enough. One
-                // that failed is asked again where it is needed. This
-                // check does not fence refused-write cleanup: the record
-                // can disappear after it. Sequential replay already has
-                // that window after its authoritative GET.
-                call.there = match &asked {
-                    Some((at, Ok(size)))
-                        if *name == listed.name
-                            && self.clock.now().0.saturating_sub(at.0) <= THERE_MS =>
-                    {
-                        Some(size.is_some())
-                    }
-                    _ => None,
-                };
                 match self
                     .replay_manifest(store, &record, layout, cursor, call, report)
                     .await?
@@ -737,13 +702,28 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             budget,
             reads,
             buckets,
-            there,
         } = call;
         let (generation, bucket) = match record {
             StoredGeneration::Single(m) => (m.generation()?, m.bucket()),
             StoredGeneration::Segmented(head) => (head.generation(), head.bucket()),
         };
-        let probe = self.catalog.replay_probe(&generation).await?;
+        // With read-ahead on, the record was read at the start of its
+        // run, some time before the step comes to it, and a write that
+        // was under way when the restore began removes its record when
+        // the catalogue refuses it. So at the record's turn the store
+        // itself, never what was read ahead, is asked whether it still
+        // has the record, at the same time as the catalogue is asked
+        // about it. Off, the record was read just now, as on main.
+        let (probe, there) = if self.cfg.replay_read_ahead {
+            let (probe, there) = future::try_join(
+                self.catalog.replay_probe(&generation),
+                self.safety.head(&cursor.name),
+            )
+            .await?;
+            (probe, Some(there.is_some()))
+        } else {
+            (self.catalog.replay_probe(&generation).await?, None)
+        };
         if probe == ReplayProbe::Superseded {
             report.superseded += 1;
             return Ok(Replayed::Done);
@@ -779,20 +759,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 return Ok(Replayed::Done);
             }
         }
-        // The record was read at the start of its run, some time
-        // before the step comes to it, and a write that was under way
-        // when the restore began removes its record when the catalogue
-        // refuses it. So the store itself is asked whether it still has
-        // the record, a moment before the first row of the record is
-        // written: a record that is gone leaves nothing behind.
-        if self.cfg.replay_read_ahead && probe != ReplayProbe::Present {
-            let there = match *there {
-                Some(there) => there,
-                None => self.safety.head(&cursor.name).await?.is_some(),
-            };
-            if !there {
-                return Ok(Replayed::Gone);
-            }
+        // A record the store no longer had at its turn leaves nothing
+        // behind: no row of it is written. This does not fence the
+        // removal of a refused record after that answer; main has the
+        // same window after its record GET.
+        if probe != ReplayProbe::Present && there == Some(false) {
+            return Ok(Replayed::Gone);
         }
         let now = self.clock.now();
         let total = generation.extent_count as usize;
@@ -1234,9 +1206,6 @@ struct Call {
     reads: usize,
     /// The id of each bucket name the catalogue was found to have.
     buckets: HashMap<String, BucketId>,
-    /// Whether the store has the record the step is at, when it was
-    /// asked a moment ago.
-    there: Option<bool>,
 }
 
 /// Aggregate budget for retained and in-flight speculative bodies.
