@@ -415,12 +415,10 @@ older Worker cannot enforce it on a direct replay call.
    - A call that gets no answer is sent again by the script after a
      wait. Leave that wait in place: the Worker may still be at work
      on the call it did not answer.
-     The total then counts what the second answer said: records the
-     first try published are counted as `present`, and a damaged
-     record that a newer record of the same object is over since is
-     left out of `damaged_unpublished`. Such a record is not the live
-     version of any object; every other finding is found again. The
-     script says at its end how many calls it sent again.
+     If a replay completed after any retry, the script exits with
+     status 3. A retry can see a later catalogue state and omit damage
+     that the lost response reported. Inspect the returned lists, but
+     do not treat empty lists as proof that the replay found no damage.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the

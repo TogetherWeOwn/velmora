@@ -285,6 +285,8 @@ pub struct Blobs {
     pub listed: RefCell<Vec<String>>,
     /// The next this many gets of this key fail.
     pub fail_gets: RefCell<Option<(String, u32)>>,
+    /// HEAD of this key fails immediately.
+    pub fail_head: RefCell<Option<String>>,
     /// The blob of this key is gone once the next get of it answered.
     pub lose_after_get: RefCell<Option<String>>,
     /// The blob of this key is gone once the next head of it answered,
@@ -493,7 +495,34 @@ impl BlobStore for Blobs {
         }
         answer
     }
+    async fn get_for_read_ahead(
+        &self,
+        key: &str,
+        reserve: impl FnOnce(u64) -> bool,
+    ) -> Result<ReadAheadBlob> {
+        self.read_turn().await;
+        if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
+            if failing == key && *left > 0 {
+                *left -= 1;
+                return Err(BridgeError::Blob("store down".into()));
+            }
+        }
+        let answer = self
+            .trip
+            .guard(blob_down, self.inner.get_for_read_ahead(key, reserve))
+            .await;
+        if matches!(answer, Ok(ReadAheadBlob::Body(_)))
+            && self.lose_after_get.borrow().as_deref() == Some(key)
+        {
+            self.lose_after_get.borrow_mut().take();
+            self.inner.lose(key);
+        }
+        answer
+    }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        if self.fail_head.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("store: head failed".into()));
+        }
         self.read_turn().await;
         let answer = self.trip.guard(blob_down, self.inner.head(key)).await;
         let lost = {

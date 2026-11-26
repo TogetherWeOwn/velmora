@@ -1747,5 +1747,63 @@ class CatalogueScripts(unittest.TestCase):
                 subprocess.run(["bash", "-n", ROOT / "ops" / f"catalog-{action}.sh"], check=True)
 
 
+class CatalogueReplayScript(unittest.TestCase):
+    def test_lost_damage_response_does_not_exit_clean(self):
+        requests = []
+        lost = dict(manifests=2, published=1, present=0,
+                    damaged_unpublished=["generation-a"])
+        retry = dict(lost, published=0, present=1, damaged_unpublished=[])
+        for report in (lost, retry):
+            report.update(damaged_total=0, damaged=[], held_missing_total=0,
+                          unpublishable=[], unreadable=[], twins=[], held_missing=[],
+                          other_bucket_total=0, other_bucket=[], next=None)
+
+        class RestoreHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                if len(requests) == 1:
+                    # This attempt ran and returned `lost`, but its response
+                    # did not reach the driver. The retry sees the newer row.
+                    self.close_connection = True
+                    return
+                data = json.dumps(retry).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            token = tmp / "admin"
+            token.write_text("local-fixture-not-a-secret\n")
+            token.chmod(0o600)
+            # Exercise real loopback curl requests without waiting 35 seconds.
+            sleep = tmp / "sleep"
+            sleep.write_text("#!/bin/sh\nexit 0\n")
+            sleep.chmod(0o700)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}",
+                       VELMORA_ADMIN_TOKEN_FILE=str(token), VELMORA_REPLAY_RETRIES="1",
+                       NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+            with ThreadingHTTPServer(("127.0.0.1", 0), RestoreHandler) as server:
+                worker = threading.Thread(target=server.serve_forever)
+                worker.start()
+                try:
+                    result = subprocess.run(
+                        ["bash", ROOT / "ops" / "catalog-replay.sh",
+                         f"http://127.0.0.1:{server.server_port}", "0"],
+                        capture_output=True, text=True, env=env, timeout=10,
+                    )
+                finally:
+                    server.shutdown()
+                    worker.join()
+        self.assertEqual(requests, [("/_admin/restore", {"since_ms": 0})] * 2)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("damage diagnostics may be incomplete", result.stderr)
+        self.assertEqual(json.loads(result.stdout.split("\n", 1)[1])["damaged_unpublished"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

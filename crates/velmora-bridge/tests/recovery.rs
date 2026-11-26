@@ -782,6 +782,64 @@ async fn an_old_answer_that_a_record_is_there_is_asked_again() {
     assert_eq!(rig.count("extents"), 19);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"x").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "one").await.unwrap();
+    let extent = &extents[0].id;
+    let plan_key = Layout::flat().article_key(extent);
+    let before = rig.bridge.safety.gets_under(&plan_key);
+    *rig.bridge.safety.fail_head.borrow_mut() = Some(extent.safety_key());
+    wipe(&rig);
+    let error = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::Blob(_)));
+    assert_eq!(
+        rig.bridge.safety.gets_under(&plan_key) - before,
+        0,
+        "a plan read ran after the pinned-copy HEAD already failed"
+    );
+}
+
+/// Neither replay mode fences the removal of a refused record once
+/// it has observed the record. The old authoritative GET and the opt-in
+/// presence check both allow the same published outcome in that window.
+#[tokio::test(flavor = "current_thread")]
+async fn removal_after_replay_observes_a_record_matches_the_sequential_path() {
+    let mut outcomes = Vec::new();
+    for read_ahead in [false, true] {
+        let mut cfg = config(Vec::new());
+        cfg.replay_read_ahead = read_ahead;
+        let rig = rig_with(NoNntp, cfg);
+        let (bucket, signer) = rig.standard(BUCKET).await;
+        rig.put(&signer, BUCKET, "refused", b"record contents")
+            .await
+            .expect(200);
+        let (generation, _) = rig.live(&bucket, "refused").await.unwrap();
+        let name = Layout::flat().generation_key(&generation.id);
+        wipe(&rig);
+        let store = &rig.bridge.safety;
+        if read_ahead {
+            *store.lose_after_head.borrow_mut() = Some((name.clone(), Box::new(|| {})));
+        } else {
+            *store.lose_after_get.borrow_mut() = Some(name.clone());
+        }
+        let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+        assert!(store.stored(&name).is_none());
+        outcomes.push((
+            report.published,
+            report.unreadable,
+            rig.live(&bucket, "refused").await.is_some(),
+        ));
+    }
+    assert_eq!(outcomes, vec![(1, Vec::new(), true); 2]);
+}
+
 /// A replay over a catalogue that has the objects already asks the
 /// store nothing about the extents of the records a newer one is over:
 /// the step leaves them out, and so do the reads ahead.
@@ -3012,6 +3070,28 @@ async fn a_pinned_copy_released_after_the_export_is_found() {
 /// holds, hide none: every held extent is checked once, and the one
 /// whose copy is gone is the one reported.
 #[tokio::test(flavor = "current_thread")]
+async fn a_failed_held_listing_falls_back_to_point_heads() {
+    use velmora_bridge::replay::ReplayPhase;
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for key in ["available", "missing"] {
+        rig.put(&signer, BUCKET, key, key.as_bytes())
+            .await
+            .expect(200);
+    }
+    let (_, extents) = rig.live(&bucket, "missing").await.unwrap();
+    let missing = &extents[0].id;
+    rig.bridge.safety.inner.lose(&missing.safety_key());
+    rig.bridge.safety.fail_list.set(true);
+    let mut cursor = ReplayCursor::start(UnixMs(0));
+    cursor.phase = ReplayPhase::Held;
+    cursor.after.clear();
+    let report = rig.bridge.replay_step(cursor).await.unwrap();
+    assert_eq!(report.held_checked, 2);
+    assert_eq!(report.held_missing, [missing.as_str()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn copies_the_catalogue_does_not_hold_hide_no_missing_one() {
     let rig = rig_with(NoNntp, read_ahead_config());
     let (bucket, signer) = rig.standard(BUCKET).await;
@@ -3952,6 +4032,59 @@ async fn plan_record(
     .await
     .unwrap();
     (extent, plan)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opt_in_replay_restores_packed_plan_and_its_parity_addendum() {
+    let mut cfg = read_ahead_config();
+    cfg.packed_plans = true;
+    let rig = rig_with_selected(NoNntp, cfg);
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![12; 12 * velmora::media::PLAIN_CHUNK_SIZE as usize];
+    rig.put(&signer, BUCKET, "with-parity", &body)
+        .await
+        .expect(200);
+    let layout = Layout::flat();
+    let (extent, rows) = plan_record(&rig, &bucket, "with-parity", &[None, None]).await;
+    let packed =
+        velmora_bridge::plan::pack_explicit(&extent.id, extent.cipher_size, &rows).unwrap();
+    let parity_rows: Vec<_> = velmora_bridge::parity::new_rows(2)
+        .into_iter()
+        .map(|row| (row, [41; 32]))
+        .collect();
+    let parity = velmora_bridge::parity::build(
+        &mut velmora::rng::SystemRng,
+        rig.now().0 / 1000,
+        &["alt.binaries.test"],
+        &extent.id,
+        extent.cipher_size,
+        &packed,
+        &parity_rows,
+    )
+    .unwrap();
+    rig.bridge
+        .safety
+        .inner
+        .lose(&layout.article_key(&extent.id));
+    velmora_bridge::recovery::write_stored_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &layout,
+        &extent,
+        &velmora_bridge::plan::StoredPlan {
+            rows,
+            packed: Some(packed.clone()),
+            parity: Some(parity.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.article_plans), (1, 1));
+    let rebuilt = rig.bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    assert_eq!(rebuilt.packed, Some(packed));
+    assert_eq!(rebuilt.parity, Some(parity));
 }
 
 /// A replay through the SQL catalogue restores each row's yEnc name: a

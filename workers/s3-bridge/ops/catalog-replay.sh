@@ -26,9 +26,9 @@
 #   VELMORA_REPLAY_RETRIES    times one call is sent again (default 5)
 #
 # The bearer reaches curl through a 0600 header file, never through argv.
-# Exit status: 0 = complete and no damage; 2 = complete, but some records
-# did not open, some generations were refused or some objects have no
-# copy (the lists are printed); 1 = the replay did not finish.
+# Exit status: 0 = complete and no damage; 1 = replay did not finish;
+# 2 = complete with damage (see the lists); 3 = complete after a retry,
+# so damage diagnostics may be incomplete (even if the lists are empty).
 
 set -euo pipefail
 set +x
@@ -133,20 +133,20 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . "$WORK/total.json"
-# What a call did before its answer was lost is in the catalogue and
-# not in the total: the call that was sent again reports the records
-# the first one published as present, and leaves out a damaged one
-# that a newer record of its object is over since.
-if [ "$resent" != 0 ]; then
-  echo "catalog-replay: $resent calls were sent again after no answer; the total counts what the last answer of each said" >&2
-  echo "catalog-replay: a damaged record that a newer one of its object replaced may be missing from damaged_unpublished" >&2
-fi
+outcome=0
 if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: the catalogue is older than the release of some pinned copies" >&2
   echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
-  exit 2
+  outcome=2
 fi
 if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + (.twins | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
-  exit 2
+  outcome=2
 fi
+# If a response was lost, the retry can see a later state and omit damage
+# that the original attempt reported. Never report a clean replay then.
+if [ "$resent" != 0 ]; then
+  echo "catalog-replay: $resent calls were sent again; damage diagnostics may be incomplete" >&2
+  exit 3
+fi
+exit "$outcome"

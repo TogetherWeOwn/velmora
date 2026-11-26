@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::{
     BlobEntry, BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector,
+    ReadAheadBlob,
 };
 use crate::recovery::{
     read_article_plan, read_segment, read_stored_generation, read_tombstone, record_name,
@@ -548,7 +549,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // by the next call.
                 cursor.name.clone_from(name);
                 // The answer for this name, when it is new enough. One
-                // that failed is asked again where it is needed.
+                // that failed is asked again where it is needed. This
+                // check does not fence refused-write cleanup: the record
+                // can disappear after it. Sequential replay already has
+                // that window after its authoritative GET.
                 call.there = match &asked {
                     Some((at, Ok(size)))
                         if *name == listed.name
@@ -709,12 +713,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             let plan = read_article_plan(store, &self.kek, extent, layout).await?;
             return Ok((pinned, plan));
         }
-        let (pinned, plan) = future::join(
+        let (pinned, plan) = future::try_join(
             store.head(&key),
             read_article_plan(store, &self.kek, extent, layout),
         )
-        .await;
-        Ok((pinned?.is_some(), plan?))
+        .await?;
+        Ok((pinned.is_some(), plan))
     }
 
     async fn replay_manifest(
@@ -1148,7 +1152,11 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         {
             let mut at = ExtentId::new(cursor.after.clone()).safety_key();
             for _ in 0..HELD_PAGES {
-                let keys = self.safety.list(PINNED_PREFIX, &at, HELD_PAGE).await?;
+                // Listing is only an optimization. If it fails, keep
+                // prior pages and ask the uncovered keys individually.
+                let Ok(keys) = self.safety.list(PINNED_PREFIX, &at, HELD_PAGE).await else {
+                    break;
+                };
                 let end = (keys.len() as u64) < u64::from(HELD_PAGE);
                 if let Some(key) = keys.last() {
                     at.clone_from(key);
@@ -1231,12 +1239,9 @@ struct Call {
     there: Option<bool>,
 }
 
-/// The bytes of answers after which a call keeps no more of what it
-/// asked for ahead, and asks no more ahead. The answers that were on
-/// their way when it was reached are kept or dropped as they come, so
-/// a call can hold more than this by the ones asked at the same time:
-/// [`STORE_READS`] records, or twice as many article plans. What is
-/// not kept is asked for when the step comes to it.
+/// Aggregate budget for retained and in-flight speculative bodies.
+/// Reserve against response metadata before reading bytes. A response
+/// that will not fit is left for the ordered replay step.
 const AHEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// The blob store of one replay call, with the answers the call asked
@@ -1264,6 +1269,8 @@ struct Kept {
     heads: HashMap<String, Option<u64>>,
     /// The bytes of `gets`.
     bytes: usize,
+    /// Bytes reserved for in-flight reads and their cache copies.
+    reserved: usize,
     /// Counts the writes: an answer asked for before a write is not
     /// kept after it.
     writes: u64,
@@ -1279,8 +1286,50 @@ impl Kept {
     fn written(&mut self) {
         *self = Kept {
             writes: self.writes + 1,
+            reserved: self.reserved,
             ..Kept::default()
         };
+    }
+}
+
+/// Release a reservation on error, completion, or cancellation of the
+/// speculative future. No lock is held across the adapter's await.
+struct Reservation<'a> {
+    kept: &'a Mutex<Kept>,
+    bytes: usize,
+}
+
+impl Reservation<'_> {
+    fn claim(&mut self, size: u64) -> bool {
+        // Reserve the body, its cached copy, and a byte for the R2 EOF
+        // check. The caller uses the returned body before yielding again.
+        let Some(bytes) = usize::try_from(size)
+            .ok()
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(1))
+        else {
+            return false;
+        };
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes > AHEAD_BYTES - (kept.bytes + kept.reserved) {
+            return false;
+        }
+        kept.reserved += bytes;
+        self.bytes = bytes;
+        true
+    }
+
+    fn release(&mut self, kept: &mut Kept) {
+        kept.reserved -= std::mem::take(&mut self.bytes);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            self.release(&mut kept);
+        }
     }
 }
 
@@ -1298,7 +1347,8 @@ impl<'a, B: BlobStore> Ahead<'a, B> {
 
     /// Whether as much is kept as a call may hold.
     fn full(&self) -> bool {
-        self.lock().bytes >= AHEAD_BYTES
+        let kept = self.lock();
+        kept.bytes + kept.reserved >= AHEAD_BYTES
     }
 
     /// The store for what is read ahead.
@@ -1360,22 +1410,43 @@ impl<B: BlobStore> BlobStore for Keeping<'_, '_, B> {
     }
 
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        // Only whole objects are useful to the speculative reader.
         if span.is_some() {
-            return self.0.store.get(key, span).await;
+            return Ok(None);
         }
         let writes = {
             let kept = self.0.lock();
             if let Some(answer) = kept.gets.get(key) {
-                return Ok(answer.clone());
+                let size = answer.as_ref().map_or(0, Vec::len);
+                return if size <= AHEAD_BYTES - (kept.bytes + kept.reserved) {
+                    Ok(answer.clone())
+                } else {
+                    Ok(None)
+                };
             }
             kept.writes
         };
-        let answer = self.0.store.get(key, None).await?;
+        let mut reservation = Reservation {
+            kept: &self.0.kept,
+            bytes: 0,
+        };
+        let answer = match self
+            .0
+            .store
+            .get_for_read_ahead(key, |size| reservation.claim(size))
+            .await?
+        {
+            ReadAheadBlob::Missing => None,
+            // Only a genuine miss belongs in the cache.
+            ReadAheadBlob::Skipped => return Ok(None),
+            ReadAheadBlob::Body(bytes) => Some(bytes),
+        };
         let mut kept = self.0.lock();
-        if kept.writes == writes && kept.bytes < AHEAD_BYTES && !kept.gets.contains_key(key) {
+        if kept.writes == writes && !kept.gets.contains_key(key) {
             kept.bytes += answer.as_ref().map_or(0, Vec::len);
             kept.gets.insert(key.to_owned(), answer.clone());
         }
+        reservation.release(&mut kept);
         Ok(answer)
     }
 
@@ -1557,6 +1628,22 @@ mod ahead {
             Ok(self.blobs.borrow().get(key).cloned())
         }
 
+        async fn get_for_read_ahead(
+            &self,
+            key: &str,
+            reserve: impl FnOnce(u64) -> bool,
+        ) -> Result<ReadAheadBlob> {
+            let size = self.blobs.borrow().get(key).map(Vec::len);
+            let accepted = size.map(|n| reserve(n as u64));
+            // Model a response whose metadata arrives before its body.
+            self.turn("get", key).await?;
+            Ok(match accepted {
+                Some(true) => ReadAheadBlob::Body(self.blobs.borrow()[key].clone()),
+                Some(false) => ReadAheadBlob::Skipped,
+                None => ReadAheadBlob::Missing,
+            })
+        }
+
         async fn head(&self, key: &str) -> Result<Option<u64>> {
             self.turn("head", key).await?;
             Ok(self.blobs.borrow().get(key).map(|b| b.len() as u64))
@@ -1635,6 +1722,27 @@ mod ahead {
         assert_eq!(slow.asked().len(), 6);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_damaged_48_mib_record_is_not_buffered_ahead() {
+        let key = "m/g_0000018bcfe5680000000000000000ff";
+        let size = 48 * 1024 * 1024;
+        let slow = Slow::with(&[(key, size)]);
+        let ahead = Ahead::new(&slow);
+        let answer = ahead.keeping().get(key, None).await.unwrap();
+        assert_eq!(
+            answer.as_ref().map(Vec::len),
+            None,
+            "oversized speculative answer"
+        );
+        assert_eq!(ahead.lock().bytes, 0);
+        // The authoritative step still sees the full damaged record.
+        let read = read_stored_generation(&ahead, &crate::testkit::TestKek::new(), key).await;
+        assert!(matches!(
+            read,
+            Err(BridgeError::Crypto(_)) | Err(BridgeError::Invalid(_))
+        ));
+    }
+
     /// No more is kept than a call may hold; a part of a blob is never
     /// kept; and a write through the wrapper voids what is kept, also
     /// what was asked for before it and answered after it.
@@ -1645,13 +1753,13 @@ mod ahead {
         let keep = ahead.keeping();
         keep.get("b", None).await.unwrap();
         assert!(!ahead.full());
-        keep.get("big", None).await.unwrap();
-        assert!(ahead.full());
+        assert!(keep.get("big", None).await.unwrap().is_none());
+        assert!(!ahead.lock().gets.contains_key("big"));
         keep.get("c", None).await.unwrap();
-        assert_eq!(ahead.lock().bytes, AHEAD_BYTES + 5);
-        assert!(!ahead.lock().gets.contains_key("c"));
+        assert_eq!(ahead.lock().bytes, 10);
         let span = ByteSpan { start: 0, len: 2 };
-        keep.get("b", Some(span)).await.unwrap();
+        assert!(keep.get("b", Some(span)).await.unwrap().is_none());
+        ahead.get("b", Some(span)).await.unwrap();
         assert_eq!(slow.asked().last().unwrap(), "range b");
 
         let (bucket, extent) = (BucketId::new("b".to_owned()), ExtentId::new("x".to_owned()));
@@ -1674,6 +1782,29 @@ mod ahead {
         assert_eq!(ahead.lock().bytes, 0);
         assert!(ahead.lock().gets.is_empty() && ahead.lock().heads.is_empty());
         assert_eq!(ahead.get("b", None).await.unwrap(), Some(vec![1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_flight_reads_share_the_byte_budget_and_release_on_cancel() {
+        let part = AHEAD_BYTES / 3;
+        let slow = Slow::with(&[("a", part), ("b", part)]);
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        {
+            let mut pending = pin!(keep.get("a", None));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(ahead.lock().reserved, 2 * part + 1);
+            assert!(keep.get("b", None).await.unwrap().is_none());
+        }
+        assert_eq!(ahead.lock().reserved, 0);
+        let answer = keep.get("b", None).await.unwrap();
+        assert_eq!(answer.as_ref().map(Vec::len), Some(part));
+        assert_eq!(ahead.lock().reserved, 0);
+        assert_eq!(ahead.lock().bytes, part);
     }
 
     /// The store is asked for several things at once, and never for
