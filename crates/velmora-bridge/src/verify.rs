@@ -376,6 +376,56 @@ pub fn release_rule<'a>(
     required > 0 && (full || !need_full) && holding.len() >= required as usize
 }
 
+/// The passes a release recorded in `extents.release_evidence` for plan
+/// `plan_rev`, read strictly: a JSON array of objects, each with a string
+/// `backbone`, a whole `plan_rev` and a known `kind`. Anything else is no
+/// evidence (`None`), on every catalogue alike.
+pub fn evidence_passes(raw: &str, plan_rev: u32) -> Option<Vec<(String, VerifyKind)>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let row = row.as_object()?;
+        let backbone = row.get("backbone")?.as_str()?;
+        let rev = u32::try_from(row.get("plan_rev")?.as_u64()?).ok()?;
+        let kind = VerifyKind::parse(row.get("kind")?.as_str()?)?;
+        if rev == plan_rev {
+            out.push((backbone.to_owned(), kind));
+        }
+    }
+    Some(out)
+}
+
+/// Whether a released extent is releasable now, from its stored release
+/// evidence: [`release_rule`] over the passes the release recorded for the
+/// extent's current plan, under the backbones that count now. The full
+/// check is asked for under `VERIFY_MODE=body`, and under the light check
+/// when the release relied on a full pass (a sampled or escalated
+/// extent): a full pass on a backbone that no longer counts is then no
+/// pass. Missing or malformed evidence is no release. Eviction applies
+/// this before it deletes an extent's last R2 copy, and the scrub before
+/// it calls an extent released.
+pub fn evidence_releasable(
+    raw: Option<&str>,
+    plan_rev: u32,
+    counting: &[String],
+    required: u32,
+    mode: crate::config::VerifyMode,
+) -> bool {
+    let Some(passes) = raw.and_then(|raw| evidence_passes(raw, plan_rev)) else {
+        return false;
+    };
+    let need_full =
+        mode == crate::config::VerifyMode::Body || passes.iter().any(|(_, kind)| kind.is_full());
+    release_rule(
+        passes
+            .iter()
+            .map(|(backbone, kind)| (backbone.as_str(), *kind)),
+        counting,
+        required,
+        need_full,
+    )
+}
+
 /// Whether the `BODY` row `b` is a full read that failed: it found an
 /// article missing or wrong, or it did not read all `total` articles of
 /// the plan. The second is a read from before parity, of the data

@@ -775,6 +775,12 @@ where
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
     pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+        // Paused (`EVICTION=paused`): a step that was queued before does
+        // nothing, so no eviction decided under an earlier configuration
+        // deletes under a later one.
+        if self.cfg.eviction_paused {
+            return Ok(0);
+        }
         // As in garbage collection: no delete on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
@@ -807,12 +813,21 @@ where
             counting: crate::verify::release_labels(&self.cfg.providers),
             required: self.cfg.required_backbones,
             scrub: counting.is_some(),
+            mode: self.cfg.verify.mode,
         };
         let window = self
             .catalog
             .evict_window(&cursor, EVICT_WINDOW, EVICT_BATCH, &rule)
             .await?;
         self.catalog.set_evict_cursor(&window.next).await?;
+        if rule.scrub && !window.unproven.is_empty() {
+            // Kept for want of a release under the backbones that count
+            // now: the scrub looks at them soon, and its re-verify writes
+            // a safety copy that no lifecycle rule expires.
+            self.catalog
+                .scrub_watch_soon(&window.unproven, self.clock.now())
+                .await?;
+        }
         let rows = window.rows;
         let mut more = window.more;
         // One extent that fails must not hold up the ones behind it. It
@@ -891,6 +906,12 @@ where
             // only one left). Nothing is deleted and nothing is finished:
             // the counts stand, and the next listing leaves the extent
             // out while the loss is on record.
+            return Ok(None);
+        }
+        if row.pinned && self.safety.head(&row.extent.safety_key()).await?.is_none() {
+            // A pinned extent whose safety copy is not in place (a repair
+            // that could not write it yet): its cache fill may be the only
+            // R2 copy. Whatever the scrub switch says, it stays.
             return Ok(None);
         }
         if !row.pinned {
@@ -1184,7 +1205,7 @@ where
         let shape = self.catalog.hot_shape().await?;
         report.hot_ctl = self.hot_ctl_check(now, shape).await;
         let over = shape.evictable_bytes > self.effective_cap().await?;
-        if over {
+        if over && !self.cfg.eviction_paused {
             let job = Job::Evict {
                 v: JOB_VERSION,
                 remaining: 0,

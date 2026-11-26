@@ -1305,14 +1305,17 @@ impl EvictCursor {
 }
 
 /// What lets a row of the eviction order go when it would delete the
-/// extent's last R2 copy: release evidence on `required` of the
-/// `counting` backbones for its current plan and, with `scrub`, no scrub
-/// loss on record on them.
+/// extent's last R2 copy: the release rule over its stored evidence
+/// ([`crate::verify::evidence_releasable`]) under the `counting`
+/// backbones, `required` and `mode`, and, with `scrub`, no scrub loss on
+/// record on them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvictRule {
     pub counting: Vec<String>,
     pub required: u32,
     pub scrub: bool,
+    /// `VERIFY_MODE`: whether the release rule asks for a full pass.
+    pub mode: crate::config::VerifyMode,
 }
 
 /// One bounded window of the eviction order.
@@ -1324,6 +1327,9 @@ pub struct EvictWindow {
     pub next: EvictCursor,
     /// False once the window reached the end of the order.
     pub more: bool,
+    /// The released extents in it kept for want of a release under the
+    /// backbones that count now.
+    pub unproven: Vec<ExtentId>,
 }
 
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses

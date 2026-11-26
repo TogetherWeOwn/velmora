@@ -423,6 +423,11 @@ pub struct BridgeConfig {
     /// The background read-back of released extents (`SCRUB` and its
     /// companions, [`crate::scrub`]).
     pub scrub: ScrubConfig,
+    /// `EVICTION=paused`: no eviction starts, and a queued step does
+    /// nothing. For changes of which backbones count and of `SCRUB` (the
+    /// procedure in ops/README.md): no eviction decided under one
+    /// configuration deletes under another.
+    pub eviction_paused: bool,
     /// NNTP sockets one post job opens at most, over all its providers.
     pub post_sockets: u32,
     /// Connections one invocation reads cold extents over
@@ -1113,6 +1118,11 @@ impl BridgeConfig {
 
         let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
         let scrub = ScrubConfig::from_vars(&get, environment == Environment::Dev)?;
+        let eviction_paused = match get("EVICTION").as_deref().map(str::trim) {
+            None | Some("") | Some("on") => false,
+            Some("paused") => true,
+            Some(_) => return Err(ConfigError::Invalid("EVICTION".into())),
+        };
         let cold_sockets = number_or(
             &get,
             "COLD_SOCKETS",
@@ -1326,6 +1336,7 @@ impl BridgeConfig {
             verify_delay_secs,
             verify,
             scrub,
+            eviction_paused,
             post_sockets,
             cold_sockets,
             propagation_grace_secs,

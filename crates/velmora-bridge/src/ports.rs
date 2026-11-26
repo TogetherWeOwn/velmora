@@ -1755,7 +1755,14 @@ pub trait Catalog {
             rows,
             next: crate::types::EvictCursor::Start,
             more,
+            unproven: Vec::new(),
         })
+    }
+    /// Gives each released extent of `extents` a scrub deadline of `at`
+    /// unless it has one (with the scrub on: eviction kept them for want of
+    /// a release under the backbones that count now).
+    async fn scrub_watch_soon(&self, _extents: &[ExtentId], _at: UnixMs) -> Result<()> {
+        Ok(())
     }
     /// Where the current drain's listing is ([`Catalog::evict_window`]).
     async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {

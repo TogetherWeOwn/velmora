@@ -1131,6 +1131,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<crate::types::EvictWindow> {
         hot::evict_window(self, cursor, window, take, rule).await
     }
+    async fn scrub_watch_soon(&self, extents: &[ExtentId], at: UnixMs) -> Result<()> {
+        hot::scrub_watch_soon(self, extents, at).await
+    }
     async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
         hot::evict_cursor(self).await
     }
@@ -1291,7 +1294,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 384, "background inventory entry count");
+        assert_eq!(statements.len(), 385, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

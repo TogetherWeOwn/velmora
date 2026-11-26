@@ -3975,7 +3975,7 @@ async fn eviction_steps_stay_bounded_past_a_long_protected_prefix() {
     let o = w.released("a", 16).await;
     let c = &w.bridge().catalog;
     let db = &c.sql.inner;
-    let evidence = r#"[{"backbone":"alpha","plan_rev":0},{"backbone":"beta","plan_rev":0}]"#;
+    let evidence = r#"[{"backbone":"alpha","kind":"body","plan_rev":0},{"backbone":"beta","kind":"stat","plan_rev":0}]"#;
     let seed = db.fixture(
         "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) \
          INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
@@ -4280,4 +4280,295 @@ async fn a_backlog_of_put_intents_is_reconciled_a_bounded_page_a_run() {
     assert_eq!(left, 300 - i64::from(velmora_bridge::scrub::RECONCILE_MAX));
     w.scrub().await;
     assert_eq!(w.rig.count("scan_cursors WHERE k LIKE 'scrub-put:%'"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Round 4: one release rule for eviction and the scrub
+// ---------------------------------------------------------------------------
+
+/// Sets an extent's release evidence to `entries` (backbone, kind) for its
+/// current plan.
+async fn set_evidence(w: &World, o: &Obj, entries: &[(&str, &str)]) {
+    let json = entries
+        .iter()
+        .map(|(b, k)| format!(r#"{{"backbone":"{b}","kind":"{k}","plan_rev":PLANREV}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rev = w
+        .scalar("SELECT plan_rev FROM extents WHERE id = ?1", &o.extent)
+        .await;
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET release_evidence = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Text(format!("[{}]", json.replace("PLANREV", &rev))),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+/// Retiring the only backbone with a full pass: two counting backbones
+/// still hold presence passes, but the release rule wants a full pass on
+/// a counting backbone (`VERIFY_MODE=body`, and a sampled extent under
+/// the light check). Eviction keeps the last copy, and the scrub
+/// re-verifies.
+#[tokio::test(flavor = "current_thread")]
+async fn retiring_the_only_backbone_with_a_full_pass_keeps_the_last_copy() {
+    use velmora_bridge::config::VerifyMode;
+    for (mode, full) in [(VerifyMode::Body, "body"), (VerifyMode::Light, "sampled")] {
+        let gamma = server().await;
+        let mut w = world_with(|cfg| {
+            cfg.hot_cap_bytes = 1;
+            cfg.providers.push(provider("p2", "gamma", &gamma));
+        })
+        .await;
+        let o = w.released_on(&[&gamma], "a", 20).await;
+        set_evidence(
+            &w,
+            &o,
+            &[("alpha", full), ("beta", "stat"), ("gamma", "stat")],
+        )
+        .await;
+        {
+            let cfg = cfg_mut(&mut w);
+            cfg.verify.mode = mode;
+            cfg.providers[0].release = false;
+        }
+        w.bridge().evict_batch(0).await.unwrap();
+        assert!(
+            w.has_safety(&o),
+            "{mode:?}: no full pass on a counting backbone"
+        );
+        // The scrub's next passing look re-verifies it.
+        w.advance_secs(31 * DAY_SECS);
+        w.scrub().await;
+        assert!(
+            alerts()
+                .iter()
+                .any(|a| a.starts_with("scrub-reverify ") && a.contains(o.extent.as_str())),
+            "{mode:?}: {:?}",
+            alerts()
+        );
+    }
+}
+
+/// Release evidence that cannot be read strictly (an object instead of an
+/// array, a plan revision that is not a number, a missing kind) is no
+/// release on SQLite and PostgreSQL alike: those extents keep their copy,
+/// and the window goes on to the next extent, which is evicted.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_release_evidence_is_no_release_and_the_window_goes_on() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let bad = [
+        r#"{"backbone":"alpha","kind":"body","plan_rev":0}"#.to_owned(),
+        r#"[{"backbone":"alpha","kind":"body","plan_rev":"x"},{"backbone":"beta","kind":"stat","plan_rev":"x"}]"#
+            .to_owned(),
+        r#"[{"backbone":"alpha","plan_rev":0},{"backbone":"beta","plan_rev":0}]"#.to_owned(),
+    ];
+    let mut kept = Vec::new();
+    for (i, evidence) in bad.iter().enumerate() {
+        let o = w.released(&format!("bad{i}"), 21 + i as u8).await;
+        w.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_exec(
+                "UPDATE extents SET release_evidence = ?2, plan_rev = 0, last_read_at = ?3 \
+                 WHERE id = ?1",
+                &[
+                    SqlValue::Text(o.extent.as_str().to_owned()),
+                    SqlValue::Text(evidence.clone()),
+                    SqlValue::Int(1 + i as i64),
+                ],
+            )
+            .await
+            .unwrap();
+        kept.push(o);
+    }
+    let good = w.released("good", 30).await;
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET last_read_at = 100 WHERE id = ?1",
+            &[SqlValue::Text(good.extent.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    w.bridge().evict_batch(0).await.unwrap();
+    for o in &kept {
+        assert!(w.has_safety(o), "malformed evidence is no release");
+    }
+    assert!(!w.has_safety(&good), "the window went on past them");
+}
+
+/// A re-pinned extent whose safety copy could not be written and whose
+/// cache fill is intact: eviction keeps that fill with the scrub turned
+/// off as well, since the fence reads the safety copy, not the switch.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pending_repairs_cache_fill_stays_with_the_scrub_off() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 31).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    repinned_without_its_copy(&w, &o).await;
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.bridge()
+        .catalog
+        .record_cache_fill(&o.extent, w.bridge().clock.now())
+        .await
+        .unwrap();
+    cfg_mut(&mut w).scrub.on = false;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&o), "the safety copy is missing");
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the only R2 copy stays with the scrub off"
+    );
+}
+
+/// Every re-verify that does not end in a re-pin keeps a retry one
+/// confirm interval ahead, also when no regular check is due: a cache
+/// copy that could not be written as the safety copy, and a read that
+/// broke off.
+#[tokio::test(flavor = "current_thread")]
+async fn an_incomplete_re_verify_always_keeps_a_retry() {
+    for case in ["put-refused", "interrupted"] {
+        let mut w = world().await;
+        let o = w.released("a", 32).await;
+        let cipher = w
+            .bridge()
+            .safety
+            .stored(&o.extent.safety_key())
+            .unwrap()
+            .bytes;
+        cfg_mut(&mut w).providers[1].release = false;
+        match case {
+            "put-refused" => {
+                assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+                let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+                let meta = BlobMeta {
+                    bucket: &extent.bucket_id,
+                    extent: &extent.id,
+                    cipher_sha256: &extent.cipher_sha256,
+                };
+                w.bridge()
+                    .cache
+                    .put(&o.extent.cache_key(), cipher, &meta)
+                    .await
+                    .unwrap();
+                for s in &w.servers {
+                    s.set_body_gone(true).await;
+                }
+                w.bridge().safety.refuse_puts(true);
+            }
+            _ => {
+                // No R2 copy either: the read that breaks off is all.
+                assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+                for s in &w.servers {
+                    s.drop_next_bodies(1000).await;
+                }
+            }
+        }
+        w.advance_secs(31 * DAY_SECS);
+        let run = w.scrub().await;
+        assert_eq!(run.repaired, 0, "{case}");
+        let now = w.bridge().clock.now().0;
+        assert_eq!(
+            w.next_at(&o).await,
+            Some(now + 3_600_000),
+            "{case}: a retry"
+        );
+        // The retry itself, with no regular check due, fails the same way
+        // and keeps the next one.
+        w.advance_secs(3600);
+        w.scrub().await;
+        let now = w.bridge().clock.now().0;
+        assert_eq!(
+            w.next_at(&o).await,
+            Some(now + 3_600_000),
+            "{case}: the watch-only retry keeps one too"
+        );
+    }
+}
+
+/// With `EVICTION=paused` no drain starts and a queued step does nothing,
+/// even over the cap.
+#[tokio::test(flavor = "current_thread")]
+async fn a_paused_eviction_deletes_nothing() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 33).await;
+    cfg_mut(&mut w).eviction_paused = true;
+    w.bridge().evict_batch(0).await.unwrap();
+    w.bridge().evict_batch(123).await.unwrap();
+    assert!(w.has_safety(&o), "paused: nothing deleted");
+    cfg_mut(&mut w).eviction_paused = false;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&o), "resumed: evicted");
+}
+
+/// With the scrub on, an extent eviction keeps for want of a release whose
+/// only R2 copy is a cache fill (which the cache bucket's lifecycle rule
+/// may expire) gets a scrub deadline at once, and the re-verify then
+/// writes a safety copy, with no regular check due.
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_cache_only_extent_gets_a_safety_copy_back_soon() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 34).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    let c = &w.bridge().catalog;
+    c.record_cache_fill(&o.extent, w.bridge().clock.now())
+        .await
+        .unwrap();
+    c.sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(w.bridge().cache.contains(&o.extent.cache_key()), "kept");
+    assert!(w.next_at(&o).await.is_some(), "the scrub looks at it soon");
+    w.scrub().await;
+    assert!(w.has_safety(&o), "the re-verify wrote a safety copy");
 }

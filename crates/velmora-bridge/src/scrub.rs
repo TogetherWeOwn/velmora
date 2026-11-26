@@ -295,42 +295,18 @@ pub fn breaker_trips(lacking: u32, checked: u32) -> bool {
         && u64::from(lacking) * 100 > u64::from(checked) * u64::from(INCIDENT_PERCENT)
 }
 
-/// The counting backbones the extent's release evidence names for its
-/// current plan.
-fn evidence_backbones(extent: &ExtentRow) -> Vec<String> {
-    let Some(raw) = extent.release_evidence.as_deref() else {
-        return Vec::new();
-    };
-    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = Vec::new();
-    for row in &rows {
-        let rev = row.get("plan_rev").and_then(serde_json::Value::as_u64);
-        let name = row.get("backbone").and_then(serde_json::Value::as_str);
-        if let (Some(rev), Some(name)) = (rev, name) {
-            if rev == u64::from(extent.plan_rev) && !out.iter().any(|b| b == name) {
-                out.push(name.to_owned());
-            }
-        }
-    }
-    out
-}
-
+/// Whether the extent's release evidence names `backbone` for its
+/// current plan (read as the release rule reads it).
 fn evidence_names(extent: &ExtentRow, backbone: &str) -> bool {
-    evidence_backbones(extent).iter().any(|b| b == backbone)
-}
-
-/// Whether the extent is releasable under `counting` (the backbones that
-/// count now): its release evidence names `required` of them for its
-/// current plan. The rule eviction applies before it deletes an extent's
-/// last R2 copy (`sql::hot` `releasable_now!`).
-pub fn releasable_now(extent: &ExtentRow, counting: &[String], required: u32) -> bool {
-    let named = evidence_backbones(extent)
-        .iter()
-        .filter(|b| counting.contains(b))
-        .count();
-    u32::try_from(named).unwrap_or(u32::MAX) >= required
+    extent
+        .release_evidence
+        .as_deref()
+        .and_then(|raw| crate::verify::evidence_passes(raw, extent.plan_rev))
+        .is_some_and(|passes| {
+            passes
+                .iter()
+                .any(|(b, _)| crate::verify::label(b) == backbone)
+        })
 }
 
 fn digest_ok(extent: &ExtentRow, bytes: &[u8]) -> bool {
@@ -682,7 +658,7 @@ where
         // again. Looked at on its own deadline too, not only with checks,
         // and that deadline stays until the re-verify replaces it (a
         // re-pin, or a deferral) or a check records a result.
-        let reverify = watch_due && !releasable_now(extent, backbones, self.cfg.required_backbones);
+        let reverify = watch_due && !self.releasable(extent, backbones);
         if watch_due && !reverify {
             // A completed repair (or an old extent-wide deadline) is not
             // evidence that any copy's scheduled read-back has passed.
@@ -804,7 +780,7 @@ where
         if lacking.is_empty() {
             let unresolved = self.catalog.scrub_has_loss(&extent.id, backbones);
             if prior_loss.is_none() && self.idle(reader, walk.stats, unresolved).await?.is_empty() {
-                if releasable_now(extent, backbones, self.cfg.required_backbones) {
+                if self.releasable(extent, backbones) {
                     walk.run.ok += 1;
                     self.scrub_record_one(reader, walk, extent, (ScrubResult::Ok, None))
                         .await?;
@@ -886,11 +862,17 @@ where
     ) -> core::result::Result<(), Halt> {
         let extent = &candidate.extent;
         let cfg = &self.cfg.scrub;
-        let unproven: Vec<String> = backbones
+        let mut unproven: Vec<String> = backbones
             .iter()
             .filter(|b| !evidence_names(extent, b))
             .cloned()
             .collect();
+        if unproven.is_empty() {
+            // Enough counting backbones, but the full pass the release
+            // relied on was on one that no longer counts: one counting
+            // backbone is read in full again.
+            unproven.extend(backbones.first().cloned());
+        }
         let may = walk.run.repaired < cfg.repairs_per_run
             && walk.run.incident.is_none()
             && walk.breaker.tripped().is_empty();
@@ -905,10 +887,35 @@ where
                 unproven.join(",")
             )
         });
-        let found = self
+        let repaired = walk.run.repaired;
+        let outcome = match self
             .repair_read(reader, walk, extent, stored, unproven)
-            .await?;
-        self.repair(reader, walk, candidate, found, true).await
+            .await
+        {
+            Ok(found) => self.repair(reader, walk, candidate, found, true).await,
+            Err(halt) => Err(halt),
+        };
+        if walk.run.repaired == repaired {
+            // Not re-pinned (a read that broke off or found no slot, a
+            // store that did not answer, a copy that could not be written,
+            // or no intact copy): looked at again after the confirm
+            // interval, whatever the outcome wrote or left.
+            let _ = self.defer_watch(walk, extent).await;
+        }
+        outcome
+    }
+
+    /// Whether the extent is releasable under the backbones that count now,
+    /// by the release rule over its stored evidence (the rule eviction
+    /// applies too).
+    fn releasable(&self, extent: &ExtentRow, backbones: &[String]) -> bool {
+        crate::verify::evidence_releasable(
+            extent.release_evidence.as_deref(),
+            extent.plan_rev,
+            backbones,
+            self.cfg.required_backbones,
+            self.cfg.verify.mode,
+        )
     }
 
     /// The extent's own deadline, one confirm interval ahead.
