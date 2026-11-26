@@ -107,6 +107,9 @@ pub const INCIDENT_PERCENT: u32 = 12;
 /// intervals (at least an hour) are longer; this binds in dev only.
 pub const REPIN_MIN_LOSS_AGE_MS: i64 = 2 * JOB_MAX_AGE_MS;
 
+/// PUT intents one run reconciles at most (two small writes each).
+pub const RECONCILE_MAX: u32 = 256;
+
 /// Re-pins a run makes at most for losses on a backbone under an
 /// incident: one, the least that is not none. A loss that lasts on one
 /// backbone (a takedown of one large object) trips the breaker again on
@@ -1625,9 +1628,16 @@ where
     /// [`SCRUB_PAGE`] a run; an intent that fails stays for the next.
     async fn reconcile_put_intents(&self, now: UnixMs) -> Result<()> {
         // Each repair makes at most a few PUTs: the page keeps up with the
-        // run's re-pins, oldest expiry first.
-        let page = SCRUB_PAGE.max(self.cfg.scrub.repairs_per_run.saturating_mul(4));
+        // run's re-pins, oldest expiry first, within a hard bound and the
+        // run's own time.
+        let page = SCRUB_PAGE
+            .max(self.cfg.scrub.repairs_per_run.saturating_mul(4))
+            .min(RECONCILE_MAX);
+        let deadline = now.plus_secs(self.cfg.scrub.run_secs);
         for (key, extent) in self.catalog.scrub_put_intents_due(now, page).await? {
+            if self.clock.now() >= deadline {
+                break;
+            }
             self.catalog.gc_enqueue_scrub_safety(&extent, now).await?;
             self.catalog.scrub_drop_put_intent(&key).await?;
         }

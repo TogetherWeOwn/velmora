@@ -4262,3 +4262,22 @@ async fn the_cache_fill_of_an_extent_under_repair_is_not_evicted() {
         "the only R2 copy of an extent under repair stays"
     );
 }
+
+/// A backlog of expired PUT intents is reconciled a bounded page a run,
+/// whatever the configured re-pins: the run's own work is not held up.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backlog_of_put_intents_is_reconciled_a_bounded_page_a_run() {
+    let w = world_with(|cfg| cfg.scrub.repairs_per_run = 10_000).await;
+    let c = &w.bridge().catalog;
+    let now = w.bridge().clock.now();
+    for i in 0..300 {
+        c.scrub_put_intent(&ExtentId::new(format!("x{i:03}")), now.plus_ms(-1))
+            .await
+            .unwrap();
+    }
+    w.scrub().await;
+    let left = w.rig.count("scan_cursors WHERE k LIKE 'scrub-put:%'");
+    assert_eq!(left, 300 - i64::from(velmora_bridge::scrub::RECONCILE_MAX));
+    w.scrub().await;
+    assert_eq!(w.rig.count("scan_cursors WHERE k LIKE 'scrub-put:%'"), 0);
+}
