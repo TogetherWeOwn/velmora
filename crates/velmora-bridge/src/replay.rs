@@ -987,12 +987,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let store = &Ahead::new(&self.safety);
         if self.cfg.replay_read_ahead {
             // The record under the first name of every id, asked ahead.
-            let keep = &store.keeping();
-            stream::iter(names.iter().map(|listed| keep.get(&listed.name, None)))
-                .buffered(STORE_READS)
-                .take_while(|_| std::future::ready(!store.full()))
-                .for_each(|_| std::future::ready(()))
-                .await;
+            read_whole_ahead(store, names.iter().map(|listed| listed.name.as_str())).await;
         }
         for listed in &names {
             let flat = &listed.flat;
@@ -1457,6 +1452,26 @@ impl<B: BlobStore> BlobStore for Keeping<'_, '_, B> {
     }
 }
 
+/// Asks the store ahead for the whole blobs at `keys`, several at a
+/// time, so that `store` keeps the answers for the step. The ordered
+/// queue holds no body: each read drops the copy it is given before it
+/// is done, so a slow read at the head of the queue does not leave the
+/// bodies of the reads after it held outside the byte budget.
+async fn read_whole_ahead<'k, B: BlobStore>(
+    store: &Ahead<'_, B>,
+    keys: impl Iterator<Item = &'k str>,
+) {
+    let keep = &store.keeping();
+    stream::iter(keys.map(|key| async move {
+        // A failed read is asked again by the step.
+        drop(keep.get(key, None).await);
+    }))
+    .buffered(STORE_READS)
+    .take_while(|()| std::future::ready(!store.full()))
+    .for_each(|()| std::future::ready(()))
+    .await;
+}
+
 /// What a call made of one generation record.
 enum Replayed {
     /// Nothing is left to do for it.
@@ -1540,6 +1555,63 @@ mod segment_reads {
 }
 
 #[cfg(test)]
+mod heap {
+    //! Counts the bytes each thread has allocated and not freed, and the
+    //! most it had at once. A test on a current-thread runtime reads its
+    //! own numbers, whatever the tests beside it do.
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    fn moved(by: isize) {
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + by;
+            live.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    // SAFETY: every call goes to the system allocator unchanged; the
+    // counters are plain thread-local cells that allocate nothing.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            moved(layout.size() as isize);
+            System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            moved(-(layout.size() as isize));
+            System.dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            moved(new_size as isize - layout.size() as isize);
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    /// Starts a new measurement: the peak is what is held now.
+    pub fn mark() -> isize {
+        let now = LIVE.with(Cell::get);
+        PEAK.with(|peak| peak.set(now));
+        now
+    }
+
+    /// The most this thread held since the last [`mark`].
+    pub fn peak() -> isize {
+        PEAK.with(Cell::get)
+    }
+
+    #[global_allocator]
+    static HEAP: Counting = Counting;
+}
+
+#[cfg(test)]
 mod ahead {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -1554,6 +1626,9 @@ mod ahead {
         flying: Cell<usize>,
         most: Cell<usize>,
         fail: Cell<bool>,
+        /// Turns of the executor a read of this key waits beyond the one
+        /// every read waits.
+        late: RefCell<BTreeMap<String, usize>>,
     }
 
     impl Slow {
@@ -1572,6 +1647,10 @@ mod ahead {
             self.flying.set(self.flying.get() + 1);
             self.most.set(self.most.get().max(self.flying.get()));
             tokio::task::yield_now().await;
+            let late = self.late.borrow().get(key).copied().unwrap_or(0);
+            for _ in 0..late {
+                tokio::task::yield_now().await;
+            }
             self.flying.set(self.flying.get() - 1);
             if self.fail.get() {
                 return Err(BridgeError::Blob("down".into()));
@@ -1774,6 +1853,36 @@ mod ahead {
         assert_eq!(answer.as_ref().map(Vec::len), Some(part));
         assert_eq!(ahead.lock().reserved, 0);
         assert_eq!(ahead.lock().bytes, part);
+    }
+
+    /// A slow read at the head of the ordered queue does not hold back
+    /// the bodies of the fast reads after it outside the byte budget.
+    /// Six reads start at once and the second is slow: the others, and
+    /// the read that starts when the first is taken, finish while it
+    /// waits. What the read ahead holds at once (kept, in flight or
+    /// waiting in the queue) stays within the budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_read_holds_no_bodies_outside_the_budget() {
+        // Six reads fit in flight at once: 2 bytes reserved per byte.
+        const SIZE: usize = 780 * 1024;
+        let keys: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        let blobs: Vec<(&str, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), if i == 1 { 1024 } else { SIZE }))
+            .collect();
+        let slow = Slow::with(&blobs);
+        slow.late.borrow_mut().insert(keys[1].clone(), 50);
+        let ahead = Ahead::new(&slow);
+        let before = heap::mark();
+        read_whole_ahead(&ahead, keys.iter().map(String::as_str)).await;
+        let held = heap::peak() - before;
+        // The read that started behind the slow one was kept.
+        assert!(ahead.lock().gets.contains_key("t06"), "{:?}", slow.asked());
+        assert!(
+            held <= AHEAD_BYTES as isize,
+            "{held} bytes held at once, budget {AHEAD_BYTES}"
+        );
     }
 
     /// The store is asked for several things at once, and never for
