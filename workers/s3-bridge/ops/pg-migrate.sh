@@ -31,6 +31,7 @@ ERRORS = {
     'VL015': 'catalogue contains an invalid index; repair it before retrying',
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
+    'VL018': 'a migration statement changed the runner apply decision; the migration was rolled back',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
     '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
 }
@@ -203,12 +204,14 @@ def pg_literal(text):
 # Set exactly once per online batch, under the locks, before any guarded
 # statement; current_setting without missing_ok fails closed if it is absent.
 APPLY = "current_setting('velmora.migration_apply') = 'on'"
+SKIP = "current_setting('velmora.migration_apply') = 'off'"
 
 
 def guarded(body):
-    """A top-level DO running body when APPLY holds. Its dollar tag is chosen
+    """A top-level DO running body when APPLY holds. Any value other than on or
+    off (RESET ALL clears it) aborts the transaction. Its dollar tag is chosen
     to be absent from the body, so no migration text can end the quote."""
-    body = f'BEGIN IF {APPLY} THEN {body} END IF; END'
+    body = f"BEGIN IF {APPLY} THEN {body} ELSIF NOT {SKIP} THEN RAISE EXCEPTION USING ERRCODE = 'VL018'; END IF; END"
     suffix = 0
     while f'$velmora_{suffix}$' in body:
         suffix += 1
@@ -281,6 +284,8 @@ def lint_migration(sql, no_tx, name):
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
+    if 'migration_apply' in sql.lower():
+        die(f'{name}: velmora.migration_apply belongs to the migration runner')
     for statement in statements:
         head = [token.upper() for token in statement[:7]]
         if head[0] in {'ABORT', 'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'START'} or head[:2] == ['PREPARE', 'TRANSACTION']:

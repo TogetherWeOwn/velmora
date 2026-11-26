@@ -133,6 +133,9 @@ class MigrationParser(unittest.TestCase):
         second = "\n-- between statements\n/* block */\nCREATE TABLE parser_second (value TEXT);"
         _, raw = namespace['lint_migration'](first + second, False, 'parser_comments.sql')
         self.assertEqual(raw, [first, second])
+        with self.assertRaisesRegex(AssertionError, "belongs to the migration runner"):
+            namespace['lint_migration']("SELECT set_config('velmora.migration_apply', 'off', true);",
+                                        False, 'parser_flag.sql')
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
@@ -246,13 +249,20 @@ class PgMigrate(unittest.TestCase):
 
     def test_online_migration_text_may_contain_the_wrapper_tags(self):
         result = self.migrate_online_with(
-            "\nSELECT '$velmora_migration$';\n"
+            "\nSELECT '$velmora_0$ $velmora_migration$';\n"
             "CREATE FUNCTION operator_tags() RETURNS text LANGUAGE sql AS $velmora_migration1$ "
             "SELECT 'it''s $velmora_migration$ and $velmora_record$' $velmora_migration1$;\n")
         self.assertIn("0003_usage_statement_triggers.sql: applied", result.stdout)
         self.assertEqual(self.ledger(), STAGES)
         self.assertEqual(self.owner_sql("SELECT operator_tags()").stdout.strip(),
                          "it's $velmora_migration$ and $velmora_record$")
+
+    def test_online_migration_cannot_clear_the_apply_decision(self):
+        result = self.migrate_online_with("\nCREATE TABLE operator_reset (value TEXT);\nRESET ALL;\n"
+                                          "CREATE TABLE operator_after_reset (value TEXT);\n", ok=False)
+        self.assertIn("changed the runner apply decision", result.stderr)
+        self.assertEqual(self.ledger(), ["0001", "0002"])
+        self.assertEqual(self.owner_sql("SELECT to_regclass('operator_reset') IS NULL").stdout.strip(), "t")
 
     def test_already_applied_online_migration_runs_nothing(self):
         self.migrate()
