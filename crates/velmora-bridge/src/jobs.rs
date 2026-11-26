@@ -1066,7 +1066,7 @@ where
     /// `REQUIRED_BACKBONES` and `VERIFY_MODE`. A change of any of them
     /// can make a released extent unreleasable, so the eviction order is
     /// swept once under the new one.
-    pub(crate) fn rule_fingerprint(&self) -> String {
+    pub fn rule_fingerprint(&self) -> String {
         let mut labels = crate::verify::release_labels(&self.cfg.providers);
         labels.sort();
         labels.dedup();
@@ -1544,14 +1544,10 @@ where
         if !self.cfg.eviction_paused && !matches!(cursor, EvictCursor::Sweep(..)) {
             let fingerprint = self.rule_fingerprint();
             match self.catalog.evict_rule_seen().await? {
-                // The first check records the rule it runs under. Nothing
-                // was kept for want of a release before this check could
-                // run: on the 2026-11-25 production snapshot no extent of
-                // the eviction order is unreleasable under it (ops README,
-                // "Retiring a backbone").
-                None => self.catalog.set_evict_rule_seen(&fingerprint).await?,
                 Some(seen) if seen == fingerprint => {}
-                Some(_) => {
+                // A rule no sweep has covered yet, the first one included:
+                // a sweep depends on no count made before it.
+                _ => {
                     self.catalog
                         .set_evict_cursor(&EvictCursor::Sweep(
                             fingerprint.clone(),

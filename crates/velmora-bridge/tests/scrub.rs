@@ -5817,3 +5817,29 @@ async fn a_marker_step_does_not_total_the_tier() {
     step.expect("no tier total in a marker's step");
     assert!(w.has_safety(&o), "the marked fill was written");
 }
+
+/// A catalogue with no rule on record (the first check after this
+/// release) sweeps the whole eviction order: an unreleasable cache-only
+/// fill present then is written to the safety store, without relying on
+/// any count made before.
+#[tokio::test(flavor = "current_thread")]
+async fn the_first_check_sweeps_and_writes_an_unreleasable_fill() {
+    let mut w = world().await;
+    let o = w.released("a", 159).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    assert_eq!(w.bridge().catalog.evict_rule_seen().await.unwrap(), None);
+    evict_check_now(&w).await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the first sweep wrote the fill"
+    );
+    assert_eq!(
+        w.bridge().catalog.evict_rule_seen().await.unwrap(),
+        Some(w.bridge().rule_fingerprint()),
+        "and recorded the rule it covered"
+    );
+}

@@ -3562,6 +3562,13 @@ async fn rows_written(packed_plans: &str, counters: bool, dropped: bool) -> (u64
     )
     .await;
     let s = "rows written";
+    // A catalogue whose first sweep of the eviction order has run: the
+    // figures are the life of an object, not of the catalogue.
+    rig.bridge
+        .catalog
+        .set_evict_rule_seen(&rig.bridge.rule_fingerprint())
+        .await
+        .unwrap();
     let sql = &rig.bridge.catalog.sql;
     if !counters {
         // The usage counters as the migration leaves them: off.
@@ -3689,11 +3696,8 @@ async fn rows_written_per_extent() {
         "rows written per packed extent: {}",
         uncounted.0
     );
-    // 23 with the eviction rule's fingerprint, which the first dispatcher
-    // check records once per catalogue (`INSERT OR REPLACE`: two rows),
-    // here within the life of the one object.
     assert!(
-        uncounted.1 <= 23,
+        uncounted.1 <= 21,
         "rows written per object: {}",
         uncounted.1
     );
@@ -3736,8 +3740,7 @@ async fn rows_written_per_extent_after_the_index_drops() {
         "rows written per packed extent: {}",
         packed.0
     );
-    // 23 with the eviction rule's fingerprint, recorded once per catalogue.
-    assert!(packed.1 <= 23, "rows written per object: {}", packed.1);
+    assert!(packed.1 <= 21, "rows written per object: {}", packed.1);
 }
 
 /// Rows written by one PutObject of one extent, the common upload.
