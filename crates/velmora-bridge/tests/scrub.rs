@@ -4948,3 +4948,185 @@ async fn admin_evict_keeps_a_last_copy_and_honours_the_pause() {
         "releasable: the fill goes"
     );
 }
+
+/// Makes `o` a released extent whose only R2 copy is a counted cache fill.
+async fn cache_only(w: &World, o: &Obj, name: &str) {
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    assert!(w.bridge().safety.lose(&key));
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    cache_fill(w, o, name, cipher).await;
+}
+
+/// Runs every queued eviction step, the ones they queue too.
+async fn drain_steps(w: &World) {
+    loop {
+        let steps: Vec<Job> = w
+            .bridge()
+            .jobs
+            .inner
+            .take()
+            .into_iter()
+            .map(|s| s.job)
+            .filter(|j| matches!(j, Job::Evict { .. }))
+            .collect();
+        if steps.is_empty() {
+            return;
+        }
+        for step in steps {
+            w.bridge().run_job(&step).await;
+        }
+    }
+}
+
+/// More kept cache-only fills in one window than a step writes: the drain
+/// goes on from the first one not written, and every one gets its safety
+/// copy, however the drain's target falls.
+#[tokio::test(flavor = "current_thread")]
+async fn every_kept_fill_of_a_window_is_promoted_before_the_drain_moves_past_it() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let mut objs = Vec::new();
+    for i in 0..9u8 {
+        let name = format!("k{i}");
+        let o = w.released(&name, 60 + i).await;
+        cache_only(&w, &o, &name).await;
+        objs.push(o);
+    }
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge().jobs.inner.take();
+    w.bridge().evict_batch(0).await.unwrap();
+    drain_steps(&w).await;
+    for (i, o) in objs.iter().enumerate() {
+        assert!(w.has_safety(o), "k{i}: promoted");
+    }
+}
+
+/// A deleted extent is not kept for want of a release: its cache fill goes
+/// and no safety copy is written for it again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deleted_extents_fill_is_evicted_not_promoted() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 70).await;
+    cache_only(&w, &o, "a").await;
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET safety_state = 'deleted', release_evidence = NULL, \
+             evict_seq = evict_seq + 1 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&o), "no safety copy for a deleted extent");
+    assert!(
+        !w.bridge().cache.contains(&o.extent.cache_key()),
+        "its fill goes"
+    );
+}
+
+/// An eviction step that ends between a promotion's write and its
+/// collection guard, after the object was deleted and collected: a later
+/// eviction step reconciles the write-ahead intent, with the scrub off,
+/// and the copy is collected.
+#[tokio::test(flavor = "current_thread")]
+async fn an_interrupted_promotion_is_collected_by_a_later_step() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 71).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).scrub.on = false;
+    cfg_mut(&mut w).providers[1].release = false;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let mut step = Box::pin(bridge.evict_batch(0));
+    let meanwhile = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        // The guard after the write never answers.
+        bridge
+            .catalog
+            .sql
+            .stall_exec_matching
+            .set(Some("'delete_safety', ?2 FROM extents e"));
+        safety.hold_put_prefix.replace(None);
+        while bridge.catalog.sql.stall_exec_matching.get().is_some() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        () = meanwhile => {}
+        _ = &mut step => panic!("the step ended before its guard"),
+    }
+    drop(step);
+    bridge.catalog.sql.selected_exec.disarm();
+    assert!(w.has_safety(&o), "the write landed");
+    bridge
+        .clock
+        .advance_ms(velmora_bridge::jobtable::JOB_MAX_AGE_MS + 1);
+    bridge.evict_batch(0).await.unwrap();
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(
+        !w.has_safety(&o),
+        "the reconciled intent collected the copy"
+    );
+}
+
+/// A promotion takes its share of the jobs' memory first. With none to
+/// spare nothing is written, the step does not move past the fill, and a
+/// later step writes it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_promotion_waits_for_the_jobs_memory() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 72).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    let bridge = w.bridge();
+    let all = bridge
+        .budget
+        .charge_job(bridge.budget.job_capacity())
+        .await
+        .unwrap();
+    bridge.jobs.inner.take();
+    bridge.evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&o), "no memory to spare: nothing written");
+    let next: Vec<_> = bridge.jobs.inner.take();
+    assert!(
+        next.iter()
+            .any(|s| matches!(s.job, Job::Evict { .. }) && s.delay_secs > 0),
+        "a later step is queued: {:?}",
+        next.iter()
+            .map(|s| (&s.job, s.delay_secs))
+            .collect::<Vec<_>>()
+    );
+    drop(all);
+    for s in next {
+        bridge.run_job(&s.job).await;
+    }
+    assert!(w.has_safety(&o), "written by the later step");
+}

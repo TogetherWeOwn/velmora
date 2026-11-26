@@ -44,10 +44,13 @@ struct RacingSql {
     /// Run before every query whose text contains the string: what
     /// another request of the isolate does at that moment.
     meanwhile: RefCell<Option<Meanwhile>>,
+    /// Statements and batches run so far: each is one D1 query.
+    statements: Cell<u64>,
 }
 
 impl RacingSql {
     fn injected(&self, sql: &str) -> Result<()> {
+        self.statements.set(self.statements.get() + 1);
         let mut fail = self.fail.borrow_mut();
         match fail.as_mut() {
             Some((part, left)) if *left > 0 && sql.contains(*part) => {
@@ -80,6 +83,7 @@ impl Sql for RacingSql {
         self.inner.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        self.statements.set(self.statements.get() + 1);
         self.inner.batch(stmts).await
     }
 }
@@ -253,6 +257,7 @@ impl Fx {
                 race: RefCell::new(None),
                 fail: RefCell::new(None),
                 meanwhile: RefCell::new(None),
+                statements: Cell::new(0),
             }),
             safety: MemBlobStore::new(),
             cache: MemBlobStore::new(),
@@ -1046,7 +1051,7 @@ async fn evict_with_safety_is_refused_on_a_real_bucket() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 0 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 0, "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o));
     assert!(fx.has_safety(&o));
@@ -1070,7 +1075,7 @@ async fn evict_keeps_the_only_copy_of_an_unposted_extent() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o));
     assert!(fx.has_safety(&o));
@@ -1101,7 +1106,7 @@ async fn evict_gives_up_a_verified_pinned_copy_on_a_disposable_bucket() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 1, "safety_kept": 0 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 1, "safety_kept": 0, "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o) && !fx.has_safety(&o));
     // The catalogue knows the copy is gone before anyone looks for it.
@@ -2392,7 +2397,7 @@ async fn evict_keeps_the_pinned_copy_while_a_release_is_running() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o), "the release job still needs the copy");
     assert_eq!(fx.safety_state(&o).await, "releasing");
@@ -2412,7 +2417,7 @@ async fn evict_keeps_the_pinned_copy_when_it_loses_the_state_race() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(
         fx.bridge.catalog.sql.race.borrow().is_none(),
@@ -2439,7 +2444,7 @@ async fn evict_keeps_the_pinned_copy_of_an_extent_being_reposted() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2460,7 +2465,7 @@ async fn evict_ignores_a_read_back_from_a_backbone_no_longer_configured() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2849,7 +2854,7 @@ async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2898,7 +2903,7 @@ async fn too_few_release_backbones_are_a_warning_and_keep_the_pinned_copy() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2945,7 +2950,7 @@ async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_do
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1, "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
 
@@ -3379,5 +3384,35 @@ async fn admin_answers_only_on_its_host_when_one_is_set() {
     assert_eq!(
         send(Some("admin.internal"), Some("Bearer wrong".to_string())).await,
         403
+    );
+}
+
+/// `/_admin/evict` reads eviction's last-copy rule once for the whole
+/// object, not once per extent: each extent costs the same catalogue
+/// statements as before the rule (its read stamp and its count), so a
+/// large object stays within D1's queries per invocation.
+#[tokio::test]
+async fn evict_reads_the_last_copy_rule_once_per_object() {
+    let fx = Fx::new().await;
+    let bucket = fx.bucket("scratch").await;
+    let whole = nntp_support::marked_plaintext(PIECES.iter().sum());
+    let (a, rest) = whole.split_at(PIECES[0]);
+    let (b, c) = rest.split_at(PIECES[1]);
+    let one = fx.put_extents(&bucket, "one", &[a]).await;
+    let three = fx.put_extents(&bucket, "three", &[a, b, c]).await;
+    for o in one.iter().chain(&three) {
+        fx.drive(o, OutboxStage::Done).await;
+    }
+    let statements = || fx.bridge.catalog.sql.statements.get();
+    let before = statements();
+    assert_eq!(fx.post("/evict/scratch/one").await.status, 200);
+    let for_one = statements() - before;
+    let before = statements();
+    assert_eq!(fx.post("/evict/scratch/three").await.status, 200);
+    let for_three = statements() - before;
+    assert_eq!(
+        (for_three - for_one) / 2,
+        2,
+        "statements per extent: {for_one} for one, {for_three} for three"
     );
 }

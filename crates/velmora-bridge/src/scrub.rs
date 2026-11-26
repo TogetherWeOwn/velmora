@@ -1701,7 +1701,7 @@ where
     /// sent it has ended, [`JOB_MAX_AGE_MS`]): each gets the guarded GC
     /// enqueue, a no-op while the extent is referenced, then goes. At most
     /// [`SCRUB_PAGE`] a run; an intent that fails stays for the next.
-    async fn reconcile_put_intents(&self, now: UnixMs) -> Result<()> {
+    pub(crate) async fn reconcile_put_intents(&self, now: UnixMs) -> Result<()> {
         // Each repair makes at most a few PUTs: the page keeps up with the
         // run's re-pins, oldest expiry first, within a hard bound and the
         // run's own time.

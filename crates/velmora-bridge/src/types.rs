@@ -1328,8 +1328,16 @@ pub struct EvictWindow {
     /// False once the window reached the end of the order.
     pub more: bool,
     /// The released extents in it kept for want of a release under the
-    /// backbones that count now.
-    pub unproven: Vec<EvictCandidate>,
+    /// backbones that count now, in order.
+    pub unproven: Vec<EvictKept>,
+}
+
+/// A released extent the window keeps for want of a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictKept {
+    pub row: EvictCandidate,
+    /// The cursor from which a later step reads this row again.
+    pub resume: EvictCursor,
 }
 
 /// An extent's ciphertext as the catalogue records it: what a blob must
@@ -1339,6 +1347,8 @@ pub struct ExtentCipher {
     pub bucket: BucketId,
     pub size: u64,
     pub sha256: [u8; 32],
+    /// The extent is released (not pinned, not deleted).
+    pub released: bool,
 }
 
 /// The answer right before a started eviction deletes the safety copy

@@ -147,7 +147,7 @@ macro_rules! evict_window {
         concat!(
             "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
             pinned!(),
-            " AS pinned, last_read_at, release_evidence, plan_rev, ",
+            " AS pinned, last_read_at, release_evidence, plan_rev, safety_state, ",
             $loss,
             " FROM extents WHERE ",
             evictable!(),
@@ -222,7 +222,7 @@ const SAFETY_FENCE: &str = "UPDATE extents SET evict_seq = evict_seq + 1 WHERE i
 
 // The extent's ciphertext as recorded: what a blob must be to be its copy.
 const EXTENT_CIPHER: &str =
-    "SELECT bucket_id, cipher_size, cipher_sha256 FROM extents WHERE id = ?1";
+    "SELECT bucket_id, cipher_size, cipher_sha256, safety_state FROM extents WHERE id = ?1";
 
 // Eviction wrote a released extent's verified cache fill to the safety
 // store (kept for want of a release): it is counted, if the row is as
@@ -231,22 +231,25 @@ const EVICT_PROMOTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size,
     evict_seq = evict_seq + 1 \
     WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' AND hot_safety_bytes = 0";
 
-// One extent, as the window reads it: whether it is releasable now.
-macro_rules! evict_point {
+// The extents of a generation, as the window reads them: whether each may
+// lose its last R2 copy now, and its ciphertext. One read for an object.
+macro_rules! evict_generation {
     ($loss:expr) => {
         concat!(
-            "SELECT ",
+            "SELECT extents.id, ",
             pinned!(),
-            " AS pinned, release_evidence, plan_rev, ",
+            " AS pinned, release_evidence, plan_rev, safety_state, ",
             $loss,
-            " FROM extents WHERE id = ?1"
+            ", bucket_id, cipher_size, cipher_sha256 \
+             FROM generation_extents r JOIN extents ON extents.id = r.extent_id \
+             WHERE r.generation_id = ?1"
         )
     };
 }
-const EVICT_POINT: &str = evict_point!("0");
-const EVICT_POINT_SCRUB: &str = evict_point!(loss_flag!("value FROM json_each(?2)"));
-const EVICT_POINT_SCRUB_PG: &str =
-    evict_point!(loss_flag!("jsonb_array_elements_text(CAST(?2 AS jsonb))"));
+const EVICT_GENERATION: &str = evict_generation!("0");
+const EVICT_GENERATION_SCRUB: &str = evict_generation!(loss_flag!("value FROM json_each(?2)"));
+const EVICT_GENERATION_SCRUB_PG: &str =
+    evict_generation!(loss_flag!("jsonb_array_elements_text(CAST(?2 AS jsonb))"));
 
 const EVICT_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'evict'";
 const SET_EVICT_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict', ?1)";
@@ -382,7 +385,14 @@ pub(super) async fn evict_window<S: Sql>(
         let read: Option<i64> = r.opt_num()?;
         let evidence = r.opt_text()?;
         let plan_rev: u32 = r.num()?;
+        let state = r.text()?;
         let loss = r.num::<i64>()? != 0;
+        // Where a later step reads this row again: past the row before
+        // it, or from the head for a row without a read stamp.
+        let resume = match read {
+            None => EvictCursor::Start,
+            Some(_) => last.clone().unwrap_or_else(|| cursor.clone()),
+        };
         // A row without a read stamp sorts first; the next window starts
         // at the stamped rows (only a legacy row has none).
         last = Some(EvictCursor::After(
@@ -392,10 +402,16 @@ pub(super) async fn evict_window<S: Sql>(
                 None => String::new(),
             },
         ));
-        let may = candidate.pinned || releasable_now(evidence.as_deref(), plan_rev, loss, rule);
+        // A deleted extent's copies are no longer in service: they go.
+        let may = candidate.pinned
+            || state == "deleted"
+            || releasable_now(evidence.as_deref(), plan_rev, loss, rule);
         if !may {
-            if !candidate.pinned && !loss {
-                out.unproven.push(candidate.clone());
+            if state == "released" && !loss {
+                out.unproven.push(crate::types::EvictKept {
+                    row: candidate.clone(),
+                    resume: resume.clone(),
+                });
             }
             continue;
         }
@@ -427,31 +443,53 @@ fn releasable_now(evidence: Option<&str>, plan_rev: u32, loss: bool, rule: &Evic
         )
 }
 
-/// Whether `extent` is releasable now under `rule`, as the window decides
-/// it (`false` while it is pinned, or not there).
-pub(super) async fn evict_releasable<S: Sql>(
+/// The extents of `generation`: for each, whether its last R2 copy may go
+/// now under `rule`, as the window decides it (never while pinned; a
+/// deleted extent's always), and its ciphertext.
+pub(super) async fn evict_generation<S: Sql>(
     c: &SqlCatalog<S>,
-    extent: &ExtentId,
+    generation: &crate::types::GenerationId,
     rule: &EvictRule,
-) -> Result<bool> {
-    let mut params = vec![text(extent.as_str())];
+) -> Result<Vec<(ExtentId, bool, crate::types::ExtentCipher)>> {
+    let mut params = vec![text(generation.as_str())];
     let sql = if rule.scrub {
         params.push(labels(&rule.counting)?);
         c.sql
             .dialect()
-            .pick(EVICT_POINT_SCRUB, EVICT_POINT_SCRUB_PG)
+            .pick(EVICT_GENERATION_SCRUB, EVICT_GENERATION_SCRUB_PG)
     } else {
-        EVICT_POINT
+        EVICT_GENERATION
     };
-    let Some(row) = c.sql.query(sql, &params).await?.into_iter().next() else {
-        return Ok(false);
-    };
-    let mut r = Cols::new(row);
-    let pinned = r.num::<i64>()? != 0;
-    let evidence = r.opt_text()?;
-    let plan_rev: u32 = r.num()?;
-    let loss = r.num::<i64>()? != 0;
-    Ok(!pinned && releasable_now(evidence.as_deref(), plan_rev, loss, rule))
+    let rows = c.sql.query(sql, &params).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut r = Cols::new(row);
+        let extent = ExtentId::new(r.text()?);
+        let pinned = r.num::<i64>()? != 0;
+        let evidence = r.opt_text()?;
+        let plan_rev: u32 = r.num()?;
+        let state = r.text()?;
+        let loss = r.num::<i64>()? != 0;
+        let may = !pinned
+            && (state == "deleted" || releasable_now(evidence.as_deref(), plan_rev, loss, rule));
+        let cipher = cipher_cols(&mut r)?;
+        out.push((extent, may, cipher));
+    }
+    Ok(out)
+}
+
+fn cipher_cols(r: &mut Cols) -> Result<crate::types::ExtentCipher> {
+    let bucket = crate::types::BucketId::new(r.text()?);
+    let size: u64 = r.num()?;
+    let sha256: [u8; 32] = r.blob()?.try_into().map_err(|_| {
+        crate::types::BridgeError::Sql("extent cipher_sha256 is not 32 bytes".into())
+    })?;
+    Ok(crate::types::ExtentCipher {
+        bucket,
+        size,
+        sha256,
+        released: false,
+    })
 }
 
 /// The extent's ciphertext as recorded ([`EXTENT_CIPHER`]).
@@ -469,16 +507,9 @@ pub(super) async fn extent_cipher<S: Sql>(
         return Ok(None);
     };
     let mut r = Cols::new(row);
-    let bucket = crate::types::BucketId::new(r.text()?);
-    let size: u64 = r.num()?;
-    let sha256: [u8; 32] = r.blob()?.try_into().map_err(|_| {
-        crate::types::BridgeError::Sql("extent cipher_sha256 is not 32 bytes".into())
-    })?;
-    Ok(Some(crate::types::ExtentCipher {
-        bucket,
-        size,
-        sha256,
-    }))
+    let mut cipher = cipher_cols(&mut r)?;
+    cipher.released = r.text()? == "released";
+    Ok(Some(cipher))
 }
 
 /// Eviction wrote the verified cache fill of a kept extent to the safety
@@ -888,8 +919,8 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (SAFETY_FENCE.to_owned(), vec![T]),
         (EXTENT_CIPHER.to_owned(), vec![T]),
         (EVICT_PROMOTED.to_owned(), vec![T, I]),
-        (EVICT_POINT.to_owned(), vec![T]),
-        (EVICT_POINT_SCRUB_PG.to_owned(), vec![T, T]),
+        (EVICT_GENERATION.to_owned(), vec![T]),
+        (EVICT_GENERATION_SCRUB_PG.to_owned(), vec![T, T]),
         (EVICT_CURSOR.to_owned(), vec![]),
         (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
