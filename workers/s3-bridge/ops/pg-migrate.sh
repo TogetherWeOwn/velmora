@@ -32,6 +32,7 @@ ERRORS = {
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
+    '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
 }
 # Declared engine difference (0003): these D1 per-row usage triggers are
 # PostgreSQL statement triggers. Each entry is the column list (KEEP_COLUMNS:
@@ -199,9 +200,26 @@ def pg_literal(text):
     return "'" + text.replace("'", "''") + "'"
 
 
+# Set exactly once per online batch, under the locks, before any guarded
+# statement; current_setting without missing_ok fails closed if it is absent.
+APPLY = "current_setting('velmora.migration_apply') = 'on'"
+
+
+def guarded(body):
+    """A top-level DO running body when APPLY holds. Its dollar tag is chosen
+    to be absent from the body, so no migration text can end the quote."""
+    body = f'BEGIN IF {APPLY} THEN {body} END IF; END'
+    suffix = 0
+    while f'$velmora_{suffix}$' in body:
+        suffix += 1
+    return f'DO $velmora_{suffix}$ {body} $velmora_{suffix}$;\n'
+
+
 def execute_migration(source_statements):
-    """Run each original migration statement inside one server-side transaction."""
-    return ''.join(f'    EXECUTE {pg_literal(statement)};\n' for statement in source_statements)
+    """Send each original statement as its own top-level DO in the batch. PostgreSQL
+    13+ restarts statement_timeout for each statement of a simple-query message,
+    so each migration statement keeps its own 3 s budget, as over stdin."""
+    return ''.join(guarded(f'EXECUTE {pg_literal(statement)};') for statement in source_statements)
 
 
 SQL_TOKEN = re.compile(r'''\s+|--[^\n]*|/\*|\$(?:[A-Za-z_]\w*)?\$|
@@ -550,6 +568,10 @@ SET LOCAL client_min_messages = error;
 
     def run(sql, *, retry=False, report=None, one_message=False):
         nonlocal one_message_checked
+        # Linux rejects one argv string of 128 KiB or more (MAX_ARG_STRLEN, with its NUL).
+        if one_message and len(sql.encode()) >= 128 * 1024:
+            die(f'{report}: one-message batch is {len(sql.encode())} bytes; psql -c takes under 128 KiB, '
+                'so split the migration into smaller files')
         if one_message and not one_message_checked:
             version = subprocess.run(['psql', '--version'], stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, check=False)
@@ -612,8 +634,11 @@ SET LOCAL client_min_messages = error;
     verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
                   + transactional_prefix + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
                   + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
+    # Verification has no execution budget, so it keeps the stdin transport:
+    # psql 14 still works, and the session prefix sets standard_conforming_strings
+    # before the server parses check_schema.sql.
     if args.verify:
-        compare(json.loads(run(verify_sql, report='schema verification', one_message=not args.import_mode)), d1, migrations)
+        compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
         return
     if args.test:
         test_triggers(run, begin, history, complete, d1)
@@ -648,21 +673,21 @@ $$;
                 batch += check(f'NOT ({ledger_exists})', 'VL017')
             batch += history
             batch += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
-            batch += (f"DO $velmora_migration$ BEGIN IF EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') THEN "
-                      "PERFORM set_config('velmora.migration_status', 'already applied', true); ELSE\n")
+            # Decide apply or skip once, then guard every statement and the ledger on it.
+            batch += (f"DO $velmora_decide$ BEGIN IF EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') THEN "
+                      "PERFORM set_config('velmora.migration_apply', 'off', true); ELSE\n")
             if version == '0002':
                 batch += (f"    IF ({MARKER} IS NOT NULL OR NOT ({SEEDS})) THEN "
                           "RAISE EXCEPTION USING ERRCODE = 'VL014'; END IF;\n")
             if version == '0001':
                 batch += (f"    IF ({USAGE} OR {MARKER} IS NOT NULL) THEN "
                           "RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;\n")
+            batch += "    PERFORM set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
             batch += execute_migration(source_statements)
-            if version == '0001':
-                batch += '    INSERT INTO usage_global(id) VALUES (1), (2);\n'
-            batch += (f"    INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
-                      "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
-                      "    PERFORM set_config('velmora.migration_status', 'applied', true); END IF; END $velmora_migration$;\n"
-                      "SELECT current_setting('velmora.migration_status');\nCOMMIT;\n")
+            batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '')
+                             + f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
+                             "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+            batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
             output = run(batch, retry=True, report=name, one_message=True).splitlines()
             if not output or output[-1] not in {'applied', 'already applied'}:
                 die(f'{name}: no migration status returned')
@@ -706,7 +731,7 @@ $$;
             die(f'{name}: no migration status returned')
         print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
-        compare(json.loads(run(verify_sql, report='pre-activation verification', one_message=True)), d1, migrations)
+        compare(json.loads(run(verify_sql, report='pre-activation verification')), d1, migrations)
         run(online_migrator_session + begin + transactional_prefix + online_limits_sql + history + complete
             + check(f'{MARKER} IS NOT NULL', 'VL016')
             + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True,

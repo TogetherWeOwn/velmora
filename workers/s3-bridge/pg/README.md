@@ -89,7 +89,10 @@ at a shipped stage. Online migrations (app schema access granted) use a 3 s
 statement timeout and, on PostgreSQL 17+, a 3 s transaction timeout so an
 acquired exclusive lock cannot stall readers indefinitely. Split changes that
 cannot fit the budget, or run them with the app offline. Inactive/import
-migrations are not subject to the 3 s execution budget.
+migrations are not subject to the 3 s execution budget. Each online
+transaction reaches the server as one message, so network round trips do not
+count against the budget; this needs psql 15 or newer and a batch under
+128 KiB. `--verify` has no budget and works with older psql.
 
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
