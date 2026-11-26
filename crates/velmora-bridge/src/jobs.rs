@@ -795,12 +795,23 @@ where
         // ended before their collection guard: collected if unreferenced,
         // whatever `SCRUB` says.
         self.reconcile_put_intents(self.clock.now()).await?;
-        // Kept fills still to be written, from an earlier step that ran
-        // out of its share when the tier was no longer over its cap.
+        // Kept fills still to be written: from an earlier step that ran
+        // out of its share when the tier was no longer over its cap, or a
+        // sweep of the whole order after the rule changed. A sweep begun
+        // under another rule than the one now starts over.
         let stored = self.catalog.evict_cursor().await?;
-        let pending = match &stored {
-            EvictCursor::Promote(inner) => Some((**inner).clone()),
-            _ => None,
+        let fingerprint = self.rule_fingerprint();
+        let (pending, sweep) = match &stored {
+            EvictCursor::Promote(inner) => (Some((**inner).clone()), None),
+            EvictCursor::Sweep(fp, inner) if *fp == fingerprint => {
+                (Some((**inner).clone()), Some(fingerprint.clone()))
+            }
+            EvictCursor::Sweep(..) => (Some(EvictCursor::Start), Some(fingerprint.clone())),
+            _ => (None, None),
+        };
+        let marker = |resume: EvictCursor| match &sweep {
+            Some(fp) => EvictCursor::Sweep(fp.clone(), Box::new(resume)),
+            None => EvictCursor::Promote(Box::new(resume)),
         };
         let mut excess = remaining;
         if excess == 0 {
@@ -848,13 +859,13 @@ where
         // (a store or catalogue error) leaves them to a later step, even
         // with the tier under its cap. The step's own cursor write at its
         // end replaces it.
-        if let Some(first) = window
-            .unproven
-            .iter()
-            .find(|kept| kept.promote && kept.row.cache_bytes > 0 && kept.row.safety_bytes == 0)
-        {
+        if let Some(first) = window.unproven.iter().find(|kept| {
+            kept.promote
+                && kept.row.cache_bytes > 0
+                && (kept.row.safety_bytes == 0 || sweep.is_some())
+        }) {
             self.catalog
-                .set_evict_cursor(&EvictCursor::Promote(Box::new(first.resume.clone())))
+                .set_evict_cursor(&marker(first.resume.clone()))
                 .await?;
         }
         // Whether each kept fill is still in the cache: HEADs, a few at a
@@ -883,7 +894,20 @@ where
                     excess = excess.saturating_sub(self.forget_gone_fill(&kept.row).await?);
                     continue;
                 }
-                if !kept.promote || kept.row.safety_bytes > 0 {
+                if !kept.promote {
+                    continue;
+                }
+                // A counted safety copy is taken at its word, but by a
+                // sweep, which looks: a count can outlive its copy (a
+                // finish that lost its compare-and-set after the deletes).
+                if kept.row.safety_bytes > 0
+                    && (sweep.is_none()
+                        || self
+                            .safety
+                            .head(&kept.row.extent.safety_key())
+                            .await?
+                            .is_some())
+                {
                     continue;
                 }
                 if promoted == EVICT_PROMOTE_PER_STEP {
@@ -921,9 +945,7 @@ where
             // the cursor itself says so, and the next step starts as a
             // drain does but writes those fills first.
             let next = if excess == 0 || promote_only {
-                self.catalog
-                    .set_evict_cursor(&EvictCursor::Promote(Box::new(resume)))
-                    .await?;
+                self.catalog.set_evict_cursor(&marker(resume)).await?;
                 Job::Evict {
                     v: JOB_VERSION,
                     remaining: 0,
@@ -938,6 +960,26 @@ where
             };
             self.jobs.send(&next, delay).await?;
             return Ok(0);
+        }
+        if let Some(fp) = &sweep {
+            if window.more {
+                // The sweep goes on with the next window.
+                self.catalog
+                    .set_evict_cursor(&EvictCursor::Sweep(
+                        fp.clone(),
+                        Box::new(window.next.clone()),
+                    ))
+                    .await?;
+                let next = Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: 0,
+                };
+                self.jobs.send(&next, 0).await?;
+                return Ok(0);
+            }
+            // The whole order is swept under this rule.
+            self.catalog.set_evict_rule_seen(fp).await?;
+            crate::trace::alert(|| format!("evict-sweep-done rule={fp}"));
         }
         if promote_only {
             // The fills the marker named are written. Eviction itself
@@ -1013,6 +1055,26 @@ where
             .scrub
             .on
             .then(|| crate::verify::release_labels(&self.cfg.providers))
+    }
+
+    /// A fingerprint of the release rule's inputs: which backbones count,
+    /// `REQUIRED_BACKBONES` and `VERIFY_MODE`. A change of any of them
+    /// can make a released extent unreleasable, so the eviction order is
+    /// swept once under the new one.
+    pub(crate) fn rule_fingerprint(&self) -> String {
+        let mut labels = crate::verify::release_labels(&self.cfg.providers);
+        labels.sort();
+        labels.dedup();
+        let mode = match self.cfg.verify.mode {
+            crate::config::VerifyMode::Body => "body",
+            crate::config::VerifyMode::Light => "light",
+        };
+        let digest = Sha256::digest(format!(
+            "{}|{}|{mode}",
+            labels.join(","),
+            self.cfg.required_backbones
+        ));
+        digest[..12].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// The rule eviction applies, and with the scrub on the backbones
@@ -1470,8 +1532,33 @@ where
         let over = shape.evictable_bytes > self.effective_cap().await?;
         // Over the cap, or with kept fills still to be written (a step
         // that came during a pause left its marker): a drain starts.
-        let started = !self.cfg.eviction_paused
-            && (over || matches!(self.catalog.evict_cursor().await?, EvictCursor::Promote(_)));
+        // A change of the rule's inputs starts a promote-only sweep of the
+        // whole order, whatever the cap.
+        let cursor = self.catalog.evict_cursor().await?;
+        let mut marked = matches!(cursor, EvictCursor::Promote(_) | EvictCursor::Sweep(..));
+        if !self.cfg.eviction_paused && !matches!(cursor, EvictCursor::Sweep(..)) {
+            let fingerprint = self.rule_fingerprint();
+            match self.catalog.evict_rule_seen().await? {
+                // The first check records the rule it runs under. Nothing
+                // was kept for want of a release before this check could
+                // run: on the 2026-11-25 production snapshot no extent of
+                // the eviction order is unreleasable under it (ops README,
+                // "Retiring a backbone").
+                None => self.catalog.set_evict_rule_seen(&fingerprint).await?,
+                Some(seen) if seen == fingerprint => {}
+                Some(_) => {
+                    self.catalog
+                        .set_evict_cursor(&EvictCursor::Sweep(
+                            fingerprint.clone(),
+                            Box::new(EvictCursor::Start),
+                        ))
+                        .await?;
+                    crate::trace::alert(|| format!("evict-sweep-start rule={fingerprint}"));
+                    marked = true;
+                }
+            }
+        }
+        let started = !self.cfg.eviction_paused && (over || marked);
         if started {
             let job = Job::Evict {
                 v: JOB_VERSION,

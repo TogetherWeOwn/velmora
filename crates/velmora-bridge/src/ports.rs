@@ -1823,6 +1823,20 @@ pub trait Catalog {
     ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
         Ok(None)
     }
+    /// The scrub, on finding a loss, wrote a released extent's checked
+    /// cache fill to the safety store: it is counted.
+    async fn scrub_loss_protected(&self, _extent: &ExtentId) -> Result<()> {
+        Ok(())
+    }
+    /// The fingerprint of the eviction rule the last full promote-only
+    /// sweep covered, if any.
+    async fn evict_rule_seen(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// Records the fingerprint a full promote-only sweep covered.
+    async fn set_evict_rule_seen(&self, _fingerprint: &str) -> Result<()> {
+        Ok(())
+    }
     /// Eviction wrote a kept extent's verified cache fill to the safety
     /// store: it is counted if the row is as `x` was listed.
     async fn evict_promoted(&self, _x: &EvictCandidate) -> Result<bool> {

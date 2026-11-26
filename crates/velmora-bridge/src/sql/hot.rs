@@ -227,9 +227,26 @@ const EXTENT_CIPHER: &str =
 // Eviction wrote a released extent's verified cache fill to the safety
 // store (kept for want of a release): it is counted, if the row is as
 // listed.
+// A stale count (the copy it counts is gone: a finish that lost its
+// compare-and-set after the deletes) is taken as no copy.
 const EVICT_PROMOTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
     evict_seq = evict_seq + 1 \
-    WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' AND hot_safety_bytes = 0";
+    WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' \
+      AND hot_safety_bytes IN (0, cipher_size)";
+
+// The scrub wrote a released extent's checked cache fill to the safety
+// store when it found a loss: counted, whatever the sequence.
+const LOSS_PROTECTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
+    evict_seq = evict_seq + 1 \
+    WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes IN (0, cipher_size)";
+
+// The fingerprint of the rule a promote-only sweep last covered the whole
+// eviction index under.
+const EVICT_RULE_SEEN: &str = "SELECT v FROM scan_cursors WHERE k = 'evict-rule'";
+const SET_EVICT_RULE_SEEN: &str =
+    "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict-rule', ?1)";
+const SET_EVICT_RULE_SEEN_PG: &str = "INSERT INTO scan_cursors(k, v) VALUES ('evict-rule', ?1) \
+    ON CONFLICT (k) DO UPDATE SET v = excluded.v";
 
 // One extent, as the window reads it, right before `/_admin/evict` deletes
 // its copies: its sequence, whether its last R2 copy may go now, and its
@@ -552,6 +569,40 @@ pub(super) async fn evict_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<EvictCurso
         Some(row) => EvictCursor::parse(&Cols::new(row).text()?),
         None => EvictCursor::Start,
     })
+}
+
+/// The scrub wrote a released extent's cache fill to the safety store
+/// ([`LOSS_PROTECTED`]).
+pub(super) async fn scrub_loss_protected<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+) -> Result<()> {
+    c.sql.exec(LOSS_PROTECTED, &[text(extent.as_str())]).await?;
+    Ok(())
+}
+
+/// The rule fingerprint the last full sweep covered ([`EVICT_RULE_SEEN`]).
+pub(super) async fn evict_rule_seen<S: Sql>(c: &SqlCatalog<S>) -> Result<Option<String>> {
+    let rows = c.sql.query(EVICT_RULE_SEEN, &[]).await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Some(Cols::new(row).text()?)),
+        None => Ok(None),
+    }
+}
+
+pub(super) async fn set_evict_rule_seen<S: Sql>(
+    c: &SqlCatalog<S>,
+    fingerprint: &str,
+) -> Result<()> {
+    c.sql
+        .exec(
+            c.sql
+                .dialect()
+                .pick(SET_EVICT_RULE_SEEN, SET_EVICT_RULE_SEEN_PG),
+            &[text(fingerprint)],
+        )
+        .await?;
+    Ok(())
 }
 
 pub(super) async fn set_evict_cursor<S: Sql>(
@@ -918,6 +969,9 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (EVICT_POINT_SCRUB_PG.to_owned(), vec![T, T]),
         (EVICT_CURSOR.to_owned(), vec![]),
         (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
+        (LOSS_PROTECTED.to_owned(), vec![T]),
+        (EVICT_RULE_SEEN.to_owned(), vec![]),
+        (SET_EVICT_RULE_SEEN_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

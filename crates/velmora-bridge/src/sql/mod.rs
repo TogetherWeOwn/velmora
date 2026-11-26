@@ -1150,6 +1150,15 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
         hot::evict_point(self, extent, rule).await
     }
+    async fn scrub_loss_protected(&self, extent: &ExtentId) -> Result<()> {
+        hot::scrub_loss_protected(self, extent).await
+    }
+    async fn evict_rule_seen(&self) -> Result<Option<String>> {
+        hot::evict_rule_seen(self).await
+    }
+    async fn set_evict_rule_seen(&self, fingerprint: &str) -> Result<()> {
+        hot::set_evict_rule_seen(self, fingerprint).await
+    }
     async fn evict_promoted(&self, x: &EvictCandidate) -> Result<bool> {
         hot::evict_promoted(self, x).await
     }
@@ -1313,7 +1322,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 391, "background inventory entry count");
+        assert_eq!(statements.len(), 394, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

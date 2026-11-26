@@ -823,6 +823,15 @@ where
         }
 
         if confirmed.is_empty() {
+            // A loss on record keeps the extent from eviction, but not its
+            // cache fill from the cache's lifecycle rule: until a re-pin
+            // writes the safety copy, a fill that is its only R2 copy is
+            // written to the safety store at the sighting, whatever the
+            // cap.
+            if extent.safety_state == SafetyState::Released {
+                Self::hang_up_all(reader, walk.stats).await;
+                self.protect_cache_fill(extent).await;
+            }
             walk.run.suspect += 1;
             self.scrub_record_one(reader, walk, extent, (ScrubResult::Suspect, None))
                 .await?;
@@ -853,6 +862,12 @@ where
         self.repair(reader, walk, &loss, found, may_repin).await?;
         if under_incident && walk.run.repaired > repaired {
             walk.blocked_repins += 1;
+        }
+        if walk.run.repaired == repaired && extent.safety_state == SafetyState::Released {
+            // Not re-pinned (held back, or no copy read): the same as at
+            // the sighting.
+            Self::hang_up_all(reader, walk.stats).await;
+            self.protect_cache_fill(extent).await;
         }
         Ok(true)
     }
@@ -1648,6 +1663,38 @@ where
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => Ok((RepairSource::Cache, Some(bytes))),
             Ok(_) if safety_answered => Ok((RepairSource::Usenet, None)),
             _ => Err(()),
+        }
+    }
+
+    /// A released extent with a loss on record whose only R2 copy is its
+    /// cache fill: the fill, checked against the extent's size and digest,
+    /// is written to the safety store (behind a write-ahead intent, with
+    /// the collection guard after it) and counted. Best effort: a store
+    /// that does not answer, or no memory to spare, leaves it to the next
+    /// sighting.
+    async fn protect_cache_fill(&self, extent: &ExtentRow) {
+        if !matches!(self.safety.head(&extent.id.safety_key()).await, Ok(None)) {
+            return;
+        }
+        let Ok(_charge) = self.budget.charge_job(extent.cipher_size).await else {
+            return;
+        };
+        let Ok(Some(cipher)) = self.cache.get(&extent.id.cache_key(), None).await else {
+            return;
+        };
+        if !self.put_safety(extent, cipher).await {
+            let _ = self.collect_if_unreferenced(extent).await;
+            return;
+        }
+        let _ = self.collect_if_unreferenced(extent).await;
+        if self.catalog.scrub_loss_protected(&extent.id).await.is_ok() {
+            crate::trace::alert(|| {
+                format!(
+                    "scrub-protect {} a loss is on record; its checked cache fill is now its \
+                     safety copy",
+                    extent.id.as_str()
+                )
+            });
         }
     }
 

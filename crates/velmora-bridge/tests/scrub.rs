@@ -986,16 +986,19 @@ async fn a_loss_on_every_backbone_is_repaired_from_the_cache_copy() {
         extent: &extent.id,
         cipher_sha256: &extent.cipher_sha256,
     };
-    w.bridge()
-        .cache
-        .put(&o.extent.cache_key(), cipher, &meta)
-        .await
-        .unwrap();
     w.advance_secs(31 * DAY_SECS);
     w.hide(0, &o, 0).await;
     w.hide(1, &o, 0).await;
 
     assert_eq!(w.scrub().await.suspect, 1);
+    // The read that fills the cache comes after the first sighting:
+    // at the sighting the scrub writes a fill that is the only R2 copy
+    // to the safety store itself (`scrub-protect`).
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
     w.advance_secs(3600);
     let run = w.scrub().await;
     assert_eq!(run.repaired, 1);
@@ -2414,15 +2417,18 @@ async fn a_cache_sourced_copy_is_written_first_and_kept_when_refused() {
         extent: &extent.id,
         cipher_sha256: &extent.cipher_sha256,
     };
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    w.scrub().await;
+    // The read that fills the cache comes after the first sighting:
+    // at the sighting the scrub writes a fill that is the only R2 copy
+    // to the safety store itself (`scrub-protect`).
     w.bridge()
         .cache
         .put(&o.extent.cache_key(), cipher, &meta)
         .await
         .unwrap();
-    w.advance_secs(31 * DAY_SECS);
-    w.hide(0, &o, 0).await;
-    w.hide(1, &o, 0).await;
-    w.scrub().await;
     // The guard will refuse: the outbox row is not `done`.
     w.bridge()
         .catalog
@@ -2522,15 +2528,18 @@ async fn cache_repair_does_not_leave_a_copy_after_gc_collects_the_extent() {
         extent: &extent.id,
         cipher_sha256: &extent.cipher_sha256,
     };
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.repaired, 0);
+    // The read that fills the cache comes after the first sighting:
+    // at the sighting the scrub writes a fill that is the only R2 copy
+    // to the safety store itself (`scrub-protect`).
     bridge
         .cache
         .put(&o.extent.cache_key(), cipher, &meta)
         .await
         .unwrap();
-    w.advance_secs(31 * DAY_SECS);
-    w.hide(0, &o, 0).await;
-    w.hide(1, &o, 0).await;
-    assert_eq!(w.scrub().await.repaired, 0);
     w.advance_secs(bridge.cfg.scrub.confirm_secs);
 
     safety.hold_put_prefix.replace(Some(safety_key));
@@ -3537,15 +3546,18 @@ async fn a_cache_repair_put_with_a_lost_reply_after_gc_is_collected() {
         extent: &extent.id,
         cipher_sha256: &extent.cipher_sha256,
     };
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    // The read that fills the cache comes after the first sighting:
+    // at the sighting the scrub writes a fill that is the only R2 copy
+    // to the safety store itself (`scrub-protect`).
     bridge
         .cache
         .put(&o.extent.cache_key(), cipher, &meta)
         .await
         .unwrap();
-    w.advance_secs(31 * DAY_SECS);
-    w.hide(0, &o, 0).await;
-    w.hide(1, &o, 0).await;
-    assert_eq!(w.scrub().await.suspect, 1);
     w.advance_secs(3600);
 
     safety.hold_put_prefix.replace(Some(key.clone()));
@@ -3819,15 +3831,18 @@ async fn a_repair_put_cancelled_before_its_catalogue_update_is_collected_later()
         extent: &extent.id,
         cipher_sha256: &extent.cipher_sha256,
     };
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    // The read that fills the cache comes after the first sighting:
+    // at the sighting the scrub writes a fill that is the only R2 copy
+    // to the safety store itself (`scrub-protect`).
     bridge
         .cache
         .put(&o.extent.cache_key(), cipher, &meta)
         .await
         .unwrap();
-    w.advance_secs(31 * DAY_SECS);
-    w.hide(0, &o, 0).await;
-    w.hide(1, &o, 0).await;
-    assert_eq!(w.scrub().await.suspect, 1);
     w.advance_secs(3600);
 
     let id: &'static str = Box::leak(o.extent.as_str().to_owned().into_boxed_str());
@@ -5616,4 +5631,168 @@ async fn a_failed_continuation_after_partial_promotion_is_finished_later() {
     for (i, o) in objs.iter().enumerate() {
         assert!(w.has_safety(o), "k{i}: written");
     }
+}
+
+/// Runs the dispatcher's eviction check (due once per `EVICT_CHECK_SECS`)
+/// and every eviction step it queues.
+async fn evict_check_now(w: &World) {
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.jobs.inner.take();
+    bridge.dispatch().await.unwrap();
+    drain_steps(w).await;
+}
+
+/// A loss the scrub records keeps the extent from eviction, and under
+/// the cap no drain lists it: the fill that is its only R2 copy (29.9
+/// days old here) is written to the safety store at the sighting, so the
+/// cache's 30-day rule cannot take the last R2 copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_extents_only_fill_under_the_cap_is_written_at_the_sighting() {
+    let w = world().await;
+    let o = w.released("a", 150).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    // The fill is written a day after the release; its checks fall due
+    // when it is 29.9 days old.
+    w.advance_secs(95_040);
+    cache_only(&w, &o, "a").await;
+    w.advance_secs(29 * DAY_SECS + 77_760);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    // The sighting; the repair waits for its confirmation.
+    assert_eq!(w.scrub().await.suspect, 1);
+    // Day 30: the cache's lifecycle rule takes the fill.
+    w.advance_secs(8_640);
+    assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the safety store holds the bytes"
+    );
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-protect ") && a.contains(o.extent.as_str())));
+}
+
+/// A rule change that retires a counting backbone, with the tier under
+/// its cap and the fill 29.9 days old: the dispatcher's check sweeps the
+/// whole eviction order and writes the fill to the safety store. With the
+/// scrub on and off.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rule_change_under_the_cap_sweeps_the_kept_fills_to_safety() {
+    for scrub in [true, false] {
+        let mut w = world().await;
+        cfg_mut(&mut w).scrub.on = scrub;
+        let o = w.released("a", 151).await;
+        let key = o.extent.safety_key();
+        let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+        cache_only(&w, &o, "a").await;
+        // The rule the dispatcher first runs under is recorded.
+        evict_check_now(&w).await;
+        w.advance_secs(29 * DAY_SECS + 77_760);
+        cfg_mut(&mut w).providers[1].release = false;
+        evict_check_now(&w).await;
+        w.advance_secs(8_640);
+        assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+        assert_eq!(
+            w.bridge().safety.stored(&key).map(|b| b.bytes),
+            Some(cipher),
+            "scrub={scrub}: the sweep wrote the fill"
+        );
+        assert!(
+            alerts().iter().any(|a| a.starts_with("evict-sweep-done ")),
+            "scrub={scrub}: the sweep's end is said"
+        );
+    }
+}
+
+/// Over the cap, a drain frees what it must from the head of the order
+/// and stops; a fill read a moment ago sits at the tail, past where any
+/// drain gets. After a rule change (here `VERIFY_MODE` from `light` to
+/// `body`, which leaves only the tail's STAT-only release unreleasable)
+/// the sweep reaches it all the same.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rule_change_reaches_a_hot_fill_at_the_tail() {
+    let mut w = world().await;
+    let tail = w.released("t", 156).await;
+    let key = tail.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    cache_only(&w, &tail, "t").await;
+    set_evidence(&w, &tail, &[("alpha", "stat"), ("beta", "stat")]).await;
+    let size: u64 = w
+        .scalar(
+            "SELECT cipher_size FROM extents WHERE id = ?1",
+            &tail.extent,
+        )
+        .await
+        .parse()
+        .unwrap();
+    // A hundred older copies ahead of it, released on a full read.
+    let db = &w.bridge().catalog.sql.inner;
+    let evidence = r#"[{"backbone":"alpha","kind":"body","plan_rev":0},{"backbone":"beta","kind":"stat","plan_rev":0}]"#;
+    let seed = db.fixture(
+        "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 100) \
+         INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT printf('fixture-%05d', x), ?1, 'committed', 1, ?3, zeroblob(48), zeroblob(16), zeroblob(32), zeroblob(32), 'released', 0, ?3, x, ?2 FROM n",
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT 'fixture-' || lpad(CAST(x AS text), 5, '0'), ?1, 'committed', 1, ?3, \
+           decode(repeat('00', 48), 'hex'), decode(repeat('00', 16), 'hex'), \
+           decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), 'released', 0, ?3, x, ?2 \
+         FROM generate_series(1, 100) x",
+    );
+    db.fixture_exec(
+        seed,
+        &[
+            SqlValue::Text(w.bucket.id.as_str().to_owned()),
+            SqlValue::Text(evidence.to_owned()),
+            SqlValue::Int(size as i64),
+        ],
+    )
+    .await
+    .unwrap();
+    cfg_mut(&mut w).verify.mode = velmora_bridge::config::VerifyMode::Light;
+    cfg_mut(&mut w).hot_cap_bytes = u64::MAX / 4;
+    evict_check_now(&w).await;
+    // Over the cap by about ten copies: a drain frees them from the head.
+    cfg_mut(&mut w).hot_cap_bytes = 101 * size - 1;
+    cfg_mut(&mut w).verify.mode = velmora_bridge::config::VerifyMode::Body;
+    evict_check_now(&w).await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the tail's fill was written"
+    );
+}
+
+/// A count that outlived its copy (a finish that lost its compare-and-set
+/// after the deletes leaves `hot_safety_bytes` with no `x/` object): a
+/// sweep looks rather than trusts it, and writes the kept fill.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sweep_writes_a_kept_fill_whose_safety_count_outlived_its_copy() {
+    let mut w = world().await;
+    let o = w.released("a", 157).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    cache_fill(&w, &o, "a", cipher.clone()).await;
+    // The copy is gone; its count stands.
+    assert!(w.bridge().safety.lose(&key));
+    assert_ne!(
+        w.scalar(
+            "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+            &o.extent
+        )
+        .await,
+        "0"
+    );
+    evict_check_now(&w).await;
+    cfg_mut(&mut w).providers[1].release = false;
+    evict_check_now(&w).await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the sweep wrote the fill"
+    );
 }

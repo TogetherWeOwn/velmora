@@ -1283,15 +1283,31 @@ pub enum EvictCursor {
     /// safety store: the next step does that first, even when the tier is
     /// no longer over its cap.
     Promote(Box<EvictCursor>),
+    /// A promote-only sweep of the whole eviction order under the rule
+    /// with this fingerprint, at this cursor: after a change of the
+    /// rule's inputs, every kept fill is written to the safety store,
+    /// whatever the cap.
+    Sweep(String, Box<EvictCursor>),
 }
 
 impl EvictCursor {
     /// A value this code did not write reads as the start.
     pub fn parse(v: &str) -> EvictCursor {
+        if let Some(rest) = v.strip_prefix("sweep:") {
+            return match rest.split_once(':') {
+                Some((fp, inner)) if !fp.is_empty() => match EvictCursor::parse(inner) {
+                    inner @ (EvictCursor::Start | EvictCursor::After(..)) => {
+                        EvictCursor::Sweep(fp.to_owned(), Box::new(inner))
+                    }
+                    _ => EvictCursor::Start,
+                },
+                _ => EvictCursor::Start,
+            };
+        }
         if let Some(rest) = v.strip_prefix("promote:") {
             return match EvictCursor::parse(rest) {
                 // Never nested: a value this code did not write.
-                EvictCursor::Promote(_) => EvictCursor::Start,
+                EvictCursor::Promote(_) | EvictCursor::Sweep(..) => EvictCursor::Start,
                 inner => EvictCursor::Promote(Box::new(inner)),
             };
         }
@@ -1312,6 +1328,7 @@ impl EvictCursor {
             EvictCursor::Start => "start".to_owned(),
             EvictCursor::After(read, id) => format!("after:{read}:{id}"),
             EvictCursor::Promote(inner) => format!("promote:{}", inner.encode()),
+            EvictCursor::Sweep(fp, inner) => format!("sweep:{fp}:{}", inner.encode()),
         }
     }
 }
