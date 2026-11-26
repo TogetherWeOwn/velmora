@@ -814,13 +814,18 @@ where
             None => EvictCursor::Promote(Box::new(resume)),
         };
         let mut excess = remaining;
+        // A marker's step writes fills and evicts nothing: it does not
+        // total the tier (an aggregate over the whole eviction order, on
+        // every step of a sweep). The fresh drain it queues at its end
+        // totals it.
         if excess == 0 {
-            let cap = self.effective_cap().await?;
-            let total = self.catalog.evictable_bytes().await?;
-            if total > cap {
+            if pending.is_none() {
+                let cap = self.effective_cap().await?;
+                let total = self.catalog.evictable_bytes().await?;
+                if total <= cap {
+                    return Ok(0);
+                }
                 excess = total - low_watermark(cap);
-            } else if pending.is_none() {
-                return Ok(0);
             }
         } else if !self.catalog.hot_drain_claim(remaining).await? {
             // A second delivery of a step that already ran, or a step of

@@ -5796,3 +5796,24 @@ async fn a_sweep_writes_a_kept_fill_whose_safety_count_outlived_its_copy() {
         "the sweep wrote the fill"
     );
 }
+
+/// A marker's step (a sweep, or fills left to write) evicts nothing and
+/// does not total the tier: that aggregate over the whole eviction order
+/// would run on every step of a sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn a_marker_step_does_not_total_the_tier() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 158).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    let c = &w.bridge().catalog;
+    c.set_evict_cursor(&EvictCursor::Promote(Box::new(EvictCursor::Start)))
+        .await
+        .unwrap();
+    *c.sql.fail_matching.borrow_mut() = Some(("), 0), COUNT(*) FROM extents WHERE", 0));
+    w.bridge().jobs.inner.take();
+    let step = w.bridge().evict_batch(0).await;
+    *c.sql.fail_matching.borrow_mut() = None;
+    step.expect("no tier total in a marker's step");
+    assert!(w.has_safety(&o), "the marked fill was written");
+}
