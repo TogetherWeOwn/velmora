@@ -430,9 +430,23 @@ async fn bulk_statements_write_each_usage_row_once() {
 /// timed) in the same transaction; return the rows it changed and the
 /// elapsed time.
 async fn timed_rollback(db: &Client, prep: &str, sql: &str) -> (u64, Duration) {
+    timed_rollback_replanned(db, prep, sql, false).await
+}
+
+/// [`timed_rollback`]; with `replan`, the plan cache is reset after `prep`,
+/// so the timed statement parses the trigger queries itself.
+async fn timed_rollback_replanned(
+    db: &Client,
+    prep: &str,
+    sql: &str,
+    replan: bool,
+) -> (u64, Duration) {
     exec(db, "BEGIN").await;
     if !prep.is_empty() {
         exec(db, prep).await;
+    }
+    if replan {
+        exec(db, "DISCARD PLANS").await;
     }
     let started = Instant::now();
     let changed = exec(db, sql).await;
@@ -460,7 +474,7 @@ async fn fastest_rollback(
         if !replan {
             assert_eq!(timed_rollback(db, "", warm).await.0, 1, "{warm}");
         }
-        let run = timed_rollback(db, prep, sql).await;
+        let run = timed_rollback_replanned(db, prep, sql, replan).await;
         if i == 0 {
             best.0 = run.0;
         }
