@@ -61,6 +61,9 @@ class PgMigrate(unittest.TestCase):
                                 "-f", str(BRIDGE / "pg" / "roles.sql")], capture_output=True, text=True,
                                env=libpq_env())
         self.assertEqual(roles.returncode, 0, roles.stderr)
+        # The verify step requires that a failed app write logs no statement
+        # text (one-message writes carry their values in it).
+        psql("ALTER ROLE kofra_app SET log_min_error_statement = panic")
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.env = Path(tmp.name) / "pg.env"
@@ -96,6 +99,28 @@ class PgMigrate(unittest.TestCase):
         fixture = self.migrate("--test").stdout
         self.assertIn("Trigger tests passed", fixture)
         self.assertIn("(2 key-order mixed-hour statements)", fixture)
+
+    def test_verify_requires_that_app_errors_log_no_statement_text(self):
+        self.migrate()
+        check = "privilege check failed: app errors log no statement text"
+        db = os.environ["PGDATABASE"]
+        try:
+            for setup in ["ALTER ROLE kofra_app RESET log_min_error_statement",
+                          "ALTER ROLE kofra_app SET log_min_error_statement = error",
+                          "ALTER ROLE kofra_app SET log_min_error_statement = panic;"
+                          f"ALTER ROLE kofra_app IN DATABASE {db} SET log_min_error_statement = warning"]:
+                with self.subTest(setup):
+                    psql(setup)
+                    result = self.migrate("--verify", ok=False)
+                    self.assertIn(check, result.stdout + result.stderr)
+                    psql(f"ALTER ROLE kofra_app IN DATABASE {db} RESET log_min_error_statement")
+            for value in ["panic", "fatal", "log"]:
+                with self.subTest(value):
+                    psql(f"ALTER ROLE kofra_app SET log_min_error_statement = {value}")
+                    self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        finally:
+            psql(f"ALTER ROLE kofra_app IN DATABASE {db} RESET log_min_error_statement;"
+                 "ALTER ROLE kofra_app SET log_min_error_statement = panic")
 
     def test_import_mode_applies_the_statement_triggers_before_activation(self):
         self.migrate("--to", "0001", "--import-mode")

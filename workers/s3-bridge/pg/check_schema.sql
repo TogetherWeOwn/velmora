@@ -83,6 +83,26 @@ SELECT json_build_object(
         'app role timeouts', (SELECT 'idle_in_transaction_session_timeout=5s' = ANY(rolconfig)
             AND (current_setting('server_version_num')::int < 170000
                  OR 'transaction_timeout=30s' = ANY(rolconfig)) FROM app),
+        -- A one-message write carries its values in the statement text, so
+        -- a failed write must not put that text in the server log: the
+        -- app's effective log_min_error_statement must be above ERROR.
+        -- Precedence: database and role, role, database, then the server
+        -- value as this session sees it unless this session overrides it.
+        'app errors log no statement text', (SELECT lower(e.v) IN ('log', 'fatal', 'panic') FROM (
+            SELECT 1 AS rank, split_part(c.setting, '=', 2) AS v FROM pg_db_role_setting s
+                JOIN pg_database d ON d.oid = s.setdatabase, LATERAL unnest(s.setconfig) AS c(setting)
+                WHERE s.setrole = (SELECT oid FROM app) AND d.datname = current_database()
+                  AND split_part(c.setting, '=', 1) = 'log_min_error_statement'
+            UNION ALL SELECT 2, split_part(c.setting, '=', 2) FROM app, LATERAL unnest(app.rolconfig) AS c(setting)
+                WHERE split_part(c.setting, '=', 1) = 'log_min_error_statement'
+            UNION ALL SELECT 3, split_part(c.setting, '=', 2) FROM pg_db_role_setting s
+                JOIN pg_database d ON d.oid = s.setdatabase, LATERAL unnest(s.setconfig) AS c(setting)
+                WHERE s.setrole = 0 AND d.datname = current_database()
+                  AND split_part(c.setting, '=', 1) = 'log_min_error_statement'
+            UNION ALL SELECT 4, CASE WHEN source IN ('default', 'configuration file', 'command line',
+                    'environment variable') THEN reset_val END
+                FROM pg_settings WHERE name = 'log_min_error_statement') e
+            WHERE e.v IS NOT NULL ORDER BY e.rank LIMIT 1) IS TRUE,
         'read-only role membership', pg_has_role('kofra_ro', 'pg_read_all_data', 'USAGE')
             AND NOT pg_has_role('kofra_ro', 'pg_write_all_data', 'MEMBER')
             AND NOT pg_has_role('kofra_ro', 'kofra_migrate', 'MEMBER')
