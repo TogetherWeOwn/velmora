@@ -1812,16 +1812,16 @@ pub trait Catalog {
     ) -> Result<Option<crate::types::ExtentCipher>> {
         Ok(None)
     }
-    /// The extents of a generation: for each, whether its last R2 copy
-    /// may go now under `rule`, as [`Catalog::evict_window`] decides it
-    /// (never while pinned), and its ciphertext. The default cannot tell:
-    /// none.
-    async fn evict_generation(
+    /// One extent, read right before `/_admin/evict` deletes its copies:
+    /// its eviction sequence, whether its last R2 copy may go now under
+    /// `rule` as [`Catalog::evict_window`] decides it (never while pinned),
+    /// and its ciphertext. The default cannot tell: `None`.
+    async fn evict_point(
         &self,
-        _generation: &GenerationId,
+        _extent: &ExtentId,
         _rule: &crate::types::EvictRule,
-    ) -> Result<Vec<(ExtentId, bool, crate::types::ExtentCipher)>> {
-        Ok(Vec::new())
+    ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
+        Ok(None)
     }
     /// Eviction wrote a kept extent's verified cache fill to the safety
     /// store: it is counted if the row is as `x` was listed.

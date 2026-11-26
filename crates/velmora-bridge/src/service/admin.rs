@@ -1424,29 +1424,30 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
     let (rule, _) = bridge.evict_rule();
     let (mut evicted, mut safety_deleted, mut safety_kept, mut cache_kept) =
         (0u32, 0u32, 0u32, 0u32);
-    // The last-copy rule, as eviction applies it: one read for the object.
-    let decided = bridge
-        .catalog
-        .evict_generation(&status.generation.id, &rule)
-        .await
-        .or_internal()?;
     for x in &status.extents {
-        // Read before any delete: a cold read that fills the cache while
-        // this runs changes it, and its copy then stays counted.
-        let seq = bridge.catalog.hot_seq(&x.extent_id).await.or_internal()?;
-        let decision = decided.iter().find(|(id, _, _)| *id == x.extent_id);
-        let releasable = decision.is_some_and(|(_, may, _)| *may);
+        // Read right before this extent's deletes, in one statement: its
+        // sequence (a cold read that fills the cache while this runs
+        // changes it, and its copy then stays counted) and the last-copy
+        // rule as eviction applies it, with any loss on record now.
+        let Some((seq, releasable, cipher)) = bridge
+            .catalog
+            .evict_point(&x.extent_id, &rule)
+            .await
+            .or_internal()?
+        else {
+            cache_kept += 1;
+            continue;
+        };
         // A held copy a drill gives up (below) is on a backbone in full.
         let posted = !matches!(x.stage, None | Some(OutboxStage::Post));
         let held_on_usenet =
             include_safety && x.safety_state == SafetyState::Held && posted && on_usenet(x);
-        let in_place = match decision {
-            Some((_, _, cipher)) if !releasable && !held_on_usenet => bridge
-                .safety_holds(&x.extent_id, cipher)
+        let in_place = !releasable
+            && !held_on_usenet
+            && bridge
+                .safety_holds(&x.extent_id, &cipher)
                 .await
-                .or_internal()?,
-            _ => false,
-        };
+                .or_internal()?;
         if !releasable && !held_on_usenet && !in_place {
             cache_kept += 1;
             continue;

@@ -840,7 +840,10 @@ where
                 break;
             }
             match self.promote_cache_fill(&kept.row).await? {
-                Promoted::Done => promoted += 1,
+                Promoted::Written => promoted += 1,
+                // Nothing to write (no fill left, other bytes, not
+                // released): not the step's share, and not waited for.
+                Promoted::Nothing => {}
                 Promoted::Busy => {
                     again = Some((kept.resume.clone(), EVICT_PROMOTE_BUSY_SECS));
                     break;
@@ -982,16 +985,16 @@ where
     /// next reconciliation, by eviction or the scrub.
     async fn promote_cache_fill(&self, kept: &EvictCandidate) -> Result<Promoted> {
         let Some(cipher) = self.catalog.extent_cipher(&kept.extent).await? else {
-            return Ok(Promoted::Done);
+            return Ok(Promoted::Nothing);
         };
         if !cipher.released {
-            return Ok(Promoted::Done);
+            return Ok(Promoted::Nothing);
         }
         let Ok(_charge) = self.budget.charge_job(cipher.size).await else {
             return Ok(Promoted::Busy);
         };
         let Some(bytes) = self.cache.get(&kept.extent.cache_key(), None).await? else {
-            return Ok(Promoted::Done);
+            return Ok(Promoted::Nothing);
         };
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if bytes.len() as u64 != cipher.size || digest != cipher.sha256 {
@@ -1001,7 +1004,7 @@ where
                     kept.extent.as_str()
                 )
             });
-            return Ok(Promoted::Done);
+            return Ok(Promoted::Nothing);
         }
         let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
         self.catalog.scrub_put_intent(&kept.extent, until).await?;
@@ -1027,7 +1030,7 @@ where
                 )
             });
         }
-        Ok(Promoted::Done)
+        Ok(Promoted::Written)
     }
 
     async fn evict_one(
@@ -1373,6 +1376,10 @@ where
             };
             self.jobs.send(&job, 0).await?;
         }
+        // Safety writes whose invocation ended before their collection
+        // guard are reconciled here too, whether or not a drain runs or
+        // the scrub is on (catalogue writes only).
+        self.reconcile_put_intents(now).await?;
         // Recorded last: a check that failed is due again on the next run.
         self.catalog.hot_checked(now).await?;
         Ok(over)
@@ -1614,8 +1621,10 @@ const EVICT_PROMOTE_BUSY_SECS: u32 = 60;
 
 /// What one promotion did (`promote_cache_fill`).
 enum Promoted {
-    /// Written, or nothing to write.
-    Done,
+    /// The copy was written.
+    Written,
+    /// Nothing to write.
+    Nothing,
     /// No memory to spare now: tried again in a later step.
     Busy,
 }

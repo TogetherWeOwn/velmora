@@ -5010,10 +5010,12 @@ async fn every_kept_fill_of_a_window_is_promoted_before_the_drain_moves_past_it(
     }
 }
 
-/// A deleted extent is not kept for want of a release: its cache fill goes
-/// and no safety copy is written for it again.
+/// `deleted` names a safety copy given up (a restore without one, a
+/// drill), not an extent out of service: a live extent in that state with
+/// no release evidence keeps its cache fill, in the drain and in
+/// `/_admin/evict`, and no safety copy is written for it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_deleted_extents_fill_is_evicted_not_promoted() {
+async fn a_live_extent_without_its_safety_copy_keeps_its_fill_unwritten() {
     let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
     let o = w.released("a", 70).await;
     cache_only(&w, &o, "a").await;
@@ -5030,11 +5032,111 @@ async fn a_deleted_extents_fill_is_evicted_not_promoted() {
         .unwrap();
     cfg_mut(&mut w).providers[1].release = false;
     w.bridge().evict_batch(0).await.unwrap();
-    assert!(!w.has_safety(&o), "no safety copy for a deleted extent");
     assert!(
-        !w.bridge().cache.contains(&o.extent.cache_key()),
-        "its fill goes"
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the drain keeps the fill"
     );
+    assert!(!w.has_safety(&o), "no safety copy is written for it");
+    let token = w.bridge().cfg.admin_token.expose().to_string();
+    let r = w
+        .rig
+        .send(Req {
+            method: Method::Post,
+            target: format!("/_admin/evict/{BUCKET}/a"),
+            headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+            body: Vec::new(),
+        })
+        .await;
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "/_admin/evict keeps the fill"
+    );
+    assert_eq!(r.status, 200);
+}
+
+/// `/_admin/evict` decides each extent's last-copy rule right before its
+/// deletes: a loss the scrub records after the request began keeps the
+/// fill that is the extent's only R2 copy.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_evict_sees_a_loss_recorded_during_the_request() {
+    let w = world().await;
+    let o = w.released("a", 73).await;
+    cache_only(&w, &o, "a").await;
+    *w.bridge().catalog.sql.before_matching.borrow_mut() = Some((
+        "SELECT evict_seq",
+        0,
+        format!(
+            "UPDATE scrub_copies SET full_loss_at = {} WHERE extent_id = '{}' AND backbone = 'beta'",
+            w.bridge().clock.now().0,
+            o.extent.as_str()
+        ),
+    ));
+    let token = w.bridge().cfg.admin_token.expose().to_string();
+    let r = w
+        .rig
+        .send(Req {
+            method: Method::Post,
+            target: format!("/_admin/evict/{BUCKET}/a"),
+            headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+            body: Vec::new(),
+        })
+        .await;
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the loss on record keeps the only R2 copy"
+    );
+    assert_eq!(r.status, 200);
+    assert!(
+        w.bridge().catalog.sql.before_matching.borrow().is_none(),
+        "the loss was recorded during the request"
+    );
+}
+
+/// Kept fills with nothing to write (the fill is gone from the cache, as
+/// the lifecycle rule takes it while it is still counted) do not take a
+/// step's share: with nine of them at the head (unstamped legacy rows), the
+/// drain still reaches the extent behind them.
+#[tokio::test(flavor = "current_thread")]
+async fn kept_fills_with_nothing_to_write_do_not_hold_the_drain() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    for i in 0..9u8 {
+        let name = format!("k{i}");
+        let o = w.released(&name, 80 + i).await;
+        cache_only(&w, &o, &name).await;
+        set_evidence(&w, &o, &[("alpha", "body")]).await;
+        assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+        w.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_exec(
+                "UPDATE extents SET last_read_at = NULL WHERE id = ?1",
+                &[SqlValue::Text(o.extent.as_str().to_owned())],
+            )
+            .await
+            .unwrap();
+    }
+    let last = w.released("z", 90).await;
+    w.bridge().jobs.inner.take();
+    w.bridge().evict_batch(0).await.unwrap();
+    for _ in 0..20 {
+        let steps: Vec<Job> = w
+            .bridge()
+            .jobs
+            .inner
+            .take()
+            .into_iter()
+            .map(|s| s.job)
+            .filter(|j| matches!(j, Job::Evict { .. }))
+            .collect();
+        if steps.is_empty() {
+            break;
+        }
+        for step in steps {
+            w.bridge().run_job(&step).await;
+        }
+    }
+    assert!(!w.has_safety(&last), "the extent behind them was evicted");
 }
 
 /// An eviction step that ends between a promotion's write and its
@@ -5087,6 +5189,71 @@ async fn an_interrupted_promotion_is_collected_by_a_later_step() {
         .clock
         .advance_ms(velmora_bridge::jobtable::JOB_MAX_AGE_MS + 1);
     bridge.evict_batch(0).await.unwrap();
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(
+        !w.has_safety(&o),
+        "the reconciled intent collected the copy"
+    );
+}
+
+/// As above, with the tier under its cap afterwards: no eviction step runs,
+/// and the dispatcher's eviction check reconciles the intent.
+#[tokio::test(flavor = "current_thread")]
+async fn an_interrupted_promotion_is_collected_by_the_dispatcher_under_the_cap() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 71).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).scrub.on = false;
+    cfg_mut(&mut w).providers[1].release = false;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let mut step = Box::pin(bridge.evict_batch(0));
+    let meanwhile = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        // The guard after the write never answers.
+        bridge
+            .catalog
+            .sql
+            .stall_exec_matching
+            .set(Some("'delete_safety', ?2 FROM extents e"));
+        safety.hold_put_prefix.replace(None);
+        while bridge.catalog.sql.stall_exec_matching.get().is_some() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        () = meanwhile => {}
+        _ = &mut step => panic!("the step ended before its guard"),
+    }
+    drop(step);
+    bridge.catalog.sql.selected_exec.disarm();
+    assert!(w.has_safety(&o), "the write landed");
+    bridge
+        .clock
+        .advance_ms(velmora_bridge::jobtable::JOB_MAX_AGE_MS + 1);
+    // The tier is under its cap now: no drain runs, the dispatcher's check
+    // still reconciles.
+    cfg_mut(&mut w).hot_cap_bytes = u64::MAX / 4;
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.dispatch().await.unwrap();
     assert_eq!(
         bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
         JobOutcome::Ack

@@ -1143,12 +1143,12 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn extent_cipher(&self, extent: &ExtentId) -> Result<Option<crate::types::ExtentCipher>> {
         hot::extent_cipher(self, extent).await
     }
-    async fn evict_generation(
+    async fn evict_point(
         &self,
-        generation: &GenerationId,
+        extent: &ExtentId,
         rule: &crate::types::EvictRule,
-    ) -> Result<Vec<(ExtentId, bool, crate::types::ExtentCipher)>> {
-        hot::evict_generation(self, generation, rule).await
+    ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
+        hot::evict_point(self, extent, rule).await
     }
     async fn evict_promoted(&self, x: &EvictCandidate) -> Result<bool> {
         hot::evict_promoted(self, x).await
