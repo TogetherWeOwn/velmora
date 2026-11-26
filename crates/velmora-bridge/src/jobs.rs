@@ -843,6 +843,20 @@ where
         // with no memory to spare now, the next step reads it again.
         let mut promoted = 0;
         let mut again = None;
+        // Write-ahead: while kept fills may still be written, a marker at
+        // the first of them is on record, so a step that fails part way
+        // (a store or catalogue error) leaves them to a later step, even
+        // with the tier under its cap. The step's own cursor write at its
+        // end replaces it.
+        if let Some(first) = window
+            .unproven
+            .iter()
+            .find(|kept| kept.promote && kept.row.cache_bytes > 0 && kept.row.safety_bytes == 0)
+        {
+            self.catalog
+                .set_evict_cursor(&EvictCursor::Promote(Box::new(first.resume.clone())))
+                .await?;
+        }
         // Whether each kept fill is still in the cache: HEADs, a few at a
         // time rather than one after another, and only as far as the step
         // gets.
@@ -1442,8 +1456,10 @@ where
     }
 
     /// The dispatcher's hot-tier check: at most one total per
-    /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap.
-    /// `GC_MODE` does not gate it: eviction removes no data.
+    /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap or
+    /// kept fills are still to be written (a promotion marker). `true`
+    /// when it sent one. `GC_MODE` does not gate it: eviction removes no
+    /// data.
     async fn evict_check(&self, now: UnixMs, report: &mut DispatchReport) -> Result<bool> {
         let every_ms = i64::from(EVICT_CHECK_SECS) * 1000;
         if !self.catalog.hot_check_due(now, every_ms).await? {
@@ -1454,9 +1470,9 @@ where
         let over = shape.evictable_bytes > self.effective_cap().await?;
         // Over the cap, or with kept fills still to be written (a step
         // that came during a pause left its marker): a drain starts.
-        if !self.cfg.eviction_paused
-            && (over || matches!(self.catalog.evict_cursor().await?, EvictCursor::Promote(_)))
-        {
+        let started = !self.cfg.eviction_paused
+            && (over || matches!(self.catalog.evict_cursor().await?, EvictCursor::Promote(_)));
+        if started {
             let job = Job::Evict {
                 v: JOB_VERSION,
                 remaining: 0,
@@ -1469,7 +1485,7 @@ where
         self.reconcile_put_intents(now).await?;
         // Recorded last: a check that failed is due again on the next run.
         self.catalog.hot_checked(now).await?;
-        Ok(over)
+        Ok(started)
     }
 
     /// The whole cron handler: bounded catalogue reads and queue sends,

@@ -5537,3 +5537,28 @@ async fn the_dispatcher_resumes_promotions_a_pause_deferred() {
     drain_steps(&w).await;
     assert!(w.has_safety(&o), "the deferred fill was written");
 }
+
+/// A step that fails part way through its kept fills (here a cache HEAD)
+/// leaves a promotion marker behind it, and the dispatcher's check writes
+/// the fills later, with the tier under its cap.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_that_fails_mid_promotion_leaves_its_fills_to_a_later_one() {
+    let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 133).await;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    w.bridge().cache.trip.arm(0, Trip::Fail);
+    assert!(w.bridge().evict_batch(0).await.is_err(), "the HEAD failed");
+    w.bridge().cache.trip.disarm();
+    assert!(!w.has_safety(&o));
+    cfg_mut(&mut w).hot_cap_bytes = u64::MAX / 4;
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.jobs.inner.take();
+    let report = bridge.dispatch().await.unwrap();
+    assert!(report.evict_enqueued, "a step for the marker is reported");
+    drain_steps(&w).await;
+    assert!(w.has_safety(&o), "written by the later step");
+}
