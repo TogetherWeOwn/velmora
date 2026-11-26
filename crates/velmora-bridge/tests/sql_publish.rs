@@ -1577,6 +1577,112 @@ async fn the_reads_after_a_refused_replay_wait_out_an_overloaded_database() {
     }
 }
 
+fn assert_plan_runs_are_bounded_and_packed(
+    plan_runs: &[Vec<usize>],
+    plan_lengths: &[usize],
+    budget: usize,
+    large_plan_bytes: usize,
+    value_lengths: &[usize],
+) {
+    assert_eq!(value_lengths.iter().sum::<usize>(), plan_lengths.len());
+    // Ten small plans fit each answer. The one oversized plan can split one
+    // small run, and the two placement values are batched independently.
+    assert!(
+        plan_runs.len() <= 54,
+        "runs were split too early: {plan_runs:?}"
+    );
+
+    let mut seen = plan_runs
+        .iter()
+        .flat_map(|run| run.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(seen.len(), plan_lengths.len());
+    seen.sort_unstable();
+    assert_eq!(seen, (0..plan_lengths.len()).collect::<Vec<_>>());
+
+    let mut ranges = Vec::with_capacity(value_lengths.len());
+    let mut start = 0;
+    for &length in value_lengths {
+        ranges.push(start..start + length);
+        start += length;
+    }
+    let value_of = |index: usize| {
+        ranges
+            .iter()
+            .position(|range| range.contains(&index))
+            .unwrap()
+    };
+    let mut runs_by_value = vec![Vec::new(); value_lengths.len()];
+    let mut large_run = None;
+    for (run_index, run) in plan_runs.iter().enumerate() {
+        assert!(!run.is_empty());
+        let value = value_of(run[0]);
+        assert!(run.iter().all(|&index| value_of(index) == value));
+        runs_by_value[value].push(run_index);
+        let run_lengths: Vec<usize> = run.iter().map(|&index| plan_lengths[index]).collect();
+        let total: usize = run_lengths.iter().sum();
+        assert!(
+            total <= budget || (run.len() == 1 && run_lengths[0] == large_plan_bytes),
+            "plan run exceeds byte budget: {run_lengths:?}"
+        );
+        if run_lengths.contains(&large_plan_bytes) {
+            large_run = Some(run.len());
+        }
+    }
+
+    // Every run other than the last in its placement value is full: the
+    // next plan would exceed the byte budget. This keeps the batching cost
+    // bounded instead of merely checking an upper bound.
+    for value_runs in runs_by_value {
+        for pair in value_runs.windows(2) {
+            let current = &plan_runs[pair[0]];
+            let current_total: usize = current.iter().map(|&i| plan_lengths[i]).sum();
+            let next_length = plan_lengths[plan_runs[pair[1]][0]];
+            assert!(
+                current_total + next_length > budget,
+                "plan run left capacity before the next plan: {current:?}"
+            );
+        }
+    }
+    assert_eq!(large_run, Some(1));
+}
+
+#[test]
+fn unordered_plan_runs_keep_large_plan_alone() {
+    const SMALL: usize = 96;
+    const LARGE: usize = 1_856;
+    const BUDGET: usize = SMALL * 10;
+    let mut lengths = vec![SMALL; 520];
+    lengths[5] = LARGE;
+
+    // The large plan is third in the database's returned order, which is a
+    // valid order for the unordered PostgreSQL query and not the old fixture
+    // order that put it sixth.
+    let mut order = vec![0, 1, 5];
+    order.extend((2..500).filter(|&index| index != 5));
+    order.extend(500..520);
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    let mut held = 0;
+    for index in order {
+        if !run.is_empty() && (index == 500 || held + lengths[index] > BUDGET) {
+            runs.push(core::mem::take(&mut run));
+            held = 0;
+        }
+        held += lengths[index];
+        run.push(index);
+    }
+    runs.push(run);
+
+    let counts: Vec<usize> = runs.iter().map(Vec::len).collect();
+    let mut old_expected = vec![5, 1];
+    old_expected.extend([10; 49]);
+    old_expected.extend([4, 10, 10]);
+    assert_eq!(&counts[..2], &[2, 1]);
+    assert_ne!(counts, old_expected);
+    assert_plan_runs_are_bounded_and_packed(&runs, &lengths, BUDGET, LARGE, &[500, 20]);
+}
+
 /// The check for a plan that cannot be read asks for plans by their
 /// bytes, not by a number of rows: first which extents have one and how
 /// large, then the plans in runs that fit one answer. A plan that is
@@ -1599,6 +1705,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
     const MANY_BYTES: u64 = 40_000_000;
     let mut plan_bytes = 0;
     let mut many_bytes = 0;
+    let mut plan_lengths = Vec::with_capacity(ids.len());
     for (i, id) in ids.iter().enumerate() {
         let cipher_size = if i == MANY { MANY_BYTES } else { 164 };
         let (plan, _) = velmora_bridge::plan::plan_seeded(
@@ -1610,6 +1717,7 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
             |span| Some([span.start as u8; 32]),
         )
         .unwrap();
+        plan_lengths.push(plan.len());
         if i == MANY {
             many_bytes = plan.len();
         } else {
@@ -1650,18 +1758,51 @@ async fn unread_plans_are_read_in_runs_bounded_by_their_bytes() {
     const SIZES: &str = "length(e.plan)";
     const PLANS: &str = "e.cipher_size, e.plan";
 
-    // Every plan reads: all of them are asked for, ten at a time, the
-    // extents 500 at a time.
+    // Every plan reads: all of them are asked for, in byte-bounded runs, and
+    // the 500 placements and then 20 placements stay separate values.
     fx.sql().queries.borrow_mut().clear();
     let before = fx.dump().await;
     let published = fx.replay(&g).await;
     assert_eq!(asked(&fx, SIZES), [500, 20]);
-    // The five before the large plan, the large plan alone, the other
-    // 494 of the first value, and the 20 of the second.
-    let mut expected = vec![5, 1];
-    expected.extend([10; 49]);
-    expected.extend([4, 10, 10]);
-    assert_eq!(asked(&fx, PLANS), expected);
+
+    // SQL does not promise row order without ORDER BY. Check the actual plan
+    // query inputs rather than assuming the database returned the large plan
+    // at its construction-time position.
+    let mut plan_runs = Vec::new();
+    for (_, params) in fx
+        .sql()
+        .queries
+        .borrow()
+        .iter()
+        .filter(|(sql, _)| sql.contains(PLANS))
+    {
+        let value: Vec<String> = match &params[0] {
+            SqlValue::Text(json) => serde_json::from_str(json).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        plan_runs.push(
+            value
+                .into_iter()
+                .map(|id| {
+                    ids.iter()
+                        .position(|candidate| candidate.as_str() == id)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    // The helper also checks that each non-final run in a value is full.
+    assert!(
+        plan_runs.len() <= 54,
+        "runs were split too early: {plan_runs:?}"
+    );
+    assert_plan_runs_are_bounded_and_packed(
+        &plan_runs,
+        &plan_lengths,
+        plan_bytes * 10,
+        many_bytes,
+        &[500, 20],
+    );
 
     // The same record with the plan of its last extent damaged, in a
     // catalogue as it was before: found in the last run.
