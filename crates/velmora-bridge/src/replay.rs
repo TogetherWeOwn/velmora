@@ -713,14 +713,16 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // the catalogue refuses it. So at the record's turn the store
         // itself, never what was read ahead, is asked whether it still
         // has the record, at the same time as the catalogue is asked
-        // about it. Off, the record was read just now, as on main.
+        // about it. Off, the record was read just now, as on main. The
+        // answer is used only for a record the catalogue does not have,
+        // so a failed HEAD fails the step only then.
         let (probe, there) = if self.cfg.replay_read_ahead {
-            let (probe, there) = future::try_join(
+            let (probe, there) = future::join(
                 self.catalog.replay_probe(&generation),
                 self.safety.head(&cursor.name),
             )
-            .await?;
-            (probe, Some(there.is_some()))
+            .await;
+            (probe?, Some(there))
         } else {
             (self.catalog.replay_probe(&generation).await?, None)
         };
@@ -763,8 +765,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // behind: no row of it is written. This does not fence the
         // removal of a refused record after that answer; main has the
         // same window after its record GET.
-        if probe != ReplayProbe::Present && there == Some(false) {
-            return Ok(Replayed::Gone);
+        if probe != ReplayProbe::Present {
+            if let Some(there) = there {
+                if there?.is_none() {
+                    return Ok(Replayed::Gone);
+                }
+            }
         }
         let now = self.clock.now();
         let total = generation.extent_count as usize;

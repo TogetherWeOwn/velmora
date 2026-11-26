@@ -752,6 +752,34 @@ async fn a_record_removed_after_it_was_read_is_not_published() {
     assert!(rig.live(&bucket, "k08").await.is_some());
 }
 
+/// The presence HEAD at a record's turn is needed only for a record the
+/// catalogue does not have. With read-ahead on, a HEAD that fails for a
+/// record the catalogue has does not fail the step; one that fails for
+/// a record still to publish does, and publishes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_presence_head_fails_the_step_only_when_it_is_needed() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"x").await.expect(200);
+    let (generation, _) = rig.live(&bucket, "one").await.unwrap();
+    let name = Layout::flat().generation_key(&generation.id);
+    *rig.bridge.safety.fail_head.borrow_mut() = Some(name);
+    let report = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap();
+    assert_eq!((report.manifests, report.published), (1, 0), "{report:?}");
+    wipe(&rig);
+    let error = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::Blob(_)), "{error:?}");
+    assert!(rig.live(&bucket, "one").await.is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
     let rig = rig_with(NoNntp, read_ahead_config());
