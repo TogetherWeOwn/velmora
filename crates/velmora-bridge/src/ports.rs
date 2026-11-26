@@ -1670,12 +1670,17 @@ pub trait Catalog {
     async fn scrub_put_intent(&self, _extent: &ExtentId, _until: UnixMs) -> Result<()> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
-    /// Recorded PUT intents whose PUT can no longer land at `now`.
-    async fn scrub_put_intents_due(&self, _now: UnixMs, _limit: u32) -> Result<Vec<ExtentId>> {
+    /// Recorded PUT intents whose PUT can no longer land at `now`, oldest
+    /// expiry first: `(key, extent)`.
+    async fn scrub_put_intents_due(
+        &self,
+        _now: UnixMs,
+        _limit: u32,
+    ) -> Result<Vec<(String, ExtentId)>> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
-    /// Removes a reconciled PUT intent.
-    async fn scrub_drop_put_intent(&self, _extent: &ExtentId) -> Result<()> {
+    /// Removes a reconciled PUT intent, by its key.
+    async fn scrub_drop_put_intent(&self, _key: &str) -> Result<()> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
     /// Whether the re-pin made at `at` is the one on the extent's row: the

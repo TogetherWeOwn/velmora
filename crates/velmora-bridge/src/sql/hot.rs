@@ -165,6 +165,16 @@ macro_rules! releasable_now_pg {
     };
 }
 
+/// With the scrub on, the cache fill of a pinned extent under a scrub
+/// repair stays: its safety copy may be the one the repair could not
+/// write yet, and the repair watch then writes it from that fill.
+macro_rules! pinned_may_scrub {
+    () => {
+        "CASE WHEN (SELECT x.scrub_result FROM extents x WHERE x.id = w.id) \
+           IN ('repairing', 'stalled', 'unrecoverable') THEN 0 ELSE 1 END"
+    };
+}
+
 /// One bounded window of the eviction order (`?1` rows of the
 /// `extents_evictable` index, after the keyset), each with whether it may
 /// go: a pinned extent's cache fill always may (its safety copy stays);
@@ -175,9 +185,14 @@ macro_rules! releasable_now_pg {
 /// step, not a scan.
 macro_rules! evict_window {
     ($keyset:literal, $order:literal, $outer:literal, $may:expr) => {
+        evict_window!($keyset, $order, $outer, "1", $may)
+    };
+    ($keyset:literal, $order:literal, $outer:literal, $pinned_may:expr, $may:expr) => {
         concat!(
             "SELECT w.id, w.hot_safety_bytes, w.hot_cache_bytes, w.evict_seq, w.pinned, \
-               w.last_read_at, CASE WHEN w.pinned THEN 1 WHEN ",
+               w.last_read_at, CASE WHEN w.pinned THEN ",
+            $pinned_may,
+            " WHEN ",
             $may,
             " THEN 1 ELSE 0 END FROM (SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
             pinned!(),
@@ -207,6 +222,7 @@ pub const EVICT_WINDOW_SCRUB: &str = evict_window!(
     "",
     "last_read_at, id",
     "w.last_read_at, w.id",
+    pinned_may_scrub!(),
     concat!(
         "NOT ",
         scrub_loss_on_record!("w.id", "value FROM json_each(?2)"),
@@ -218,6 +234,7 @@ pub const EVICT_WINDOW_SCRUB_AFTER: &str = evict_window!(
     " AND (last_read_at, id) > (?2, ?3)",
     "last_read_at, id",
     "w.last_read_at, w.id",
+    pinned_may_scrub!(),
     concat!(
         "NOT ",
         scrub_loss_on_record!("w.id", "value FROM json_each(?4)"),
@@ -241,6 +258,7 @@ pub const EVICT_WINDOW_SCRUB_PG: &str = evict_window!(
     "",
     "last_read_at ASC NULLS FIRST, id",
     "w.last_read_at ASC NULLS FIRST, w.id",
+    pinned_may_scrub!(),
     concat!(
         "NOT ",
         scrub_loss_on_record!("w.id", "jsonb_array_elements_text(CAST(?2 AS jsonb))"),
@@ -252,6 +270,7 @@ pub const EVICT_WINDOW_SCRUB_AFTER_PG: &str = evict_window!(
     " AND (last_read_at, id) > (?2, ?3)",
     "last_read_at ASC NULLS FIRST, id",
     "w.last_read_at ASC NULLS FIRST, w.id",
+    pinned_may_scrub!(),
     concat!(
         "NOT ",
         scrub_loss_on_record!("w.id", "jsonb_array_elements_text(CAST(?4 AS jsonb))"),

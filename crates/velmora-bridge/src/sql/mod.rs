@@ -1053,11 +1053,15 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_put_intent(&self, extent: &ExtentId, until: UnixMs) -> Result<()> {
         scrub::put_intent(self, extent, until).await
     }
-    async fn scrub_put_intents_due(&self, now: UnixMs, limit: u32) -> Result<Vec<ExtentId>> {
+    async fn scrub_put_intents_due(
+        &self,
+        now: UnixMs,
+        limit: u32,
+    ) -> Result<Vec<(String, ExtentId)>> {
         scrub::put_intents_due(self, now, limit).await
     }
-    async fn scrub_drop_put_intent(&self, extent: &ExtentId) -> Result<()> {
-        scrub::drop_put_intent(self, extent).await
+    async fn scrub_drop_put_intent(&self, key: &str) -> Result<()> {
+        scrub::drop_put_intent(self, key).await
     }
     async fn scrub_repin_landed(&self, extent: &ExtentId, at: UnixMs) -> Result<bool> {
         scrub::repin_landed(self, extent, at).await

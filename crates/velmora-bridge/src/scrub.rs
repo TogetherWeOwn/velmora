@@ -673,16 +673,18 @@ where
                 .await?;
             return Ok(watched);
         }
-        if watch_due {
+        // Released, but not releasable under the backbones that count now
+        // (one that held it stopped counting): eviction keeps its last R2
+        // copy until a re-verify on the counting backbones releases it
+        // again. Looked at on its own deadline too, not only with checks,
+        // and that deadline stays until the re-verify replaces it (a
+        // re-pin, or a deferral) or a check records a result.
+        let reverify = watch_due && !releasable_now(extent, backbones, self.cfg.required_backbones);
+        if watch_due && !reverify {
             // A completed repair (or an old extent-wide deadline) is not
             // evidence that any copy's scheduled read-back has passed.
             self.catalog.scrub_drop(token, &extent.id).await?;
         }
-        // Released, but not releasable under the backbones that count now
-        // (one that held it stopped counting): eviction keeps its last R2
-        // copy until a re-verify on the counting backbones releases it
-        // again. Looked at on its own deadline too, not only with checks.
-        let reverify = watch_due && !releasable_now(extent, backbones, self.cfg.required_backbones);
         if candidate.checks.is_empty() && !reverify {
             return Ok(false);
         }
@@ -696,6 +698,9 @@ where
                 // time: deferred like an addendum that cannot be read.
                 // A catalogue that did not answer still stops the run.
                 Err(BridgeError::Invalid(what)) => {
+                    if reverify {
+                        self.defer_watch(walk, extent).await?;
+                    }
                     return self.defer_bad_plan(reader, walk, candidate, what).await;
                 }
                 Err(e) => return Err(e.into()),
@@ -734,6 +739,9 @@ where
         let parity = match stored.parity_plan(&extent.id, extent.cipher_size) {
             Ok(parity) => parity,
             Err(_) => {
+                if reverify {
+                    self.defer_watch(walk, extent).await?;
+                }
                 return self
                     .defer_bad_plan(reader, walk, candidate, "parity addendum")
                     .await;
@@ -884,11 +892,7 @@ where
             && walk.run.incident.is_none()
             && walk.breaker.tripped().is_empty();
         if !may {
-            let next = self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000);
-            self.catalog
-                .scrub_defer(walk.token, &extent.id, next)
-                .await?;
-            return Ok(());
+            return self.defer_watch(walk, extent).await;
         }
         crate::trace::alert(|| {
             format!(
@@ -902,6 +906,22 @@ where
             .repair_read(reader, walk, extent, stored, unproven)
             .await?;
         self.repair(reader, walk, candidate, found, true).await
+    }
+
+    /// The extent's own deadline, one confirm interval ahead.
+    async fn defer_watch(
+        &self,
+        walk: &mut Walk<'_, '_, C, N, T>,
+        extent: &ExtentRow,
+    ) -> core::result::Result<(), Halt> {
+        let next = self
+            .clock
+            .now()
+            .plus_ms(i64::from(self.cfg.scrub.confirm_secs) * 1000);
+        self.catalog
+            .scrub_defer(walk.token, &extent.id, next)
+            .await?;
+        Ok(())
     }
 
     fn alert_bad_plan(extent: &ExtentRow, what: &str) {
@@ -1604,9 +1624,12 @@ where
     /// enqueue, a no-op while the extent is referenced, then goes. At most
     /// [`SCRUB_PAGE`] a run; an intent that fails stays for the next.
     async fn reconcile_put_intents(&self, now: UnixMs) -> Result<()> {
-        for extent in self.catalog.scrub_put_intents_due(now, SCRUB_PAGE).await? {
+        // Each repair makes at most a few PUTs: the page keeps up with the
+        // run's re-pins, oldest expiry first.
+        let page = SCRUB_PAGE.max(self.cfg.scrub.repairs_per_run.saturating_mul(4));
+        for (key, extent) in self.catalog.scrub_put_intents_due(now, page).await? {
             self.catalog.gc_enqueue_scrub_safety(&extent, now).await?;
-            self.catalog.scrub_drop_put_intent(&extent).await?;
+            self.catalog.scrub_drop_put_intent(&key).await?;
         }
         Ok(())
     }

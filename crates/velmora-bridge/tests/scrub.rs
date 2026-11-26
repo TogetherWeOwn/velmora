@@ -4160,3 +4160,105 @@ async fn a_re_pin_whose_reply_is_lost_still_writes_the_safety_copy() {
     assert_eq!(w.safety_state(&o).await, "held");
     assert!(w.has_safety(&o), "the copy is written as after any re-pin");
 }
+
+/// Expired PUT intents are reconciled oldest first: newer intents of
+/// extents whose ids sort lower cannot keep an expired one out of the
+/// page.
+#[tokio::test(flavor = "current_thread")]
+async fn an_expired_put_intent_is_not_held_up_by_newer_ones() {
+    let w = world().await;
+    let c = &w.bridge().catalog;
+    let now = w.bridge().clock.now();
+    for i in 0..20 {
+        c.scrub_put_intent(&ExtentId::new(format!("a{i:02}")), now.plus_secs(3600))
+            .await
+            .unwrap();
+    }
+    c.scrub_put_intent(&ExtentId::new("zz-expired"), now.plus_ms(-1))
+        .await
+        .unwrap();
+    let due = c.scrub_put_intents_due(now, 8).await.unwrap();
+    let shown = format!("{due:?}");
+    assert!(shown.contains("zz-expired"), "{shown}");
+    assert!(
+        !shown.contains("a00"),
+        "an intent not yet expired waits: {shown}"
+    );
+}
+
+/// A re-verify that waits on the extent's own deadline (no copy check
+/// due) keeps a deadline whatever stops it: past the run's re-pins, or a
+/// plan that cannot be decoded. It is never left without one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deferred_re_verify_keeps_its_deadline() {
+    let mut w = world_with(|cfg| {
+        cfg.packed_plans = true;
+        cfg.scrub.repairs_per_run = 0;
+    })
+    .await;
+    let o = w.released("a", 18).await;
+    cfg_mut(&mut w).providers[1].release = false;
+    // A passing check: not releasable under alpha alone, no re-pin left.
+    w.advance_secs(31 * DAY_SECS);
+    w.scrub().await;
+    let deferred = w.next_at(&o).await.expect("a deadline");
+    // Its own deadline comes, with no copy check due, and the plan
+    // cannot be decoded.
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET plan = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Blob(vec![0xee; 9]),
+            ],
+        )
+        .await
+        .unwrap();
+    w.bridge().clock.set(UnixMs(deferred));
+    w.scrub().await;
+    let next = w.next_at(&o).await;
+    assert!(
+        next.is_some_and(|n| n > deferred),
+        "still has a deadline ahead: {next:?}"
+    );
+}
+
+/// With the scrub on, the cache fill of a pinned extent under a scrub
+/// repair stays: its safety copy could not be written, and the repair
+/// watch writes it from that fill.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cache_fill_of_an_extent_under_repair_is_not_evicted() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 19).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    repinned_without_its_copy(&w, &o).await;
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.bridge()
+        .catalog
+        .record_cache_fill(&o.extent, w.bridge().clock.now())
+        .await
+        .unwrap();
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the only R2 copy of an extent under repair stays"
+    );
+}
