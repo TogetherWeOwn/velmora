@@ -551,6 +551,42 @@ async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_sessi
     eprintln!("warm-session usage triggers:\n{}", report.join("\n"));
 }
 
+/// The byte deltas are summed with their sign over both transition tables.
+/// Negating a BIGINT-minimum cipher_size must not overflow before the
+/// unchanged row's two sides cancel.
+#[tokio::test]
+async fn byte_deltas_do_not_overflow_at_the_bigint_boundary() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let pg = TestPostgres::through_stage(&stage_under_test(), true).unwrap();
+    let db = session(&pg).await;
+    exec(
+        &db,
+        "INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) \
+           VALUES ('b','b','o','\\x',1,0); \
+         INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,\
+           plain_sha256,cipher_sha256,safety_state,created_at) VALUES \
+           ('kmin','b','staged',1,-9223372036854775808,'\\x','\\x','\\x','\\x','held',0), \
+           ('kten','b','staged',1,8,'\\x','\\x','\\x','\\x','held',0)",
+    )
+    .await;
+    let x = "x_unreleased, unreleased_bytes, x_released, released_bytes";
+    let min = i64::MIN;
+    assert_eq!(global(&db, 1, x).await, [2, min + 8, 0, 0]);
+    // One statement: the BIGINT-minimum extent unchanged, an 8-byte release.
+    let changed = db
+        .execute(
+            "UPDATE extents SET safety_state = CASE id WHEN 'kten' THEN 'released' ELSE safety_state END \
+             WHERE id IN ('kmin','kten')",
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{}", sqlstate("UPDATE extents … kmin, kten", &e)));
+    assert_eq!(changed, 2);
+    assert_eq!(global(&db, 1, x).await, [1, min, 1, 8]);
+}
+
 // ---------------------------------------------------------------------------
 // The failure trigger
 // ---------------------------------------------------------------------------

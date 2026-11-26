@@ -130,13 +130,16 @@ BEGIN
     -- NEW minus OLD over every row, without pairing: a pair outside the WHEN
     -- has the same class and cipher_size on both sides, so it adds zero, and
     -- both sides of a pair have the same key, so the same coverage.
+    -- The byte products are numeric: -1 * a BIGINT-minimum size must not
+    -- overflow before the unchanged pair cancels; the bigint column
+    -- assignment still errors on a real overflow.
     UPDATE usage_global u SET
         (x_unreleased, unreleased_bytes, x_released, released_bytes, x_deleted) = (
             SELECT u.x_unreleased + sum(d.sign * (d.safety_state IN ('held', 'releasing'))::int),
-                   u.unreleased_bytes + sum(d.sign * CASE WHEN d.safety_state IN ('held', 'releasing')
+                   u.unreleased_bytes + sum(d.sign::numeric * CASE WHEN d.safety_state IN ('held', 'releasing')
                                                           THEN d.cipher_size ELSE 0 END),
                    u.x_released + sum(d.sign * (d.safety_state = 'released')::int),
-                   u.released_bytes + sum(d.sign * CASE WHEN d.safety_state = 'released'
+                   u.released_bytes + sum(d.sign::numeric * CASE WHEN d.safety_state = 'released'
                                                         THEN d.cipher_size ELSE 0 END),
                    u.x_deleted + sum(d.sign * (d.safety_state = 'deleted')::int)
               FROM (SELECT n.id, n.safety_state, n.cipher_size, 1 AS sign FROM new_rows n
