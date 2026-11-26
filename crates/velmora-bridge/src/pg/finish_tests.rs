@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio_postgres::{config::SslMode, Config, NoTls};
 
-use super::{PgConfig, PgConnect, PgConnection, PgSql};
+use super::{PgConfig, PgConnect, PgConnection, PgSql, WriteTx};
 use crate::{BridgeError, Result, Sql, SqlValue};
 
 #[derive(Clone, Copy)]
@@ -87,7 +87,8 @@ async fn send(out: &mut DuplexStream, tag: u8, body: &[u8]) -> io::Result<()> {
 }
 
 /// Just enough of a backend for the adapter's statements: trust startup,
-/// simple queries, and extended Parse/Bind/Describe/Execute/Sync.
+/// simple queries (one-message transactions included), and extended
+/// Parse/Bind/Describe/Execute/Sync.
 async fn backend(mut io: DuplexStream, commit: CommitReply) {
     let _ = serve(&mut io, commit).await;
 }
@@ -114,6 +115,22 @@ async fn serve(io: &mut DuplexStream, commit: CommitReply) -> io::Result<()> {
             }
             b'Q' if body == b"ROLLBACK\0" => {
                 send(io, b'C', b"ROLLBACK\0").await?;
+                send(io, b'Z', b"I").await?;
+            }
+            b'Q' if body.ends_with(b"\n;\nCOMMIT\0") => {
+                // One message: six prelude statements, the statements
+                // between separators, then COMMIT.
+                let parts = body.windows(3).filter(|w| w == b"\n;\n").count();
+                if commit == CommitReply::Vanish {
+                    return Ok(());
+                }
+                for _ in 0..6 {
+                    send(io, b'C', b"SET\0").await?;
+                }
+                for _ in 1..parts {
+                    send(io, b'C', b"INSERT 0 1\0").await?;
+                }
+                send(io, b'C', b"COMMIT\0").await?;
                 send(io, b'Z', b"I").await?;
             }
             b'Q' => {
@@ -202,33 +219,35 @@ impl PgConnect for &Fake {
     }
 }
 
-fn pg(fake: &Fake, pipeline: bool) -> PgSql<&Fake> {
+fn pg(fake: &Fake, write_tx: WriteTx) -> PgSql<&Fake> {
     PgSql::new(
         fake,
         fake,
         PgConfig {
-            pipeline,
+            write_tx,
             ..PgConfig::default()
         },
     )
 }
 
+const BOTH: [WriteTx; 2] = [WriteTx::Message, WriteTx::Pipeline];
+
 /// Far beyond the in-memory exchange, even on a loaded runner.
 const DEADLINE: Duration = Duration::from_secs(5);
 
-async fn insert(fake: &Fake, pipeline: bool) -> Result<Vec<u64>> {
+async fn insert(fake: &Fake, write_tx: WriteTx) -> Result<Vec<u64>> {
     let stmts = vec![("INSERT INTO t VALUES (?1)", vec![SqlValue::Int(1)])];
-    tokio::time::timeout(DEADLINE, pg(fake, pipeline).batch(stmts))
+    tokio::time::timeout(DEADLINE, pg(fake, write_tx).batch(stmts))
         .await
         .expect("the result must not wait for the connection to close")
 }
 
 #[tokio::test]
 async fn a_close_that_never_resolves_does_not_delay_a_confirmed_commit() {
-    for pipeline in [true, false] {
+    for write_tx in BOTH {
         let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-        let result = insert(&fake, pipeline).await;
-        assert_eq!(result.unwrap(), [1], "pipeline={pipeline}");
+        let result = insert(&fake, write_tx).await;
+        assert_eq!(result.unwrap(), [1], "{write_tx:?}");
         // Returned with the driver stopped and before the graceful close
         // (Terminate, then the socket's shutdown) was even started.
         assert!(fake.stopped.load(Ordering::SeqCst));
@@ -240,9 +259,9 @@ async fn a_close_that_never_resolves_does_not_delay_a_confirmed_commit() {
 
 #[tokio::test]
 async fn a_close_error_after_a_confirmed_commit_is_success() {
-    for pipeline in [true, false] {
+    for write_tx in BOTH {
         let fake = Fake::new(Close::Fail, CommitReply::Confirm);
-        assert_eq!(insert(&fake, pipeline).await.unwrap(), [1]);
+        assert_eq!(insert(&fake, write_tx).await.unwrap(), [1]);
         assert!(fake.transport_released().await);
         assert_eq!(fake.connects.get(), 1);
     }
@@ -251,12 +270,12 @@ async fn a_close_error_after_a_confirmed_commit_is_success() {
 #[tokio::test]
 async fn an_error_before_the_commit_is_confirmed_still_propagates() {
     for close in [Close::Hang, Close::Fail] {
-        for pipeline in [true, false] {
+        for write_tx in BOTH {
             let fake = Fake::new(close, CommitReply::Vanish);
-            let result = insert(&fake, pipeline).await;
+            let result = insert(&fake, write_tx).await;
             assert!(
                 matches!(&result, Err(BridgeError::Sql(s)) if s == "pg: statement failed"),
-                "pipeline={pipeline}"
+                "{write_tx:?}"
             );
             assert_eq!(fake.connects.get(), 1);
         }
@@ -266,7 +285,7 @@ async fn an_error_before_the_commit_is_confirmed_still_propagates() {
 #[tokio::test]
 async fn a_read_does_not_wait_for_the_connection_to_close() {
     let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-    let rows = tokio::time::timeout(DEADLINE, pg(&fake, true).query("SELECT 1", &[]))
+    let rows = tokio::time::timeout(DEADLINE, pg(&fake, WriteTx::Message).query("SELECT 1", &[]))
         .await
         .expect("the result must not wait for the connection to close");
     assert!(rows.unwrap().is_empty());

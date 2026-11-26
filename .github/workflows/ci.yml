@@ -395,8 +395,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.bridge == 'true'
     runs-on: ubuntu-latest
-    # Measured local suite time and hosted test slowdown imply ~47 minutes plus build.
-    timeout-minutes: 75
+    # Measured local suite time and hosted test slowdown imply ~47 minutes plus build,
+    # plus the write-transport comparison step (4.5 min locally at 8 threads).
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:18@sha256:eece53c7c4410fb9c6556a19b8e0f2d61708a5893e2aa0a1e3c716661374ab18
@@ -447,7 +448,20 @@ jobs:
           coverage=0
           cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --tests --no-fail-fast -- --test-threads=4 || suite=$?
           cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record --test pg_statements catalog_statement_coverage -- --ignored --exact --nocapture || coverage=$?
-          (( suite == 0 && coverage == 0 ))
+          # Every write of these suites also runs, rolled back, on both write
+          # transports (typed and one message), with its own values and with
+          # NULL in every position; any difference fails. Three tests compare
+          # identity-sequence order between two fixtures, which the extra
+          # rolled-back inserts shift; they run in the suite above.
+          differential=0
+          VELMORA_TEST_PG_DIFFERENTIAL=1 cargo test --locked -p velmora-bridge --features testkit-pg,pg-test-record \
+            --test sql_objects --test sql_outbox --test sql_permits --test sql_uploads --test sql_publish \
+            --test sql_hot --test multipart --test conditional_writes --test usage --test gate_permits \
+            --no-fail-fast -- --test-threads=4 \
+            --skip a_replay_leaves_the_rows_the_per_extent_statements_left \
+            --skip complete_leaves_the_rows_the_per_extent_statements_left \
+            --skip unread_plans_are_read_in_runs_bounded_by_their_bytes || differential=$?
+          (( suite == 0 && coverage == 0 && differential == 0 ))
 
   # The S3 Worker bundle: wasm clippy with the request-target lint
   # (workers/s3-bridge/clippy.toml bans worker::Request::url), worker-build,

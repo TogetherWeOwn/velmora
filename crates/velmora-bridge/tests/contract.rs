@@ -594,7 +594,7 @@ fn missing_secret_fails_closed() {
     // Worker-only optional variables, validated by the Worker catalogue
     // selector instead of BridgeConfig. Nothing BridgeConfig reads may
     // be added here to bypass its missing-variable checks.
-    const WORKER_ONLY_OPTIONAL: [&str; 2] = ["CATALOG_BACKEND", "PG_PIPELINE"];
+    const WORKER_ONLY_OPTIONAL: [&str; 2] = ["CATALOG_BACKEND", "PG_WRITE_TX"];
     let (prod, dev) = wrangler_vars();
     let full = with_secrets(prod, &prod_providers());
     let dev = with_secrets(dev, PROVIDER_PLAIN);

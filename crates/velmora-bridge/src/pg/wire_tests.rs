@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
-use super::{batch::REJECT_BIND_SQL, PgConfig, PgConnect, PgConnection, PgSql};
+use super::{batch::REJECT_BIND_SQL, PgConfig, PgConnect, PgConnection, PgSql, WriteTx};
 use crate::{BridgeError, Result, Sql, SqlValue};
 
 const INSERT: &str = "INSERT INTO wp1_fault_marker VALUES (?1)";
@@ -188,13 +188,13 @@ async fn through_proxy(
     fault: Fault,
     stmts: Vec<(&'static str, Vec<SqlValue>)>,
 ) -> (Result<Vec<u64>>, Vec<Wire>) {
-    through_proxy_mode(port, fault, true, stmts).await
+    through_proxy_mode(port, fault, WriteTx::Pipeline, stmts).await
 }
 
 async fn through_proxy_mode(
     port: u16,
     fault: Fault,
-    pipeline: bool,
+    write_tx: WriteTx,
     stmts: Vec<(&'static str, Vec<SqlValue>)>,
 ) -> (Result<Vec<u64>>, Vec<Wire>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -207,7 +207,8 @@ async fn through_proxy_mode(
         c,
         PgConfig {
             lock_key: 7_413_000_011,
-            pipeline,
+            write_tx,
+            ..PgConfig::default()
         },
     );
     let result = tokio::time::timeout(Duration::from_secs(5), pg.batch(stmts))
@@ -312,11 +313,16 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
     );
     assert_eq!(stored(&root).await, 1);
 
-    let (res, trace) =
-        through_proxy_mode(port, Fault::RejectCommitReply, false, vec![insert(13)]).await;
+    let (res, trace) = through_proxy_mode(
+        port,
+        Fault::RejectCommitReply,
+        WriteTx::Pipeline,
+        vec![insert(13)],
+    )
+    .await;
     assert!(
         matches!(res,Err(BridgeError::Sql(s)) if s=="pg: statement failed"),
-        "sequential COMMIT timeout must be unknown"
+        "a COMMIT timeout must be unknown"
     );
     assert_eq!(
         trace,
@@ -332,20 +338,28 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
     let (res, _) = through_proxy(port, Fault::ChunkReplies, vec![insert(6)]).await;
     assert_eq!(res.unwrap(), [1]);
     assert_eq!(stored(&root).await, 3);
-    for pipelined in [false, true] {
+    for write_tx in [WriteTx::Message, WriteTx::Pipeline] {
         let c = Connector(config(port, "wp1_fault_writer"));
         let pg = PgSql::new(
             c.clone(),
             c,
             PgConfig {
                 lock_key: 7_413_000_011,
-                pipeline: pipelined,
+                write_tx,
+                ..PgConfig::default()
             },
         );
         assert_eq!(
-            pg.exec(INSERT, &[SqlValue::Int(if pipelined { 7 } else { 8 })])
-                .await
-                .unwrap(),
+            pg.exec(
+                INSERT,
+                &[SqlValue::Int(if write_tx == WriteTx::Pipeline {
+                    7
+                } else {
+                    8
+                })]
+            )
+            .await
+            .unwrap(),
             1
         );
     }

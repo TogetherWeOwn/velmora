@@ -77,6 +77,16 @@ impl Params {
             .map(|(b, t)| (b as &(dyn ToSql + Sync), t.clone()))
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The checked values, for the literal renderer. INT8 is 8 big-endian
+    /// bytes, TEXT is UTF-8 without NUL, BYTEA is raw, UNKNOWN is SQL NULL.
+    pub(super) fn wire(&self) -> impl Iterator<Item = (Option<&[u8]>, &Type)> {
+        self.0.iter().map(|(b, t)| (b.0.as_deref(), t))
+    }
+
     #[cfg(any(test, feature = "pg-test-record"))]
     pub(super) fn oids(&self) -> impl Iterator<Item = u32> + '_ {
         self.0.iter().map(|(_, t)| t.oid())

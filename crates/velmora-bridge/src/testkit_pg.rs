@@ -12,7 +12,7 @@ use tokio::runtime::{Builder, Handle, Id};
 use tokio::task::JoinHandle;
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
-use crate::pg::{PgConfig, PgConnect, PgConnection, PgSql};
+use crate::pg::{PgConfig, PgConnect, PgConnection, PgSql, ProbeOutcome, WriteTx};
 use crate::ports::{Row, Sql, SqlValue};
 use crate::types::{BridgeError, Result};
 
@@ -68,6 +68,19 @@ fn schema_script(last: &str) -> Result<String> {
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 pub const URL_VAR: &str = "VELMORA_TEST_PG_URL";
+
+/// `VELMORA_TEST_PG_WRITE_TX=pipeline` runs the suite on the typed write
+/// transport; unset or `message` on the default one-message transport.
+pub const WRITE_TX_VAR: &str = "VELMORA_TEST_PG_WRITE_TX";
+
+/// Run the transport comparison on every catalogue write (see
+/// [`TestPostgres::differential`]).
+pub const DIFFERENTIAL_VAR: &str = "VELMORA_TEST_PG_DIFFERENTIAL";
+
+fn write_tx() -> WriteTx {
+    let value = std::env::var(WRITE_TX_VAR).ok();
+    WriteTx::parse(value.as_deref()).unwrap_or_else(|e| panic!("{WRITE_TX_VAR}: {e}"))
+}
 
 fn pg_error(context: &str, error: tokio_postgres::Error) -> BridgeError {
     // Never print a connection URL, server message, or bound parameter.
@@ -271,20 +284,24 @@ impl TestPostgres {
             config: scoped,
             pool: None,
         };
-        let sql = |connector: NativePgConnect| {
+        let sql = |connector: NativePgConnect, write_tx| {
             PgSql::new(
                 connector.clone(),
                 connector,
                 PgConfig {
                     lock_key,
+                    write_tx,
                     ..PgConfig::default()
                 },
             )
         };
-        let catalog = sql(NativePgConnect {
-            config: connector.config.clone(),
-            pool: Some(Arc::default()),
-        });
+        let catalog = sql(
+            NativePgConnect {
+                config: connector.config.clone(),
+                pool: Some(Arc::default()),
+            },
+            write_tx(),
+        );
         #[cfg(feature = "pg-test-record")]
         let catalog = if _record {
             catalog.with_statement_recording()
@@ -307,13 +324,67 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            fixture_sql: sql(connector.clone()),
+            // Fixture SQL is test text, not a catalogue statement with
+            // declared results: it uses the typed transport.
+            fixture_sql: sql(connector.clone(), WriteTx::Pipeline),
             connector,
         })
     }
 
     pub fn lock_key(&self) -> i64 {
         self.lock_key
+    }
+
+    /// Run one write transaction on each transport against the current
+    /// catalogue state, rolling both back: (typed, one message).
+    pub async fn compare_transports(
+        &self,
+        stmts: &[(&str, Vec<SqlValue>)],
+        collect_rows: bool,
+    ) -> (ProbeOutcome, ProbeOutcome) {
+        let typed = self
+            .sql
+            .rolled_back(WriteTx::Pipeline, stmts, collect_rows)
+            .await;
+        let message = self
+            .sql
+            .rolled_back(WriteTx::Message, stmts, collect_rows)
+            .await;
+        (typed, message)
+    }
+
+    /// With `VELMORA_TEST_PG_DIFFERENTIAL=1`, every catalogue write of the
+    /// suite first runs rolled back on both transports, with its own
+    /// values and again with NULL in every position, and the results must
+    /// be equal. Statement text, never values, goes into a failure.
+    pub(super) async fn differential(&self, stmts: &[(&str, Vec<SqlValue>)], collect_rows: bool) {
+        if std::env::var_os(DIFFERENTIAL_VAR).is_none() {
+            return;
+        }
+        let nulls: Vec<(&str, Vec<SqlValue>)> = stmts
+            .iter()
+            .map(|(sql, args)| (*sql, vec![SqlValue::Null; args.len()]))
+            .collect();
+        for (variant, stmts) in [("values", stmts), ("nulls", &nulls[..])] {
+            let (typed, message) = self.compare_transports(stmts, collect_rows).await;
+            let same = match (&typed, &message) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(a), Err(b)) => format!("{a:?}") == format!("{b:?}"),
+                _ => false,
+            };
+            if !same {
+                let texts: Vec<&str> = stmts.iter().map(|(sql, _)| *sql).collect();
+                let class = |o: &ProbeOutcome| match o {
+                    Ok((counts, rows)) => format!("Ok(counts {counts:?}, {} row sets)", rows.len()),
+                    Err(e) => format!("Err({e:?})"),
+                };
+                panic!(
+                    "transport difference ({variant}): typed {}, message {}: {texts:?}",
+                    class(&typed),
+                    class(&message)
+                );
+            }
+        }
     }
 
     /// Open a session for typed PREPARE and fixture setup. The connection is
@@ -335,6 +406,7 @@ impl TestPostgres {
                 connector,
                 PgConfig {
                     lock_key,
+                    write_tx: WriteTx::Pipeline,
                     ..PgConfig::default()
                 },
             );

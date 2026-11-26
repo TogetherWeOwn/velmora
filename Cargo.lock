@@ -2461,6 +2461,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "hmac",
+ "log",
  "md-5",
  "md5",
  "native-tls",
@@ -2560,6 +2561,7 @@ name = "velmora-s3-bridge"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "log",
  "serde",
  "serde_json",
  "tokio",

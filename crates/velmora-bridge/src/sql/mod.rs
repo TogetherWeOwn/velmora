@@ -1147,6 +1147,23 @@ mod pg_manifest_tests {
         }
     }
 
+    /// The one-message transport sends only ASCII: every catalogue
+    /// statement text is ASCII, so the rendered message is too.
+    #[test]
+    fn every_statement_renders_as_one_ascii_message() {
+        let all = pg_datapath_statements()
+            .into_iter()
+            .map(|(sql, params)| (sql.to_owned(), params))
+            .chain(pg_background_statements());
+        for (sql, params) in all {
+            assert!(sql.is_ascii(), "non-ASCII catalogue SQL: {sql}");
+            assert!(
+                crate::pg::renders_as_one_message(&sql, &params).unwrap(),
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn declared_background_binds_cover_every_statement_position() {
         let statements = pg_background_statements();

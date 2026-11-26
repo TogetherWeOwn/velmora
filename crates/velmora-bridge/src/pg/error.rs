@@ -4,7 +4,7 @@ pub(super) fn statement_failed() -> BridgeError {
     BridgeError::Sql("pg: statement failed".into())
 }
 
-fn overloaded() -> BridgeError {
+pub(super) fn overloaded() -> BridgeError {
     BridgeError::Sql("pg: overloaded".into())
 }
 
@@ -17,6 +17,26 @@ pub(super) fn before_catalogue(error: tokio_postgres::Error) -> BridgeError {
     } else {
         without_guard(from_driver(error))
     }
+}
+
+/// Whether Hyperdrive's 58000 is known to come before it forwards a
+/// one-message transaction. Until the message-mode pool probe shows it,
+/// a 58000 with no CommandComplete may follow a forwarded message, so it
+/// is `statement failed`, not a refusal.
+pub(super) const MESSAGE_58000_BEFORE_FORWARD: bool = false;
+
+/// SQLSTATEs a catalogue or prelude statement itself raises, by the C1
+/// classification table. Any other code inside a one-message transaction
+/// (a connection class, an internal error, a proxy's code) is `statement
+/// failed`, whatever `classify` would say.
+pub(super) fn server_statement_code(code: &str) -> bool {
+    code.starts_with("23")
+        || code.starts_with("22")
+        || code.starts_with("42")
+        || matches!(
+            code,
+            "VL001" | "55P03" | "57014" | "40001" | "40P01" | "25006"
+        )
 }
 
 pub(super) fn shape() -> BridgeError {
