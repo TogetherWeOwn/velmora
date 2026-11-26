@@ -426,6 +426,118 @@ async fn bulk_statements_write_each_usage_row_once() {
     eprintln!("usage bulk workload, 12 statements of 100,000 rows: {elapsed:?}");
 }
 
+/// Time one statement inside a rolled-back transaction; return the rows it
+/// changed and the elapsed time.
+async fn timed_rollback(db: &Client, sql: &str) -> (u64, Duration) {
+    exec(db, "BEGIN").await;
+    let started = Instant::now();
+    let changed = exec(db, sql).await;
+    let elapsed = started.elapsed();
+    exec(db, "ROLLBACK").await;
+    (changed, elapsed)
+}
+
+/// PL/pgSQL caches each trigger query with the transition-table size of
+/// its first firing in the session. A pooled session's first event is
+/// usually one row, so every changed trigger must stay linear after a
+/// single-row firing on the same connection: 10x the rows may take at most
+/// 30x the time (quadratic is 100x), and 20,000 rows at most 4 s.
+#[tokio::test]
+async fn bulk_statements_stay_linear_after_a_single_row_firing_on_the_same_session() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let pg = TestPostgres::through_stage(&stage_under_test(), true).unwrap();
+    let db = session(&pg).await;
+    let last = 20_005;
+    exec(
+        &db,
+        &format!(
+            "SET statement_timeout = '60s'; \
+             INSERT INTO buckets(id,name,owner,bdk_wrapped,kek_version,created_at) \
+               VALUES ('b','b','o','\\x',1,0); \
+             UPDATE usage_global SET cur_x = 'k0010000', cur_o = 'k0010000', cur_g = 'g0010000' WHERE id = 2; \
+             INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,\
+               plain_sha256,cipher_sha256,safety_state,created_at) \
+               SELECT 'k' || lpad(i::text, 7, '0'),'b','staged',1,10,'\\x','\\x','\\x','\\x','held',0 \
+                 FROM generate_series(0, {last}) i; \
+             INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at) \
+               SELECT id,'gen','post',0,{T0} FROM extents; \
+             INSERT INTO generations(id,bucket_id,key,state,size,etag,content_json,user_meta_json,\
+               extent_count,created_at) \
+               SELECT 'g' || lpad(i::text, 7, '0'),'b','key' || i,'live',3,'e','{{}}','{{}}',0,0 \
+                 FROM generate_series(0, {last}) i"
+        ),
+    )
+    .await;
+    let below = |n: i64| format!("'k{n:07}'");
+    let gbelow = |n: i64| format!("'g{n:07}'");
+    // (single-row firing that has an event, bulk statement over the first n rows)
+    type Shape = (&'static str, Box<dyn Fn(i64) -> String>);
+    let shapes: Vec<Shape> = vec![
+        (
+            "UPDATE extents SET safety_state = 'released' WHERE id = 'k0020000'",
+            Box::new(move |n| {
+                format!("UPDATE extents SET safety_state = 'released' WHERE id < {}", below(n))
+            }),
+        ),
+        (
+            "UPDATE generations SET state = 'superseded' WHERE id = 'g0020000'",
+            Box::new(move |n| {
+                format!("UPDATE generations SET state = 'superseded' WHERE id < {}", gbelow(n))
+            }),
+        ),
+        (
+            "UPDATE outbox SET stage = 'verify', updated_at = 1762992000000 WHERE extent_id = 'k0020001'",
+            Box::new(move |n| {
+                format!(
+                    "UPDATE outbox SET stage = 'verify', updated_at = {} WHERE extent_id < {}",
+                    T0 + HOUR,
+                    below(n)
+                )
+            }),
+        ),
+        (
+            "UPDATE outbox SET last_error = 'boom', updated_at = 1762992000000 WHERE extent_id = 'k0020002'",
+            Box::new(move |n| {
+                format!(
+                    "UPDATE outbox SET last_error = 'boom', updated_at = {} WHERE extent_id < {}",
+                    T0 + HOUR,
+                    below(n)
+                )
+            }),
+        ),
+        (
+            "DELETE FROM outbox WHERE extent_id = 'k0020003'",
+            Box::new(move |n| format!("DELETE FROM outbox WHERE extent_id < {}", below(n))),
+        ),
+        (
+            "DELETE FROM generations WHERE id = 'g0020003'",
+            Box::new(move |n| format!("DELETE FROM generations WHERE id < {}", gbelow(n))),
+        ),
+    ];
+    let mut report = Vec::new();
+    for (warm, bulk) in &shapes {
+        assert_eq!(exec(&db, warm).await, 1, "{warm}");
+        let (small_rows, small) = timed_rollback(&db, &bulk(2_000)).await;
+        let (large_rows, large) = timed_rollback(&db, &bulk(20_000)).await;
+        assert_eq!(
+            (small_rows, large_rows),
+            (2_000, 20_000),
+            "{}",
+            bulk(20_000)
+        );
+        report.push(format!("{:?} -> {:?}: {}", small, large, bulk(20_000)));
+        assert!(
+            large < Duration::from_secs(4)
+                && large.as_secs_f64() < 30.0 * small.as_secs_f64().max(0.01),
+            "not linear on a warm session: 2,000 rows {small:?}, 20,000 rows {large:?}: {}",
+            bulk(20_000)
+        );
+    }
+    eprintln!("warm-session usage triggers:\n{}", report.join("\n"));
+}
+
 // ---------------------------------------------------------------------------
 // The failure trigger
 // ---------------------------------------------------------------------------

@@ -34,6 +34,15 @@ DROP FUNCTION trg_usage_outbox_insert();
 DROP FUNCTION trg_usage_outbox_delete();
 DROP FUNCTION trg_usage_outbox_update();
 
+-- Plans: PL/pgSQL caches each query with the transition-table size of its
+-- first firing in the session, which is usually one row. A cached inner
+-- join of two transition tables can then run as a nested loop, O(N^2) for a
+-- later bulk statement. So no query here joins new_rows to old_rows with an
+-- inner join: per-row deltas are summed from a UNION ALL of both tables (no
+-- join), and pairing by key is a FULL JOIN, which PostgreSQL executes only as
+-- a hash or merge join, never as a nested loop. A FULL JOIN that a WHERE
+-- clause could reduce to an inner join is kept in a MATERIALIZED CTE.
+--
 -- Coverage: usage row u counts changed row r when u.all_* = 1 or r's key
 -- <= u.cur_* (byte order: every key column and variable is COLLATE "C").
 -- A row covers some changed row exactly when it covers the smallest one,
@@ -118,23 +127,22 @@ BEGIN
     IF first_id IS NULL THEN
         RETURN NULL;
     END IF;
+    -- NEW minus OLD over every row, without pairing: a pair outside the WHEN
+    -- has the same class and cipher_size on both sides, so it adds zero, and
+    -- both sides of a pair have the same key, so the same coverage.
     UPDATE usage_global u SET
         (x_unreleased, unreleased_bytes, x_released, released_bytes, x_deleted) = (
-            SELECT u.x_unreleased + sum((n.safety_state IN ('held', 'releasing'))::int
-                                        - (o.safety_state IN ('held', 'releasing'))::int),
-                   u.unreleased_bytes + sum(
-                         CASE WHEN n.safety_state IN ('held', 'releasing') THEN n.cipher_size ELSE 0 END
-                       - CASE WHEN o.safety_state IN ('held', 'releasing') THEN o.cipher_size ELSE 0 END),
-                   u.x_released + sum((n.safety_state = 'released')::int - (o.safety_state = 'released')::int),
-                   u.released_bytes + sum(
-                         CASE WHEN n.safety_state = 'released' THEN n.cipher_size ELSE 0 END
-                       - CASE WHEN o.safety_state = 'released' THEN o.cipher_size ELSE 0 END),
-                   u.x_deleted + sum((n.safety_state = 'deleted')::int - (o.safety_state = 'deleted')::int)
-              FROM new_rows n JOIN old_rows o ON o.id = n.id
-             WHERE ((n.safety_state IN ('held', 'releasing')) <> (o.safety_state IN ('held', 'releasing'))
-                    OR (n.safety_state = 'released') <> (o.safety_state = 'released')
-                    OR n.cipher_size <> o.cipher_size)
-               AND (u.all_x = 1 OR n.id <= u.cur_x))
+            SELECT u.x_unreleased + sum(d.sign * (d.safety_state IN ('held', 'releasing'))::int),
+                   u.unreleased_bytes + sum(d.sign * CASE WHEN d.safety_state IN ('held', 'releasing')
+                                                          THEN d.cipher_size ELSE 0 END),
+                   u.x_released + sum(d.sign * (d.safety_state = 'released')::int),
+                   u.released_bytes + sum(d.sign * CASE WHEN d.safety_state = 'released'
+                                                        THEN d.cipher_size ELSE 0 END),
+                   u.x_deleted + sum(d.sign * (d.safety_state = 'deleted')::int)
+              FROM (SELECT n.id, n.safety_state, n.cipher_size, 1 AS sign FROM new_rows n
+                    UNION ALL
+                    SELECT o.id, o.safety_state, o.cipher_size, -1 FROM old_rows o) d
+             WHERE u.all_x = 1 OR d.id <= u.cur_x)
      WHERE u.id IN (1, 2) AND (u.all_x = 1 OR u.cur_x >= first_id);
     RETURN NULL;
 END;
@@ -184,26 +192,35 @@ CREATE TRIGGER usage_generations_delete AFTER DELETE ON generations
 
 CREATE FUNCTION trg_usage_generations_update_stmt() RETURNS trigger
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+    unpaired BOOLEAN;
 BEGIN
-    IF EXISTS (SELECT FROM new_rows n FULL JOIN old_rows o ON o.id = n.id
-               WHERE n.id IS NULL OR o.id IS NULL) THEN
+    SELECT bool_or(n.id IS NULL OR o.id IS NULL) INTO unpaired
+      FROM new_rows n FULL JOIN old_rows o ON o.id = n.id;
+    IF unpaired THEN
         RAISE EXCEPTION 'usage counters require a stable generations.id' USING ERRCODE = 'VL002';
     END IF;
+    -- Which buckets a pair touches depends on the pair (the D1 WHEN), so
+    -- this pairs rows by key, in a FULL JOIN that the outer filter cannot
+    -- turn into an inner join.
+    WITH p AS MATERIALIZED (
+        SELECT n.id, o.bucket_id AS o_bucket, o.size AS o_size, o.state = 'live' AS o_live,
+               n.bucket_id AS n_bucket, n.size AS n_size, n.state = 'live' AS n_live
+          FROM new_rows n FULL JOIN old_rows o ON o.id = n.id
+    ), e AS (
+        SELECT u.id AS kind, p.o_bucket AS bucket_id, -1 AS objects, -p.o_size AS bytes
+          FROM p JOIN usage_global u ON u.id IN (1, 2) AND (u.all_g = 1 OR p.id <= u.cur_g)
+         WHERE p.o_live
+           AND (p.n_live <> p.o_live OR (p.n_live AND (p.n_size <> p.o_size OR p.n_bucket <> p.o_bucket)))
+        UNION ALL
+        SELECT u.id, p.n_bucket, 1, p.n_size
+          FROM p JOIN usage_global u ON u.id IN (1, 2) AND (u.all_g = 1 OR p.id <= u.cur_g)
+         WHERE p.n_live
+           AND (p.n_live <> p.o_live OR (p.n_live AND (p.n_size <> p.o_size OR p.n_bucket <> p.o_bucket)))
+    )
     INSERT INTO usage_buckets (kind, bucket_id, live_objects, live_bytes)
     SELECT e.kind, e.bucket_id, sum(e.objects), sum(e.bytes)
-      FROM (SELECT u.id AS kind, o.bucket_id, -1 AS objects, -o.size AS bytes
-              FROM new_rows n JOIN old_rows o ON o.id = n.id
-              JOIN usage_global u ON u.id IN (1, 2) AND (u.all_g = 1 OR o.id <= u.cur_g)
-             WHERE o.state = 'live'
-               AND ((n.state = 'live') <> (o.state = 'live')
-                    OR (n.state = 'live' AND (n.size <> o.size OR n.bucket_id <> o.bucket_id)))
-            UNION ALL
-            SELECT u.id, n.bucket_id, 1, n.size
-              FROM new_rows n JOIN old_rows o ON o.id = n.id
-              JOIN usage_global u ON u.id IN (1, 2) AND (u.all_g = 1 OR n.id <= u.cur_g)
-             WHERE n.state = 'live'
-               AND ((n.state = 'live') <> (o.state = 'live')
-                    OR (n.state = 'live' AND (n.size <> o.size OR n.bucket_id <> o.bucket_id)))) e
+      FROM e
      GROUP BY e.kind, e.bucket_id
     ON CONFLICT (kind, bucket_id) DO UPDATE SET
         live_objects = usage_buckets.live_objects + EXCLUDED.live_objects,
@@ -350,14 +367,19 @@ BEGIN
                    count(*) FILTER (WHERE (e.os = 'release' AND e.ns = 'done') OR e.released) AS releases,
                    count(*) FILTER (WHERE e.ns = 'dead' AND e.os <> 'dead') AS dead,
                    count(*) FILTER (WHERE e.ns = e.os) AS failed
-              FROM (SELECT n.updated_at / 3600000 AS event_hour, n.stage AS ns, o.stage AS os,
-                           CASE WHEN o.stage = 'verify' AND n.stage = 'done'
-                                THEN EXISTS (SELECT 1 FROM extents x WHERE x.id = n.extent_id
-                                              AND x.safety_state = 'released' AND x.released_at = n.updated_at)
+              FROM (WITH p AS MATERIALIZED (
+                        -- Events are per pair: a FULL JOIN (hash or merge
+                        -- only), kept apart from the filter below.
+                        SELECT n.extent_id, n.updated_at, n.stage AS ns, o.stage AS os, n.last_error
+                          FROM new_rows n FULL JOIN old_rows o ON o.extent_id = n.extent_id)
+                    SELECT p.updated_at / 3600000 AS event_hour, p.ns, p.os,
+                           CASE WHEN p.os = 'verify' AND p.ns = 'done'
+                                THEN EXISTS (SELECT 1 FROM extents x WHERE x.id = p.extent_id
+                                              AND x.safety_state = 'released' AND x.released_at = p.updated_at)
                                 ELSE false END AS released
-                      FROM new_rows n JOIN old_rows o ON o.extent_id = n.extent_id
-                     WHERE (n.stage <> o.stage OR (failures AND n.last_error IS NOT NULL))
-                       AND (u.all_o = 1 OR n.extent_id <= cur)) e
+                      FROM p
+                     WHERE (p.ns <> p.os OR (failures AND p.last_error IS NOT NULL))
+                       AND (u.all_o = 1 OR p.extent_id <= cur)) e
              GROUP BY e.event_hour
              ORDER BY e.event_hour
         LOOP

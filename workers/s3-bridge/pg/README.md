@@ -127,7 +127,11 @@ N rows changed in one transaction. Stage 0003 replaces them with statement
 triggers over transition tables: each statement writes each `usage_global`
 row at most once, each `usage_buckets` key once and each `usage_hours` row
 once per rolled hour, with the same values at every statement boundary.
-`usage_outbox_failure` keeps its `last_error` column list to see SET
+No query joins the two transition tables with an inner join: PL/pgSQL
+caches plans with the first firing's (often one-row) table size, and a
+cached nested loop would be quadratic again. Deltas are summed over
+`new_rows UNION ALL old_rows`, and pairing by key is a FULL JOIN (hash or
+merge only). `usage_outbox_failure` keeps its `last_error` column list to see SET
 targets; it marks the statement and `usage_outbox_stage` counts the
 failures in the same ascending-hour pass. `--test` compares the shared
 fixture with SQLite, including mixed-hour statements that SQLite applies in

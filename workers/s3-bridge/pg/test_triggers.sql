@@ -381,4 +381,46 @@ BEGIN
     IF NOT FOUND THEN RAISE EXCEPTION 'non-shared outbox row was not cancellable'; END IF;
 END;
 $$;
+-- PostgreSQL only (SQLite applies rows in key order): one statement whose
+-- lower-key row fails in a later hour than its higher-key row's stage
+-- change must equal the same changes as separate statements in ascending
+-- hour order. Each variant runs in a block that is rolled back.
+DO $$
+DECLARE
+    combined text;
+    separate text;
+    filed bigint;
+BEGIN
+    INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,
+                        cipher_sha256,safety_state,created_at) VALUES
+        ('wp2_pa','wp2_a','staged',1,1,'','','','','held',0), ('wp2_pb','wp2_a','staged',1,1,'','','','','held',0);
+    INSERT INTO outbox(extent_id,generation_id,stage,next_at,updated_at,seq) VALUES
+        ('wp2_pa','g_p','verify',0,0,-201), ('wp2_pb','g_p','post',0,0,-202);
+    BEGIN
+        UPDATE outbox SET stage = CASE extent_id WHEN 'wp2_pb' THEN 'verify' ELSE stage END,
+                          last_error = CASE extent_id WHEN 'wp2_pa' THEN 'late' ELSE last_error END,
+                          updated_at = CASE extent_id WHEN 'wp2_pa' THEN 75600000 ELSE 72000000 END
+         WHERE extent_id IN ('wp2_pa','wp2_pb');
+        SELECT (SELECT string_agg(g::text, ';' ORDER BY g.id) FROM usage_global g) || '|'
+               || COALESCE((SELECT string_agg(h::text, ';' ORDER BY h.hour) FROM usage_hours h), '') INTO combined;
+        SELECT posts INTO filed FROM usage_hours WHERE hour = 20;
+        RAISE EXCEPTION USING ERRCODE = 'VL990';
+    EXCEPTION WHEN SQLSTATE 'VL990' THEN NULL;
+    END;
+    BEGIN
+        UPDATE outbox SET stage = 'verify', updated_at = 72000000 WHERE extent_id = 'wp2_pb';
+        UPDATE outbox SET last_error = 'late', updated_at = 75600000 WHERE extent_id = 'wp2_pa';
+        SELECT (SELECT string_agg(g::text, ';' ORDER BY g.id) FROM usage_global g) || '|'
+               || COALESCE((SELECT string_agg(h::text, ';' ORDER BY h.hour) FROM usage_hours h), '') INTO separate;
+        RAISE EXCEPTION USING ERRCODE = 'VL990';
+    EXCEPTION WHEN SQLSTATE 'VL990' THEN NULL;
+    END;
+    IF combined IS NULL OR combined IS DISTINCT FROM separate THEN
+        RAISE EXCEPTION 'mixed-hour statement differs from ascending separate statements: % / %', combined, separate;
+    END IF;
+    IF filed IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'the hour-20 post was not filed in hour 20 (posts %)', filed;
+    END IF;
+END;
+$$;
 SELECT json_agg(json_build_array(step,target,values_) ORDER BY step,target) FROM wp2_usage_trace;
