@@ -795,14 +795,22 @@ where
         // ended before their collection guard: collected if unreferenced,
         // whatever `SCRUB` says.
         self.reconcile_put_intents(self.clock.now()).await?;
+        // Kept fills still to be written, from an earlier step that ran
+        // out of its share when the tier was no longer over its cap.
+        let stored = self.catalog.evict_cursor().await?;
+        let pending = match &stored {
+            EvictCursor::Promote(inner) => Some((**inner).clone()),
+            _ => None,
+        };
         let mut excess = remaining;
         if excess == 0 {
             let cap = self.effective_cap().await?;
             let total = self.catalog.evictable_bytes().await?;
-            if total <= cap {
+            if total > cap {
+                excess = total - low_watermark(cap);
+            } else if pending.is_none() {
                 return Ok(0);
             }
-            excess = total - low_watermark(cap);
         } else if !self.catalog.hot_drain_claim(remaining).await? {
             // A second delivery of a step that already ran, or a step of
             // a drain that another one replaced: its `remaining` is stale.
@@ -813,9 +821,10 @@ where
         // on where the step before left the listing. Each step reads one
         // bounded window, however many rows in it may not go, and moves
         // the cursor past it even when none could.
-        let cursor = match remaining {
-            0 => EvictCursor::Start,
-            _ => self.catalog.evict_cursor().await?,
+        let cursor = match (pending, remaining) {
+            (Some(inner), _) => inner,
+            (None, 0) => EvictCursor::Start,
+            (None, _) => stored,
         };
         let (rule, counting) = self.evict_rule();
         let window = self
@@ -831,16 +840,33 @@ where
         // with no memory to spare now, the next step reads it again.
         let mut promoted = 0;
         let mut again = None;
-        for kept in &window.unproven {
+        // Whether each kept fill is still in the cache: HEADs, a few at a
+        // time rather than one after another.
+        let mut present = Vec::with_capacity(window.unproven.len());
+        for chunk in window.unproven.chunks(EVICT_HEADS_AT_ONCE) {
+            let heads = chunk.iter().map(|kept| async move {
+                match kept.row.cache_bytes {
+                    0 => Ok(true),
+                    _ => self
+                        .cache
+                        .head(&kept.row.extent.cache_key())
+                        .await
+                        .map(|head| head.is_some()),
+                }
+            });
+            for head in futures_util::future::join_all(heads).await {
+                present.push(head?);
+            }
+        }
+        for (kept, present) in window.unproven.iter().zip(present) {
             if kept.row.cache_bytes == 0 {
                 continue;
             }
             // A fill the cache's lifecycle rule took is no longer counted,
             // and its bytes are no longer part of what this drain has to
             // free: they would make it take other copies.
-            let gone = self.forget_gone_fill(&kept.row).await?;
-            if gone > 0 {
-                excess = excess.saturating_sub(gone);
+            if !present {
+                excess = excess.saturating_sub(self.forget_gone_fill(&kept.row).await?);
                 continue;
             }
             if !kept.promote || kept.row.safety_bytes > 0 {
@@ -876,12 +902,24 @@ where
         }
         if let Some((resume, delay)) = again {
             // Nothing is evicted in this step; the next one goes on from
-            // the first fill not yet written.
-            self.catalog.set_evict_cursor(&resume).await?;
-            self.catalog.hot_drain_set(excess).await?;
-            let next = Job::Evict {
-                v: JOB_VERSION,
-                remaining: excess,
+            // the first fill not yet written. With nothing left to free,
+            // the cursor itself says so, and the next step starts as a
+            // drain does but writes those fills first.
+            let next = if excess == 0 {
+                self.catalog
+                    .set_evict_cursor(&EvictCursor::Promote(Box::new(resume)))
+                    .await?;
+                Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: 0,
+                }
+            } else {
+                self.catalog.set_evict_cursor(&resume).await?;
+                self.catalog.hot_drain_set(excess).await?;
+                Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: excess,
+                }
             };
             self.jobs.send(&next, delay).await?;
             return Ok(0);
@@ -1051,11 +1089,8 @@ where
 
     /// A kept fill that is gone from the cache (the lifecycle rule took
     /// it) is no longer counted, if the row is as listed. The bytes no
-    /// longer counted (0 when the fill is there or the row moved).
+    /// longer counted (0 when the row moved).
     async fn forget_gone_fill(&self, kept: &EvictCandidate) -> Result<u64> {
-        if self.cache.head(&kept.extent.cache_key()).await?.is_some() {
-            return Ok(0);
-        }
         Ok(
             match self
                 .catalog
@@ -1650,6 +1685,9 @@ where
 /// eviction step (each one a read and a write of up to one extent); the
 /// next step goes on from the first one not written.
 const EVICT_PROMOTE_PER_STEP: usize = 8;
+
+/// Cache HEADs of kept fills a step has in flight at once.
+const EVICT_HEADS_AT_ONCE: usize = 16;
 
 /// The next step's delay when the jobs' memory had no room for a write.
 const EVICT_PROMOTE_BUSY_SECS: u32 = 60;

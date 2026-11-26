@@ -1279,11 +1279,22 @@ pub enum EvictCursor {
     Start,
     /// After the row with this read stamp and id.
     After(i64, String),
+    /// Kept fills from this cursor on are still to be written to the
+    /// safety store: the next step does that first, even when the tier is
+    /// no longer over its cap.
+    Promote(Box<EvictCursor>),
 }
 
 impl EvictCursor {
     /// A value this code did not write reads as the start.
     pub fn parse(v: &str) -> EvictCursor {
+        if let Some(rest) = v.strip_prefix("promote:") {
+            return match EvictCursor::parse(rest) {
+                // Never nested: a value this code did not write.
+                EvictCursor::Promote(_) => EvictCursor::Start,
+                inner => EvictCursor::Promote(Box::new(inner)),
+            };
+        }
         match v.split_once(':') {
             Some(("after", rest)) => match rest.split_once(':') {
                 Some((read, id)) => read
@@ -1300,6 +1311,7 @@ impl EvictCursor {
         match self {
             EvictCursor::Start => "start".to_owned(),
             EvictCursor::After(read, id) => format!("after:{read}:{id}"),
+            EvictCursor::Promote(inner) => format!("promote:{}", inner.encode()),
         }
     }
 }

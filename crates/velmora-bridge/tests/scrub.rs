@@ -3698,14 +3698,15 @@ async fn a_slow_pool_read_ends_the_retained_sessions_before_their_slots_run_out(
         w.advance_secs(PERMIT_SECS + 60);
         // Bounded by time, not executor turns: ending the session is
         // catalogue I/O, which on PostgreSQL takes real round trips.
-        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
-        while held().await != "0" {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the kept session is ended while the pool read is pending"
-            );
-            tokio::task::yield_now().await;
-        }
+        // The whole wait is bounded, a stalled count read with it.
+        let ended = async {
+            while held().await != "0" {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(HOLD_TIMEOUT, ended)
+            .await
+            .expect("the kept session is ended while the pool read is pending");
         sql.selected_query.release();
     };
     tokio::select! {
@@ -5388,4 +5389,60 @@ async fn a_gone_fill_does_not_make_the_drain_take_another_copy() {
     assert!(w.bridge().cache.lose(&kept.extent.cache_key()));
     w.bridge().evict_batch(0).await.unwrap();
     assert!(w.has_safety(&other), "the evictable copy stays");
+}
+
+/// Kept fills still to be written when the drain has nothing left to free
+/// (gone fills took its whole excess): the next step writes them, though
+/// it starts as a new drain and the tier, with the copies written so far,
+/// is no longer over its cap.
+#[tokio::test(flavor = "current_thread")]
+async fn kept_fills_are_promoted_after_the_excess_runs_out() {
+    let mut w = world().await;
+    // Nine fills the lifecycle rule took, ahead of nine to write.
+    let mut gone = Vec::new();
+    for i in 0..9u8 {
+        let name = format!("g{i}");
+        let o = w.released(&name, 91 + i).await;
+        cache_only(&w, &o, &name).await;
+        set_evidence(&w, &o, &[("alpha", "body")]).await;
+        gone.push(o);
+    }
+    let mut objs = Vec::new();
+    for i in 0..9u8 {
+        let name = format!("k{i}");
+        let o = w.released(&name, 110 + i).await;
+        cache_only(&w, &o, &name).await;
+        set_evidence(&w, &o, &[("alpha", "body")]).await;
+        w.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_exec(
+                "UPDATE extents SET last_read_at = last_read_at + 1000 WHERE id = ?1",
+                &[SqlValue::Text(o.extent.as_str().to_owned())],
+            )
+            .await
+            .unwrap();
+        objs.push(o);
+    }
+    let size: u64 = w
+        .scalar(
+            "SELECT cipher_size FROM extents WHERE id = ?1",
+            &gone[0].extent,
+        )
+        .await
+        .parse()
+        .unwrap();
+    // 18 fills counted, over the cap; once the gone ones are not counted,
+    // the nine fills and the eight copies written in a step are under it.
+    cfg_mut(&mut w).hot_cap_bytes = 18 * size - 1;
+    for o in &gone {
+        assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+    }
+    w.bridge().jobs.inner.take();
+    w.bridge().evict_batch(0).await.unwrap();
+    drain_steps(&w).await;
+    for (i, o) in objs.iter().enumerate() {
+        assert!(w.has_safety(o), "k{i}: promoted");
+    }
 }
