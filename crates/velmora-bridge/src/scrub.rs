@@ -245,6 +245,10 @@ struct Walk<'w, 's, C: Catalog, N: NntpConnector, T: Clock> {
     blocked_repins: u32,
     /// Separate recovery streaks; a check of A never clears B's block.
     clean: Vec<(String, u64)>,
+    /// A re-verify under way: its retry deadline, kept by every record of
+    /// the extent that names none, until a re-pin (the run's `repaired`
+    /// count when it began).
+    retry: Option<(UnixMs, u64)>,
 }
 
 struct Observation {
@@ -384,6 +388,7 @@ where
             unavailable: Vec::new(),
             blocked_repins: 0,
             clean,
+            retry: None,
         };
         let ended = self.scrub_pages(started, &mut reader, &mut walk).await;
         let mut blocked = core::mem::take(&mut walk.blocked);
@@ -573,6 +578,12 @@ where
     ) -> core::result::Result<(), Halt> {
         let token = walk.token;
         let now = self.clock.now();
+        // A re-verify that has not re-pinned keeps its retry.
+        let next = next.or_else(|| {
+            walk.retry
+                .filter(|(_, repaired)| u64::from(walk.run.repaired) == *repaired)
+                .map(|(at, _)| at)
+        });
         // Released-copy deadlines live in scrub_copies. Only the repair
         // watch puts an extent-wide deadline on the extent row.
         let write = self
@@ -877,7 +888,7 @@ where
             && walk.run.incident.is_none()
             && walk.breaker.tripped().is_empty();
         if !may {
-            return self.defer_watch(walk, extent).await;
+            return self.defer_watch(walk, extent).await.map(|_| ());
         }
         crate::trace::alert(|| {
             format!(
@@ -887,7 +898,14 @@ where
                 unproven.join(",")
             )
         });
-        let repaired = walk.run.repaired;
+        // The retry is on record before anything of the re-verify is, and
+        // every record of it that names no deadline keeps it, until a
+        // re-pin sets the repair's own (a read that broke off or found no
+        // slot, a store that did not answer, a copy that could not be
+        // written, or no intact copy: looked at again after the confirm
+        // interval).
+        let retry = self.defer_watch(walk, extent).await?;
+        walk.retry = Some((retry, u64::from(walk.run.repaired)));
         let outcome = match self
             .repair_read(reader, walk, extent, stored, unproven)
             .await
@@ -895,13 +913,7 @@ where
             Ok(found) => self.repair(reader, walk, candidate, found, true).await,
             Err(halt) => Err(halt),
         };
-        if walk.run.repaired == repaired {
-            // Not re-pinned (a read that broke off or found no slot, a
-            // store that did not answer, a copy that could not be written,
-            // or no intact copy): looked at again after the confirm
-            // interval, whatever the outcome wrote or left.
-            let _ = self.defer_watch(walk, extent).await;
-        }
+        walk.retry = None;
         outcome
     }
 
@@ -923,7 +935,7 @@ where
         &self,
         walk: &mut Walk<'_, '_, C, N, T>,
         extent: &ExtentRow,
-    ) -> core::result::Result<(), Halt> {
+    ) -> core::result::Result<UnixMs, Halt> {
         let next = self
             .clock
             .now()
@@ -931,7 +943,7 @@ where
         self.catalog
             .scrub_defer(walk.token, &extent.id, next)
             .await?;
-        Ok(())
+        Ok(next)
     }
 
     fn alert_bad_plan(extent: &ExtentRow, what: &str) {
@@ -1639,13 +1651,37 @@ where
         }
     }
 
-    /// Deletes a safety object whose bytes are not the extent's. Every
-    /// object under a safety key is then an intact copy: eviction keeps a
-    /// pinned extent's cache fill only until one is in place, by `HEAD`.
-    /// The deleted object is no longer counted. `false`: the delete or the
-    /// count failed.
+    /// Deletes a safety object whose bytes are not the extent's, unless the
+    /// store checked them as the extent's when they were stored. Eviction
+    /// takes only such a checked blob for a pinned extent's copy, so the
+    /// two never meet on one blob; the sequence moves before the delete
+    /// as well. The deleted object is no longer counted. `false`: nothing
+    /// was deleted, or the count failed.
     async fn drop_wrong_safety(&self, extent: &ExtentRow) -> bool {
-        let deleted = self.safety.delete(&extent.id.safety_key()).await.is_ok();
+        let key = extent.id.safety_key();
+        // A blob whose digest the store checked against the extent's when
+        // it was stored is the extent's copy: never deleted here, as
+        // eviction takes it for the copy (a read that came back other is
+        // a fault of the read). Not known: nothing is deleted.
+        match self.safety.head_identity(&key).await {
+            Ok(Some(blob)) if blob.is(extent.cipher_size, &extent.cipher_sha256) => {
+                crate::trace::alert(|| {
+                    format!(
+                        "scrub-bad-safety-copy {} read back other than the store checked it; kept",
+                        extent.id.as_str()
+                    )
+                });
+                return false;
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        // The sequence moves first: an eviction that claimed the row
+        // before finds it moved at its check, and deletes nothing.
+        if self.catalog.scrub_safety_fence(&extent.id).await.is_err() {
+            return false;
+        }
+        let deleted = self.safety.delete(&key).await.is_ok();
         let uncounted = deleted && self.catalog.scrub_safety_gone(&extent.id).await.is_ok();
         crate::trace::alert(|| {
             format!(

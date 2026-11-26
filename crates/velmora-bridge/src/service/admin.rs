@@ -13,7 +13,7 @@
 //! | `DELETE /_admin/keys/<access_key_id>` | `204` revoked; `404` unknown (so a second call is `404`) |
 //! | `DELETE /_admin/keys/<access_key_id>/grants` | `405`: grants are not removed one by one |
 //! | `GET /_admin/objects/<bucket>/<key>` | `200` per-extent state |
-//! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200`; `403` for `include_safety` on a non-disposable bucket |
+//! | `POST /_admin/evict/<bucket>/<key>[?include_safety=1]` | `200` (a copy the last-copy rule keeps is counted in `cache_kept`); `403` for `include_safety` on a non-disposable bucket; `503` `EvictionPaused` while `EVICTION=paused` |
 //! | `POST /_admin/drill/<bucket>/<key>[?range=<first>-[<last>]][&sockets=<n>][&state=<token>]` | `200` read-back from Usenet only, with the SHA-256 and MD5 of the range; `503` `SlowDown` (with a `class`) when it could not be read now; `400` bad `range`, `sockets` or `state`; `416` a range past the end |
 //! | `GET /_admin/status` | `200` |
 //! | `POST /_admin/restore` `{since_ms[, margin_ms]}` or `{cursor}` | `200` with the counts of one replay step and `next`; `409` unless `MAINTENANCE=restore` |
@@ -1370,16 +1370,28 @@ async fn object_status<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K
 // Evict
 // ---------------------------------------------------------------------------
 
-/// Deletes an object's cache copies. With `include_safety`, and only in a
-/// disposable bucket, it also gives up the pinned copy of every extent
-/// that is past the post stage and that a backbone currently holds in
-/// full: the catalogue is told first, then the blob goes.
+/// Deletes an object's cache copies, under eviction's last-copy rule: a
+/// cache fill goes only while the extent's safety copy is in place (the
+/// store checked its digest) or the extent is releasable under the
+/// backbones that count now; any other stays (`cache_kept`). With
+/// `include_safety`, and only in a disposable bucket, it also gives up the
+/// safety copy of a released extent that is releasable now, and the pinned
+/// copy of every extent that is past the post stage and that a backbone
+/// currently holds in full: the catalogue is told first, then the blob
+/// goes. Refused while eviction is paused (`EVICTION=paused`).
 async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>(
     bridge: &Bridge<C, B, N, J, K, T>,
     bucket: &str,
     key: &str,
     include_safety: bool,
 ) -> Admin<S3Response> {
+    if bridge.cfg.eviction_paused {
+        return Err(fail(
+            503,
+            "EvictionPaused",
+            "Eviction is paused (EVICTION=paused); no R2 copy is deleted.",
+        ));
+    }
     let bucket = bucket_named(bridge, bucket).await?;
     if include_safety && !bucket.disposable {
         return Err(fail(
@@ -1409,11 +1421,30 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
                 .any(|b| b.counts && b.kind.is_full() && configured.contains(&label(&b.backbone)))
     };
 
-    let (mut evicted, mut safety_deleted, mut safety_kept) = (0u32, 0u32, 0u32);
+    let (rule, _) = bridge.evict_rule();
+    let (mut evicted, mut safety_deleted, mut safety_kept, mut cache_kept) =
+        (0u32, 0u32, 0u32, 0u32);
     for x in &status.extents {
         // Read before any delete: a cold read that fills the cache while
         // this runs changes it, and its copy then stays counted.
         let seq = bridge.catalog.hot_seq(&x.extent_id).await.or_internal()?;
+        // The last-copy rule, as eviction applies it.
+        let releasable = bridge
+            .catalog
+            .evict_releasable(&x.extent_id, &rule)
+            .await
+            .or_internal()?;
+        // A held copy a drill gives up (below) is on a backbone in full.
+        let posted = !matches!(x.stage, None | Some(OutboxStage::Post));
+        let held_on_usenet =
+            include_safety && x.safety_state == SafetyState::Held && posted && on_usenet(x);
+        if !releasable
+            && !held_on_usenet
+            && !bridge.safety_in_place(&x.extent_id).await.or_internal()?
+        {
+            cache_kept += 1;
+            continue;
+        }
         delete_blob(&bridge.cache, &x.extent_id.cache_key())
             .await
             .or_internal()?;
@@ -1431,9 +1462,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             SafetyState::Held => {
                 // The post stage reads the pinned copy; without a full
                 // copy on a backbone the pinned one is the only one.
-                let posted = !matches!(x.stage, None | Some(OutboxStage::Post));
-                posted
-                    && on_usenet(x)
+                held_on_usenet
                     && bridge
                         .catalog
                         .set_safety_state(&x.extent_id, SafetyState::Held, SafetyState::Deleted)
@@ -1442,9 +1471,10 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
             }
             // A release job is between its decision and its end.
             SafetyState::Releasing => false,
-            // No longer pinned: the copy is only cache (a released one
-            // still serves reads until it is evicted).
-            SafetyState::Released | SafetyState::Deleted => true,
+            // No longer pinned: the copy goes as eviction would take it,
+            // only while the extent is releasable now.
+            SafetyState::Released => releasable,
+            SafetyState::Deleted => true,
         };
         if gone {
             delete_blob(&bridge.safety, &x.extent_id.safety_key())
@@ -1463,6 +1493,7 @@ async fn evict<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T
         "evicted": evicted,
         "safety_deleted": safety_deleted,
         "safety_kept": safety_kept,
+        "cache_kept": cache_kept,
     })))
 }
 

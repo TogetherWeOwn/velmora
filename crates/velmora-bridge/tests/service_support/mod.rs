@@ -549,6 +549,11 @@ impl BlobStore for Blobs {
         self.read_turn().await;
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
+    async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
+        self.trip
+            .guard(blob_down, self.inner.head_identity(key))
+            .await
+    }
     async fn delete(&self, key: &str) -> Result<()> {
         self.allow_write()?;
         fire(&self.before_delete, key);

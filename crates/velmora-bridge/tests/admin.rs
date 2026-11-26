@@ -1046,7 +1046,7 @@ async fn evict_with_safety_is_refused_on_a_real_bucket() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 0 , "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o));
     assert!(fx.has_safety(&o));
@@ -1070,7 +1070,7 @@ async fn evict_keeps_the_only_copy_of_an_unposted_extent() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o));
     assert!(fx.has_safety(&o));
@@ -1101,7 +1101,7 @@ async fn evict_gives_up_a_verified_pinned_copy_on_a_disposable_bucket() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 1, "safety_kept": 0 })
+        json!({ "evicted": 1, "safety_deleted": 1, "safety_kept": 0 , "cache_kept": 0 })
     );
     assert!(!fx.has_cache(&o) && !fx.has_safety(&o));
     // The catalogue knows the copy is gone before anyone looks for it.
@@ -2392,7 +2392,7 @@ async fn evict_keeps_the_pinned_copy_while_a_release_is_running() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o), "the release job still needs the copy");
     assert_eq!(fx.safety_state(&o).await, "releasing");
@@ -2412,7 +2412,7 @@ async fn evict_keeps_the_pinned_copy_when_it_loses_the_state_race() {
     assert_eq!(r.status, 200);
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(
         fx.bridge.catalog.sql.race.borrow().is_none(),
@@ -2439,7 +2439,7 @@ async fn evict_keeps_the_pinned_copy_of_an_extent_being_reposted() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2460,7 +2460,7 @@ async fn evict_ignores_a_read_back_from_a_backbone_no_longer_configured() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2849,7 +2849,7 @@ async fn evict_keeps_the_pinned_copy_when_the_only_pass_is_a_stat() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2898,7 +2898,7 @@ async fn too_few_release_backbones_are_a_warning_and_keep_the_pinned_copy() {
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
     assert_eq!(fx.safety_state(&o).await, "held");
@@ -2945,7 +2945,7 @@ async fn evict_keeps_the_pinned_copy_when_the_read_back_is_on_a_backbone_that_do
     let r = fx.post("/evict/scratch/k?include_safety=1").await;
     assert_eq!(
         r.json(),
-        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 })
+        json!({ "evicted": 1, "safety_deleted": 0, "safety_kept": 1 , "cache_kept": 0 })
     );
     assert!(fx.has_safety(&o));
 

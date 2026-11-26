@@ -1329,7 +1329,16 @@ pub struct EvictWindow {
     pub more: bool,
     /// The released extents in it kept for want of a release under the
     /// backbones that count now.
-    pub unproven: Vec<ExtentId>,
+    pub unproven: Vec<EvictCandidate>,
+}
+
+/// An extent's ciphertext as the catalogue records it: what a blob must
+/// be to be its copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtentCipher {
+    pub bucket: BucketId,
+    pub size: u64,
+    pub sha256: [u8; 32],
 }
 
 /// The answer right before a started eviction deletes the safety copy

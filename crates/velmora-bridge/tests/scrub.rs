@@ -2303,7 +2303,7 @@ async fn the_eviction_job_keeps_the_safety_copy_of_an_extent_re_pinned_under_it(
     // Right before the eviction asks whether the copy may still go, the
     // scrub re-pins the extent.
     *w.bridge().catalog.sql.before_matching.borrow_mut() = Some((
-        "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        "FROM extents WHERE id = ?1 AND evict_seq = ?2",
         0,
         format!(
             "UPDATE extents SET safety_state = 'held', evict_seq = evict_seq + 1 WHERE id = '{}'",
@@ -3339,11 +3339,8 @@ async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record
             o.extent.as_str()
         );
         if late {
-            *c.sql.before_matching.borrow_mut() = Some((
-                "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
-                0,
-                loss,
-            ));
+            *c.sql.before_matching.borrow_mut() =
+                Some(("FROM extents WHERE id = ?1 AND evict_seq = ?2", 0, loss));
         } else {
             c.sql.inner.fixture_script(&loss).unwrap();
         }
@@ -4685,7 +4682,7 @@ async fn a_moved_sequence_at_the_pre_delete_check_ends_the_drain() {
         .await
         .unwrap();
     *c.sql.before_matching.borrow_mut() = Some((
-        "THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        "FROM extents WHERE id = ?1 AND evict_seq = ?2",
         0,
         format!(
             "UPDATE extents SET hot_cache_bytes = cipher_size, evict_seq = evict_seq + 1 \
@@ -4745,4 +4742,209 @@ async fn a_deleted_wrong_safety_object_is_uncounted_and_a_failed_delete_is_said(
             assert_eq!(w.result(&o).await, "unrecoverable");
         }
     }
+}
+
+/// Writes the extent's own bytes under its safety key, as a checked put.
+async fn put_safety_copy(w: &World, o: &Obj, name: &str, cipher: Vec<u8>) {
+    let extent = w.rig.live(&w.bucket, name).await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    w.bridge()
+        .safety
+        .put(&o.extent.safety_key(), cipher, &meta)
+        .await
+        .unwrap();
+}
+
+/// A pinned extent's cache fill goes only while its safety copy is in
+/// place: a blob the store checked as the extent's bytes. A blob that is
+/// only there (other bytes, never checked) is not the copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_fill_stays_while_the_safety_blob_is_not_the_extents() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 47).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    repinned_without_its_copy(&w, &o).await;
+    put_safety_copy(&w, &o, "a", cipher.clone()).await;
+    assert!(w.bridge().safety.corrupt(&key, |b| b[10] ^= 1));
+    cache_fill(&w, &o, "a", cipher).await;
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "other bytes under the safety key: the fill stays"
+    );
+}
+
+/// The scrub moves the sequence before it deletes a safety object: an
+/// eviction that claimed the pinned row and found the copy in place, but
+/// whose claim moved before the delete, deletes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_fill_eviction_checks_its_claim_after_the_safety_check() {
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 48).await;
+    let cipher = w
+        .bridge()
+        .safety
+        .stored(&o.extent.safety_key())
+        .unwrap()
+        .bytes;
+    repinned_without_its_copy(&w, &o).await;
+    put_safety_copy(&w, &o, "a", cipher.clone()).await;
+    cache_fill(&w, &o, "a", cipher).await;
+    let c = &w.bridge().catalog;
+    // What the scrub does before it deletes a safety object.
+    *c.sql.before_matching.borrow_mut() = Some((
+        "FROM extents WHERE id = ?1 AND evict_seq = ?2",
+        0,
+        format!(
+            "UPDATE extents SET evict_seq = evict_seq + 1 WHERE id = '{}'",
+            o.extent.as_str()
+        ),
+    ));
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the claim moved: nothing deleted"
+    );
+    assert!(
+        c.sql.before_matching.borrow().is_none(),
+        "the claim was checked"
+    );
+}
+
+/// A released extent eviction keeps for want of a release, whose only R2
+/// copy is a cache fill 29.9 days old: the fill is written to the safety
+/// store when eviction keeps it, so the cache's 30-day lifecycle rule
+/// cannot take the last R2 copy. With the scrub on and off alike.
+#[tokio::test(flavor = "current_thread")]
+async fn a_kept_fill_near_the_cache_expiry_is_promoted_to_the_safety_store() {
+    for scrub in [true, false] {
+        let mut w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+        let o = w.released("a", 49).await;
+        let key = o.extent.safety_key();
+        let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+        assert!(w.bridge().safety.lose(&key));
+        w.bridge()
+            .catalog
+            .sql
+            .inner
+            .fixture_exec(
+                "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+                &[SqlValue::Text(o.extent.as_str().to_owned())],
+            )
+            .await
+            .unwrap();
+        cache_fill(&w, &o, "a", cipher.clone()).await;
+        // The fill is 29.9 days old when eviction looks at it.
+        w.advance_secs(29 * DAY_SECS + 77_760);
+        cfg_mut(&mut w).scrub.on = scrub;
+        cfg_mut(&mut w).providers[1].release = false;
+        w.bridge().evict_batch(0).await.unwrap();
+        assert!(w.bridge().cache.contains(&o.extent.cache_key()), "kept");
+        // Day 30: the cache's lifecycle rule takes the fill.
+        w.advance_secs(8_640);
+        assert!(w.bridge().cache.lose(&o.extent.cache_key()));
+        let stored = w.bridge().safety.stored(&key);
+        assert_eq!(
+            stored.map(|b| b.bytes),
+            Some(cipher),
+            "scrub={scrub}: the safety copy holds the extent's bytes"
+        );
+        assert_eq!(
+            w.scalar(
+                "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+                &o.extent
+            )
+            .await,
+            w.scalar("SELECT cipher_size FROM extents WHERE id = ?1", &o.extent)
+                .await,
+            "scrub={scrub}: counted"
+        );
+    }
+}
+
+/// The retry of a re-verify is on record before the re-verify writes or
+/// records anything: an invocation that ends during its cache-to-safety
+/// write (after the copy checks were recorded) leaves the retry behind.
+#[tokio::test(flavor = "current_thread")]
+async fn a_re_verify_retry_is_on_record_before_its_safety_write() {
+    let mut w = world().await;
+    let o = w.released("a", 50).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    cfg_mut(&mut w).providers[1].release = false;
+    assert!(w.bridge().safety.lose(&key));
+    cache_fill(&w, &o, "a", cipher).await;
+    for s in &w.servers {
+        s.set_body_gone(true).await;
+    }
+    w.advance_secs(31 * DAY_SECS);
+    let safety = &w.bridge().safety;
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let mut run = Box::pin(w.bridge().scrub_run());
+    let held = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        () = held => {}
+        _ = &mut run => panic!("the run ended before its safety write"),
+    }
+    // The invocation ends there.
+    drop(run);
+    safety.hold_put_prefix.replace(None);
+    let now = w.bridge().clock.now().0;
+    assert_eq!(
+        w.next_at(&o).await,
+        Some(now + 3_600_000),
+        "the retry stands"
+    );
+}
+
+/// `/_admin/evict` applies eviction's last-copy rule and its pause: a
+/// cache fill that is an unreleasable extent's only R2 copy stays, and
+/// nothing is deleted while `EVICTION=paused`.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_evict_keeps_a_last_copy_and_honours_the_pause() {
+    let mut w = world().await;
+    let o = w.released("a", 51).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    assert!(w.bridge().safety.lose(&key));
+    cache_fill(&w, &o, "a", cipher).await;
+    let token = w.bridge().cfg.admin_token.expose().to_string();
+    let evict = || Req {
+        method: Method::Post,
+        target: format!("/_admin/evict/{BUCKET}/a"),
+        headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+        body: Vec::new(),
+    };
+    cfg_mut(&mut w).eviction_paused = true;
+    let paused = w.rig.send(evict()).await;
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "paused: nothing deleted"
+    );
+    assert_eq!(paused.status, 503);
+    cfg_mut(&mut w).eviction_paused = false;
+    cfg_mut(&mut w).providers[1].release = false;
+    let kept = w.rig.send(evict()).await;
+    assert!(
+        w.bridge().cache.contains(&o.extent.cache_key()),
+        "the only R2 copy of an unreleasable extent stays"
+    );
+    assert_eq!(kept.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&kept.body).unwrap();
+    assert_eq!(body["cache_kept"], 1);
+    cfg_mut(&mut w).providers[1].release = true;
+    w.rig.send(evict()).await.expect(200);
+    assert!(
+        !w.bridge().cache.contains(&o.extent.cache_key()),
+        "releasable: the fill goes"
+    );
 }

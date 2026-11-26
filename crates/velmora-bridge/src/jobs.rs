@@ -28,15 +28,20 @@
 //!   of extents that Usenet is proven to hold, never a catalogue row and
 //!   never a pinned copy, so it is not data deletion and `GC_MODE` does
 //!   not apply to it. The only keys it can name are an extent's
-//!   `x/<extent>` and `c/<extent>`.
+//!   `x/<extent>` and `c/<extent>`. The one write it makes is the safety
+//!   copy of a released extent it keeps for want of a release, from the
+//!   extent's verified cache fill, so that the cache's lifecycle rule
+//!   cannot take the extent's last R2 copy.
 
 use std::collections::BTreeMap;
+
+use sha2::{Digest, Sha256};
 
 use crate::config::{GcMode, HotCtlMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::hotctl::{self, Counters, Rates, Reason, Sample, Signals, State, Step};
 use crate::ports::{
-    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
-    PERMIT_SECS,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
+    MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
@@ -808,24 +813,33 @@ where
             0 => EvictCursor::Start,
             _ => self.catalog.evict_cursor().await?,
         };
-        let counting = self.scrub_counting();
-        let rule = EvictRule {
-            counting: crate::verify::release_labels(&self.cfg.providers),
-            required: self.cfg.required_backbones,
-            scrub: counting.is_some(),
-            mode: self.cfg.verify.mode,
-        };
+        let (rule, counting) = self.evict_rule();
         let window = self
             .catalog
             .evict_window(&cursor, EVICT_WINDOW, EVICT_BATCH, &rule)
             .await?;
         self.catalog.set_evict_cursor(&window.next).await?;
+        // Kept for want of a release under the backbones that count now.
+        // A cache fill that is the extent's only R2 copy is written to the
+        // safety store now, from its verified bytes: the cache bucket's
+        // lifecycle rule expires fills by age, whatever eviction decides,
+        // and the safety store has no such rule.
+        let mut promoted = 0;
+        for kept in &window.unproven {
+            if promoted >= EVICT_PROMOTE_PER_STEP {
+                break;
+            }
+            if kept.safety_bytes == 0 && kept.cache_bytes > 0 {
+                promoted += 1;
+                self.promote_cache_fill(kept).await?;
+            }
+        }
         if rule.scrub && !window.unproven.is_empty() {
-            // Kept for want of a release under the backbones that count
-            // now: the scrub looks at them soon, and its re-verify writes
-            // a safety copy that no lifecycle rule expires.
+            // And the scrub looks at them soon: its re-verify records a
+            // release under the backbones that count now.
+            let kept: Vec<ExtentId> = window.unproven.iter().map(|x| x.extent.clone()).collect();
             self.catalog
-                .scrub_watch_soon(&window.unproven, self.clock.now())
+                .scrub_watch_soon(&kept, self.clock.now())
                 .await?;
         }
         let rows = window.rows;
@@ -891,19 +905,102 @@ where
             .then(|| crate::verify::release_labels(&self.cfg.providers))
     }
 
+    /// The rule eviction applies, and with the scrub on the backbones
+    /// whose losses fence it. One for the drain and `/_admin/evict`.
+    pub(crate) fn evict_rule(&self) -> (EvictRule, Option<Vec<String>>) {
+        let counting = self.scrub_counting();
+        let rule = EvictRule {
+            counting: crate::verify::release_labels(&self.cfg.providers),
+            required: self.cfg.required_backbones,
+            scrub: counting.is_some(),
+            mode: self.cfg.verify.mode,
+        };
+        (rule, counting)
+    }
+
+    /// Whether the safety store holds the extent's copy: a blob whose size
+    /// and digest, as the store checked them when it was stored, are the
+    /// ones the catalogue records. A blob that is only there (a streamed
+    /// put, whose digest the store never checked, or other bytes) is not.
+    pub(crate) async fn safety_in_place(&self, extent: &ExtentId) -> Result<bool> {
+        let Some(cipher) = self.catalog.extent_cipher(extent).await? else {
+            return Ok(false);
+        };
+        Ok(self
+            .safety
+            .head_identity(&extent.safety_key())
+            .await?
+            .is_some_and(|blob| blob.is(cipher.size, &cipher.sha256)))
+    }
+
+    /// Writes the verified cache fill of a released extent that eviction
+    /// keeps for want of a release to the safety store, and counts it.
+    /// Bytes that are not the extent's are never written.
+    async fn promote_cache_fill(&self, kept: &EvictCandidate) -> Result<()> {
+        let Some(cipher) = self.catalog.extent_cipher(&kept.extent).await? else {
+            return Ok(());
+        };
+        let Some(bytes) = self.cache.get(&kept.extent.cache_key(), None).await? else {
+            return Ok(());
+        };
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if bytes.len() as u64 != cipher.size || digest != cipher.sha256 {
+            crate::trace::alert(|| {
+                format!(
+                    "evict-promote-refused {} its cache fill is not its ciphertext",
+                    kept.extent.as_str()
+                )
+            });
+            return Ok(());
+        }
+        let meta = BlobMeta {
+            bucket: &cipher.bucket,
+            extent: &kept.extent,
+            cipher_sha256: &cipher.sha256,
+        };
+        self.safety
+            .put(&kept.extent.safety_key(), bytes, &meta)
+            .await?;
+        // A copy written after the extent stopped being referenced is
+        // collected (a no-op while it is referenced).
+        self.catalog
+            .gc_enqueue_scrub_safety(&kept.extent, self.clock.now())
+            .await?;
+        if self.catalog.evict_promoted(kept).await? {
+            crate::trace::alert(|| {
+                format!(
+                    "evict-promote {} kept for want of a release; its verified cache fill is \
+                     now its safety copy",
+                    kept.extent.as_str()
+                )
+            });
+        }
+        Ok(())
+    }
+
     async fn evict_one(
         &self,
         row: &EvictCandidate,
         counting: Option<&[String]>,
     ) -> Result<Evicted> {
-        if row.pinned && self.safety.head(&row.extent.safety_key()).await?.is_none() {
-            // A pinned extent whose safety copy is not in place (a repair
-            // that could not write it yet): its cache fill may be the only
-            // R2 copy. Whatever the scrub switch says, it stays.
-            return Ok(Evicted::Kept);
-        }
         if !self.catalog.begin_evict(row).await? {
             return Ok(Evicted::Contended);
+        }
+        if row.pinned {
+            // The cache fill of a pinned extent may be its only R2 copy
+            // until its safety copy is in place (a repair that could not
+            // write it yet, or other bytes under the key): checked after
+            // the claim, by what the store checked at the put, and then
+            // the claim again. The scrub moves the sequence before it
+            // deletes a safety object, and never deletes one whose digest
+            // the store checked, so the copy found here is still there
+            // when the fill goes.
+            if !self.safety_in_place(&row.extent).await? {
+                return Ok(Evicted::Kept);
+            }
+            if self.catalog.evict_safety_still_ok(row, None).await? == EvictCheck::Moved {
+                return Ok(Evicted::Contended);
+            }
         }
         // Both keys go whatever the counts say, so a copy the catalogue
         // did not count goes too. The one exception is the safety copy of
@@ -1454,6 +1551,10 @@ where
         Ok(())
     }
 }
+
+/// At most this many kept cache fills are written to the safety store per
+/// eviction step (each one a read and a write of up to one extent).
+const EVICT_PROMOTE_PER_STEP: usize = 8;
 
 /// What one eviction did (`evict_one`).
 enum Evicted {

@@ -1137,6 +1137,22 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_safety_gone(&self, extent: &ExtentId) -> Result<()> {
         hot::scrub_safety_gone(self, extent).await
     }
+    async fn scrub_safety_fence(&self, extent: &ExtentId) -> Result<()> {
+        hot::scrub_safety_fence(self, extent).await
+    }
+    async fn extent_cipher(&self, extent: &ExtentId) -> Result<Option<crate::types::ExtentCipher>> {
+        hot::extent_cipher(self, extent).await
+    }
+    async fn evict_releasable(
+        &self,
+        extent: &ExtentId,
+        rule: &crate::types::EvictRule,
+    ) -> Result<bool> {
+        hot::evict_releasable(self, extent, rule).await
+    }
+    async fn evict_promoted(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::evict_promoted(self, x).await
+    }
     async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
         hot::evict_cursor(self).await
     }
@@ -1297,7 +1313,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 386, "background inventory entry count");
+        assert_eq!(statements.len(), 391, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

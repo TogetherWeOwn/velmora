@@ -215,6 +215,39 @@ const WATCH_SOON: &str = "UPDATE extents SET scrub_next_at = ?2 \
 const SAFETY_GONE: &str = "UPDATE extents SET hot_safety_bytes = 0, evict_seq = evict_seq + 1 \
     WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes > 0";
 
+// Right before the scrub deletes a safety object whose bytes are not the
+// extent's: the sequence moves first, so an eviction that claimed the row
+// before finds it moved at its check and deletes nothing.
+const SAFETY_FENCE: &str = "UPDATE extents SET evict_seq = evict_seq + 1 WHERE id = ?1";
+
+// The extent's ciphertext as recorded: what a blob must be to be its copy.
+const EXTENT_CIPHER: &str =
+    "SELECT bucket_id, cipher_size, cipher_sha256 FROM extents WHERE id = ?1";
+
+// Eviction wrote a released extent's verified cache fill to the safety
+// store (kept for want of a release): it is counted, if the row is as
+// listed.
+const EVICT_PROMOTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
+    evict_seq = evict_seq + 1 \
+    WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' AND hot_safety_bytes = 0";
+
+// One extent, as the window reads it: whether it is releasable now.
+macro_rules! evict_point {
+    ($loss:expr) => {
+        concat!(
+            "SELECT ",
+            pinned!(),
+            " AS pinned, release_evidence, plan_rev, ",
+            $loss,
+            " FROM extents WHERE id = ?1"
+        )
+    };
+}
+const EVICT_POINT: &str = evict_point!("0");
+const EVICT_POINT_SCRUB: &str = evict_point!(loss_flag!("value FROM json_each(?2)"));
+const EVICT_POINT_SCRUB_PG: &str =
+    evict_point!(loss_flag!("jsonb_array_elements_text(CAST(?2 AS jsonb))"));
+
 const EVICT_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'evict'";
 const SET_EVICT_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict', ?1)";
 const SET_EVICT_CURSOR_PG: &str =
@@ -359,18 +392,10 @@ pub(super) async fn evict_window<S: Sql>(
                 None => String::new(),
             },
         ));
-        let may = candidate.pinned
-            || (!loss
-                && crate::verify::evidence_releasable(
-                    evidence.as_deref(),
-                    plan_rev,
-                    &rule.counting,
-                    rule.required,
-                    rule.mode,
-                ));
+        let may = candidate.pinned || releasable_now(evidence.as_deref(), plan_rev, loss, rule);
         if !may {
             if !candidate.pinned && !loss {
-                out.unproven.push(candidate.extent.clone());
+                out.unproven.push(candidate.clone());
             }
             continue;
         }
@@ -385,6 +410,92 @@ pub(super) async fn evict_window<S: Sql>(
         out.next = last.unwrap_or(EvictCursor::Start);
     }
     Ok(out)
+}
+
+/// The last-copy rule: an extent's last R2 copy may go only while it is
+/// releasable under the backbones that count now, by the release rule
+/// over its stored evidence, and, with the scrub on, has no loss on
+/// record there.
+fn releasable_now(evidence: Option<&str>, plan_rev: u32, loss: bool, rule: &EvictRule) -> bool {
+    !loss
+        && crate::verify::evidence_releasable(
+            evidence,
+            plan_rev,
+            &rule.counting,
+            rule.required,
+            rule.mode,
+        )
+}
+
+/// Whether `extent` is releasable now under `rule`, as the window decides
+/// it (`false` while it is pinned, or not there).
+pub(super) async fn evict_releasable<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    rule: &EvictRule,
+) -> Result<bool> {
+    let mut params = vec![text(extent.as_str())];
+    let sql = if rule.scrub {
+        params.push(labels(&rule.counting)?);
+        c.sql
+            .dialect()
+            .pick(EVICT_POINT_SCRUB, EVICT_POINT_SCRUB_PG)
+    } else {
+        EVICT_POINT
+    };
+    let Some(row) = c.sql.query(sql, &params).await?.into_iter().next() else {
+        return Ok(false);
+    };
+    let mut r = Cols::new(row);
+    let pinned = r.num::<i64>()? != 0;
+    let evidence = r.opt_text()?;
+    let plan_rev: u32 = r.num()?;
+    let loss = r.num::<i64>()? != 0;
+    Ok(!pinned && releasable_now(evidence.as_deref(), plan_rev, loss, rule))
+}
+
+/// The extent's ciphertext as recorded ([`EXTENT_CIPHER`]).
+pub(super) async fn extent_cipher<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+) -> Result<Option<crate::types::ExtentCipher>> {
+    let Some(row) = c
+        .sql
+        .query(EXTENT_CIPHER, &[text(extent.as_str())])
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let mut r = Cols::new(row);
+    let bucket = crate::types::BucketId::new(r.text()?);
+    let size: u64 = r.num()?;
+    let sha256: [u8; 32] = r.blob()?.try_into().map_err(|_| {
+        crate::types::BridgeError::Sql("extent cipher_sha256 is not 32 bytes".into())
+    })?;
+    Ok(Some(crate::types::ExtentCipher {
+        bucket,
+        size,
+        sha256,
+    }))
+}
+
+/// Eviction wrote the verified cache fill of a kept extent to the safety
+/// store: counted if the row is as listed ([`EVICT_PROMOTED`]).
+pub(super) async fn evict_promoted<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
+    let changed = c
+        .sql
+        .exec(EVICT_PROMOTED, &[text(x.extent.as_str()), int(x.seq)?])
+        .await?;
+    Ok(changed == 1)
+}
+
+/// The sequence moves before the scrub deletes a safety object
+/// ([`SAFETY_FENCE`]).
+pub(super) async fn scrub_safety_fence<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<()> {
+    c.sql.exec(SAFETY_FENCE, &[text(extent.as_str())]).await?;
+    Ok(())
 }
 
 /// Gives each of `extents` (released, kept by eviction for want of a
@@ -774,6 +885,11 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (EVICT_WINDOW_SCRUB_AFTER_PG.to_owned(), vec![I, I, T, T]),
         (WATCH_SOON.to_owned(), vec![T, I]),
         (SAFETY_GONE.to_owned(), vec![T]),
+        (SAFETY_FENCE.to_owned(), vec![T]),
+        (EXTENT_CIPHER.to_owned(), vec![T]),
+        (EVICT_PROMOTED.to_owned(), vec![T, I]),
+        (EVICT_POINT.to_owned(), vec![T]),
+        (EVICT_POINT_SCRUB_PG.to_owned(), vec![T, T]),
         (EVICT_CURSOR.to_owned(), vec![]),
         (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),

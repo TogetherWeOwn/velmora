@@ -13,7 +13,7 @@ CREATE TABLE scrub_copies (
     full_loss_at BIGINT,
     PRIMARY KEY (extent_id, backbone)
 );
--- This table is empty when created; the populated extents indexes follow in 0005.
+-- This table is empty when created; the populated extents indexes follow in 0006.
 CREATE INDEX scrub_copies_due ON scrub_copies(backbone, LEAST(stat_at, full_at), extent_id);
 
 ALTER TABLE scrub_state

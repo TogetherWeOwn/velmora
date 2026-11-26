@@ -188,6 +188,25 @@ pub struct StreamMeta<'a> {
     pub extent: &'a ExtentId,
 }
 
+/// What a store says of a blob without reading its bytes
+/// ([`BlobStore::head_identity`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobIdentity {
+    pub size: u64,
+    /// The SHA-256 the store itself checked the body against when it was
+    /// stored ([`BlobStore::put`] gives the store the digest to check).
+    /// `None` when the store did not check one (a streamed put).
+    pub sha256: Option<[u8; 32]>,
+}
+
+impl BlobIdentity {
+    /// The store checked these bytes against this size and digest: they
+    /// are the extent's ciphertext.
+    pub fn is(&self, size: u64, sha256: &[u8; 32]) -> bool {
+        self.size == size && self.sha256.as_ref() == Some(sha256)
+    }
+}
+
 /// What the store holds after [`BlobStore::put_stream`], as the store
 /// itself reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,6 +320,14 @@ pub trait BlobStore {
     }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
+    /// The size and the digest the store checked at the put, `None` =
+    /// absent. This default knows no digest.
+    async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
+        Ok(self
+            .head(key)
+            .await?
+            .map(|size| BlobIdentity { size, sha256: None }))
+    }
     /// Idempotent. Refuses a recovery record (any key under `m/`, which
     /// includes the tenant keys under `m/tk/`) and a rollback stamp (any
     /// key under `rs/`) with [`crate::recovery::ERR_RECORD_DELETE`]
@@ -1769,6 +1796,36 @@ pub trait Catalog {
     /// counted in the hot tier.
     async fn scrub_safety_gone(&self, _extent: &ExtentId) -> Result<()> {
         Ok(())
+    }
+    /// Moves the extent's eviction sequence before the scrub deletes its
+    /// safety object, so that an eviction that claimed it before finds it
+    /// moved.
+    async fn scrub_safety_fence(&self, _extent: &ExtentId) -> Result<()> {
+        Ok(())
+    }
+    /// The extent's ciphertext as recorded. `None` when the catalogue
+    /// cannot tell (the default) or the extent is not there: then no blob
+    /// is taken for its copy.
+    async fn extent_cipher(
+        &self,
+        _extent: &ExtentId,
+    ) -> Result<Option<crate::types::ExtentCipher>> {
+        Ok(None)
+    }
+    /// Whether the extent is releasable now under `rule`, as
+    /// [`Catalog::evict_window`] decides it (`false` while pinned). The
+    /// default cannot tell: `false`.
+    async fn evict_releasable(
+        &self,
+        _extent: &ExtentId,
+        _rule: &crate::types::EvictRule,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    /// Eviction wrote a kept extent's verified cache fill to the safety
+    /// store: it is counted if the row is as `x` was listed.
+    async fn evict_promoted(&self, _x: &EvictCandidate) -> Result<bool> {
+        Ok(false)
     }
     /// Where the current drain's listing is ([`Catalog::evict_window`]).
     async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
