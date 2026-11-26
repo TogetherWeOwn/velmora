@@ -50,7 +50,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::Mutex;
 
-use futures_util::future::{self, Either};
+use futures_util::future::{self, Either, FutureExt};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
@@ -625,11 +625,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 ids.iter().skip(skip).map(move |id| (id, &listed.layout))
             })
             .take(extents);
-        stream::iter(wanted.map(|(id, layout)| self.probe_replay_extent(keep, id, layout)))
-            .buffered(STORE_READS)
-            .take_while(|_| std::future::ready(!store.full()))
-            .count()
-            .await
+        // Each answer is kept by `keep` and dropped inside its read, so
+        // the ordered queue holds nothing outside the byte budget.
+        stream::iter(
+            wanted.map(|(id, layout)| self.probe_replay_extent(keep, id, layout).map(drop)),
+        )
+        .buffered(STORE_READS)
+        .take_while(|_| std::future::ready(!store.full()))
+        .count()
+        .await
     }
 
     /// Reads every segment of `head`, one at a time, and holds each to
@@ -713,18 +717,28 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // the catalogue refuses it. So at the record's turn the store
         // itself, never what was read ahead, is asked whether it still
         // has the record, at the same time as the catalogue is asked
-        // about it. Off, the record was read just now, as on main. The
-        // answer is used only for a record the catalogue does not have,
-        // so a failed HEAD fails the step only then.
-        let (probe, there) = if self.cfg.replay_read_ahead {
+        // about it. A record that is gone then is skipped whatever the
+        // catalogue says of it, before anything is counted or written,
+        // as main skips a record its GET at the turn does not find. Off,
+        // the record was read just now, as on main. A failed HEAD fails
+        // the step, except for a record the catalogue has: that one is
+        // replayed from the body read ahead, which writes nothing new.
+        let probe = if self.cfg.replay_read_ahead {
             let (probe, there) = future::join(
                 self.catalog.replay_probe(&generation),
                 self.safety.head(&cursor.name),
             )
             .await;
-            (probe?, Some(there))
+            let probe = probe?;
+            match there {
+                Ok(None) => return Ok(Replayed::Gone),
+                Ok(Some(_)) => {}
+                Err(_) if probe == ReplayProbe::Present => {}
+                Err(e) => return Err(e),
+            }
+            probe
         } else {
-            (self.catalog.replay_probe(&generation).await?, None)
+            self.catalog.replay_probe(&generation).await?
         };
         if probe == ReplayProbe::Superseded {
             report.superseded += 1;
@@ -761,17 +775,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 return Ok(Replayed::Done);
             }
         }
-        // A record the store no longer had at its turn leaves nothing
-        // behind: no row of it is written. This does not fence the
-        // removal of a refused record after that answer; main has the
-        // same window after its record GET.
-        if probe != ReplayProbe::Present {
-            if let Some(there) = there {
-                if there?.is_none() {
-                    return Ok(Replayed::Gone);
-                }
-            }
-        }
+        // The presence answer above does not fence the removal of a
+        // refused record after it; main has the same window after its
+        // record GET.
         let now = self.clock.now();
         let total = generation.extent_count as usize;
         let mut at = cursor.extent as usize;

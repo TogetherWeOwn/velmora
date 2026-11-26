@@ -804,30 +804,95 @@ async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
     );
 }
 
-/// A refused writer removes record N while the step is still staging
-/// record N-1, after the records were read ahead. Presence is decided
-/// at N's own turn in both modes, so neither publishes N, and both
-/// leave the same rows.
-#[tokio::test(flavor = "current_thread")]
-async fn removal_during_the_prior_record_matches_the_sequential_path() {
+/// What the catalogue says of the record that goes while the record
+/// before it is staged.
+#[derive(Clone, Copy, Debug)]
+enum Removed {
+    /// Nothing: the catalogue was lost.
+    Unpublished,
+    /// A newer generation of its key is live.
+    Superseded,
+    /// Its bucket's name now belongs to a bucket made again.
+    OtherBucket,
+    /// It is published already (only an operator removes such a record).
+    Present,
+}
+
+/// A record (N) is removed while the step is still staging the record
+/// before it (N-1), after both were read ahead. Presence is decided at
+/// N's own turn in both modes, so both skip N whatever the catalogue
+/// says of it, as main's record GET does, and both give the same report
+/// and leave the same rows.
+async fn removal_during_the_prior_record(case: Removed) {
     let mut rig = rig();
-    let (bucket, signer) = rig.standard(BUCKET).await;
-    rig.put(&signer, BUCKET, "prior", b"keep").await.expect(200);
+    let (vault, signer) = rig.standard(BUCKET).await;
+    let prior_bucket = match case {
+        Removed::OtherBucket => {
+            let keep = rig.bucket("keep", true).await;
+            rig.grant(AKID, &keep, Perm::Rw).await;
+            keep
+        }
+        _ => vault.clone(),
+    };
+    rig.put(&signer, &prior_bucket.name, "prior", b"keep")
+        .await
+        .expect(200);
     tick(&rig);
     rig.put(&signer, BUCKET, "refused", b"remove")
         .await
         .expect(200);
-    let (_, extents) = rig.live(&bucket, "prior").await.unwrap();
+    let (refused, _) = rig.live(&vault, "refused").await.unwrap();
+    if let Removed::Superseded = case {
+        tick(&rig);
+        rig.put(&signer, BUCKET, "refused", b"newer")
+            .await
+            .expect(200);
+    }
+    let (_, extents) = rig.live(&prior_bucket, "prior").await.unwrap();
     let prior_extent: &'static str = Box::leak(extents[0].id.as_str().to_owned().into_boxed_str());
-    let (refused, _) = rig.live(&bucket, "refused").await.unwrap();
     let name = Layout::flat().generation_key(&refused.id);
     let sealed = rig.bridge.safety.get(&name, None).await.unwrap().unwrap();
     let record_id = ExtentId::new(refused.id.as_str().to_owned());
     let digest = sha2::Sha256::digest(&sealed).into();
+    match case {
+        Removed::Unpublished => wipe(&rig),
+        Removed::OtherBucket => {
+            wipe(&rig);
+            let again = rig.bucket("vault-again", true).await;
+            assert_ne!(again.id, vault.id);
+            sql(
+                &rig,
+                "UPDATE buckets SET name = 'vault' WHERE name = 'vault-again'",
+            );
+        }
+        // The catalogue no longer has the old generation, only the
+        // newer one that is live.
+        Removed::Superseded => {
+            let g = refused.id.as_str();
+            let of = format!("(SELECT id FROM extents WHERE generation_id = '{g}')");
+            sql(
+                &rig,
+                &format!(
+                    "DELETE FROM generation_extents WHERE generation_id = '{g}'; \
+                     DELETE FROM outbox WHERE generation_id = '{g}' OR extent_id IN {of}; \
+                     DELETE FROM verifications WHERE extent_id IN {of}; \
+                     DELETE FROM articles WHERE extent_id IN {of}; \
+                     DELETE FROM gc WHERE extent_id IN {of}; \
+                     DELETE FROM extents WHERE generation_id = '{g}'; \
+                     DELETE FROM generations WHERE id = '{g}';"
+                ),
+            );
+        }
+        Removed::Present => {}
+    }
+    // Both modes start from this catalogue.
+    export(&rig);
 
+    let mut reports = Vec::new();
     let mut catalogues = Vec::new();
     for enabled in [false, true] {
         wipe(&rig);
+        import(&rig);
         std::rc::Rc::get_mut(&mut rig.bridge)
             .unwrap()
             .cfg
@@ -838,7 +903,7 @@ async fn removal_during_the_prior_record_matches_the_sequential_path() {
                 &name,
                 sealed.clone(),
                 &BlobMeta {
-                    bucket: &bucket.id,
+                    bucket: &vault.id,
                     extent: &record_id,
                     cipher_sha256: &digest,
                 },
@@ -869,13 +934,41 @@ async fn removal_during_the_prior_record_matches_the_sequential_path() {
         )
         .await;
         let report = step.unwrap();
-        assert_eq!(report.published, 1, "read-ahead={enabled}: {report:?}");
+        store.slow_reads.set(false);
         assert!(store.stored(&name).is_none());
-        assert!(rig.live(&bucket, "refused").await.is_none());
-        assert!(rig.live(&bucket, "prior").await.is_some());
+        if let Removed::Unpublished | Removed::OtherBucket = case {
+            assert_eq!(report.published, 1, "read-ahead={enabled}: {report:?}");
+            assert!(rig.live(&vault, "refused").await.is_none());
+        }
+        assert!(rig.live(&prior_bucket, "prior").await.is_some());
+        reports.push(format!("{report:?}"));
         catalogues.push(dump_rows(&rig, true));
     }
-    assert_eq!(catalogues[0], catalogues[1]);
+    assert_eq!(reports[0], reports[1], "{case:?}: off, then on");
+    assert!(
+        catalogues[0] == catalogues[1],
+        "{case:?}: the catalogue rows differ"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_during_the_prior_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Unpublished).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_superseded_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Superseded).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_record_of_a_bucket_made_again_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::OtherBucket).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_published_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Present).await;
 }
 
 /// A replay over a catalogue that has the objects already asks the
