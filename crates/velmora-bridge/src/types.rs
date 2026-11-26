@@ -1271,6 +1271,61 @@ pub struct HotShape {
     pub oldest_read_at: Option<UnixMs>,
 }
 
+/// Where the eviction job's listing is in the eviction order, between the
+/// steps of one drain (`scan_cursors`, key `evict`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvictCursor {
+    /// The head of the order.
+    Start,
+    /// After the row with this read stamp and id.
+    After(i64, String),
+}
+
+impl EvictCursor {
+    /// A value this code did not write reads as the start.
+    pub fn parse(v: &str) -> EvictCursor {
+        match v.split_once(':') {
+            Some(("after", rest)) => match rest.split_once(':') {
+                Some((read, id)) => read
+                    .parse()
+                    .map(|read| EvictCursor::After(read, id.to_owned()))
+                    .unwrap_or(EvictCursor::Start),
+                None => EvictCursor::Start,
+            },
+            _ => EvictCursor::Start,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self {
+            EvictCursor::Start => "start".to_owned(),
+            EvictCursor::After(read, id) => format!("after:{read}:{id}"),
+        }
+    }
+}
+
+/// What lets a row of the eviction order go when it would delete the
+/// extent's last R2 copy: release evidence on `required` of the
+/// `counting` backbones for its current plan and, with `scrub`, no scrub
+/// loss on record on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictRule {
+    pub counting: Vec<String>,
+    pub required: u32,
+    pub scrub: bool,
+}
+
+/// One bounded window of the eviction order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictWindow {
+    /// The rows in it that may go, in order.
+    pub rows: Vec<EvictCandidate>,
+    /// Where the next window starts.
+    pub next: EvictCursor,
+    /// False once the window reached the end of the order.
+    pub more: bool,
+}
+
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses
 /// it if anything here has changed since.
 #[derive(Clone, Debug, PartialEq, Eq)]

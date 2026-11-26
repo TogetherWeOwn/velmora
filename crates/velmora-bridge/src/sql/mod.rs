@@ -84,11 +84,14 @@ pub mod usage;
 
 pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
 /// Hot-tier statements that must use covering partial indexes.
-/// The eviction listing while `SCRUB` is on: the same index and order
-/// as `HOT_INDEX_ONLY`'s listing, with a key lookup in `scrub_copies`.
-pub const HOT_SCRUB_CANDIDATES: &str = hot::CANDIDATES_SCRUB;
-/// Its PostgreSQL twin.
-pub const HOT_SCRUB_CANDIDATES_PG: &str = hot::CANDIDATES_SCRUB_PG;
+/// The eviction job's bounded windows (from the head, after a cursor),
+/// with the scrub's loss check, for SQLite and PostgreSQL: plan tests.
+pub const HOT_EVICT_WINDOWS: [&str; 4] = [
+    hot::EVICT_WINDOW_SCRUB,
+    hot::EVICT_WINDOW_SCRUB_AFTER,
+    hot::EVICT_WINDOW_SCRUB_PG,
+    hot::EVICT_WINDOW_SCRUB_AFTER_PG,
+];
 pub const HOT_INDEX_ONLY: [(&str, &str); 4] = [
     hot::INDEX_ONLY[0],
     hot::INDEX_ONLY[1],
@@ -1047,6 +1050,18 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_drop(&self, token: u64, extent: &ExtentId) -> Result<bool> {
         scrub::drop_due(self, token, extent).await
     }
+    async fn scrub_put_intent(&self, extent: &ExtentId, until: UnixMs) -> Result<()> {
+        scrub::put_intent(self, extent, until).await
+    }
+    async fn scrub_put_intents_due(&self, now: UnixMs, limit: u32) -> Result<Vec<ExtentId>> {
+        scrub::put_intents_due(self, now, limit).await
+    }
+    async fn scrub_drop_put_intent(&self, extent: &ExtentId) -> Result<()> {
+        scrub::drop_put_intent(self, extent).await
+    }
+    async fn scrub_repin_landed(&self, extent: &ExtentId, at: UnixMs) -> Result<bool> {
+        scrub::repin_landed(self, extent, at).await
+    }
     async fn scrub_repin(
         &self,
         token: u64,
@@ -1101,14 +1116,22 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         hotctl::store(self, expected_at, entries).await
     }
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
-        hot::evict_candidates(self, limit, None).await
+        hot::evict_candidates(self, limit).await
     }
-    async fn evict_candidates_keeping_scrub_losses(
+    async fn evict_window(
         &self,
-        limit: u32,
-        backbones: &[String],
-    ) -> Result<Vec<EvictCandidate>> {
-        hot::evict_candidates(self, limit, Some(backbones)).await
+        cursor: &crate::types::EvictCursor,
+        window: u32,
+        take: u32,
+        rule: &crate::types::EvictRule,
+    ) -> Result<crate::types::EvictWindow> {
+        hot::evict_window(self, cursor, window, take, rule).await
+    }
+    async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
+        hot::evict_cursor(self).await
+    }
+    async fn set_evict_cursor(&self, cursor: &crate::types::EvictCursor) -> Result<()> {
+        hot::set_evict_cursor(self, cursor).await
     }
     async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::begin_evict(self, x).await
@@ -1264,7 +1287,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 375, "background inventory entry count");
+        assert_eq!(statements.len(), 384, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

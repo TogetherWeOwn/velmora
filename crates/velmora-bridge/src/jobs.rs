@@ -42,9 +42,9 @@ use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
-    BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
-    GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job, JobOutcome, Oldest,
-    OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
+    BlobStoreKind, DispatchReport, EvictCandidate, EvictCursor, EvictRule, ExtentId, FailClass,
+    GcRow, GcStep, GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job, JobOutcome,
+    Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
 use crate::verify::release_labels;
 
@@ -349,6 +349,11 @@ pub const ORPHAN_SCAN: u32 = 500;
 pub const ORPHAN_BATCH: u32 = 100;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
+
+/// Rows of the eviction order one step reads at most before it filters
+/// them ([`Catalog::evict_window`]): the bound on a step's reads when
+/// many rows in a row may not go.
+pub const EVICT_WINDOW: u32 = 200;
 /// Least time between two totals of the evictable bytes by the
 /// dispatcher. The total reads one index entry per evictable extent, so
 /// it is not taken on every run; the tier may sit over the cap for this
@@ -789,20 +794,27 @@ where
             return Ok(0);
         }
         let mut freed = 0u64;
-        // With the scrub on, an extent with a loss on its record is not
-        // listed: its copies may be what the repair of that loss needs.
-        // Only losses on the backbones that count now: the scrub checks
-        // no other, so a loss on a retired one would never clear.
-        let counting = self.scrub_counting();
-        let rows = match &counting {
-            Some(backbones) => {
-                self.catalog
-                    .evict_candidates_keeping_scrub_losses(EVICT_BATCH, backbones)
-                    .await?
-            }
-            None => self.catalog.evict_candidates(EVICT_BATCH).await?,
+        // A new drain starts at the head of the order; its later steps go
+        // on where the step before left the listing. Each step reads one
+        // bounded window, however many rows in it may not go, and moves
+        // the cursor past it even when none could.
+        let cursor = match remaining {
+            0 => EvictCursor::Start,
+            _ => self.catalog.evict_cursor().await?,
         };
-        let mut more = rows.len() >= EVICT_BATCH as usize;
+        let counting = self.scrub_counting();
+        let rule = EvictRule {
+            counting: crate::verify::release_labels(&self.cfg.providers),
+            required: self.cfg.required_backbones,
+            scrub: counting.is_some(),
+        };
+        let window = self
+            .catalog
+            .evict_window(&cursor, EVICT_WINDOW, EVICT_BATCH, &rule)
+            .await?;
+        self.catalog.set_evict_cursor(&window.next).await?;
+        let rows = window.rows;
+        let mut more = window.more;
         // One extent that fails must not hold up the ones behind it. It
         // stays counted, and the first error makes the job retry.
         let mut failed = None;
@@ -831,10 +843,7 @@ where
         if let Some(e) = failed {
             return Err(e);
         }
-        // A batch that freed nothing (every copy in it kept for a loss
-        // the scrub recorded after the listing) ends the drain; the next
-        // listing leaves those extents out.
-        if excess > 0 && more && freed > 0 {
+        if excess > 0 && more {
             // The next step runs once: it has to claim this record. If the
             // send is lost, the dispatcher starts a new drain once the
             // cap is exceeded.
@@ -875,28 +884,24 @@ where
         // The safety copy only if nothing pinned the extent again since
         // the begin (the scrub re-pins a released extent and puts its
         // copy back) and, with the scrub on, no loss of it is on record.
-        let kept = !row.pinned && !self.catalog.evict_safety_still_ok(row, counting).await?;
-        if !row.pinned && !kept {
+        if !row.pinned && !self.catalog.evict_safety_still_ok(row, counting).await? {
+            // Re-pinned since the begin, or, with the scrub on, a loss of
+            // the extent was recorded after the listing: either R2 copy
+            // may be what the repair needs (the cache fill can be the
+            // only one left). Nothing is deleted and nothing is finished:
+            // the counts stand, and the next listing leaves the extent
+            // out while the loss is on record.
+            return Ok(None);
+        }
+        if !row.pinned {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }
         delete_blob(&self.cache, &row.extent.cache_key()).await?;
-        // `false`: a cold read refilled the cache, another eviction took
-        // the extent, or a re-pin moved it, since `begin_evict`. The
-        // counts stand, and what this drain still has to evict is no
-        // longer known.
-        // A safety copy that stayed stays counted: the end of the cache
-        // fill's eviction only, as for a pinned extent. (One kept for a
-        // loss recorded after the listing is not listed again while the
-        // loss is on record.)
-        let done = match kept {
-            true => EvictCandidate {
-                pinned: true,
-                ..row.clone()
-            },
-            false => row.clone(),
-        };
-        Ok(match self.catalog.finish_evict(&done).await? {
-            true => Some(done.evictable_bytes()),
+        // `false`: a cold read refilled the cache, or another eviction
+        // took the extent, since `begin_evict`. The counts stand, and
+        // what this drain still has to evict is no longer known.
+        Ok(match self.catalog.finish_evict(row).await? {
+            true => Some(row.evictable_bytes()),
             false => None,
         })
     }

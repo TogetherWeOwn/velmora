@@ -615,6 +615,84 @@ const REPIN_OUTBOX: &str =
     last_error = NULL, updated_at = ?2, lease_token = lease_token + 1, lease_owner = NULL, \
     lease_until = NULL WHERE extent_id = ?1 AND stage = 'done'";
 
+// Write-ahead intents of the scrub's safety PUTs: a row of `scan_cursors`
+// per extent (`scrub-put:<id>`, the time after which the PUT can no longer
+// land). Written before the PUT; a later run reconciles each one that is
+// due with the guarded GC enqueue, then removes it.
+const PUT_INTENT: &str =
+    "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('scrub-put:' || ?1, ?2)";
+const PUT_INTENT_PG: &str = "INSERT INTO scan_cursors(k, v) VALUES ('scrub-put:' || ?1, ?2) \
+    ON CONFLICT (k) DO UPDATE SET v = excluded.v";
+const PUT_INTENTS: &str = "SELECT substr(k, 11), v FROM scan_cursors \
+    WHERE k >= 'scrub-put:' AND k < 'scrub-put;' ORDER BY k LIMIT ?1";
+const DROP_PUT_INTENT: &str = "DELETE FROM scan_cursors WHERE k = 'scrub-put:' || ?1";
+
+pub(super) async fn put_intent<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    until: UnixMs,
+) -> Result<()> {
+    c.sql
+        .exec(
+            c.sql.dialect().pick(PUT_INTENT, PUT_INTENT_PG),
+            &[text(extent.as_str()), text(&until.0.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The intents whose PUT can no longer land at `now`, from the first
+/// `limit` on record.
+pub(super) async fn put_intents_due<S: Sql>(
+    c: &SqlCatalog<S>,
+    now: UnixMs,
+    limit: u32,
+) -> Result<Vec<ExtentId>> {
+    let rows = c
+        .sql
+        .query(PUT_INTENTS, &[SqlValue::Int(i64::from(limit))])
+        .await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let mut r = Cols::new(row);
+        let id = r.text()?;
+        // An unreadable time is due: the reconcile only ever enqueues
+        // the guarded collection.
+        let until = r.text()?.parse::<i64>().unwrap_or(i64::MIN);
+        if until <= now.0 {
+            out.push(ExtentId::new(id));
+        }
+    }
+    Ok(out)
+}
+
+pub(super) async fn drop_put_intent<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<()> {
+    c.sql
+        .exec(DROP_PUT_INTENT, &[text(extent.as_str())])
+        .await?;
+    Ok(())
+}
+
+// The re-pin of `?2` (its `now`) is the one on the row: a point read
+// after a batch whose reply was lost.
+const REPIN_LANDED: &str = "SELECT COUNT(*) FROM extents WHERE id = ?1 \
+    AND safety_state = 'held' AND scrub_result = 'repairing' AND last_scrubbed_at = ?2";
+
+pub(super) async fn repin_landed<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    at: UnixMs,
+) -> Result<bool> {
+    let rows = c
+        .sql
+        .query(REPIN_LANDED, &[text(extent.as_str()), ms(at)])
+        .await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Cols::new(row).num::<i64>()? == 1),
+        None => Ok(false),
+    }
+}
+
 macro_rules! repin_verifications {
     ($items:literal) => {
         concat!(
@@ -717,6 +795,10 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (REPIN_GUARD, "TI"),
         (REPIN_EXTENT, "TII"),
         (REPIN_OUTBOX, "TI"),
+        (REPIN_LANDED, "TI"),
+        (PUT_INTENT_PG, "TT"),
+        (PUT_INTENTS, "I"),
+        (DROP_PUT_INTENT, "T"),
         (REPIN_VERIFICATIONS_PG, "TTI"),
         (REPIN_COPIES_PG, "TTI"),
         (END, "IIIIIIIIIINNINN"),

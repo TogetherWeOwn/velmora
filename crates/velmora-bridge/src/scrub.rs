@@ -81,8 +81,8 @@ use crate::ports::PermitClass;
 use crate::ports::{BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::post::Stop;
 use crate::types::{
-    ArticleRow, ArticleState, ExtentRow, JobOutcome, ProviderConfig, Result, SafetyState,
-    ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
+    ArticleRow, ArticleState, BridgeError, ExtentRow, JobOutcome, ProviderConfig, Result,
+    SafetyState, ScrubCandidate, ScrubEnd, ScrubResult, ScrubRun, UnixMs,
 };
 use crate::verify::{release_backbones, MISSING_BACKOFF_SECS, REVERIFY_SECS};
 
@@ -292,6 +292,44 @@ pub fn breaker_trips(lacking: u32, checked: u32) -> bool {
         && u64::from(lacking) * 100 > u64::from(checked) * u64::from(INCIDENT_PERCENT)
 }
 
+/// The counting backbones the extent's release evidence names for its
+/// current plan.
+fn evidence_backbones(extent: &ExtentRow) -> Vec<String> {
+    let Some(raw) = extent.release_evidence.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(raw) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for row in &rows {
+        let rev = row.get("plan_rev").and_then(serde_json::Value::as_u64);
+        let name = row.get("backbone").and_then(serde_json::Value::as_str);
+        if let (Some(rev), Some(name)) = (rev, name) {
+            if rev == u64::from(extent.plan_rev) && !out.iter().any(|b| b == name) {
+                out.push(name.to_owned());
+            }
+        }
+    }
+    out
+}
+
+fn evidence_names(extent: &ExtentRow, backbone: &str) -> bool {
+    evidence_backbones(extent).iter().any(|b| b == backbone)
+}
+
+/// Whether the extent is releasable under `counting` (the backbones that
+/// count now): its release evidence names `required` of them for its
+/// current plan. The rule eviction applies before it deletes an extent's
+/// last R2 copy (`sql::hot` `releasable_now!`).
+pub fn releasable_now(extent: &ExtentRow, counting: &[String], required: u32) -> bool {
+    let named = evidence_backbones(extent)
+        .iter()
+        .filter(|b| counting.contains(b))
+        .count();
+    u32::try_from(named).unwrap_or(u32::MAX) >= required
+}
+
 fn digest_ok(extent: &ExtentRow, bytes: &[u8]) -> bool {
     bytes.len() as u64 == extent.cipher_size
         && <[u8; 32]>::from(Sha256::digest(bytes)) == extent.cipher_sha256
@@ -325,6 +363,7 @@ where
         };
         // A failure before the run begins gives the lease back at once.
         let begun = async {
+            self.reconcile_put_intents(started).await?;
             let state = self.catalog.scrub_state().await?;
             let reader = self.scrub_reader(self.cfg.scrub.sockets)?;
             Ok::<_, crate::types::BridgeError>((state, reader))
@@ -605,9 +644,21 @@ where
                 // The stored plan with its parity addendum: the watch may
                 // rebuild a lost copy from parity, as the repair read does.
                 let plan = self.catalog.stored_plan(&extent.id);
-                let plan = self.idle(reader, walk.stats, plan).await?;
-                let next = self.watch_repair(reader, walk, candidate, plan).await?;
-                (next, next.is_some())
+                match self.idle(reader, walk.stats, plan).await {
+                    Ok(plan) => {
+                        let next = self.watch_repair(reader, walk, candidate, plan).await?;
+                        (next, next.is_some())
+                    }
+                    // A plan that cannot be decoded: said, and the watch
+                    // looks again later with the repair on record as it is.
+                    Err(BridgeError::Invalid(what)) => {
+                        Self::alert_bad_plan(extent, what);
+                        let next = self.clock.now().plus_ms(confirm);
+                        self.catalog.scrub_defer(token, &extent.id, next).await?;
+                        (Some(next), false)
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 self.catalog.scrub_drop(token, &extent.id).await?;
                 (None, false)
@@ -627,14 +678,28 @@ where
             // evidence that any copy's scheduled read-back has passed.
             self.catalog.scrub_drop(token, &extent.id).await?;
         }
-        if candidate.checks.is_empty() {
+        // Released, but not releasable under the backbones that count now
+        // (one that held it stopped counting): eviction keeps its last R2
+        // copy until a re-verify on the counting backbones releases it
+        // again. Looked at on its own deadline too, not only with checks.
+        let reverify = watch_due && !releasable_now(extent, backbones, self.cfg.required_backbones);
+        if candidate.checks.is_empty() && !reverify {
             return Ok(false);
         }
         let live = self.catalog.scrub_live(&extent.id);
         let live = self.idle(reader, walk.stats, live).await?;
         let stored = if live {
             let load = self.catalog.stored_plan(&extent.id);
-            Some(self.idle(reader, walk.stats, load).await?)
+            match self.idle(reader, walk.stats, load).await {
+                Ok(stored) => Some(stored),
+                // A packed plan that cannot be decoded is the same every
+                // time: deferred like an addendum that cannot be read.
+                // A catalogue that did not answer still stops the run.
+                Err(BridgeError::Invalid(what)) => {
+                    return self.defer_bad_plan(reader, walk, candidate, what).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else {
             None
         };
@@ -669,28 +734,16 @@ where
         let parity = match stored.parity_plan(&extent.id, extent.cipher_size) {
             Ok(parity) => parity,
             Err(_) => {
-                // A plan this version cannot read is no evidence about the
-                // copies: its checks wait a confirm interval with their
-                // phases and losses as they are, nothing is recorded, and
-                // the run goes on with the next extent.
-                crate::trace::alert(|| {
-                    format!(
-                        "scrub-bad-plan {} its parity addendum cannot be read; \
-                         looked at again after SCRUB_CONFIRM_SECS",
-                        extent.id.as_str()
-                    )
-                });
-                let next = self.clock.now().plus_ms(confirm);
-                let updates: Vec<_> = candidate
-                    .checks
-                    .iter()
-                    .map(|check| (check.clone(), next, check.loss_at))
-                    .collect();
-                self.advance_checks(reader, walk, extent, &updates, None)
-                    .await?;
-                return Ok(false);
+                return self
+                    .defer_bad_plan(reader, walk, candidate, "parity addendum")
+                    .await;
             }
         };
+        if candidate.checks.is_empty() {
+            self.reverify(reader, walk, candidate, backbones, stored)
+                .await?;
+            return Ok(true);
+        }
         let mut plan = stored.rows.clone();
         if let Some(parity) = parity {
             plan.extend(parity.articles);
@@ -740,9 +793,14 @@ where
         if lacking.is_empty() {
             let unresolved = self.catalog.scrub_has_loss(&extent.id, backbones);
             if prior_loss.is_none() && self.idle(reader, walk.stats, unresolved).await?.is_empty() {
-                walk.run.ok += 1;
-                self.scrub_record_one(reader, walk, extent, (ScrubResult::Ok, None))
-                    .await?;
+                if releasable_now(extent, backbones, self.cfg.required_backbones) {
+                    walk.run.ok += 1;
+                    self.scrub_record_one(reader, walk, extent, (ScrubResult::Ok, None))
+                        .await?;
+                } else {
+                    self.reverify(reader, walk, candidate, backbones, stored)
+                        .await?;
+                }
             }
             return Ok(true);
         }
@@ -799,6 +857,85 @@ where
             walk.blocked_repins += 1;
         }
         Ok(true)
+    }
+
+    /// Re-verifies a released extent that is not releasable under the
+    /// backbones that count now: it is re-pinned from verified bytes, and
+    /// verify reads the counting backbones its release evidence does not
+    /// name in full (posting what one lacks) before it releases it again,
+    /// with evidence on the counting backbones. Within the run's re-pins;
+    /// past them, looked at again after the confirm interval.
+    async fn reverify<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
+        candidate: &ScrubCandidate,
+        backbones: &[String],
+        stored: StoredPlan,
+    ) -> core::result::Result<(), Halt> {
+        let extent = &candidate.extent;
+        let cfg = &self.cfg.scrub;
+        let unproven: Vec<String> = backbones
+            .iter()
+            .filter(|b| !evidence_names(extent, b))
+            .cloned()
+            .collect();
+        let may = walk.run.repaired < cfg.repairs_per_run
+            && walk.run.incident.is_none()
+            && walk.breaker.tripped().is_empty();
+        if !may {
+            let next = self.clock.now().plus_ms(i64::from(cfg.confirm_secs) * 1000);
+            self.catalog
+                .scrub_defer(walk.token, &extent.id, next)
+                .await?;
+            return Ok(());
+        }
+        crate::trace::alert(|| {
+            format!(
+                "scrub-reverify {} unproven=[{}]: not releasable under the backbones that \
+                 count now",
+                extent.id.as_str(),
+                unproven.join(",")
+            )
+        });
+        let found = self
+            .repair_read(reader, walk, extent, stored, unproven)
+            .await?;
+        self.repair(reader, walk, candidate, found, true).await
+    }
+
+    fn alert_bad_plan(extent: &ExtentRow, what: &str) {
+        crate::trace::alert(|| {
+            format!(
+                "scrub-bad-plan {} its {what} cannot be read; looked at again after \
+                 SCRUB_CONFIRM_SECS",
+                extent.id.as_str()
+            )
+        });
+    }
+
+    /// A plan this version cannot decode is no evidence about the copies:
+    /// the due checks wait a confirm interval with their phases and losses
+    /// as they are, nothing is recorded, and the run goes on.
+    async fn defer_bad_plan<'s>(
+        &'s self,
+        reader: &mut ColdReader<'s, C, N, T>,
+        walk: &mut Walk<'_, 's, C, N, T>,
+        candidate: &ScrubCandidate,
+        what: &str,
+    ) -> core::result::Result<bool, Halt> {
+        let extent = &candidate.extent;
+        Self::alert_bad_plan(extent, what);
+        let confirm = i64::from(self.cfg.scrub.confirm_secs) * 1000;
+        let next = self.clock.now().plus_ms(confirm);
+        let updates: Vec<_> = candidate
+            .checks
+            .iter()
+            .map(|check| (check.clone(), next, check.loss_at))
+            .collect();
+        self.advance_checks(reader, walk, extent, &updates, None)
+            .await?;
+        Ok(false)
     }
 
     async fn advance_checks<'s>(
@@ -1360,12 +1497,24 @@ where
         {
             Ok(repinned) => repinned,
             Err(e) => {
-                // Not known to be pinned: the cache-sourced copy written
-                // above is not to outlive an extent GC collects.
-                if source == RepairSource::Cache {
-                    let _ = self.collect_if_unreferenced(extent).await;
+                // The batch may have committed with its reply lost. One
+                // point read tells: re-pinned by this very batch, it goes
+                // on as after any re-pin (the copy written and checked,
+                // the watch moved up if it is not there). Not known either
+                // way, the copy is written all the same. A copy written
+                // here or above is not to outlive an extent GC collects.
+                match self.catalog.scrub_repin_landed(&extent.id, now).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        let _ = self.collect_if_unreferenced(extent).await;
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        let _ = self.put_safety(extent, cipher.clone()).await;
+                        let _ = self.collect_if_unreferenced(extent).await;
+                        return Err(e.into());
+                    }
                 }
-                return Err(e.into());
             }
         };
         if repinned {
@@ -1450,6 +1599,18 @@ where
         }
     }
 
+    /// The PUT intents whose PUT can no longer land (the invocation that
+    /// sent it has ended, [`JOB_MAX_AGE_MS`]): each gets the guarded GC
+    /// enqueue, a no-op while the extent is referenced, then goes. At most
+    /// [`SCRUB_PAGE`] a run; an intent that fails stays for the next.
+    async fn reconcile_put_intents(&self, now: UnixMs) -> Result<()> {
+        for extent in self.catalog.scrub_put_intents_due(now, SCRUB_PAGE).await? {
+            self.catalog.gc_enqueue_scrub_safety(&extent, now).await?;
+            self.catalog.scrub_drop_put_intent(&extent).await?;
+        }
+        Ok(())
+    }
+
     /// After a safety PUT made past the last catalogue check, whatever its
     /// answer (a lost reply may hide a write): a guarded `delete_safety`
     /// row, inserted only if the extent is unreferenced now. Garbage
@@ -1462,9 +1623,22 @@ where
             .await
     }
 
-    /// Writes verified ciphertext as the extent's safety copy.
+    /// Writes verified ciphertext as the extent's safety copy, behind a
+    /// write-ahead intent: the intent is on record before the PUT is sent,
+    /// so a run that stops between the PUT and its catalogue update (or
+    /// the guarded GC enqueue after it) leaves it for a later run to
+    /// reconcile ([`Self::reconcile_put_intents`]). No intent, no PUT.
     async fn put_safety(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {
         if !digest_ok(extent, &cipher) {
+            return false;
+        }
+        let until = self.clock.now().plus_ms(JOB_MAX_AGE_MS);
+        if self
+            .catalog
+            .scrub_put_intent(&extent.id, until)
+            .await
+            .is_err()
+        {
             return false;
         }
         let meta = BlobMeta {

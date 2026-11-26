@@ -354,17 +354,10 @@ where
     let safety = &rig.bridge.safety;
     safety.hold_list.set(true);
     let between = async {
-        // Bounded: a `checked` that makes no list call fails the test.
-        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
-        while !safety.list_held.get() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no list call was made"
-            );
-            tokio::task::yield_now().await;
-        }
+        // Bounded in time: a `checked` that makes no list call fails the test.
+        safety.list_is_held().await;
         between.await;
-        safety.list_held.set(false);
+        safety.release_list();
     };
     tokio::join!(checked, between).0
 }
@@ -424,6 +417,26 @@ async fn a_rollback_beside_a_check_is_found() {
     snapshot(&rig);
     let lost = async {
         // Moves the counter and comes back to the same value.
+        bridge.raise_stamp().await.unwrap();
+        rollback(&rig);
+    };
+    assert!(interleave(&rig, bridge.catalogue_rolled_back(), lost)
+        .await
+        .unwrap());
+    assert!(row(&rig).await.rolled_back);
+}
+
+/// The same, with the other side slow in wall-clock time (as PostgreSQL
+/// round trips on a loaded runner are): the held list call waits for it,
+/// bounded in time, not in turns of the executor.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rollback_beside_a_slow_check_is_found() {
+    let rig = rig_selected();
+    let bridge = &rig.bridge;
+    bridge.raise_stamp().await.unwrap();
+    snapshot(&rig);
+    let lost = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         bridge.raise_stamp().await.unwrap();
         rollback(&rig);
     };

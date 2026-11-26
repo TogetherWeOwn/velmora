@@ -155,7 +155,9 @@ impl Hot {
     fn mark_released(&self, extent: &ExtentRow) {
         self.sql(
             "UPDATE extents SET safety_state = 'released', hot_safety_bytes = cipher_size, \
-               last_read_at = created_at, evict_seq = evict_seq + 1 WHERE id = ?1",
+               last_read_at = created_at, evict_seq = evict_seq + 1, \
+               release_evidence = '[{\"backbone\":\"alpha\",\"plan_rev\":' || plan_rev || '}]' \
+             WHERE id = ?1",
             extent,
         );
     }

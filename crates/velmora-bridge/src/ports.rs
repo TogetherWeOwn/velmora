@@ -1665,6 +1665,24 @@ pub trait Catalog {
     ) -> Result<bool> {
         Err(BridgeError::Invalid("this catalogue has no scrub"))
     }
+    /// Records, before a scrub safety PUT, that a PUT of the extent's safety
+    /// copy may land until `until`.
+    async fn scrub_put_intent(&self, _extent: &ExtentId, _until: UnixMs) -> Result<()> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Recorded PUT intents whose PUT can no longer land at `now`.
+    async fn scrub_put_intents_due(&self, _now: UnixMs, _limit: u32) -> Result<Vec<ExtentId>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Removes a reconciled PUT intent.
+    async fn scrub_drop_put_intent(&self, _extent: &ExtentId) -> Result<()> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Whether the re-pin made at `at` is the one on the extent's row: the
+    /// point read after a re-pin batch whose reply was lost.
+    async fn scrub_repin_landed(&self, _extent: &ExtentId, _at: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
     /// Stores the backbones under an incident (`scrub_state.last_incident`)
     /// at once, under the lease of `token`.
     async fn scrub_block(
@@ -1714,16 +1732,33 @@ pub trait Catalog {
     ) -> Result<bool>;
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
-    /// [`Catalog::evict_candidates`] less the extents whose loss the scrub
-    /// has on record on one of `backbones`, those that count now (`SCRUB`
-    /// on): their copies stay until the loss is settled. The default
-    /// lists them all.
-    async fn evict_candidates_keeping_scrub_losses(
+    /// One bounded window of `window` rows of the eviction order after
+    /// `cursor`, and of them at most `take` that may go under `rule`: the
+    /// cache fill of a pinned extent, or an extent releasable under the
+    /// backbones that count now (with the scrub on, and no loss on record
+    /// there). The default lists the head of the order unfiltered.
+    async fn evict_window(
         &self,
-        limit: u32,
-        _backbones: &[String],
-    ) -> Result<Vec<EvictCandidate>> {
-        self.evict_candidates(limit).await
+        _cursor: &crate::types::EvictCursor,
+        _window: u32,
+        take: u32,
+        _rule: &crate::types::EvictRule,
+    ) -> Result<crate::types::EvictWindow> {
+        let rows = self.evict_candidates(take).await?;
+        let more = rows.len() as u64 >= u64::from(take);
+        Ok(crate::types::EvictWindow {
+            rows,
+            next: crate::types::EvictCursor::Start,
+            more,
+        })
+    }
+    /// Where the current drain's listing is ([`Catalog::evict_window`]).
+    async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
+        Ok(crate::types::EvictCursor::Start)
+    }
+    /// Stores the drain's listing position.
+    async fn set_evict_cursor(&self, _cursor: &crate::types::EvictCursor) -> Result<()> {
+        Ok(())
     }
     /// Starts an eviction in one statement that re-checks the extent:
     /// `true` only if it is exactly as listed (sequence, byte counts,

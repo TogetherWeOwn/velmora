@@ -248,7 +248,8 @@ PERMITS = "do"
 #     are staggered across each interval from activation or release, whichever is later. New intervals apply to new deadlines.
 #     A loss confirmed by the same check after SCRUB_CONFIRM_SECS re-pins the extent from verified bytes and sends
 #     it back to verify. Repair-source reads do not complete any scheduled check. See src/scrub.rs.
-#     Not set here.
+#     Turning it on or off, or changing which backbones count, follows the three-deploy procedure in ops/README.md
+#     (Scrub): SCRUB_REPAIRS_PER_RUN at 0 for 16 minutes on each side of the change. Not set here.
 #   SCRUB_EXTENTS_PER_RUN (96, 8 to 10000): extents one run checks at most; at least what the breaker needs.
 #   SCRUB_SOCKETS (2, 1 to COLD_SOCKETS): drill connections the repair-source reader can use.
 #   SCRUB_INTERVAL_DAYS (30): days between STAT checks of a copy.

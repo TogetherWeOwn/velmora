@@ -239,8 +239,11 @@ pub struct Blobs {
     pub puts: RefCell<Vec<(String, [u8; 32])>>,
     /// The next list call waits until `list_held` is cleared again.
     pub hold_list: Cell<bool>,
-    /// A list call is waiting.
+    /// A list call is waiting. Set and cleared through
+    /// [`Blobs::release_list`] and the held call, which notify.
     pub list_held: Cell<bool>,
+    /// Wakes whoever waits on `list_held` changing.
+    pub list_changed: tokio::sync::Notify,
     /// With `hold_list`: the held call reads its keys before it waits,
     /// not after.
     pub list_first: Cell<bool>,
@@ -372,6 +375,28 @@ impl std::ops::Deref for Blobs {
 }
 
 impl Blobs {
+    /// Waits, at most [`HOLD_TIMEOUT`], until a list call is held.
+    pub async fn list_is_held(&self) {
+        let held = async {
+            loop {
+                let changed = self.list_changed.notified();
+                if self.list_held.get() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(HOLD_TIMEOUT, held)
+            .await
+            .expect("no list call was made");
+    }
+
+    /// Lets the held list call go on.
+    pub fn release_list(&self) {
+        self.list_held.set(false);
+        self.list_changed.notify_waiters();
+    }
+
     fn allow_write(&self) -> Result<()> {
         if self.frozen.get() {
             self.frozen_write_attempts
@@ -572,15 +597,21 @@ impl BlobStore for Blobs {
             false => None,
         };
         self.list_held.set(true);
-        // Bounded: a test that never lets go fails instead of hanging.
-        let deadline = Instant::now() + HOLD_TIMEOUT;
-        while self.list_held.get() {
-            assert!(
-                Instant::now() < deadline,
-                "the held list call was never let go"
-            );
-            tokio::task::yield_now().await;
-        }
+        self.list_changed.notify_waiters();
+        // Bounded in time: a test that never lets go fails instead of
+        // hanging, however long the other side takes.
+        let released = async {
+            loop {
+                let changed = self.list_changed.notified();
+                if !self.list_held.get() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(HOLD_TIMEOUT, released)
+            .await
+            .expect("the held list call was never let go");
         match early {
             Some(keys) => keys,
             None => self.inner.list(prefix, start_after, limit).await,
@@ -615,6 +646,9 @@ pub struct FailSql {
     pub selected_query: Tripwire,
     /// Stalls one batch with a matching first text parameter.
     pub stall_batch_key: Cell<Option<&'static str>>,
+    /// Runs one batch with a statement whose text contains the string,
+    /// then answers it with an error: a commit whose reply was lost.
+    pub lose_batch_matching: Cell<Option<&'static str>>,
     pub selected_batch: Tripwire,
     /// Runs the given SQL once, just before a read whose text contains
     /// the string, after letting the given number of such reads through:
@@ -830,6 +864,15 @@ impl Sql for FailSql {
                 return self.inner.batch(stmts).await;
             }
         }
+        let lose = self
+            .lose_batch_matching
+            .get()
+            .is_some_and(|text| stmts.iter().any(|(sql, _)| sql.contains(text)));
+        if lose {
+            self.lose_batch_matching.set(None);
+            self.inner.batch(stmts).await?;
+            return Err(BridgeError::Sql("no answer".into()));
+        }
         let stall = self.stall_batch_key.get().is_some_and(|key| {
             stmts.iter().any(
                 |(_, params)| matches!(params.first(), Some(SqlValue::Text(found)) if found == key),
@@ -966,6 +1009,7 @@ fn rig_on<N: NntpConnector + 'static>(
                 stall_query_matching: Cell::new(None),
                 selected_query: Tripwire::default(),
                 stall_batch_key: Cell::new(None),
+                lose_batch_matching: Cell::new(None),
                 selected_batch: Tripwire::default(),
                 before_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),

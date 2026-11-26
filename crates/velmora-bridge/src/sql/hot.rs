@@ -26,11 +26,13 @@
 //! a listing never survives a state change.
 //!
 //! The job asks once more right before it deletes the safety copy
-//! (`evict_safety_still_ok`). With `SCRUB` on, an extent whose loss the
-//! scrub has on record is not listed (`CANDIDATES_SCRUB`), so it cannot
-//! hold the head of the order, and keeps its safety copy if the loss was
-//! recorded after it was listed: the re-pin of that loss may need it.
-//! That eviction ends the cache fill's count only.
+//! (`evict_safety_still_ok`); a no there (a re-pin, or a scrub loss
+//! recorded after the listing) deletes nothing.
+//!
+//! The job lists bounded windows of the eviction order (`evict_window`):
+//! a row that would delete an extent's last R2 copy may go only while the
+//! extent is releasable under the backbones that count now and, with
+//! `SCRUB` on, has no loss on record there.
 //!
 //! The counts are not exact, and they are not a bound in either
 //! direction. Each error is limited to one extent's bytes and repairs
@@ -52,7 +54,9 @@
 use super::uploads::{int, ms, text, Cols};
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
-use crate::types::{EvictCandidate, ExtentId, HotStats, Result, UnixMs};
+use crate::types::{
+    EvictCandidate, EvictCursor, EvictRule, EvictWindow, ExtentId, HotStats, Result, UnixMs,
+};
 
 /// True for an extent whose safety copy is pinned. The text matches the
 /// `extents_safety` index.
@@ -116,40 +120,150 @@ const CANDIDATES: &str = concat!(
 /// own `HAS_LOSS` reads it): key lookups in `scrub_copies`. A loss on a
 /// backbone that no longer counts is never checked again, so it must not
 /// keep the extent's copies.
+// A scalar subquery with LIMIT 1, not EXISTS: PostgreSQL may turn an
+// EXISTS into one hashed pass over all of `scrub_copies`; this stays one
+// key lookup per row on both engines.
 macro_rules! scrub_loss_on_record {
     ($x:literal, $labels:literal) => {
         concat!(
-            "EXISTS (SELECT 1 FROM scrub_copies s WHERE s.extent_id = ",
+            "(SELECT 1 FROM scrub_copies s WHERE s.extent_id = ",
             $x,
             " AND s.backbone IN (SELECT ",
             $labels,
-            ") AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL))"
+            ") AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL) LIMIT 1) IS NOT NULL"
         )
     };
 }
 
-/// With `SCRUB` on: the candidates less the extents with a loss on the
-/// scrub's record. Their copies stay until the loss is settled (the
-/// re-pin of a confirmed loss may need either), and they do not hold the
-/// head of the order. The order and the index are those of `CANDIDATES`.
-pub const CANDIDATES_SCRUB: &str = concat!(
-    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
-    pinned!(),
-    " FROM extents WHERE ",
-    evictable!(),
-    " AND NOT ",
-    scrub_loss_on_record!("extents.id", "value FROM json_each(?2)"),
-    " ORDER BY last_read_at, id LIMIT ?1"
+/// True while the extent of window row `w` is releasable under the
+/// backbones that count now: its release evidence, for its current plan,
+/// names at least `$r` distinct backbones of `$l` (a JSON array).
+macro_rules! releasable_now {
+    ($l:literal, $r:literal) => {
+        concat!(
+            "(SELECT COUNT(DISTINCT json_extract(r.value, '$.backbone')) \
+               FROM json_each(w.release_evidence) r \
+              WHERE json_extract(r.value, '$.plan_rev') = w.plan_rev \
+                AND json_extract(r.value, '$.backbone') IN (SELECT value FROM json_each(",
+            $l,
+            "))) >= ",
+            $r
+        )
+    };
+}
+macro_rules! releasable_now_pg {
+    ($l:literal, $r:literal) => {
+        concat!(
+            "(SELECT COUNT(DISTINCT r ->> 'backbone') \
+               FROM jsonb_array_elements(CAST(w.release_evidence AS jsonb)) r \
+              WHERE CAST(r ->> 'plan_rev' AS bigint) = w.plan_rev \
+                AND r ->> 'backbone' IN (SELECT jsonb_array_elements_text(CAST(",
+            $l,
+            " AS jsonb)))) >= ",
+            $r
+        )
+    };
+}
+
+/// One bounded window of the eviction order (`?1` rows of the
+/// `extents_evictable` index, after the keyset), each with whether it may
+/// go: a pinned extent's cache fill always may (its safety copy stays);
+/// any other row deletes the extent's last R2 copy, so only while the
+/// extent is releasable under the backbones that count now and, with the
+/// scrub on, has no loss on record there. The window is read before it is
+/// filtered, so a long run of rows that may not go costs one window per
+/// step, not a scan.
+macro_rules! evict_window {
+    ($keyset:literal, $order:literal, $outer:literal, $may:expr) => {
+        concat!(
+            "SELECT w.id, w.hot_safety_bytes, w.hot_cache_bytes, w.evict_seq, w.pinned, \
+               w.last_read_at, CASE WHEN w.pinned THEN 1 WHEN ",
+            $may,
+            " THEN 1 ELSE 0 END FROM (SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+            pinned!(),
+            " AS pinned, last_read_at, release_evidence, plan_rev FROM extents WHERE ",
+            evictable!(),
+            $keyset,
+            " ORDER BY ",
+            $order,
+            " LIMIT ?1) w ORDER BY ",
+            $outer
+        )
+    };
+}
+pub const EVICT_WINDOW: &str = evict_window!(
+    "",
+    "last_read_at, id",
+    "w.last_read_at, w.id",
+    releasable_now!("?2", "?3")
 );
-pub const CANDIDATES_SCRUB_PG: &str = concat!(
-    "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
-    pinned!(),
-    " FROM extents WHERE ",
-    evictable!(),
-    " AND NOT ",
-    scrub_loss_on_record!("extents.id", "jsonb_array_elements_text(CAST(?2 AS jsonb))"),
-    " ORDER BY last_read_at ASC NULLS FIRST, id LIMIT ?1"
+pub const EVICT_WINDOW_AFTER: &str = evict_window!(
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at, id",
+    "w.last_read_at, w.id",
+    releasable_now!("?4", "?5")
 );
+pub const EVICT_WINDOW_SCRUB: &str = evict_window!(
+    "",
+    "last_read_at, id",
+    "w.last_read_at, w.id",
+    concat!(
+        "NOT ",
+        scrub_loss_on_record!("w.id", "value FROM json_each(?2)"),
+        " AND ",
+        releasable_now!("?2", "?3")
+    )
+);
+pub const EVICT_WINDOW_SCRUB_AFTER: &str = evict_window!(
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at, id",
+    "w.last_read_at, w.id",
+    concat!(
+        "NOT ",
+        scrub_loss_on_record!("w.id", "value FROM json_each(?4)"),
+        " AND ",
+        releasable_now!("?4", "?5")
+    )
+);
+pub const EVICT_WINDOW_PG: &str = evict_window!(
+    "",
+    "last_read_at ASC NULLS FIRST, id",
+    "w.last_read_at ASC NULLS FIRST, w.id",
+    releasable_now_pg!("?2", "?3")
+);
+pub const EVICT_WINDOW_AFTER_PG: &str = evict_window!(
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at ASC NULLS FIRST, id",
+    "w.last_read_at ASC NULLS FIRST, w.id",
+    releasable_now_pg!("?4", "?5")
+);
+pub const EVICT_WINDOW_SCRUB_PG: &str = evict_window!(
+    "",
+    "last_read_at ASC NULLS FIRST, id",
+    "w.last_read_at ASC NULLS FIRST, w.id",
+    concat!(
+        "NOT ",
+        scrub_loss_on_record!("w.id", "jsonb_array_elements_text(CAST(?2 AS jsonb))"),
+        " AND ",
+        releasable_now_pg!("?2", "?3")
+    )
+);
+pub const EVICT_WINDOW_SCRUB_AFTER_PG: &str = evict_window!(
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at ASC NULLS FIRST, id",
+    "w.last_read_at ASC NULLS FIRST, w.id",
+    concat!(
+        "NOT ",
+        scrub_loss_on_record!("w.id", "jsonb_array_elements_text(CAST(?4 AS jsonb))"),
+        " AND ",
+        releasable_now_pg!("?4", "?5")
+    )
+);
+
+const EVICT_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'evict'";
+const SET_EVICT_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict', ?1)";
+const SET_EVICT_CURSOR_PG: &str =
+    "INSERT INTO scan_cursors(k, v) VALUES ('evict', ?1) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
 
 /// The periodic statements with the index each must be answered from
 /// alone, without touching the table or sorting. Tests hold them to it.
@@ -197,17 +311,14 @@ pub(super) async fn hot_stats<S: Sql>(c: &SqlCatalog<S>) -> Result<HotStats> {
 pub(super) async fn evict_candidates<S: Sql>(
     c: &SqlCatalog<S>,
     limit: u32,
-    scrub: Option<&[String]>,
 ) -> Result<Vec<EvictCandidate>> {
-    let mut params = vec![SqlValue::Int(i64::from(limit))];
-    let sql = match scrub {
-        Some(backbones) => {
-            params.push(labels(backbones)?);
-            c.sql.dialect().pick(CANDIDATES_SCRUB, CANDIDATES_SCRUB_PG)
-        }
-        None => c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
-    };
-    let rows = c.sql.query(sql, &params).await?;
+    let rows = c
+        .sql
+        .query(
+            c.sql.dialect().pick(CANDIDATES, CANDIDATES_PG),
+            &[SqlValue::Int(i64::from(limit))],
+        )
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
@@ -220,6 +331,100 @@ pub(super) async fn evict_candidates<S: Sql>(
         });
     }
     Ok(out)
+}
+
+/// One bounded window of the eviction order after `cursor`, filtered by
+/// `rule` (see `evict_window!`): at most `take` rows that may go. The
+/// cursor that comes back is past the last row looked at, whether or not
+/// any could go; `more` is false once the window reached the end.
+pub(super) async fn evict_window<S: Sql>(
+    c: &SqlCatalog<S>,
+    cursor: &EvictCursor,
+    window: u32,
+    take: u32,
+    rule: &EvictRule,
+) -> Result<EvictWindow> {
+    let pg = c.sql.dialect() == crate::ports::Dialect::Postgres;
+    let mut params = vec![SqlValue::Int(i64::from(window))];
+    if let EvictCursor::After(read, id) = cursor {
+        params.push(SqlValue::Int(*read));
+        params.push(text(id));
+    }
+    params.push(labels(&rule.counting)?);
+    params.push(SqlValue::Int(i64::from(rule.required)));
+    let after = matches!(cursor, EvictCursor::After(..));
+    let sql = match (rule.scrub, after, pg) {
+        (false, false, false) => EVICT_WINDOW,
+        (false, true, false) => EVICT_WINDOW_AFTER,
+        (true, false, false) => EVICT_WINDOW_SCRUB,
+        (true, true, false) => EVICT_WINDOW_SCRUB_AFTER,
+        (false, false, true) => EVICT_WINDOW_PG,
+        (false, true, true) => EVICT_WINDOW_AFTER_PG,
+        (true, false, true) => EVICT_WINDOW_SCRUB_PG,
+        (true, true, true) => EVICT_WINDOW_SCRUB_AFTER_PG,
+    };
+    let rows = c.sql.query(sql, &params).await?;
+    let full = rows.len() as u64 >= u64::from(window);
+    let mut out = EvictWindow {
+        rows: Vec::new(),
+        next: EvictCursor::Start,
+        more: full,
+    };
+    let mut last = None;
+    for row in rows {
+        let mut r = Cols::new(row);
+        let candidate = EvictCandidate {
+            extent: ExtentId::new(r.text()?),
+            safety_bytes: r.num()?,
+            cache_bytes: r.num()?,
+            seq: r.num()?,
+            pinned: r.num::<i64>()? != 0,
+        };
+        let read: Option<i64> = r.opt_num()?;
+        let may = r.num::<i64>()? != 0;
+        // A row without a read stamp sorts first; the next window starts
+        // at the stamped rows (only a legacy row has none).
+        last = Some(EvictCursor::After(
+            read.unwrap_or(i64::MIN),
+            match read {
+                Some(_) => candidate.extent.as_str().to_owned(),
+                None => String::new(),
+            },
+        ));
+        if may {
+            out.rows.push(candidate);
+            if out.rows.len() as u64 >= u64::from(take) {
+                // Stopped inside the window: the rest of it is next.
+                out.more = true;
+                break;
+            }
+        }
+    }
+    if out.more {
+        out.next = last.unwrap_or(EvictCursor::Start);
+    }
+    Ok(out)
+}
+
+pub(super) async fn evict_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<EvictCursor> {
+    let rows = c.sql.query(EVICT_CURSOR, &[]).await?;
+    Ok(match rows.into_iter().next() {
+        Some(row) => EvictCursor::parse(&Cols::new(row).text()?),
+        None => EvictCursor::Start,
+    })
+}
+
+pub(super) async fn set_evict_cursor<S: Sql>(
+    c: &SqlCatalog<S>,
+    cursor: &EvictCursor,
+) -> Result<()> {
+    c.sql
+        .exec(
+            c.sql.dialect().pick(SET_EVICT_CURSOR, SET_EVICT_CURSOR_PG),
+            &[text(&cursor.encode())],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Starts an eviction: `true` only if the extent is exactly as `x`
@@ -551,7 +756,12 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
         (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
         (EVICT_SAFETY_STILL_OK_SCRUB_PG.to_owned(), vec![T, I, T]),
-        (CANDIDATES_SCRUB_PG.to_owned(), vec![I, T]),
+        (EVICT_WINDOW_PG.to_owned(), vec![I, T, I]),
+        (EVICT_WINDOW_AFTER_PG.to_owned(), vec![I, I, T, T, I]),
+        (EVICT_WINDOW_SCRUB_PG.to_owned(), vec![I, T, I]),
+        (EVICT_WINDOW_SCRUB_AFTER_PG.to_owned(), vec![I, I, T, T, I]),
+        (EVICT_CURSOR.to_owned(), vec![]),
+        (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

@@ -3280,13 +3280,19 @@ async fn a_scheduled_body_pass_advances_last_verified_at() {
 
 /// With the scrub on, an extent with a loss on record is not listed for
 /// eviction: both copies stay, counted. One whose loss is recorded after
-/// the listing, right before the safety delete, keeps its safety copy
-/// (still counted) and loses only the cache fill. With the scrub off the
-/// old rule holds: both go.
+/// the listing, right before the deletes, keeps both copies too: the
+/// cache fill can be the only R2 copy left (its safety copy already
+/// evicted), and the repair of that loss may need it. With the scrub off
+/// the old rule holds: both go.
 #[tokio::test(flavor = "current_thread")]
 async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record() {
-    // (scrub on, loss recorded only after the listing)
-    for (scrub, late) in [(true, false), (true, true), (false, false)] {
+    // (scrub on, loss recorded only after the listing, safety copy already evicted)
+    for (scrub, late, cache_only) in [
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+        (false, false, false),
+    ] {
         let w = world_with(|cfg| {
             cfg.hot_cap_bytes = 1;
             cfg.scrub.on = scrub;
@@ -3314,6 +3320,17 @@ async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record
         c.record_cache_fill(&o.extent, w.bridge().clock.now())
             .await
             .unwrap();
+        if cache_only {
+            assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+            c.sql
+                .inner
+                .fixture_exec(
+                    "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+                    &[SqlValue::Text(o.extent.as_str().to_owned())],
+                )
+                .await
+                .unwrap();
+        }
         let loss = format!(
             "UPDATE scrub_copies SET full_loss_at = {} WHERE extent_id = '{}' AND backbone = 'beta'",
             w.bridge().clock.now().0,
@@ -3340,20 +3357,20 @@ async fn eviction_keeps_and_counts_the_copies_of_an_extent_with_a_loss_on_record
             )
             .await;
         let size = extent.cipher_size;
-        let (safety, cache, expected) = match (scrub, late) {
+        let (safety, cache, expected) = match (scrub, cache_only) {
             (true, false) => (true, true, format!("{size}:{size}")),
-            (true, true) => (true, false, format!("{size}:0")),
+            (true, true) => (false, true, format!("0:{size}")),
             (false, _) => (false, false, "0:0".to_owned()),
         };
         assert_eq!(
             w.has_safety(&o),
             safety,
-            "safety copy, scrub={scrub} late={late}"
+            "safety copy, scrub={scrub} late={late} cache_only={cache_only}"
         );
         assert_eq!(
             w.bridge().cache.contains(&o.extent.cache_key()),
             cache,
-            "cache fill, scrub={scrub} late={late}"
+            "cache fill, scrub={scrub} late={late} cache_only={cache_only}"
         );
         assert_eq!(counts, expected, "scrub={scrub} late={late}");
     }
@@ -3420,34 +3437,6 @@ async fn kept_copies_at_the_head_of_the_order_do_not_stall_eviction() {
             .await;
         assert_eq!(read, (1 + i).to_string(), "its read stamp is untouched");
     }
-}
-
-/// The eviction listing with the scrub on reads the same covering index,
-/// in order, as the listing without it: no table scan, no sort.
-#[tokio::test(flavor = "current_thread")]
-async fn the_scrub_eviction_listing_reads_only_its_index() {
-    let w = world_on(true, |_| {}).await;
-    let plan: Vec<String> = w.bridge().catalog.sql.with_conn(|c| {
-        let sql = format!(
-            "EXPLAIN QUERY PLAN {}",
-            velmora_bridge::sql::HOT_SCRUB_CANDIDATES
-                .replace("?1", "10")
-                .replace("?2", r#"'["alpha","beta"]'"#)
-        );
-        let mut stmt = c.prepare(&sql).unwrap();
-        let rows = stmt.query_map((), |r| r.get::<_, String>(3)).unwrap();
-        rows.map(|r| r.unwrap()).collect()
-    });
-    let plan = plan.join(" | ");
-    assert!(
-        plan.contains("USING COVERING INDEX extents_evictable"),
-        "{plan}"
-    );
-    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-    assert!(
-        !plan.contains("SCAN s"),
-        "a key lookup in scrub_copies: {plan}"
-    );
 }
 
 /// Re-pins `o` from Usenet (beta lacks article 0) without its safety
@@ -3647,72 +3636,6 @@ async fn a_loss_on_a_backbone_that_no_longer_counts_does_not_keep_the_copies() {
     }
 }
 
-/// The PostgreSQL twin of the scrub eviction listing reads the same
-/// partial index in order, with key lookups in `scrub_copies`: no scan,
-/// on 20,000 evictable extents with schedules.
-#[tokio::test(flavor = "current_thread")]
-async fn the_scrub_eviction_listing_reads_only_its_index_on_postgres() {
-    let w = world().await;
-    let db = &w.bridge().catalog.sql.inner;
-    if db.dialect() != Dialect::Postgres {
-        return; // The SQLite side is the_scrub_eviction_listing_reads_only_its_index.
-    }
-    #[cfg(feature = "testkit-pg")]
-    if let Some(pg) = db.postgres() {
-        let client = pg.client().await.unwrap();
-        client
-            .batch_execute(&format!(
-                "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,\
-                   plain_sha256,cipher_sha256,safety_state,created_at,hot_cache_bytes,last_read_at) \
-                 SELECT 'fixture-' || lpad(CAST(x AS text), 5, '0'), '{}', 'committed', 1, 65, \
-                   decode(repeat('00', 48), 'hex'), decode(repeat('00', 16), 'hex'), \
-                   decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), 'released', 0, 65, x \
-                 FROM generate_series(1, 20000) x; \
-                 INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at,stat_phase_at,full_phase_at,stat_loss_at) \
-                 SELECT id, b, 0, 100, 0, 100, CASE WHEN id < 'fixture-00100' THEN 1 END \
-                 FROM extents CROSS JOIN (VALUES ('alpha'), ('beta')) v(b) WHERE id LIKE 'fixture-%'; \
-                 ANALYZE extents; ANALYZE scrub_copies;",
-                w.bucket.id.as_str()
-            ))
-            .await
-            .unwrap();
-        let query =
-            velmora_bridge::pg::normalize_statement(velmora_bridge::sql::HOT_SCRUB_CANDIDATES_PG)
-                .unwrap();
-        let labels = r#"["alpha","beta"]"#;
-        // Bound as the adapter binds them: INT8 and TEXT.
-        let explain = client
-            .prepare_typed(
-                &format!("EXPLAIN {query}"),
-                &[
-                    tokio_postgres::types::Type::INT8,
-                    tokio_postgres::types::Type::TEXT,
-                ],
-            )
-            .await
-            .unwrap();
-        let rows = client.query(&explain, &[&50i64, &labels]).await.unwrap();
-        let plan = rows
-            .iter()
-            .map(|r| r.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(plan.contains("extents_evictable"), "{plan}");
-        assert!(plan.contains("scrub_copies_pkey"), "{plan}");
-        assert!(!plan.contains("Seq Scan"), "{plan}");
-        assert!(!plan.contains("Sort"), "{plan}");
-        // And it answers: the first 99 have a loss on record and are left out.
-        let listed = w
-            .bridge()
-            .catalog
-            .evict_candidates_keeping_scrub_losses(3, &["alpha".into(), "beta".into()])
-            .await
-            .unwrap();
-        let ids: Vec<&str> = listed.iter().map(|x| x.extent.as_str()).collect();
-        assert_eq!(ids, ["fixture-00100", "fixture-00101", "fixture-00102"]);
-    }
-}
-
 /// A copy check reads the provider pool while the run keeps a session
 /// from the check before. A pool read that outlasts that session's slot
 /// does not keep the socket past it: the session is ended (its slot
@@ -3791,4 +3714,449 @@ async fn a_slow_pool_read_ends_the_retained_sessions_before_their_slots_run_out(
     let run = run.await;
     assert_eq!((run.checked, run.ok), (1, 1), "the same read went on");
     assert_eq!(w.result(&o).await, "ok");
+}
+
+// ---------------------------------------------------------------------------
+// Second re-review: releasability, write-ahead PUT intents, bad packed
+// plans, bounded eviction windows, lost re-pin replies
+// ---------------------------------------------------------------------------
+
+fn cfg_mut(w: &mut World) -> &mut velmora_bridge::config::BridgeConfig {
+    &mut std::rc::Rc::get_mut(&mut w.rig.bridge)
+        .expect("no request in flight")
+        .cfg
+}
+
+/// A backbone that held a released extent stops counting: the extent is
+/// no longer releasable under the backbones that count now (one of the
+/// two required), so eviction must not delete its last R2 copy, with no
+/// loss on record anywhere and with the scrub off as well.
+#[tokio::test(flavor = "current_thread")]
+async fn eviction_keeps_the_last_copy_of_an_extent_not_releasable_under_the_counting_backbones() {
+    for scrub in [true, false] {
+        let mut w = world_with(|cfg| {
+            cfg.hot_cap_bytes = 1;
+            cfg.scrub.on = scrub;
+        })
+        .await;
+        let o = w.released("a", 9).await;
+        cfg_mut(&mut w).providers[1].release = false;
+        w.bridge().evict_batch(0).await.unwrap();
+        assert!(w.has_safety(&o), "scrub={scrub}: the last copy stays");
+        // Both backbones counting again: it may go.
+        cfg_mut(&mut w).providers[1].release = true;
+        w.bridge().evict_batch(0).await.unwrap();
+        assert!(
+            !w.has_safety(&o),
+            "scrub={scrub}: releasable again, evicted"
+        );
+    }
+}
+
+/// The protection clears by itself: with beta retired and gamma counting
+/// in its place, the scrub's next look re-verifies the extent (re-pinned,
+/// posted to gamma, released on alpha and gamma), and eviction may then
+/// take its R2 copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retired_backbone_is_replaced_by_a_scrub_re_verify_and_eviction_then_proceeds() {
+    let gamma = server().await;
+    let mut w = world_with(|cfg| {
+        cfg.hot_cap_bytes = 1;
+        let mut p = provider("p2", "gamma", &gamma);
+        p.enabled = false;
+        cfg.providers.push(p);
+    })
+    .await;
+    let o = w.released("a", 10).await;
+    {
+        let cfg = cfg_mut(&mut w);
+        cfg.providers[1].release = false;
+        cfg.providers[2].enabled = true;
+    }
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(w.has_safety(&o), "not releasable under alpha and gamma yet");
+    w.advance_secs(31 * DAY_SECS);
+    let run = w.scrub().await;
+    assert_eq!(run.repaired, 1, "{:?}", alerts());
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-reverify ") && a.contains("unproven=[gamma]")));
+    assert_eq!(w.safety_state(&o).await, "held");
+    w.drive(&o).await;
+    assert_eq!(w.safety_state(&o).await, "released");
+    let evidence = w
+        .scalar(
+            "SELECT release_evidence FROM extents WHERE id = ?1",
+            &o.extent,
+        )
+        .await;
+    assert!(evidence.contains("gamma"), "{evidence}");
+    for row in w.plan(&o).await {
+        assert!(gamma.is_stored(&row.message_id).await, "posted to gamma");
+    }
+    w.bridge().evict_batch(0).await.unwrap();
+    assert!(!w.has_safety(&o), "releasable again: evicted");
+}
+
+/// A cache-sourced repair whose run stops between the PUT and its
+/// catalogue update (the re-pin batch never runs), after GC collected
+/// the extent: the write-ahead intent is reconciled by a later run, once
+/// the PUT can no longer land, and GC collects the copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repair_put_cancelled_before_its_catalogue_update_is_collected_later() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 11).await;
+    let bridge = w.bridge();
+    let safety = &bridge.safety;
+    let key = o.extent.safety_key();
+    let cipher = safety.stored(&key).unwrap().bytes;
+    assert!(safety.lose(&key));
+    let extent = w.rig.live(&w.bucket, "a").await.unwrap().1.remove(0);
+    let meta = BlobMeta {
+        bucket: &extent.bucket_id,
+        extent: &extent.id,
+        cipher_sha256: &extent.cipher_sha256,
+    };
+    bridge
+        .cache
+        .put(&o.extent.cache_key(), cipher, &meta)
+        .await
+        .unwrap();
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, &o, 0).await;
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+
+    let id: &'static str = Box::leak(o.extent.as_str().to_owned().into_boxed_str());
+    safety.hold_put_prefix.replace(Some(key.clone()));
+    let mut run = Box::pin(w.scrub());
+    let collect = async {
+        while !safety.held.get() {
+            tokio::task::yield_now().await;
+        }
+        w.rig
+            .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+            .await
+            .expect(204);
+        assert_eq!(
+            bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        assert_eq!(w.safety_state(&o).await, "deleted", "GC ran to its end");
+        // The re-pin batch that follows the PUT never answers.
+        bridge.catalog.sql.stall_batch_key.set(Some(id));
+        safety.hold_put_prefix.replace(None);
+        while bridge.catalog.sql.stall_batch_key.get().is_some() {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        () = collect => {}
+        _ = &mut run => panic!("the run ended with its re-pin stalled"),
+    }
+    // The invocation is cancelled there: the PUT landed, nothing after it ran.
+    drop(run);
+    bridge.catalog.sql.selected_batch.disarm();
+    assert!(w.has_safety(&o), "the PUT landed");
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(w.has_safety(&o), "no cleanup was queued before the cancel");
+    // Once the cancelled invocation can no longer write, a run reconciles.
+    bridge
+        .clock
+        .advance_ms(velmora_bridge::jobtable::JOB_MAX_AGE_MS + 1);
+    w.scrub().await;
+    assert_eq!(
+        bridge.run_job(&Job::Gc { v: JOB_VERSION }).await,
+        JobOutcome::Ack
+    );
+    assert!(
+        !w.has_safety(&o),
+        "the reconciled intent collected the copy"
+    );
+    assert_eq!(
+        w.rig.count("scan_cursors WHERE k LIKE 'scrub-put:%'"),
+        0,
+        "the intent is gone"
+    );
+}
+
+/// A packed data plan that cannot be decoded: its extent is said and
+/// deferred, its evidence kept, and the run goes on, on the scheduled
+/// path and on the repair watch's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_corrupt_packed_plan_defers_its_extent_and_the_run_goes_on() {
+    // Scheduled checks.
+    let w = world_with(|cfg| cfg.packed_plans = true).await;
+    let a = w.released("a", 12).await;
+    let b = w.released("b", 13).await;
+    w.advance_secs(31 * DAY_SECS);
+    let now = w.bridge().clock.now();
+    let far = now.plus_secs(60 * DAY_SECS);
+    for name in ["alpha", "beta"] {
+        w.set_clocks(&a, name, now.plus_ms(-2000), far).await;
+        w.set_clocks(&b, name, now.plus_ms(-1000), far).await;
+    }
+    let packed = w
+        .scalar(
+            "SELECT COUNT(*) FROM extents WHERE id = ?1 AND plan IS NOT NULL",
+            &a.extent,
+        )
+        .await;
+    assert_eq!(packed, "1", "the plan is stored packed");
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET plan = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(a.extent.as_str().to_owned()),
+                SqlValue::Blob(vec![0xee; 9]),
+            ],
+        )
+        .await
+        .unwrap();
+    let run = w.scrub().await;
+    assert_ne!(run.ended, ScrubEnd::Stopped);
+    assert_eq!((run.checked, run.ok), (1, 1), "b is checked");
+    assert!(alerts()
+        .iter()
+        .any(|l| l.starts_with("scrub-bad-plan ") && l.contains(a.extent.as_str())));
+    let (stat, _) = w.clocks(&a, "alpha").await;
+    assert!(stat > now && stat < now.plus_secs(DAY_SECS), "deferred");
+
+    // The repair watch of a re-pinned extent.
+    let w = world_with(|cfg| cfg.packed_plans = true).await;
+    let a = w.released("a", 14).await;
+    let b = w.released("b", 15).await;
+    repinned_without_its_copy(&w, &a).await;
+    let result = w.result(&a).await;
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET plan = ?2 WHERE id = ?1",
+            &[
+                SqlValue::Text(a.extent.as_str().to_owned()),
+                SqlValue::Blob(vec![0xee; 9]),
+            ],
+        )
+        .await
+        .unwrap();
+    w.advance_secs(3600);
+    let now = w.bridge().clock.now();
+    for name in ["alpha", "beta"] {
+        w.set_clocks(&b, name, now.plus_ms(-1000), now.plus_secs(60 * DAY_SECS))
+            .await;
+    }
+    let run = w.scrub().await;
+    assert_ne!(run.ended, ScrubEnd::Stopped);
+    assert_eq!(w.result(&b).await, "ok", "b is checked");
+    assert_eq!(w.result(&a).await, result, "the repair stays on record");
+    assert_eq!(
+        w.next_at(&a).await,
+        Some(now.0 + 3_600_000),
+        "looked at again"
+    );
+}
+
+/// 20,000 extents with a loss on record (protected) sit at the head of
+/// the eviction order, ahead of one that may go. Each drain step reads
+/// one bounded window, and the steps reach that extent.
+#[tokio::test(flavor = "current_thread")]
+async fn eviction_steps_stay_bounded_past_a_long_protected_prefix() {
+    use velmora_bridge::jobs::EVICT_WINDOW;
+    let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
+    let o = w.released("a", 16).await;
+    let c = &w.bridge().catalog;
+    let db = &c.sql.inner;
+    let evidence = r#"[{"backbone":"alpha","plan_rev":0},{"backbone":"beta","plan_rev":0}]"#;
+    let seed = db.fixture(
+        "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 20000) \
+         INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT printf('fixture-%05d', x), ?1, 'committed', 1, 65, zeroblob(48), zeroblob(16), zeroblob(32), zeroblob(32), 'released', 0, 65, x, ?2 FROM n",
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT 'fixture-' || lpad(CAST(x AS text), 5, '0'), ?1, 'committed', 1, 65, \
+           decode(repeat('00', 48), 'hex'), decode(repeat('00', 16), 'hex'), \
+           decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), 'released', 0, 65, x, ?2 \
+         FROM generate_series(1, 20000) x",
+    );
+    db.fixture_exec(
+        seed,
+        &[
+            SqlValue::Text(w.bucket.id.as_str().to_owned()),
+            SqlValue::Text(evidence.to_owned()),
+        ],
+    )
+    .await
+    .unwrap();
+    db.fixture_exec(
+        "INSERT INTO scrub_copies(extent_id,backbone,stat_at,full_at,stat_phase_at,full_phase_at,stat_loss_at) \
+         SELECT id, 'alpha', 0, 100, 0, 100, 1 FROM extents WHERE id LIKE 'fixture-%'",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.fixture_exec(
+        "UPDATE extents SET last_read_at = 30000 WHERE id = ?1",
+        &[SqlValue::Text(o.extent.as_str().to_owned())],
+    )
+    .await
+    .unwrap();
+    #[cfg(feature = "testkit-pg")]
+    if let Some(pg) = db.postgres() {
+        let client = pg.client().await.unwrap();
+        client
+            .batch_execute("ANALYZE extents; ANALYZE scrub_copies;")
+            .await
+            .unwrap();
+    }
+    w.bridge().jobs.inner.take();
+    let mut steps = 0;
+    let mut remaining = 0;
+    loop {
+        if db.dialect() == Dialect::Sqlite {
+            db.sqlite().reset_read_stats();
+        }
+        w.bridge().evict_batch(remaining).await.unwrap();
+        steps += 1;
+        if db.dialect() == Dialect::Sqlite {
+            let reads = db.sqlite().read_stats();
+            assert!(
+                reads.vm_steps < 300_000,
+                "a step reads one window, not the prefix: {reads:?}"
+            );
+        }
+        let next = w
+            .bridge()
+            .jobs
+            .inner
+            .take()
+            .into_iter()
+            .find_map(|s| match s.job {
+                Job::Evict { remaining, .. } => Some(remaining),
+                _ => None,
+            });
+        match next {
+            Some(r) => remaining = r,
+            None => break,
+        }
+        assert!(steps <= 20_000 / EVICT_WINDOW as usize + 2, "the steps end");
+    }
+    assert!(!w.has_safety(&o), "reached and evicted after {steps} steps");
+    assert!(steps >= 20_000 / EVICT_WINDOW as usize, "one window a step");
+    // PostgreSQL: the window's index scan stops at the window.
+    #[cfg(feature = "testkit-pg")]
+    if let Some(pg) = db.postgres() {
+        let client = pg.client().await.unwrap();
+        let query =
+            velmora_bridge::pg::normalize_statement(velmora_bridge::sql::HOT_EVICT_WINDOWS[2])
+                .unwrap();
+        let explain = client
+            .prepare_typed(
+                &format!("EXPLAIN (ANALYZE, FORMAT TEXT) {query}"),
+                &[
+                    tokio_postgres::types::Type::INT8,
+                    tokio_postgres::types::Type::TEXT,
+                    tokio_postgres::types::Type::INT8,
+                ],
+            )
+            .await
+            .unwrap();
+        let labels = r#"["alpha","beta"]"#;
+        let rows = client
+            .query(&explain, &[&i64::from(EVICT_WINDOW), &labels, &2i64])
+            .await
+            .unwrap();
+        let plan = rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("extents_evictable"), "{plan}");
+        assert!(!plan.contains("Seq Scan"), "{plan}");
+        let scan = plan
+            .lines()
+            .find(|l| l.contains("Index") && l.contains("extents_evictable"))
+            .unwrap();
+        let actual = scan.split("actual").nth(1).unwrap();
+        let read: u64 = actual
+            .split("rows=")
+            .nth(1)
+            .unwrap()
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(read <= u64::from(EVICT_WINDOW), "{plan}");
+    }
+}
+
+/// The SQLite windows read `extents_evictable` in order with key lookups
+/// in `scrub_copies`: no sort, no scan.
+#[tokio::test(flavor = "current_thread")]
+async fn the_eviction_windows_read_their_index_in_order() {
+    let w = world_on(true, |_| {}).await;
+    let labels = r#"'["alpha","beta"]'"#;
+    let windows = [
+        velmora_bridge::sql::HOT_EVICT_WINDOWS[0]
+            .replace("?3", "2")
+            .replace("?2", labels)
+            .replace("?1", "200"),
+        velmora_bridge::sql::HOT_EVICT_WINDOWS[1]
+            .replace("?5", "2")
+            .replace("?4", labels)
+            .replace("?3", "'x'")
+            .replace("?2", "7")
+            .replace("?1", "200"),
+    ];
+    for sql in &windows {
+        let plan: Vec<String> = w.bridge().catalog.sql.with_conn(|c| {
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut stmt = c.prepare(&sql).unwrap();
+            let rows = stmt.query_map((), |r| r.get::<_, String>(3)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        });
+        let plan = plan.join(" | ");
+        assert!(plan.contains("INDEX extents_evictable"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE FOR ORDER BY"), "{plan}");
+        assert!(
+            !plan.contains("SCAN s"),
+            "a key lookup in scrub_copies: {plan}"
+        );
+    }
+}
+
+/// A Usenet-sourced re-pin whose batch committed but whose reply was
+/// lost: a point read finds it re-pinned, and the safety copy is written
+/// as after any re-pin, not left missing until the repair bound.
+#[tokio::test(flavor = "current_thread")]
+async fn a_re_pin_whose_reply_is_lost_still_writes_the_safety_copy() {
+    let w = world().await;
+    let o = w.released("a", 17).await;
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(1, &o, 0).await;
+    assert_eq!(w.scrub().await.suspect, 1);
+    w.advance_secs(3600);
+    // The re-pin batch (the statement that pins the extent again).
+    w.bridge()
+        .catalog
+        .sql
+        .lose_batch_matching
+        .set(Some("SET safety_state = 'held', evict_seq = evict_seq + 1"));
+    let run = w.scrub().await;
+    assert!(
+        w.bridge().catalog.sql.lose_batch_matching.get().is_none(),
+        "the re-pin's reply was lost"
+    );
+    assert_eq!(run.repaired, 1);
+    assert_eq!(w.safety_state(&o).await, "held");
+    assert!(w.has_safety(&o), "the copy is written as after any re-pin");
 }
