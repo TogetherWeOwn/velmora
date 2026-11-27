@@ -316,7 +316,23 @@ async fn a_write_without_the_prelude_is_refused_by_the_read_only_default() {
     let role = unique("velmora_a1_ro");
     // A throwaway password, so the role also logs in where the test server
     // asks for one.
-    let password = unique("pw");
+    let password = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        format!(
+            "{:016x}{:016x}",
+            h.finish(),
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        )
+    };
     s.admin
         .batch_execute(&format!(
             "CREATE ROLE {role} LOGIN PASSWORD '{password}'; ALTER ROLE {role} SET default_transaction_read_only = on;
