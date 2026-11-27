@@ -186,14 +186,22 @@ pub enum ErrorPosition {
     Commit,
 }
 
+#[cfg(feature = "testkit-pg")]
 std::thread_local! {
     static ERROR_POSITION: std::cell::Cell<Option<ErrorPosition>> =
         const { std::cell::Cell::new(None) };
 }
 
+/// Test builds only. Called right before a transaction returns its error,
+/// after its last await, so no other future on the thread can run between
+/// this and the caller reading it.
+#[cfg(feature = "testkit-pg")]
 fn set_error_position(position: ErrorPosition) {
     ERROR_POSITION.with(|p| p.set(Some(position)));
 }
+
+#[cfg(not(feature = "testkit-pg"))]
+fn set_error_position(_: ErrorPosition) {}
 
 /// The position of the last write transaction error on this thread, taken.
 #[cfg(feature = "testkit-pg")]
@@ -275,12 +283,15 @@ pub(super) async fn transaction(
         WriteTx::SingleSync => {
             match single_sync(client, lock_key, prepared, collect_rows, record, end).await {
                 Ok(replies) => Ok(replies),
-                Err((sent, err)) => {
+                Err((sent, position, err)) => {
                     if sent {
                         // W1 is released when the error aborts the transaction;
                         // this returns the origin connection clean. Its outcome
                         // changes nothing: the connection is dropped next.
                         let _ = client.simple_query("ROLLBACK").await;
+                    }
+                    if let Some(position) = position {
+                        set_error_position(position);
                     }
                     Err(err)
                 }
@@ -337,9 +348,9 @@ pub(super) fn message_error(
     }
 }
 
-/// The whole transaction as one request with one Sync. `Err((sent, _))`
-/// says whether anything reached the connection: an encode error or a
-/// closed connection sends nothing.
+/// The whole transaction as one request with one Sync. `Err((sent, _, _))`
+/// says whether anything reached the connection (an encode error or a
+/// closed connection sends nothing) and where the first error was.
 async fn single_sync(
     client: &Client,
     lock_key: Option<i64>,
@@ -347,7 +358,7 @@ async fn single_sync(
     collect_rows: bool,
     _record: bool,
     end: &'static str,
-) -> core::result::Result<Vec<Reply>, (bool, BridgeError)> {
+) -> core::result::Result<Vec<Reply>, (bool, Option<ErrorPosition>, BridgeError)> {
     let key = lock_key.unwrap_or_default();
     let mut stmts: Vec<PipelineStatement<'_>> = PRELUDE
         .iter()
@@ -376,7 +387,7 @@ async fn single_sync(
     let outcome = client
         .pipeline_typed(&stmts, collect_rows)
         .await
-        .map_err(|_| (false, error::statement_failed()))?;
+        .map_err(|_| (false, None, error::statement_failed()))?;
     if let Some((done, err)) = outcome.error {
         #[cfg(feature = "pg-test-record")]
         if _record {
@@ -388,15 +399,16 @@ async fn single_sync(
         let server = err
             .as_db_error()
             .map(|db| (db.code().code(), db.constraint()));
-        set_error_position(if done < prelude {
+        let position = if done < prelude {
             ErrorPosition::Prelude
         } else if done < prelude + n {
             ErrorPosition::Statement(done - prelude)
         } else {
             ErrorPosition::Commit
-        });
+        };
         return Err((
             true,
+            Some(position),
             message_error(server, done, prelude, n, outcome.status),
         ));
     }
@@ -407,7 +419,7 @@ async fn single_sync(
         || replies.last().map(|r| r.tag.as_str()) != Some(end)
         || outcome.status != Some(b'I')
     {
-        return Err((true, error::shape()));
+        return Err((true, None, error::shape()));
     }
     #[cfg(feature = "pg-test-record")]
     if _record {
