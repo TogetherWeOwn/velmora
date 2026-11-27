@@ -2764,6 +2764,12 @@ where
     ///
     /// Without the first count nothing is written: an uncounted copy
     /// could outlive the cap. `false` = not written for that reason.
+    ///
+    /// A released extent that is not releasable under the rule that holds
+    /// now keeps its R2 copy from eviction, but a cache fill is not a
+    /// durable copy: the cache's lifecycle rule expires it. So the same
+    /// verified bytes are written to the safety store too, unless a copy
+    /// is there already ([`Self::fill_safety_copy`]).
     pub(crate) async fn cache_fill(&self, extent: &ExtentRow, cipher: Vec<u8>) -> Result<bool> {
         let meta = BlobMeta {
             bucket: &extent.bucket_id,
@@ -2774,11 +2780,82 @@ where
         if count().await.is_err() {
             return Ok(false);
         }
+        let keep = self.unreleasable_now(extent).then(|| cipher.clone());
         self.cache
             .put(&extent.id.cache_key(), cipher, &meta)
             .await?;
         let _ = count().await;
+        if let Some(cipher) = keep {
+            self.fill_safety_copy(extent, cipher).await;
+        }
         Ok(true)
+    }
+
+    /// Released, and not releasable by its evidence under the rule that
+    /// holds now.
+    fn unreleasable_now(&self, extent: &ExtentRow) -> bool {
+        extent.safety_state == crate::types::SafetyState::Released
+            && !crate::verify::evidence_releasable(
+                extent.release_evidence.as_deref(),
+                extent.plan_rev,
+                &crate::verify::release_labels(&self.cfg.providers),
+                self.cfg.required_backbones,
+                self.cfg.verify.mode,
+            )
+    }
+
+    /// Writes the verified bytes of a cold fill of an unreleasable extent
+    /// to the safety store, as eviction's promotion does: behind a
+    /// write-ahead intent, with the collection guard after it, and
+    /// counted. It never fails the read. When it cannot be done (a store
+    /// or catalogue error), a sweep of the eviction order is put on
+    /// record, which the dispatcher starts whatever the cap and which
+    /// writes the fill then.
+    async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) {
+        let written = async {
+            if self.safety.head(&extent.id.safety_key()).await?.is_some() {
+                return Ok::<_, crate::types::BridgeError>(());
+            }
+            let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
+            self.catalog.scrub_put_intent(&extent.id, until).await?;
+            let meta = BlobMeta {
+                bucket: &extent.bucket_id,
+                extent: &extent.id,
+                cipher_sha256: &extent.cipher_sha256,
+            };
+            self.safety
+                .put(&extent.id.safety_key(), cipher, &meta)
+                .await?;
+            self.catalog
+                .gc_enqueue_scrub_safety(&extent.id, self.clock.now())
+                .await?;
+            self.catalog.safety_copy_written(&extent.id).await?;
+            crate::trace::alert(|| {
+                format!(
+                    "fill-protect {} not releasable; its verified cold fill is also its \
+                     safety copy",
+                    extent.id.as_str()
+                )
+            });
+            Ok(())
+        };
+        if written.await.is_err() {
+            let retry = crate::types::EvictCursor::Sweep(
+                self.rule_fingerprint(),
+                Box::new(crate::types::EvictCursor::Start),
+            );
+            let marked = self.catalog.set_evict_cursor(&retry).await.is_ok();
+            crate::trace::alert(|| {
+                format!(
+                    "fill-protect-deferred {} the safety write failed; {}",
+                    extent.id.as_str(),
+                    match marked {
+                        true => "a sweep is on record",
+                        false => "no sweep could be put on record either",
+                    }
+                )
+            });
+        }
     }
 
     /// Reads `extents` from Usenet one after the other with one reader,

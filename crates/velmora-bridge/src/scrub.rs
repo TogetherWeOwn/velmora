@@ -1687,7 +1687,7 @@ where
             return;
         }
         let _ = self.collect_if_unreferenced(extent).await;
-        if self.catalog.scrub_loss_protected(&extent.id).await.is_ok() {
+        if self.catalog.safety_copy_written(&extent.id).await.is_ok() {
             crate::trace::alert(|| {
                 format!(
                     "scrub-protect {} a loss is on record; its checked cache fill is now its \

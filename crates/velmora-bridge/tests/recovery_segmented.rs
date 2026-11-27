@@ -63,11 +63,15 @@ fn fresh_replay_rows(rig: &Rig) -> String {
     for t in TABLES {
         // A fresh replay allocates a new internal scan identity (SQLite
         // rowid or PostgreSQL seq); it does not change the posting job.
-        let columns = if t == "outbox" {
-            "extent_id, generation_id, stage, attempts, next_at, lease_token, lease_owner, \
-             lease_until, cursor, last_error, updated_at, sent_at"
-        } else {
-            "*"
+        let columns = match t {
+            "outbox" => "extent_id, generation_id, stage, attempts, next_at, lease_token, \
+                         lease_owner, lease_until, cursor, last_error, updated_at, sent_at"
+                .to_owned(),
+            // The scrub's columns (added by its migrations, at their
+            // defaults after a replay) are not among the bytes the golden
+            // pins: every other column, in table order.
+            "extents" => extents_columns_but_the_scrubs(rig),
+            _ => "*".to_owned(),
         };
         for row in rig
             .bridge
@@ -81,6 +85,34 @@ fn fresh_replay_rows(rig: &Rig) -> String {
         }
     }
     out
+}
+
+fn extents_columns_but_the_scrubs(rig: &Rig) -> String {
+    let db = &rig.bridge.catalog.sql.inner;
+    let sql = match db.dialect() {
+        Dialect::Postgres => {
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'extents' \
+             ORDER BY ordinal_position"
+        }
+        _ => "SELECT name FROM pragma_table_info('extents') ORDER BY cid",
+    };
+    let scrubs = [
+        "scrub_enrolled",
+        "last_scrubbed_at",
+        "scrub_result",
+        "scrub_next_at",
+    ];
+    let mut columns = Vec::new();
+    for row in db.fixture_query_now(sql, &[]).unwrap() {
+        let SqlValue::Text(name) = &row[0] else {
+            panic!("a column name: {row:?}")
+        };
+        if !scrubs.contains(&name.as_str()) {
+            columns.push(name.clone());
+        }
+    }
+    columns.join(", ")
 }
 
 fn outbox_identities(rig: &Rig) -> Option<Vec<Row>> {

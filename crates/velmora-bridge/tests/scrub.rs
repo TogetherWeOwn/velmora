@@ -5936,3 +5936,95 @@ async fn turning_the_scrub_off_sweeps_a_lost_extents_fill_to_safety() {
         "the sweep after the toggle wrote the fill"
     );
 }
+
+/// Makes `o` a released extent with no R2 copy at all (Usenet only).
+async fn usenet_only(w: &World, o: &Obj) {
+    assert!(w.bridge().safety.lose(&o.extent.safety_key()));
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE extents SET hot_safety_bytes = 0 WHERE id = ?1",
+            &[SqlValue::Text(o.extent.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+}
+
+/// A GET that reads the object from Usenet and fills the cache.
+async fn read_cold(w: &World, o: &Obj, name: &str) {
+    let r = w
+        .rig
+        .call(&w.signer, Method::Get, &path(BUCKET, name), &[], &[], b"")
+        .await;
+    r.expect(200);
+    assert_eq!(r.body, o.plain, "the object reads back");
+    assert!(w.bridge().cache.contains(&o.extent.cache_key()), "filled");
+}
+
+/// A cold fill of an extent that is not releasable under the rule now,
+/// with no safety copy, writes the same verified bytes to the safety
+/// store too: the cache's lifecycle rule cannot take its only R2 copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_fill_of_an_unreleasable_extent_writes_its_safety_copy() {
+    let mut w = world().await;
+    let o = w.released("a", 162).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    usenet_only(&w, &o).await;
+    cfg_mut(&mut w).providers[1].release = false;
+    read_cold(&w, &o, "a").await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the fill's bytes are its safety copy too"
+    );
+    assert_ne!(
+        w.scalar(
+            "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+            &o.extent
+        )
+        .await,
+        "0",
+        "and counted"
+    );
+}
+
+/// The safety write of such a fill fails: the read still answers, and a
+/// sweep is put on record, which the dispatcher runs under the cap and
+/// which writes the fill.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_fill_time_safety_write_leaves_a_sweep_that_writes_it() {
+    let mut w = world().await;
+    let o = w.released("a", 163).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    usenet_only(&w, &o).await;
+    cfg_mut(&mut w).providers[1].release = false;
+    // The rule's first sweep is done; the tier is far under its cap.
+    evict_check_now(&w).await;
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
+    read_cold(&w, &o, "a").await;
+    *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
+    assert!(!w.has_safety(&o), "the write failed");
+    evict_check_now(&w).await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the sweep wrote the fill"
+    );
+}
+
+/// A releasable extent's cold fill writes nothing to the safety store: no
+/// cost for the common case.
+#[tokio::test(flavor = "current_thread")]
+async fn a_releasable_extents_cold_fill_writes_no_safety_copy() {
+    let w = world().await;
+    let o = w.released("a", 164).await;
+    usenet_only(&w, &o).await;
+    let safety_puts = w.bridge().safety.puts.borrow().len();
+    read_cold(&w, &o, "a").await;
+    assert!(!w.has_safety(&o));
+    assert_eq!(w.bridge().safety.puts.borrow().len(), safety_puts);
+}

@@ -1150,8 +1150,8 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
         hot::evict_point(self, extent, rule).await
     }
-    async fn scrub_loss_protected(&self, extent: &ExtentId) -> Result<()> {
-        hot::scrub_loss_protected(self, extent).await
+    async fn safety_copy_written(&self, extent: &ExtentId) -> Result<()> {
+        hot::safety_copy_written(self, extent).await
     }
     async fn evict_rule_seen(&self) -> Result<Option<String>> {
         hot::evict_rule_seen(self).await

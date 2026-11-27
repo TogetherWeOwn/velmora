@@ -1823,9 +1823,10 @@ pub trait Catalog {
     ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
         Ok(None)
     }
-    /// The scrub, on finding a loss, wrote a released extent's checked
-    /// cache fill to the safety store: it is counted.
-    async fn scrub_loss_protected(&self, _extent: &ExtentId) -> Result<()> {
+    /// A released extent's checked bytes were written to the safety store
+    /// outside eviction (the scrub on a loss, a cold fill of an extent
+    /// that is not releasable): the copy is counted.
+    async fn safety_copy_written(&self, _extent: &ExtentId) -> Result<()> {
         Ok(())
     }
     /// The fingerprint of the eviction rule the last full promote-only

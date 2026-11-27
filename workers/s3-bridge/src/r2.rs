@@ -26,8 +26,7 @@ use velmora_bridge::recovery::{
 };
 use velmora_bridge::{
     BlobEntry, BlobIdentity, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt,
-    ReadAheadBlob,
-    Result, StreamMeta,
+    ReadAheadBlob, Result, StreamMeta,
 };
 use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::prelude::wasm_bindgen;

@@ -234,9 +234,10 @@ const EVICT_PROMOTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size,
     WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' \
       AND hot_safety_bytes IN (0, cipher_size)";
 
-// The scrub wrote a released extent's checked cache fill to the safety
-// store when it found a loss: counted, whatever the sequence.
-const LOSS_PROTECTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
+// A released extent's checked bytes were written to the safety store
+// outside eviction (the scrub on a loss, a cold fill of an extent that is
+// not releasable): counted, whatever the sequence.
+const SAFETY_WRITTEN: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
     evict_seq = evict_seq + 1 \
     WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes IN (0, cipher_size)";
 
@@ -572,12 +573,12 @@ pub(super) async fn evict_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<EvictCurso
 }
 
 /// The scrub wrote a released extent's cache fill to the safety store
-/// ([`LOSS_PROTECTED`]).
-pub(super) async fn scrub_loss_protected<S: Sql>(
+/// ([`SAFETY_WRITTEN`]).
+pub(super) async fn safety_copy_written<S: Sql>(
     c: &SqlCatalog<S>,
     extent: &ExtentId,
 ) -> Result<()> {
-    c.sql.exec(LOSS_PROTECTED, &[text(extent.as_str())]).await?;
+    c.sql.exec(SAFETY_WRITTEN, &[text(extent.as_str())]).await?;
     Ok(())
 }
 
@@ -969,7 +970,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (EVICT_POINT_SCRUB_PG.to_owned(), vec![T, T]),
         (EVICT_CURSOR.to_owned(), vec![]),
         (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
-        (LOSS_PROTECTED.to_owned(), vec![T]),
+        (SAFETY_WRITTEN.to_owned(), vec![T]),
         (EVICT_RULE_SEEN.to_owned(), vec![]),
         (SET_EVICT_RULE_SEEN_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
