@@ -57,8 +57,21 @@ fn wipe(rig: &Rig) {
     }
 }
 
-/// Catalogue rows for comparing two independent fresh replays.
+/// Catalogue rows for comparing two independent fresh replays: every
+/// column, the scrub's included.
 fn fresh_replay_rows(rig: &Rig) -> String {
+    replay_rows(rig, false)
+}
+
+/// The rows the golden pins: [`fresh_replay_rows`] without the scrub's
+/// columns of `extents`, which its migrations added after the golden was
+/// captured. The test that compares with the golden checks those
+/// separately, at their defaults.
+fn golden_replay_rows(rig: &Rig) -> String {
+    replay_rows(rig, true)
+}
+
+fn replay_rows(rig: &Rig, but_the_scrubs: bool) -> String {
     let mut out = String::new();
     for t in TABLES {
         // A fresh replay allocates a new internal scan identity (SQLite
@@ -67,10 +80,7 @@ fn fresh_replay_rows(rig: &Rig) -> String {
             "outbox" => "extent_id, generation_id, stage, attempts, next_at, lease_token, \
                          lease_owner, lease_until, cursor, last_error, updated_at, sent_at"
                 .to_owned(),
-            // The scrub's columns (added by its migrations, at their
-            // defaults after a replay) are not among the bytes the golden
-            // pins: every other column, in table order.
-            "extents" => extents_columns_but_the_scrubs(rig),
+            "extents" if but_the_scrubs => extents_columns_but_the_scrubs(rig),
             _ => "*".to_owned(),
         };
         for row in rig
@@ -311,7 +321,22 @@ async fn default_replay_preserves_main_reports_and_catalogue_bytes() {
     assert_eq!(reports.iter().map(|step| step.extents).sum::<u32>(), 255);
     assert_eq!(rig.bridge.safety.most_reading.get(), 1);
     let report_bytes = serde_json::to_vec(&reports).unwrap();
-    let catalogue_bytes = fresh_replay_rows(&rig);
+    let catalogue_bytes = golden_replay_rows(&rig);
+    // A replay restores no scrub state: every extent's is at its default.
+    assert_eq!(
+        rig.bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_query_now(
+                "SELECT COUNT(*) FROM extents WHERE scrub_enrolled <> 0 \
+                 OR last_scrubbed_at IS NOT NULL OR scrub_result IS NOT NULL \
+                 OR scrub_next_at IS NOT NULL",
+                &[],
+            )
+            .unwrap()[0][0],
+        SqlValue::Int(0)
+    );
     assert_eq!(
         (
             hex(&Sha256::digest(&report_bytes)),

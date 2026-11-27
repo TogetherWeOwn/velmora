@@ -5952,7 +5952,7 @@ async fn usenet_only(w: &World, o: &Obj) {
         .unwrap();
 }
 
-/// A GET that reads the object from Usenet and fills the cache.
+/// A GET that reads the object from Usenet.
 async fn read_cold(w: &World, o: &Obj, name: &str) {
     let r = w
         .rig
@@ -5960,12 +5960,12 @@ async fn read_cold(w: &World, o: &Obj, name: &str) {
         .await;
     r.expect(200);
     assert_eq!(r.body, o.plain, "the object reads back");
-    assert!(w.bridge().cache.contains(&o.extent.cache_key()), "filled");
 }
 
 /// A cold fill of an extent that is not releasable under the rule now,
-/// with no safety copy, writes the same verified bytes to the safety
-/// store too: the cache's lifecycle rule cannot take its only R2 copy.
+/// with no safety copy, writes its verified bytes to the safety store,
+/// not the cache: no cache-only copy is left for the lifecycle rule to
+/// take, and the fill holds one buffer.
 #[tokio::test(flavor = "current_thread")]
 async fn a_cold_fill_of_an_unreleasable_extent_writes_its_safety_copy() {
     let mut w = world().await;
@@ -5978,7 +5978,11 @@ async fn a_cold_fill_of_an_unreleasable_extent_writes_its_safety_copy() {
     assert_eq!(
         w.bridge().safety.stored(&key).map(|b| b.bytes),
         Some(cipher),
-        "the fill's bytes are its safety copy too"
+        "the fill's bytes are its safety copy"
+    );
+    assert!(
+        !w.bridge().cache.contains(&o.extent.cache_key()),
+        "and the cache took no second copy"
     );
     assert_ne!(
         w.scalar(
@@ -5991,28 +5995,53 @@ async fn a_cold_fill_of_an_unreleasable_extent_writes_its_safety_copy() {
     );
 }
 
-/// The safety write of such a fill fails: the read still answers, and a
-/// sweep is put on record, which the dispatcher runs under the cap and
-/// which writes the fill.
+/// The safety write of such a fill fails: the read still answers, and
+/// nothing is written to the cache either, so no cache-only copy is left
+/// to expire unprotected, by a failure or by a request cancelled between
+/// two writes. The next read writes the copy.
 #[tokio::test(flavor = "current_thread")]
-async fn a_failed_fill_time_safety_write_leaves_a_sweep_that_writes_it() {
+async fn a_failed_fill_time_safety_write_leaves_no_cache_only_copy() {
     let mut w = world().await;
     let o = w.released("a", 163).await;
     let key = o.extent.safety_key();
     let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
     usenet_only(&w, &o).await;
     cfg_mut(&mut w).providers[1].release = false;
-    // The rule's first sweep is done; the tier is far under its cap.
-    evict_check_now(&w).await;
     *w.bridge().safety.fail_put_prefix.borrow_mut() = Some("x/".to_string());
     read_cold(&w, &o, "a").await;
     *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
     assert!(!w.has_safety(&o), "the write failed");
-    evict_check_now(&w).await;
+    assert!(
+        !w.bridge().cache.contains(&o.extent.cache_key()),
+        "no cache-only copy"
+    );
+    read_cold(&w, &o, "a").await;
     assert_eq!(
         w.bridge().safety.stored(&key).map(|b| b.bytes),
         Some(cipher),
-        "the sweep wrote the fill"
+        "the next read wrote it"
+    );
+}
+
+/// A blob under the safety key that is not the extent's (the read skipped
+/// it) does not stand for its copy: the cold fill replaces it with the
+/// verified bytes.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_fill_replaces_a_safety_blob_that_is_not_the_extents() {
+    let mut w = world().await;
+    let o = w.released("a", 165).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    assert!(w.bridge().safety.corrupt(&key, |b| {
+        let mid = b.len() / 2;
+        b[mid] ^= 1
+    }));
+    cfg_mut(&mut w).providers[1].release = false;
+    read_cold(&w, &o, "a").await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the verified bytes replaced the blob"
     );
 }
 
@@ -6025,6 +6054,7 @@ async fn a_releasable_extents_cold_fill_writes_no_safety_copy() {
     usenet_only(&w, &o).await;
     let safety_puts = w.bridge().safety.puts.borrow().len();
     read_cold(&w, &o, "a").await;
+    assert!(w.bridge().cache.contains(&o.extent.cache_key()), "filled");
     assert!(!w.has_safety(&o));
     assert_eq!(w.bridge().safety.puts.borrow().len(), safety_puts);
 }

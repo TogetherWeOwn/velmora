@@ -2766,11 +2766,16 @@ where
     /// could outlive the cap. `false` = not written for that reason.
     ///
     /// A released extent that is not releasable under the rule that holds
-    /// now keeps its R2 copy from eviction, but a cache fill is not a
-    /// durable copy: the cache's lifecycle rule expires it. So the same
-    /// verified bytes are written to the safety store too, unless a copy
-    /// is there already ([`Self::fill_safety_copy`]).
+    /// now is the exception: a cache fill is not a durable copy (the
+    /// cache's lifecycle rule expires it), so its verified bytes go to the
+    /// safety store instead ([`Self::fill_safety_copy`]), which reads
+    /// take as they take the cache. No cache-only copy of such an extent
+    /// is ever written, so none is left for a later pass to protect, and
+    /// the fill holds one buffer, as any other. `false` = not written.
     pub(crate) async fn cache_fill(&self, extent: &ExtentRow, cipher: Vec<u8>) -> Result<bool> {
+        if self.unreleasable_now(extent) {
+            return Ok(self.fill_safety_copy(extent, cipher).await);
+        }
         let meta = BlobMeta {
             bucket: &extent.bucket_id,
             extent: &extent.id,
@@ -2780,14 +2785,10 @@ where
         if count().await.is_err() {
             return Ok(false);
         }
-        let keep = self.unreleasable_now(extent).then(|| cipher.clone());
         self.cache
             .put(&extent.id.cache_key(), cipher, &meta)
             .await?;
         let _ = count().await;
-        if let Some(cipher) = keep {
-            self.fill_safety_copy(extent, cipher).await;
-        }
         Ok(true)
     }
 
@@ -2805,15 +2806,23 @@ where
     }
 
     /// Writes the verified bytes of a cold fill of an unreleasable extent
-    /// to the safety store, as eviction's promotion does: behind a
+    /// as its safety copy, as eviction's promotion does: behind a
     /// write-ahead intent, with the collection guard after it, and
-    /// counted. It never fails the read. When it cannot be done (a store
-    /// or catalogue error), a sweep of the eviction order is put on
-    /// record, which the dispatcher starts whatever the cap and which
-    /// writes the fill then.
-    async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) {
+    /// counted. A blob the store checked as the extent's is kept;
+    /// anything else under the key (other bytes, or a streamed put whose
+    /// digest the store never checked) is replaced. It never fails the
+    /// read: when the write cannot be made, nothing is written anywhere,
+    /// and the next read of the extent fills it again. `true` = the copy
+    /// is there.
+    async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {
+        let key = extent.id.safety_key();
         let written = async {
-            if self.safety.head(&extent.id.safety_key()).await?.is_some() {
+            if self
+                .safety
+                .head_identity(&key)
+                .await?
+                .is_some_and(|blob| blob.is(extent.cipher_size, &extent.cipher_sha256))
+            {
                 return Ok::<_, crate::types::BridgeError>(());
             }
             let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
@@ -2823,39 +2832,30 @@ where
                 extent: &extent.id,
                 cipher_sha256: &extent.cipher_sha256,
             };
-            self.safety
-                .put(&extent.id.safety_key(), cipher, &meta)
-                .await?;
+            self.safety.put(&key, cipher, &meta).await?;
             self.catalog
                 .gc_enqueue_scrub_safety(&extent.id, self.clock.now())
                 .await?;
             self.catalog.safety_copy_written(&extent.id).await?;
             crate::trace::alert(|| {
                 format!(
-                    "fill-protect {} not releasable; its verified cold fill is also its \
-                     safety copy",
+                    "fill-protect {} not releasable; its verified cold fill is its safety copy",
                     extent.id.as_str()
                 )
             });
             Ok(())
         };
-        if written.await.is_err() {
-            let retry = crate::types::EvictCursor::Sweep(
-                self.rule_fingerprint(),
-                Box::new(crate::types::EvictCursor::Start),
-            );
-            let marked = self.catalog.set_evict_cursor(&retry).await.is_ok();
+        let done = written.await.is_ok();
+        if !done {
             crate::trace::alert(|| {
                 format!(
-                    "fill-protect-deferred {} the safety write failed; {}",
-                    extent.id.as_str(),
-                    match marked {
-                        true => "a sweep is on record",
-                        false => "no sweep could be put on record either",
-                    }
+                    "fill-protect-failed {} not releasable and the safety write failed; \
+                     nothing was cached, the next read fills it again",
+                    extent.id.as_str()
                 )
             });
         }
+        done
     }
 
     /// Reads `extents` from Usenet one after the other with one reader,
@@ -2884,8 +2884,8 @@ where
 
     /// Rebuilds an extent's ciphertext from Usenet when neither blob store
     /// has it ([`ColdReader::fetch`]). The assembled extent is checked
-    /// against `cipher_sha256` and written to the cache before it is
-    /// returned, so nothing unverified is ever served or cached. The
+    /// against `cipher_sha256` and written to the cache (or the safety
+    /// store, [`Self::cache_fill`]) before it is returned, so nothing unverified is ever served or cached. The
     /// bytes are verified whether or not the cache took them, so the
     /// read itself succeeds either way.
     pub async fn fetch_cold(&self, extent: &ExtentRow) -> Result<ColdFetch> {
