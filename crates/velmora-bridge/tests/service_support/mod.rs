@@ -275,6 +275,20 @@ pub struct Blobs {
     pub stop_stream_after: Cell<Option<usize>>,
     /// What a stream put answers in place of the true receipt.
     pub false_receipt: Cell<Option<ReceiptLie>>,
+    /// A `get` or a `head` answers a turn of the executor later, so
+    /// that calls made at the same time are under way together.
+    pub slow_reads: Cell<bool>,
+    /// The most reads that were under way together, with `slow_reads`.
+    pub most_reading: Cell<u32>,
+    reading: Cell<u32>,
+    /// The prefix of every listing that was asked for.
+    pub listed: RefCell<Vec<String>>,
+    /// The next this many gets of this key fail.
+    pub fail_gets: RefCell<Option<(String, u32)>>,
+    /// HEAD of this key fails immediately.
+    pub fail_head: RefCell<Option<String>>,
+    /// The blob of this key is gone once the next get of it answered.
+    pub lose_after_get: RefCell<Option<String>>,
 }
 
 /// Told the length of a piece of a stream.
@@ -301,6 +315,29 @@ pub struct StreamSeen {
 impl StreamSeen {
     pub fn taken(&self) -> u64 {
         self.pieces.iter().map(|n| *n as u64).sum()
+    }
+}
+
+/// A read that is under way.
+struct Reading<'a>(&'a Cell<u32>);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+impl Blobs {
+    /// With `slow_reads`: counts the read and lets the others go on.
+    async fn read_turn(&self) {
+        if !self.slow_reads.get() {
+            return;
+        }
+        self.reading.set(self.reading.get() + 1);
+        let _reading = Reading(&self.reading);
+        self.most_reading
+            .set(self.most_reading.get().max(self.reading.get()));
+        tokio::task::yield_now().await;
     }
 }
 
@@ -438,9 +475,49 @@ impl BlobStore for Blobs {
         })
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
-        self.trip.guard(blob_down, self.inner.get(key, span)).await
+        self.read_turn().await;
+        if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
+            if failing == key && *left > 0 {
+                *left -= 1;
+                return Err(BridgeError::Blob("store down".into()));
+            }
+        }
+        let answer = self.trip.guard(blob_down, self.inner.get(key, span)).await;
+        if self.lose_after_get.borrow().as_deref() == Some(key) {
+            self.lose_after_get.borrow_mut().take();
+            self.inner.lose(key);
+        }
+        answer
+    }
+    async fn get_for_read_ahead(
+        &self,
+        key: &str,
+        reserve: impl FnOnce(u64) -> bool,
+    ) -> Result<ReadAheadBlob> {
+        self.read_turn().await;
+        if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
+            if failing == key && *left > 0 {
+                *left -= 1;
+                return Err(BridgeError::Blob("store down".into()));
+            }
+        }
+        let answer = self
+            .trip
+            .guard(blob_down, self.inner.get_for_read_ahead(key, reserve))
+            .await;
+        if matches!(answer, Ok(ReadAheadBlob::Body(_)))
+            && self.lose_after_get.borrow().as_deref() == Some(key)
+        {
+            self.lose_after_get.borrow_mut().take();
+            self.inner.lose(key);
+        }
+        answer
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        if self.fail_head.borrow().as_deref() == Some(key) {
+            return Err(BridgeError::Blob("store: head failed".into()));
+        }
+        self.read_turn().await;
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -476,6 +553,7 @@ impl BlobStore for Blobs {
             .await
     }
     async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.listed.borrow_mut().push(prefix.to_string());
         if self.fail_list.get() {
             return Err(BridgeError::Blob("list failed".into()));
         }
@@ -521,6 +599,9 @@ pub struct FailSql {
     /// Fails every statement (read or write) whose text contains the
     /// string, after letting the given number of them through.
     pub fail_matching: RefCell<Option<(&'static str, u32)>>,
+    /// Fails every read whose text contains the string and whose first
+    /// parameter is this text.
+    pub fail_read_for: RefCell<Option<(&'static str, String)>>,
     /// Stalls one matching write at the tripwire until the test releases it.
     pub stall_exec_matching: Cell<Option<&'static str>>,
     pub selected_exec: Tripwire,
@@ -643,6 +724,13 @@ impl Sql for FailSql {
         if self.refused(sql) {
             return Err(BridgeError::Sql("database down".into()));
         }
+        let failed = matches!(
+            (self.fail_read_for.borrow().as_ref(), params.first()),
+            (Some((text, key)), Some(SqlValue::Text(first))) if sql.contains(*text) && first == key
+        );
+        if failed {
+            return Err(BridgeError::Sql("database down".into()));
+        }
         self.interleave(sql);
         self.trip
             .guard(sql_down, self.inner.query(sql, params))
@@ -757,6 +845,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         intent_sweep: false,
         gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
+        replay_read_ahead: false,
         packed_plans: false,
         parity: false,
         required_backbones: 1,
@@ -853,6 +942,7 @@ fn rig_on<N: NntpConnector + 'static>(
                 refuse_publishes: Cell::new(0),
                 fail_next_batch: Cell::new(false),
                 fail_matching: RefCell::new(None),
+                fail_read_for: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),
                 selected_exec: Tripwire::default(),
                 stall_batch_key: Cell::new(None),

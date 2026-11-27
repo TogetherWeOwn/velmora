@@ -210,6 +210,7 @@ impl Fx {
             intent_sweep: false,
             gc_orphans: false,
             records: velmora_bridge::recovery::Layout::flat(),
+            replay_read_ahead: false,
             packed_plans: false,
             parity: false,
             required_backbones: 1,

@@ -25,8 +25,8 @@ use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
 use velmora_bridge::{
-    BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt, Result,
-    StreamMeta,
+    BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt, ReadAheadBlob,
+    Result, StreamMeta,
 };
 use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::prelude::wasm_bindgen;
@@ -204,12 +204,26 @@ async fn fill_body<R: BodyReads>(
     reads: &mut R,
     expected: u64,
 ) -> std::result::Result<Vec<u8>, BodyError> {
+    fill_body_with_capacity(reads, expected, false).await
+}
+
+async fn fill_body_with_capacity<R: BodyReads>(
+    reads: &mut R,
+    expected: u64,
+    exact_capacity: bool,
+) -> std::result::Result<Vec<u8>, BodyError> {
     // Only a 32-bit target refuses here, and no extent comes near 4 GiB.
     let room = usize::try_from(expected)
         .ok()
         .and_then(|e| e.checked_add(1))
         .ok_or(BodyError::Read)?;
-    let mut bytes = Vec::new();
+    // A speculative caller already budgeted this capacity; do not let
+    // geometric Vec growth exceed it.
+    let mut bytes = if exact_capacity {
+        Vec::with_capacity(room)
+    } else {
+        Vec::new()
+    };
     let mut filled = 0;
     loop {
         if filled == bytes.len() {
@@ -313,6 +327,14 @@ impl BodyReads for ByobReads {
 }
 
 async fn read_body(object: worker::Object, span: Option<ByteSpan>) -> Result<Vec<u8>> {
+    read_body_with_capacity(object, span, false).await
+}
+
+async fn read_body_with_capacity(
+    object: worker::Object,
+    span: Option<ByteSpan>,
+    exact_capacity: bool,
+) -> Result<Vec<u8>> {
     let body = object
         .body()
         .ok_or_else(|| BridgeError::Blob("r2: get returned no body".into()))?;
@@ -324,7 +346,12 @@ async fn read_body(object: worker::Object, span: Option<ByteSpan>) -> Result<Vec
     let Some(mut reads) = ByobReads::new(&stream, expected) else {
         return Err(BridgeError::Blob("r2: get body failed".into()));
     };
-    fill_body(&mut reads, expected).await.map_err(|e| {
+    let result = if exact_capacity {
+        fill_body_with_capacity(&mut reads, expected, true).await
+    } else {
+        fill_body(&mut reads, expected).await
+    };
+    result.map_err(|e| {
         BridgeError::Blob(
             match (e, span) {
                 (BodyError::Short, Some(_)) => "r2: short range",
@@ -442,6 +469,35 @@ impl BlobStore for R2Blobs {
             return Ok(None);
         };
         read_body(object, span).await.map(Some)
+    }
+
+    async fn get_for_read_ahead(
+        &self,
+        key: &str,
+        reserve: impl FnOnce(u64) -> bool,
+    ) -> Result<ReadAheadBlob> {
+        let Some(object) = self
+            .bucket
+            .get(key)
+            .execute()
+            .await
+            .map_err(blob_err("get"))?
+        else {
+            return Ok(ReadAheadBlob::Missing);
+        };
+        if !reserve(object.size()) {
+            // No body bytes have been copied out of the binding. Cancel the
+            // unread stream so a rejected prefetch does not hold a slot.
+            if let Some(body) = object.body() {
+                if let Ok(worker::ResponseBody::Stream(stream)) = body.response_body() {
+                    let _ = JsFuture::from(stream.cancel()).await;
+                }
+            }
+            return Ok(ReadAheadBlob::Skipped);
+        }
+        read_body_with_capacity(object, None, true)
+            .await
+            .map(ReadAheadBlob::Body)
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {

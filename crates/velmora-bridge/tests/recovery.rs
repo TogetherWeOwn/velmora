@@ -8,11 +8,12 @@ mod service_support;
 
 use serde_json::{json, Value};
 use service_support::*;
+use sha2::Digest as _;
 use velmora_bridge::config::Maintenance;
 use velmora_bridge::recovery::{
     delete_blob, tombstone_id, write_tombstone, Layout, GENERATION_PREFIX, TOMBSTONE_PREFIX,
 };
-use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport};
+use velmora_bridge::replay::{RecordRef, ReplayCursor, ReplayLimits, ReplayReport, STORE_READS};
 use velmora_bridge::*;
 
 const BUCKET: &str = "vault";
@@ -102,11 +103,25 @@ fn import(rig: &Rig) {
 
 /// Everything the catalogue says, for "nothing changed" checks.
 fn dump(rig: &Rig) -> String {
+    dump_rows(rig, false)
+}
+
+fn dump_rows(rig: &Rig, rebuilt: bool) -> String {
     let mut out = String::new();
     for t in TABLES {
+        // A fresh rebuild allocates new internal identities for the
+        // posting and GC jobs; compare their actual work and state.
+        let columns = match (rebuilt, t) {
+            (true, "outbox") => {
+                "extent_id, generation_id, stage, attempts, next_at, lease_token, lease_owner, \
+                 lease_until, cursor, last_error, updated_at, sent_at"
+            }
+            (true, "gc") => "extent_id, action, due_at, done_at",
+            _ => "*",
+        };
         for row in fixture_rows(
             &rig.bridge.catalog.sql,
-            &format!("SELECT * FROM {t} ORDER BY 1, 2"),
+            &format!("SELECT {columns} FROM {t} ORDER BY 1, 2"),
             &[],
         ) {
             out.push_str(&format!("{t}|{row:?}\n"));
@@ -579,6 +594,448 @@ async fn export_plus_replay_restores_later_writes() {
 // ---------------------------------------------------------------------------
 // Total loss: the records alone rebuild the catalogue
 // ---------------------------------------------------------------------------
+
+fn read_ahead_config() -> velmora_bridge::config::BridgeConfig {
+    let mut cfg = config(Vec::new());
+    cfg.replay_read_ahead = true;
+    cfg
+}
+
+/// A call asks the store ahead for the records it lists and for what
+/// their extents have there. The step then works with those answers:
+/// no record is read twice, the report is the one of a replay that
+/// takes one record and one extent a call, and so is the catalogue.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_reads_each_record_once_and_changes_nothing_of_the_result() {
+    let rig = rig_with_selected(NoNntp, read_ahead_config());
+    let (_, signer) = rig.standard(BUCKET).await;
+    for i in 0..40 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    // Some keys have an older generation, some a tombstone.
+    for i in 0..10 {
+        rig.put(&signer, BUCKET, &format!("k{i:02}"), b"again")
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    for i in 5..15 {
+        delete(&rig, &signer, &format!("k{i:02}")).await.expect(204);
+        tick(&rig);
+    }
+    multipart(&rig, &signer, "big", 3).await;
+
+    wipe(&rig);
+    let one = ReplayLimits {
+        records: 1,
+        extents: 1,
+    };
+    let (slow, calls) = replay(&rig, UnixMs(0), one).await;
+    assert!(calls > 60, "{calls} calls");
+    let by_one = dump_rows(&rig, true);
+
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    let records: Vec<String> = store
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with("m/"))
+        .collect();
+    assert!(records.len() >= 61, "{} records", records.len());
+    let before: Vec<u64> = records.iter().map(|k| store.gets_under(k)).collect();
+    let limits = ReplayLimits {
+        records: 100,
+        extents: 1000,
+    };
+    // The store answers a turn later, as a real one does: the reads
+    // made ahead are under way together, and while the step works.
+    store.slow_reads.set(true);
+    let (fast, calls) = replay(&rig, UnixMs(0), limits).await;
+    assert_eq!(calls, 3, "manifests, tombstones, pinned copies");
+    for (key, before) in records.iter().zip(before) {
+        assert_eq!(store.gets_under(key) - before, 1, "{key} is read once");
+    }
+    let together = store.most_reading.get();
+    assert!(
+        (STORE_READS as u32..=4 * STORE_READS as u32).contains(&together),
+        "{together} reads at the same time"
+    );
+    assert_eq!(format!("{fast:?}"), format!("{slow:?}"));
+    assert_eq!(fast.manifests, 51, "{fast:?}");
+    assert_eq!((fast.tombstones, fast.deleted), (10, 10), "{fast:?}");
+    assert_eq!(dump_rows(&rig, true), by_one);
+
+    // Calls that end inside a run of records that was asked ahead, and
+    // inside a record.
+    for (records, extents) in [(100, 7), (5, 1000), (3, 2)] {
+        wipe(&rig);
+        let limits = ReplayLimits { records, extents };
+        let (cut, _) = replay(&rig, UnixMs(0), limits).await;
+        assert_eq!(format!("{cut:?}"), format!("{slow:?}"), "{limits:?}");
+        assert_eq!(dump_rows(&rig, true), by_one, "{limits:?}");
+    }
+}
+
+/// A read that fails ahead decides nothing: the step asks the store
+/// again, and the replay is the one of a store that never failed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_that_fails_ahead_is_asked_again_by_the_step() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let (whole, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    let reference = dump(&rig);
+
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    store.slow_reads.set(true);
+    let before = store.gets_under(&record);
+    *store.fail_gets.borrow_mut() = Some((record.clone(), 1));
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(store.gets_under(&record) - before, 1, "asked again, once");
+    assert_eq!(store.fail_gets.borrow().as_ref().unwrap().1, 0);
+    assert_eq!(format!("{report:?}"), format!("{whole:?}"));
+    assert_eq!(dump(&rig), reference);
+
+    // Twice: the step fails as it would have without the reads ahead.
+    wipe(&rig);
+    *store.fail_gets.borrow_mut() = Some((record, 2));
+    let failed = rig
+        .bridge
+        .replay_step_within(ReplayCursor::start(UnixMs(0)), ReplayLimits::default())
+        .await;
+    assert!(matches!(failed, Err(BridgeError::Blob(_))), "{failed:?}");
+}
+
+/// A record is read at the start of its run, before the step comes to
+/// it. One that was removed in between (by a write that was under way
+/// and that the catalogue refused) is not published from memory, and
+/// no row of it is written.
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_removed_after_it_was_read_is_not_published() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for i in 0..20 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        tick(&rig);
+    }
+    let (generation, _) = rig.live(&bucket, "k07").await.unwrap();
+    let record = format!("m/{}", generation.id.as_str());
+    wipe(&rig);
+    let store = &rig.bridge.safety;
+    *store.lose_after_get.borrow_mut() = Some(record.clone());
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert!(store.stored(&record).is_none());
+    assert_eq!(report.published, 19, "{report:?}");
+    assert_eq!(report.manifests, 19, "{report:?}");
+    assert!(report.unreadable.is_empty(), "{report:?}");
+    assert!(rig.live(&bucket, "k07").await.is_none());
+    // Nothing of it was staged either.
+    assert_eq!(rig.count("extents"), 19);
+    assert_eq!(rig.count("generations"), 19);
+    assert!(rig.live(&bucket, "k08").await.is_some());
+}
+
+/// The presence HEAD at a record's turn is needed only for a record the
+/// catalogue does not have. With read-ahead on, a HEAD that fails for a
+/// record the catalogue has does not fail the step; one that fails for
+/// a record still to publish does, and publishes nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_presence_head_fails_the_step_only_when_it_is_needed() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"x").await.expect(200);
+    let (generation, _) = rig.live(&bucket, "one").await.unwrap();
+    let name = Layout::flat().generation_key(&generation.id);
+    *rig.bridge.safety.fail_head.borrow_mut() = Some(name);
+    let report = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap();
+    assert_eq!((report.manifests, report.published), (1, 0), "{report:?}");
+    wipe(&rig);
+    let error = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::Blob(_)), "{error:?}");
+    assert!(rig.live(&bucket, "one").await.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_pinned_head_does_not_wait_for_a_plan_read() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    rig.put(&signer, BUCKET, "one", b"x").await.expect(200);
+    let (_, extents) = rig.live(&bucket, "one").await.unwrap();
+    let extent = &extents[0].id;
+    let plan_key = Layout::flat().article_key(extent);
+    let before = rig.bridge.safety.gets_under(&plan_key);
+    *rig.bridge.safety.fail_head.borrow_mut() = Some(extent.safety_key());
+    wipe(&rig);
+    let error = rig
+        .bridge
+        .replay_step(ReplayCursor::start(UnixMs(0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::Blob(_)));
+    assert_eq!(
+        rig.bridge.safety.gets_under(&plan_key) - before,
+        0,
+        "a plan read ran after the pinned-copy HEAD already failed"
+    );
+}
+
+/// What the catalogue says of the record that goes while the record
+/// before it is staged.
+#[derive(Clone, Copy, Debug)]
+enum Removed {
+    /// Nothing: the catalogue was lost.
+    Unpublished,
+    /// A newer generation of its key is live.
+    Superseded,
+    /// Its bucket's name now belongs to a bucket made again.
+    OtherBucket,
+    /// It is published already (only an operator removes such a record).
+    Present,
+    /// Nothing, and the catalogue fails every probe of its generation.
+    ProbeFails,
+}
+
+/// A record (N) is removed while the step is still staging the record
+/// before it (N-1), after both were read ahead. Presence is decided at
+/// N's own turn in both modes, so both skip N whatever the catalogue
+/// says of it, as main's record GET does, and both give the same report
+/// and leave the same rows.
+async fn removal_during_the_prior_record(case: Removed) {
+    let mut rig = rig();
+    let (vault, signer) = rig.standard(BUCKET).await;
+    let prior_bucket = match case {
+        Removed::OtherBucket => {
+            let keep = rig.bucket("keep", true).await;
+            rig.grant(AKID, &keep, Perm::Rw).await;
+            keep
+        }
+        _ => vault.clone(),
+    };
+    rig.put(&signer, &prior_bucket.name, "prior", b"keep")
+        .await
+        .expect(200);
+    tick(&rig);
+    rig.put(&signer, BUCKET, "refused", b"remove")
+        .await
+        .expect(200);
+    let (refused, _) = rig.live(&vault, "refused").await.unwrap();
+    if let Removed::Superseded = case {
+        tick(&rig);
+        rig.put(&signer, BUCKET, "refused", b"newer")
+            .await
+            .expect(200);
+    }
+    let (_, extents) = rig.live(&prior_bucket, "prior").await.unwrap();
+    let prior_extent: &'static str = Box::leak(extents[0].id.as_str().to_owned().into_boxed_str());
+    let name = Layout::flat().generation_key(&refused.id);
+    let sealed = rig.bridge.safety.get(&name, None).await.unwrap().unwrap();
+    let record_id = ExtentId::new(refused.id.as_str().to_owned());
+    let digest = sha2::Sha256::digest(&sealed).into();
+    match case {
+        Removed::Unpublished | Removed::ProbeFails => wipe(&rig),
+        Removed::OtherBucket => {
+            wipe(&rig);
+            let again = rig.bucket("vault-again", true).await;
+            assert_ne!(again.id, vault.id);
+            sql(
+                &rig,
+                "UPDATE buckets SET name = 'vault' WHERE name = 'vault-again'",
+            );
+        }
+        // The catalogue no longer has the old generation, only the
+        // newer one that is live.
+        Removed::Superseded => {
+            let g = refused.id.as_str();
+            let of = format!("(SELECT id FROM extents WHERE generation_id = '{g}')");
+            sql(
+                &rig,
+                &format!(
+                    "DELETE FROM generation_extents WHERE generation_id = '{g}'; \
+                     DELETE FROM outbox WHERE generation_id = '{g}' OR extent_id IN {of}; \
+                     DELETE FROM verifications WHERE extent_id IN {of}; \
+                     DELETE FROM articles WHERE extent_id IN {of}; \
+                     DELETE FROM gc WHERE extent_id IN {of}; \
+                     DELETE FROM extents WHERE generation_id = '{g}'; \
+                     DELETE FROM generations WHERE id = '{g}';"
+                ),
+            );
+        }
+        Removed::Present => {}
+    }
+    // Both modes start from this catalogue.
+    export(&rig);
+
+    let mut reports = Vec::new();
+    let mut catalogues = Vec::new();
+    for enabled in [false, true] {
+        wipe(&rig);
+        import(&rig);
+        std::rc::Rc::get_mut(&mut rig.bridge)
+            .unwrap()
+            .cfg
+            .replay_read_ahead = enabled;
+        let store = &rig.bridge.safety;
+        store
+            .put(
+                &name,
+                sealed.clone(),
+                &BlobMeta {
+                    bucket: &vault.id,
+                    extent: &record_id,
+                    cipher_sha256: &digest,
+                },
+            )
+            .await
+            .unwrap();
+        // Reads answer a turn later, so the reads ahead of N are under
+        // way together and done before N-1 is staged.
+        store.slow_reads.set(true);
+        let sql = &rig.bridge.catalog.sql;
+        if let Removed::ProbeFails = case {
+            *sql.fail_read_for.borrow_mut() = Some((
+                "FROM generations WHERE id = ?1), ",
+                refused.id.as_str().to_owned(),
+            ));
+        }
+        sql.stall_batch_key.set(Some(prior_extent));
+        let remove = async {
+            let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
+            while sql.stall_batch_key.get().is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prior record never reached its staging batch"
+                );
+                tokio::task::yield_now().await;
+            }
+            store.inner.lose(&name);
+            sql.selected_batch.release();
+            // The tripwire observes the release on its next poll.
+            tokio::task::yield_now().await;
+        };
+        let (step, ()) = futures_util::future::join(
+            rig.bridge.replay_step(ReplayCursor::start(UnixMs(0))),
+            remove,
+        )
+        .await;
+        let report = step.unwrap_or_else(|e| panic!("{case:?} read-ahead={enabled}: {e:?}"));
+        store.slow_reads.set(false);
+        *sql.fail_read_for.borrow_mut() = None;
+        assert!(store.stored(&name).is_none());
+        if let Removed::Unpublished | Removed::OtherBucket | Removed::ProbeFails = case {
+            assert_eq!(report.published, 1, "read-ahead={enabled}: {report:?}");
+            assert!(rig.live(&vault, "refused").await.is_none());
+        }
+        assert!(rig.live(&prior_bucket, "prior").await.is_some());
+        reports.push(format!("{report:?}"));
+        catalogues.push(dump_rows(&rig, true));
+    }
+    assert_eq!(reports[0], reports[1], "{case:?}: off, then on");
+    assert!(
+        catalogues[0] == catalogues[1],
+        "{case:?}: the catalogue rows differ"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_during_the_prior_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Unpublished).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_superseded_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Superseded).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_record_of_a_bucket_made_again_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::OtherBucket).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_published_record_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::Present).await;
+}
+
+/// The store's answer that the record is gone decides first: main never
+/// asks the catalogue about a record its GET does not find.
+#[tokio::test(flavor = "current_thread")]
+async fn removal_of_a_record_whose_probe_fails_matches_the_sequential_path() {
+    removal_during_the_prior_record(Removed::ProbeFails).await;
+}
+
+/// A replay over a catalogue that has the objects already asks the
+/// store nothing about the extents of the records a newer one is over:
+/// the step leaves them out, and so do the reads ahead.
+#[tokio::test(flavor = "current_thread")]
+async fn nothing_is_asked_ahead_about_the_extents_of_a_superseded_record() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (_, signer) = rig.standard(BUCKET).await;
+    for round in 0..6 {
+        for i in 0..10 {
+            let body = format!("{round}-{i}");
+            rig.put(&signer, BUCKET, &format!("k{i:02}"), body.as_bytes())
+                .await
+                .expect(200);
+            tick(&rig);
+        }
+    }
+    wipe(&rig);
+    let (first, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!(first.published, 60, "{first:?}");
+    let store = &rig.bridge.safety;
+    let plans = store.gets_under("m/art/");
+    assert!(plans >= 60, "{plans} reads of article plans");
+    // Again, over a catalogue that has the live generations only, as
+    // one has that was exported after the older ones were collected:
+    // fifty records are of generations that a newer one is over.
+    let live = "(SELECT generation_id FROM objects)";
+    let old = format!("(SELECT id FROM extents WHERE generation_id NOT IN {live})");
+    for table in ["outbox", "articles", "verifications", "generation_extents"] {
+        sql(
+            &rig,
+            &format!("DELETE FROM {table} WHERE extent_id IN {old};"),
+        );
+    }
+    sql(
+        &rig,
+        &format!(
+            "DELETE FROM extents WHERE generation_id NOT IN {live}; \
+             DELETE FROM generations WHERE id NOT IN {live};"
+        ),
+    );
+    let (again, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((again.superseded, again.present), (50, 10), "{again:?}");
+    let asked = store.gets_under("m/art/") - plans;
+    assert!(
+        asked * 6 <= plans,
+        "{asked} reads of article plans, {plans} before"
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn records_alone_rebuild_the_catalogue() {
@@ -2755,6 +3212,123 @@ async fn a_pinned_copy_released_after_the_export_is_found() {
     assert_eq!(report.safety_missing, 1, "{report:?}");
 }
 
+/// The pinned copies are found by a listing, and one the listing does
+/// not name is asked for by its key. Copies of extents the catalogue
+/// does not hold, however many lie before and between the ones it
+/// holds, hide none: every held extent is checked once, and the one
+/// whose copy is gone is the one reported.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_held_listing_falls_back_to_point_heads() {
+    use velmora_bridge::replay::ReplayPhase;
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    for key in ["available", "missing"] {
+        rig.put(&signer, BUCKET, key, key.as_bytes())
+            .await
+            .expect(200);
+    }
+    let (_, extents) = rig.live(&bucket, "missing").await.unwrap();
+    let missing = &extents[0].id;
+    rig.bridge.safety.inner.lose(&missing.safety_key());
+    rig.bridge.safety.fail_list.set(true);
+    let mut cursor = ReplayCursor::start(UnixMs(0));
+    cursor.phase = ReplayPhase::Held;
+    cursor.after.clear();
+    let report = rig.bridge.replay_step(cursor).await.unwrap();
+    assert_eq!(report.held_checked, 2);
+    assert_eq!(report.held_missing, [missing.as_str()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn copies_the_catalogue_does_not_hold_hide_no_missing_one() {
+    let rig = rig_with(NoNntp, read_ahead_config());
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let mut held = Vec::new();
+    for i in 0..12 {
+        let key = format!("k{i:02}");
+        rig.put(&signer, BUCKET, &key, key.as_bytes())
+            .await
+            .expect(200);
+        let (_, extents) = rig.live(&bucket, &key).await.unwrap();
+        held.extend(extents.into_iter().map(|x| x.id));
+        tick(&rig);
+    }
+    held.sort();
+    export(&rig);
+    let exported_at = rig.now();
+    tick(&rig);
+    let store = &rig.bridge.safety.inner;
+    // More copies of no extent of the catalogue than a call lists,
+    // before the first held one, and some after each of the first.
+    let sha: [u8; 32] = sha2::Sha256::digest(b"").into();
+    let mut strays: Vec<String> = (0..8500).map(|i| format!("x/x_{i:026}")).collect();
+    strays.extend(
+        held.iter()
+            .take(6)
+            .map(|id| format!("{}-", id.safety_key())),
+    );
+    for key in strays.iter().skip(8500) {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    let lost = &held[7];
+    assert!(store.lose(&lost.safety_key()));
+    wipe(&rig);
+    import(&rig);
+
+    // With the strays between only, one listing names every copy but
+    // the lost one.
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 12, "{report:?}");
+    assert_eq!(report.held_missing, [lost.as_str()]);
+    // With more of them than one listing holds between the held ones,
+    // the second listing goes on where the first ended.
+    let between: Vec<String> = (0..1500)
+        .map(|i| format!("{}-{i:04}", held[5].safety_key()))
+        .collect();
+    for key in &between {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    let copies = |rig: &Rig| {
+        let listed = rig.bridge.safety.listed.borrow();
+        listed.iter().filter(|p| p.starts_with("x/")).count()
+    };
+    let lists = copies(&rig);
+    let (report, _) = replay(&rig, exported_at, ReplayLimits::default()).await;
+    assert_eq!(report.held_checked, 12, "{report:?}");
+    assert_eq!(report.held_missing, [lost.as_str()]);
+    assert_eq!(copies(&rig) - lists, 2, "two listings");
+    // With more before the first than a call lists, every copy is asked
+    // for by its key.
+    for key in strays.iter().take(8500) {
+        let meta = BlobMeta {
+            bucket: &bucket.id,
+            extent: &held[0],
+            cipher_sha256: &sha,
+        };
+        store.put(key, Vec::new(), &meta).await.unwrap();
+    }
+    for extents in [1000, 5, 1] {
+        let limits = ReplayLimits {
+            records: 100,
+            extents,
+        };
+        let (report, _) = replay(&rig, exported_at, limits).await;
+        assert_eq!(report.held_checked, 12, "{extents}: {report:?}");
+        assert_eq!(report.held_missing_total, 1, "{extents}: {report:?}");
+        assert_eq!(report.held_missing, [lost.as_str()], "{extents}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Random histories inside one millisecond replay to the same answers
 // ---------------------------------------------------------------------------
@@ -3606,6 +4180,59 @@ async fn plan_record(
     .await
     .unwrap();
     (extent, plan)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn opt_in_replay_restores_packed_plan_and_its_parity_addendum() {
+    let mut cfg = read_ahead_config();
+    cfg.packed_plans = true;
+    let rig = rig_with_selected(NoNntp, cfg);
+    let (bucket, signer) = rig.standard(BUCKET).await;
+    let body = vec![12; 12 * velmora::media::PLAIN_CHUNK_SIZE as usize];
+    rig.put(&signer, BUCKET, "with-parity", &body)
+        .await
+        .expect(200);
+    let layout = Layout::flat();
+    let (extent, rows) = plan_record(&rig, &bucket, "with-parity", &[None, None]).await;
+    let packed =
+        velmora_bridge::plan::pack_explicit(&extent.id, extent.cipher_size, &rows).unwrap();
+    let parity_rows: Vec<_> = velmora_bridge::parity::new_rows(2)
+        .into_iter()
+        .map(|row| (row, [41; 32]))
+        .collect();
+    let parity = velmora_bridge::parity::build(
+        &mut velmora::rng::SystemRng,
+        rig.now().0 / 1000,
+        &["alt.binaries.test"],
+        &extent.id,
+        extent.cipher_size,
+        &packed,
+        &parity_rows,
+    )
+    .unwrap();
+    rig.bridge
+        .safety
+        .inner
+        .lose(&layout.article_key(&extent.id));
+    velmora_bridge::recovery::write_stored_plan(
+        &rig.bridge.safety,
+        &rig.bridge.kek,
+        &layout,
+        &extent,
+        &velmora_bridge::plan::StoredPlan {
+            rows,
+            packed: Some(packed.clone()),
+            parity: Some(parity.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    wipe(&rig);
+    let (report, _) = replay(&rig, UnixMs(0), ReplayLimits::default()).await;
+    assert_eq!((report.published, report.article_plans), (1, 1));
+    let rebuilt = rig.bridge.catalog.stored_plan(&extent.id).await.unwrap();
+    assert_eq!(rebuilt.packed, Some(packed));
+    assert_eq!(rebuilt.parity, Some(parity));
 }
 
 /// A replay through the SQL catalogue restores each row's yEnc name: a
