@@ -291,7 +291,7 @@ where
     )
 }
 
-fn encode_bind_raw<P, I>(
+pub(crate) fn encode_bind_raw<P, I>(
     statement_name: &str,
     params: I,
     portal: &str,

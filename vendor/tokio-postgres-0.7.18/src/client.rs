@@ -558,6 +558,17 @@ impl Client {
         query::query_typed(&self.inner, query, params).await
     }
 
+    /// Sends several statements as one request with a single Sync and
+    /// returns what the server answered to each (vendored addition; see
+    /// `pipeline.rs`). An encode error returns `Err` before anything is sent.
+    pub async fn pipeline_typed(
+        &self,
+        statements: &[crate::PipelineStatement<'_>],
+        collect_rows: bool,
+    ) -> Result<crate::PipelineOutcome, Error> {
+        crate::pipeline::pipeline_typed(&self.inner, statements, collect_rows).await
+    }
+
     /// Executes a statement, returning the number of rows modified.
     ///
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list

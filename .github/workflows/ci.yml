@@ -307,6 +307,16 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Audit advisories, bans, licenses, sources
         run: cargo-deny --manifest-path Cargo.toml check
+      # tokio-postgres is vendored with one added request type. Prove the
+      # tree is the published crate (pinned SHA-256) plus exactly the
+      # reviewed upstream.diff.
+      - name: The vendored tokio-postgres is crates.io 0.7.18 plus its patch
+        run: bash vendor/check-tokio-postgres.sh
+      # A path [patch.crates-io] crate has no registry source in Cargo.lock,
+      # so cargo-deny skips it. Read the advisory database cargo-deny just
+      # fetched for the vendored version.
+      - name: RustSec advisories for the vendored tokio-postgres
+        run: python3 -I vendor/check-advisories.py
 
   # Path filter for the S3 bridge jobs below. Pull requests that touch only
   # files outside the Rust workspace (docs, READMEs, other workflows) skip
@@ -334,7 +344,7 @@ jobs:
             exit 0
           fi
           # Treat renames as delete/add and read unquoted paths one at a time.
-          bridge_paths='^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/)'
+          bridge_paths='^(Cargo\.toml|Cargo\.lock|deny\.toml|\.github/workflows/ci\.yml|crates/|workers/s3-bridge/|vendor/)'
           bridge=$(git diff --no-renames --name-only -z HEAD^1 HEAD | {
             matched=false
             # Read bytes so malformed UTF-8 cannot swallow a NUL delimiter.
