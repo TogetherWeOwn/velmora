@@ -5898,3 +5898,41 @@ async fn a_sweep_step_covers_a_whole_window() {
     }
     assert!(steps <= 4, "{steps} steps for 451 rows");
 }
+
+/// `SCRUB` decides whether a loss on record keeps a row from a sweep's
+/// promotion. An unreleasable extent with a loss on record, whose fill
+/// the scrub never managed to write, is promoted by the sweep that
+/// turning `SCRUB` off starts, with the tier under its cap.
+#[tokio::test(flavor = "current_thread")]
+async fn turning_the_scrub_off_sweeps_a_lost_extents_fill_to_safety() {
+    let mut w = world().await;
+    let o = w.released("a", 161).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    cache_only(&w, &o, "a").await;
+    cfg_mut(&mut w).providers[1].release = false;
+    // A loss on record on alpha; the scrub's writes of the fill failed.
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE scrub_copies SET full_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'alpha'",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Int(w.bridge().clock.now().0),
+            ],
+        )
+        .await
+        .unwrap();
+    // The sweep under `SCRUB=on` leaves the lost row to the scrub.
+    evict_check_now(&w).await;
+    assert!(!w.has_safety(&o));
+    cfg_mut(&mut w).scrub.on = false;
+    evict_check_now(&w).await;
+    assert_eq!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "the sweep after the toggle wrote the fill"
+    );
+}

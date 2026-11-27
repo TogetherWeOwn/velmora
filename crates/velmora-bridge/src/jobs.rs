@@ -1074,7 +1074,8 @@ where
     }
 
     /// A fingerprint of the release rule's inputs: which backbones count,
-    /// `REQUIRED_BACKBONES` and `VERIFY_MODE`. A change of any of them
+    /// `REQUIRED_BACKBONES`, `VERIFY_MODE`, and `SCRUB` (which decides
+    /// whether a loss on record keeps a row from promotion). A change of any of them
     /// can make a released extent unreleasable, so the eviction order is
     /// swept once under the new one.
     pub fn rule_fingerprint(&self) -> String {
@@ -1085,10 +1086,13 @@ where
             crate::config::VerifyMode::Body => "body",
             crate::config::VerifyMode::Light => "light",
         };
+        // `SCRUB` decides whether a loss on record keeps a row from the
+        // sweep's promotion, so a toggle sweeps too.
         let digest = Sha256::digest(format!(
-            "{}|{}|{mode}",
+            "{}|{}|{mode}|scrub={}",
             labels.join(","),
-            self.cfg.required_backbones
+            self.cfg.required_backbones,
+            self.cfg.scrub.on
         ));
         digest[..12].iter().map(|b| format!("{b:02x}")).collect()
     }
