@@ -5843,3 +5843,58 @@ async fn the_first_check_sweeps_and_writes_an_unreleasable_fill() {
         "and recorded the rule it covered"
     );
 }
+
+/// A sweep step covers a whole window: rows that may go do not end it
+/// early, as they end a drain's step at a batch. 450 releasable rows take
+/// three windows of 200, not nine batches of 50.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sweep_step_covers_a_whole_window() {
+    let w = world().await;
+    let o = w.released("a", 160).await;
+    let db = &w.bridge().catalog.sql.inner;
+    let evidence = r#"[{"backbone":"alpha","kind":"body","plan_rev":0},{"backbone":"beta","kind":"stat","plan_rev":0}]"#;
+    let seed = db.fixture(
+        "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x+1 FROM n WHERE x < 450) \
+         INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT printf('fixture-%05d', x), ?1, 'committed', 1, 65, zeroblob(48), zeroblob(16), zeroblob(32), zeroblob(32), 'released', 0, 65, x, ?2 FROM n",
+        "INSERT INTO extents(id,bucket_id,state,plain_size,cipher_size,media_header,plain_md5,plain_sha256,cipher_sha256,safety_state,created_at,hot_safety_bytes,last_read_at,release_evidence) \
+         SELECT 'fixture-' || lpad(CAST(x AS text), 5, '0'), ?1, 'committed', 1, 65, \
+           decode(repeat('00', 48), 'hex'), decode(repeat('00', 16), 'hex'), \
+           decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), 'released', 0, 65, x, ?2 \
+         FROM generate_series(1, 450) x",
+    );
+    db.fixture_exec(
+        seed,
+        &[
+            SqlValue::Text(w.bucket.id.as_str().to_owned()),
+            SqlValue::Text(evidence.to_owned()),
+        ],
+    )
+    .await
+    .unwrap();
+    let _ = o;
+    let bridge = w.bridge();
+    bridge
+        .clock
+        .advance_ms(i64::from(velmora_bridge::jobs::EVICT_CHECK_SECS) * 1000);
+    bridge.jobs.inner.take();
+    bridge.dispatch().await.unwrap();
+    let mut steps = 0;
+    while bridge.catalog.evict_rule_seen().await.unwrap().is_none() {
+        let queued: Vec<Job> = bridge
+            .jobs
+            .inner
+            .take()
+            .into_iter()
+            .map(|s| s.job)
+            .filter(|j| matches!(j, Job::Evict { .. }))
+            .collect();
+        assert!(!queued.is_empty(), "the sweep stalled after {steps} steps");
+        for step in queued {
+            bridge.run_job(&step).await;
+            steps += 1;
+        }
+        assert!(steps <= 20, "the sweep did not end");
+    }
+    assert!(steps <= 4, "{steps} steps for 451 rows");
+}

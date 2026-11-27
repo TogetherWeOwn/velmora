@@ -848,7 +848,18 @@ where
         let (rule, counting) = self.evict_rule();
         let window = self
             .catalog
-            .evict_window(&cursor, EVICT_WINDOW, EVICT_BATCH, &rule)
+            // A marker's step evicts nothing: the whole window is its, not
+            // only as far as a batch of rows that may go.
+            .evict_window(
+                &cursor,
+                EVICT_WINDOW,
+                if promote_only {
+                    EVICT_WINDOW
+                } else {
+                    EVICT_BATCH
+                },
+                &rule,
+            )
             .await?;
         // Kept for want of a release under the backbones that count now.
         // A cache fill that is the extent's only R2 copy is written to the
