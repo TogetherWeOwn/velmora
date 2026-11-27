@@ -82,7 +82,11 @@ impl Prepared {
         let changed = stream
             .rows_affected()
             .map(|count| if self.statement.select { 0 } else { count });
+        // Only the transport comparison reads tags: no copy elsewhere.
+        #[cfg(feature = "testkit-pg")]
         let tag = stream.command_tag().map(str::to_owned);
+        #[cfg(not(feature = "testkit-pg"))]
+        let tag = None;
         Ok(Reply { rows, changed, tag })
     }
 }
