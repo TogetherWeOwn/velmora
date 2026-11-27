@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::types::Type;
 use velmora_bridge::pg::normalize_statement;
 use velmora_bridge::sql::{pg_background_statements, pg_datapath_statements};
-use velmora_bridge::testkit::TestSql;
+use velmora_bridge::testkit::{TestPostgres, TestSql};
 use velmora_bridge::{Sql, SqlValue};
 
 const COVERAGE_DIR: &str = "VELMORA_PG_STATEMENTS_DIR";
@@ -254,7 +254,9 @@ async fn postgres_testkit_preserves_private_type_lookup_statements() {
     if !TestSql::postgres_selected() {
         return;
     }
-    let db = TestSql::with_schema_unrecorded().unwrap();
+    // Type lookups happen on the one-Sync-per-statement transport only: the
+    // single-Sync transport takes column types from the built-in table.
+    let db = TestSql::Postgres(Box::new(TestPostgres::with_typed_writes().unwrap()));
     db.fixture_script(
         "CREATE TYPE testkit_enum_one AS ENUM ('value');
          CREATE TYPE testkit_enum_two AS ENUM ('value');",
@@ -505,4 +507,156 @@ fn coverage_rejects_hidden_new_missing_and_stale_exceptions() {
     assert!(errors
         .iter()
         .any(|error| error.starts_with("stale unexecuted SQL exception: ")));
+}
+
+/// Tables whose rows carry wrapped key material. A CHECK, NOT NULL or
+/// UNIQUE failure on them logs the failing row (or key) in the server's
+/// error DETAIL, wrapped bytes included. This exists without the
+/// single-Sync transport; the lists below make every statement, constraint
+/// and trigger function that can raise there visible in review.
+const SECRET_ROW_TABLES: [&str; 3] = ["buckets", "access_keys", "extents"];
+const SECRET_ROW_WRITES: &str = include_str!("pg-secret-row-writes.txt");
+
+fn writes_secret_row_table(sql: &str) -> Option<&'static str> {
+    let upper = sql.to_ascii_uppercase();
+    let words: Vec<&str> = upper
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    SECRET_ROW_TABLES.into_iter().find(|table| {
+        let t = table.to_ascii_uppercase();
+        words
+            .windows(2)
+            .any(|w| (w[0] == "INTO" || w[0] == "UPDATE") && w[1] == t)
+    })
+}
+
+#[tokio::test]
+async fn statements_constraints_and_triggers_that_can_log_secret_rows_are_pinned() {
+    if !TestSql::postgres_selected() {
+        return;
+    }
+    let mut actual = BTreeSet::new();
+    for statement in manifest() {
+        if let Some(table) = writes_secret_row_table(&statement.sql) {
+            let head: String = statement
+                .sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let head: String = head
+                .chars()
+                .take(72)
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            actual.insert(format!(
+                "statement {} {table}: {head}",
+                &fingerprint(&statement.sql)[..16]
+            ));
+        }
+    }
+    let db = TestSql::with_schema_unrecorded().unwrap();
+    let client = db.postgres().unwrap().client().await.unwrap();
+    let tables: Vec<String> = SECRET_ROW_TABLES.iter().map(|t| t.to_string()).collect();
+    for row in client
+        .query(
+            "SELECT c.relname, k.conname, k.contype::text FROM pg_constraint k \
+             JOIN pg_class c ON c.oid = k.conrelid \
+             WHERE c.relnamespace = current_schema()::regnamespace AND c.relname = ANY($1) \
+               AND k.contype IN ('c', 'u', 'p')",
+            &[&tables],
+        )
+        .await
+        .unwrap()
+    {
+        actual.insert(format!(
+            "constraint {}.{} {}",
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2)
+        ));
+    }
+    for row in client
+        .query(
+            "SELECT c.relname, a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relnamespace = current_schema()::regnamespace AND c.relname = ANY($1) \
+               AND a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull",
+            &[&tables],
+        )
+        .await
+        .unwrap()
+    {
+        actual.insert(format!(
+            "not-null {}.{}",
+            row.get::<_, String>(0),
+            row.get::<_, String>(1)
+        ));
+    }
+    // Trigger functions of the schema that write those tables, and the
+    // triggers on them.
+    for row in client
+        .query(
+            "SELECT p.proname, p.prosrc FROM pg_proc p \
+             WHERE p.pronamespace = current_schema()::regnamespace",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let (name, source): (String, String) = (row.get(0), row.get(1));
+        if let Some(table) = writes_secret_row_table(&source) {
+            actual.insert(format!("function {name} {table}"));
+        }
+    }
+    for row in client
+        .query(
+            "SELECT c.relname, t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+             WHERE c.relnamespace = current_schema()::regnamespace AND c.relname = ANY($1) \
+               AND NOT t.tgisinternal",
+            &[&tables],
+        )
+        .await
+        .unwrap()
+    {
+        actual.insert(format!(
+            "trigger {}.{}",
+            row.get::<_, String>(0),
+            row.get::<_, String>(1)
+        ));
+    }
+    let mut pinned = BTreeSet::new();
+    for line in SECRET_ROW_WRITES
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let (entry, reason) = match line.split_once(" # ") {
+            Some((entry, reason)) => (entry, reason.trim()),
+            None => (line, ""),
+        };
+        let needs_reason = entry.starts_with("not-null ")
+            || (entry.starts_with("constraint ") && entry.ends_with(" c"));
+        assert!(
+            !needs_reason || !reason.is_empty(),
+            "no reason for: {entry}"
+        );
+        pinned.insert(entry.to_owned());
+    }
+    let added: Vec<_> = actual.difference(&pinned).collect();
+    let removed: Vec<_> = pinned.difference(&actual).collect();
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "update tests/pg-secret-row-writes.txt after review\nnew:\n{}\ngone:\n{}",
+        added
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        removed
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

@@ -36,7 +36,8 @@ region = "aws:us-east-1"
 [vars]
 # PostgreSQL bindings are activated only during the catalogue cutover.
 CATALOG_BACKEND = "d1"
-PG_PIPELINE = "1"
+# Write transactions: "single-sync" (one Sync each) or "pipeline" (one per statement).
+PG_WRITE_TX = "single-sync"
 ENVIRONMENT = "prod"
 S3_HOST = "velmora-s3.<account>.workers.dev"
 S3_REGION = "auto"

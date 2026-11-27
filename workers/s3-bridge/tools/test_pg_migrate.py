@@ -327,6 +327,71 @@ class PgMigrate(unittest.TestCase):
         self.assertIn("0003_usage_statement_triggers.sql: already applied", activated)
         self.assertIn("App schema USAGE granted", activated)
 
+    def test_verify_refuses_settings_that_log_bind_values(self):
+        self.migrate()
+        self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        check = "privilege check failed: app sessions log no bind values"
+        db = '"' + os.environ["PGDATABASE"].replace('"', '""') + '"'
+        for setting in ["log_statement = 'all'", "log_statement = 'mod'",
+                        "log_min_duration_statement = 0", "log_min_duration_sample = 0",
+                        "log_transaction_sample_rate = 1", "log_parameter_max_length_on_error = -1",
+                        "auto_explain.log_min_duration = 0", "pginsights.raw_queries = on",
+                        "pgaudit.log = 'all'"]:
+            name = setting.split(" = ")[0]
+            for scope in ["", f"IN DATABASE {db} "]:
+                with self.subTest(setting=setting, scope=scope):
+                    psql(f"ALTER ROLE kofra_app {scope}SET {setting}")
+                    try:
+                        result = self.migrate("--verify", ok=False)
+                        self.assertIn(check, result.stdout + result.stderr)
+                    finally:
+                        psql(f"ALTER ROLE kofra_app {scope}RESET {name}")
+        self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        # Every role's default, and a server-level extension setting this
+        # session sees only as a placeholder.
+        def reloaded(name, expected):
+            # pg_reload_conf() only signals: wait until a new session sees it.
+            for _ in range(100):
+                seen = psql(f"SELECT coalesce(current_setting('{name}', true), '')").stdout.strip()
+                if seen == expected:
+                    return
+                time.sleep(0.1)
+            self.fail(f"configuration reload not visible: {seen!r}")
+
+        for setup, undo, value in [
+                ("ALTER ROLE ALL SET log_statement = 'all'", "ALTER ROLE ALL RESET log_statement", None),
+                ("ALTER SYSTEM SET auto_explain.log_min_duration = 0; SELECT pg_reload_conf()",
+                 "ALTER SYSTEM RESET auto_explain.log_min_duration; SELECT pg_reload_conf()",
+                 ("auto_explain.log_min_duration", "0")),
+                ("ALTER SYSTEM SET pgaudit.log = 'all'; SELECT pg_reload_conf()",
+                 "ALTER SYSTEM RESET pgaudit.log; SELECT pg_reload_conf()", ("pgaudit.log", "all"))]:
+            with self.subTest(setup=setup):
+                for statement in setup.split("; "):
+                    psql(statement)
+                try:
+                    if value is not None:
+                        reloaded(*value)
+                    result = self.migrate("--verify", ok=False)
+                    self.assertIn(check, result.stdout + result.stderr)
+                finally:
+                    for statement in undo.split("; "):
+                        psql(statement)
+                    if value is not None:
+                        reloaded(value[0], "")
+        # A removed extension setting leaves an empty placeholder: no longer
+        # a refusal.
+        self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        # An explicit pgaudit.log = 'none' logs nothing: accepted.
+        psql("ALTER SYSTEM SET pgaudit.log = 'none'")
+        psql("SELECT pg_reload_conf()")
+        try:
+            reloaded("pgaudit.log", "none")
+            self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        finally:
+            psql("ALTER SYSTEM RESET pgaudit.log")
+            psql("SELECT pg_reload_conf()")
+            reloaded("pgaudit.log", "")
+
     def test_import_mode_applies_the_statement_triggers_before_activation(self):
         self.migrate("--to", "0001", "--import-mode")
         # What the importer leaves: its marker and the copied usage rows.

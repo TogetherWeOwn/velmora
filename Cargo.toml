@@ -1,6 +1,9 @@
 [workspace]
 members = ["crates/velmora", "crates/velmora-test-nntp", "crates/velmora-ssrf-guard", "crates/velmora-s3-proto", "crates/velmora-bridge", "crates/velmora-parity-bench", "crates/velmora-cpu-bench", "crates/velmora-kit", "crates/velmora-recover", "workers/s3-bridge", "workers/pg-load"]
 resolver = "2"
+# The vendored driver is a path patch, not a member: it keeps its upstream
+# formatting and lints.
+exclude = ["vendor/tokio-postgres-0.7.18"]
 
 # `cargo test` only. The tests seal, encode, hash and read back hundreds of
 # megabytes, and at opt-level 0 that work alone took most of the native CI
@@ -138,3 +141,9 @@ opt-level = 3
 
 [profile.release.package.pin-project-lite]
 opt-level = 3
+
+# tokio-postgres 0.7.18 from crates.io, verbatim, plus one request type that
+# sends several extended-protocol statements with a single Sync
+# (`Client::pipeline_typed`). See vendor/tokio-postgres-0.7.18/VENDORED.md.
+[patch.crates-io]
+tokio-postgres = { path = "vendor/tokio-postgres-0.7.18" }

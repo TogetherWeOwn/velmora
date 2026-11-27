@@ -46,6 +46,10 @@ rusqlite = { version = "0.42", features = ["bundled", "preupdate_hook"], optiona
 quick-xml = "=0.42.0"
 bytes = { version = "1", optional = true }
 tokio-postgres = { version = "=0.7.18", default-features = false, optional = true }
+# Compile out every `log` record, in every crate of the build. The driver
+# logs whole simple queries at debug level; the one-message write transport
+# puts the values (some are wrapped key material) into that text.
+log = { version = "0.4", default-features = false, features = ["max_level_off"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["js"], optional = true }
