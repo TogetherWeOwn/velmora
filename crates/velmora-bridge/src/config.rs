@@ -402,6 +402,9 @@ pub struct BridgeConfig {
     /// `tenant` goes on only once no older version can come back, and a
     /// rollback after that is to a version that knows the switch.
     pub records: crate::recovery::Layout,
+    /// Enable bounded store read-ahead and larger catalogue replay steps
+    /// (`REPLAY_READ_AHEAD`). Off preserves sequential replay.
+    pub replay_read_ahead: bool,
     pub required_backbones: u32,
     pub safety_min_age_secs: u32,
     /// Let the verify job release the extent itself
@@ -973,6 +976,12 @@ impl BridgeConfig {
             Some(_) => return Err(ConfigError::Invalid("RECORD_LAYOUT".into())),
         };
 
+        let replay_read_ahead = match get("REPLAY_READ_AHEAD").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("REPLAY_READ_AHEAD".into())),
+        };
+
         let required_backbones: u32 = number(&get, "REQUIRED_BACKBONES")?;
         if required_backbones == 0 {
             return Err(ConfigError::Invalid("REQUIRED_BACKBONES".into()));
@@ -1196,6 +1205,7 @@ impl BridgeConfig {
             packed_plans,
             parity,
             records,
+            replay_read_ahead,
             required_backbones,
             safety_min_age_secs,
             release_at_verify,

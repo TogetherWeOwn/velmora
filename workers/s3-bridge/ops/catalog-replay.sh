@@ -10,15 +10,25 @@
 #
 # The script calls POST /_admin/restore until the Worker reports the end,
 # and prints the summed counts. It can be stopped and started again at any
-# time: every step is idempotent.
+# time: every step is idempotent. For the same reason a call that gets no
+# answer, or a 5xx one, is sent again as it was, a few times, before the
+# script gives up; any other answer than 200 ends it at once. A call is
+# sent again after more than 30 seconds: the Worker can go on with a
+# call for that long after the connection is lost, and the next call
+# starts when it has stopped.
+#
+# The calls go one after the other: each starts where the one before
+# ended, and the catalogue takes a step only from the place it has
+# reached. One line of progress per call goes to stderr.
 #
 # Environment:
 #   VELMORA_ADMIN_TOKEN_FILE  admin bearer file, mode 0600
+#   VELMORA_REPLAY_RETRIES    times one call is sent again (default 5)
 #
 # The bearer reaches curl through a 0600 header file, never through argv.
-# Exit status: 0 = complete and no damage; 2 = complete, but some records
-# did not open, some generations were refused or some objects have no
-# copy (the lists are printed); 1 = the replay did not finish.
+# Exit status: 0 = complete and no damage; 1 = replay did not finish;
+# 2 = complete with damage (see the lists); 3 = complete after a retry,
+# so damage diagnostics may be incomplete (even if the lists are empty).
 
 set -euo pipefail
 set +x
@@ -36,7 +46,7 @@ case "$SINCE$MARGIN" in *[!0-9]*) echo "catalog-replay: times are whole millisec
 }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -r -- "$WORK"' EXIT
 {
   printf 'authorization: Bearer '
   tr -d '\r\n' <"$VELMORA_ADMIN_TOKEN_FILE"
@@ -49,15 +59,31 @@ else
   body=$(jq -cn --argjson s "$SINCE" '{since_ms: $s}')
 fi
 
+RETRIES=${VELMORA_REPLAY_RETRIES:-5}
+case "$RETRIES" in '' | *[!0-9]*) echo "catalog-replay: VELMORA_REPLAY_RETRIES is a whole number" >&2; exit 1 ;; esac
+
 # The running total stays in a file: its lists can outgrow what one
 # command-line argument may hold.
 echo '{}' >"$WORK/total.json"
 calls=0
+resent=0
+started=$(date +%s)
 while :; do
   calls=$((calls + 1))
-  status=$(curl -sS -o "$WORK/step.json" -w '%{http_code}' --max-time 300 \
-    -X POST -H @"$WORK/auth" -H 'content-type: application/json' \
-    --data-binary "$body" "$BASE/_admin/restore") || status=000
+  tries=0
+  while :; do
+    : >"$WORK/step.json"
+    status=$(curl -sS -o "$WORK/step.json" -w '%{http_code}' --max-time 300 \
+      -X POST -H @"$WORK/auth" -H 'content-type: application/json' \
+      --data-binary "$body" "$BASE/_admin/restore") || status=000
+    case "$status" in 000 | 5??) ;; *) break ;; esac
+    [ "$tries" -lt "$RETRIES" ] || break
+    tries=$((tries + 1))
+    resent=$((resent + 1))
+    wait=$((30 + tries * 5))
+    echo "catalog-replay: call $calls answered $status; sent again in $wait s ($tries of $RETRIES)" >&2
+    sleep "$wait"
+  done
   if [ "$status" != 200 ]; then
     echo "catalog-replay: call $calls answered $status:" >&2
     head -c 600 "$WORK/step.json" >&2 2>/dev/null || true
@@ -95,6 +121,10 @@ while :; do
     | .damaged_total = $s.damaged_total
     | .damaged = $s.damaged' "$WORK/step.json" >"$WORK/total.next"
   mv "$WORK/total.next" "$WORK/total.json"
+  jq -r --argjson c "$calls" --argjson t "$(($(date +%s) - started))" --slurpfile s "$WORK/step.json" '
+    "catalog-replay: call \($c), \($t) s: \(.manifests) records, \(.extents) extents, \(.tombstones) tombstones, \(.held_checked) pinned copies checked"
+    + (if $t > 0 then " (\(.extents / $t * 10 | round / 10) extents/s)" else "" end)
+    + "; now in \($s[0].next.phase // "the end")"' "$WORK/total.json" >&2
   if [ "$(jq -r '.next == null' "$WORK/step.json")" = true ]; then
     break
   fi
@@ -103,12 +133,20 @@ done
 
 echo "catalog-replay: complete after $calls calls"
 jq . "$WORK/total.json"
+outcome=0
 if [ "$(jq -r '.held_missing_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: the catalogue is older than the release of some pinned copies" >&2
   echo "catalog-replay: run it again with restore point 0 before leaving maintenance" >&2
-  exit 2
+  outcome=2
 fi
 if [ "$(jq -r '(.unpublishable | length) + (.damaged_unpublished | length) + (.unreadable | length) + (.twins | length) + .damaged_total + .other_bucket_total' "$WORK/total.json")" != 0 ]; then
   echo "catalog-replay: finished with damage, see the lists above" >&2
-  exit 2
+  outcome=2
 fi
+# If a response was lost, the retry can see a later state and omit damage
+# that the original attempt reported. Never report a clean replay then.
+if [ "$resent" != 0 ]; then
+  echo "catalog-replay: $resent calls were sent again; damage diagnostics may be incomplete" >&2
+  exit 3
+fi
+exit "$outcome"

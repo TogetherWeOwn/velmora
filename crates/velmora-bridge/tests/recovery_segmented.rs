@@ -234,6 +234,65 @@ fn invalid(e: BridgeError) -> String {
 // The bytes
 // ---------------------------------------------------------------------------
 
+#[tokio::test(flavor = "current_thread")]
+async fn default_replay_preserves_main_reports_and_catalogue_bytes() {
+    let rig = rig();
+    let m = golden_manifest();
+    let layout = Layout::flat();
+    for i in 0..51 {
+        let mut m = m.clone();
+        m.generation.id = format!("g_0000018bcfe568{i:016x}");
+        m.generation.key = format!("fixture-{i:02}");
+        for e in &mut m.extents {
+            e.id = format!("x_0000018bcfe568{:016x}", i * 5 + u64::from(e.seq));
+        }
+        let key = layout.generation_key(&GenerationId::new(m.generation.id.clone()));
+        let plain = serde_json::to_vec(&m).unwrap();
+        let sealed = seal_manifest(&rig.bridge.kek, &key, &plain, &mut SystemRng).unwrap();
+        let digest = Sha256::digest(&sealed).into();
+        rig.bridge
+            .safety
+            .put(
+                &key,
+                sealed,
+                &BlobMeta {
+                    bucket: &BucketId::new(m.bucket.id),
+                    extent: &ExtentId::new(m.generation.id),
+                    cipher_sha256: &digest,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    rig.bridge.safety.slow_reads.set(true);
+    // Pin the exact serialized reports including the cursor at each default
+    // page boundary, then the exact deterministic catalogue rows they leave.
+    let mut cursor = Some(ReplayCursor::start(UnixMs(0)));
+    let mut reports = Vec::new();
+    while let Some(at) = cursor {
+        let report = rig.bridge.replay_step(at).await.unwrap();
+        cursor = report.next.clone();
+        reports.push(report);
+        assert!(reports.len() <= 10, "default restore did not finish");
+    }
+    assert_eq!(reports.iter().map(|step| step.extents).sum::<u32>(), 255);
+    assert_eq!(rig.bridge.safety.most_reading.get(), 1);
+    let report_bytes = serde_json::to_vec(&reports).unwrap();
+    let catalogue_bytes = fresh_replay_rows(&rig);
+    assert_eq!(
+        (
+            hex(&Sha256::digest(&report_bytes)),
+            hex(&Sha256::digest(catalogue_bytes.as_bytes())),
+        ),
+        // Captured on e77c93dc, before the replay speed-up.
+        (
+            "0e0b0ae28634456e26f039604a1ab1c6fd38a95ad438c5fd03b674084e5d20ab".to_owned(),
+            "f4340803f3f4fb61fa8ea74d7062454e3d95d4884fcbdeece034e67c71ff9842".to_owned(),
+        ),
+    );
+}
+
 fn golden_manifest() -> GenerationManifest {
     let extent = |seq: u32| ExtentRecord {
         id: format!("x_0000018bcfe568{seq:02x}00000000000000aa"),
@@ -1005,7 +1064,12 @@ async fn a_record_under_two_names_is_replayed_from_the_one_that_reads() {
 async fn a_single_record_behind_a_segmented_one_that_does_not_read_is_replayed() {
     for lost in [0, 2] {
         for limits in [
-            ReplayLimits::default(),
+            // A call that stops inside the record, in many records and
+            // in one.
+            ReplayLimits {
+                records: 50,
+                extents: 100,
+            },
             ReplayLimits {
                 records: 1,
                 extents: 7,
