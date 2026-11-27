@@ -93,7 +93,7 @@ fn same(a: &ProbeOutcome, b: &ProbeOutcome) -> bool {
 
 fn class(o: &ProbeOutcome) -> String {
     match o {
-        Ok((counts, rows)) => format!("Ok(counts {counts:?}, rows {rows:?})"),
+        Ok((counts, tags, rows)) => format!("Ok(counts {counts:?}, tags {tags:?}, rows {rows:?})"),
         Err(e) => format!("Err({e:?})"),
     }
 }

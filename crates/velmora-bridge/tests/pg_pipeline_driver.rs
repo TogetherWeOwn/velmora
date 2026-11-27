@@ -380,7 +380,9 @@ async fn an_error_in_each_protocol_phase_has_its_index_and_rolls_back() {
             // A malformed binary value is a protocol violation at Bind.
             "08P01",
         ),
-        ("Execute", stmt("SELECT 1/0"), "22012"),
+        // A duplicate key fails while the INSERT executes (a division by
+        // a constant could already fail while it is planned at Bind).
+        ("Execute", stmt("INSERT INTO p(n) VALUES (7)"), "23505"),
     ];
     for (phase, failing, code) in phases {
         let stmts = [
@@ -586,4 +588,72 @@ async fn a_reply_error_after_sending_is_an_outcome_not_an_err() {
             .get::<_, i64>(0),
         6
     );
+}
+
+/// The adapter's prelude, statement by statement (crates/velmora-bridge
+/// src/pg/batch.rs PRELUDE and LOCK).
+const PRELUDE: [&str; 6] = [
+    "BEGIN READ WRITE, ISOLATION LEVEL READ COMMITTED",
+    "SET LOCAL lock_timeout = '2s'",
+    "SET LOCAL statement_timeout = '20s'",
+    "SET LOCAL idle_in_transaction_session_timeout = '5s'",
+    "SET LOCAL log_parameter_max_length_on_error = 0",
+    "SELECT pg_advisory_xact_lock($1::bigint)",
+];
+
+#[tokio::test]
+async fn an_error_at_every_prelude_position_has_its_index() {
+    let Some(s) = Schema::new(SETUP).await else {
+        return;
+    };
+    let (_proxy, client) = proxied(&s).await;
+    let key = s.lock_key;
+    // A failing variant of each prelude statement.
+    let failing = [
+        "BEGIN READ WRITE, ISOLATION LEVEL NONSENSE",
+        "SET LOCAL lock_timeout = 'never'",
+        "SET LOCAL statement_timeout = 'never'",
+        "SET LOCAL idle_in_transaction_session_timeout = 'never'",
+        "SET LOCAL log_parameter_max_length_on_error = 'never'",
+        "",
+    ];
+    for k in 0..PRELUDE.len() {
+        let holder = connect(&s.config()).await;
+        let mut texts: Vec<&str> = PRELUDE.to_vec();
+        if k == 5 {
+            // The lock itself: held by another session, with a short wait.
+            holder
+                .batch_execute(&format!(
+                    "BEGIN; SELECT pg_advisory_xact_lock({key}::bigint)"
+                ))
+                .await
+                .unwrap();
+            texts[1] = "SET LOCAL lock_timeout = '100ms'";
+        } else {
+            texts[k] = failing[k];
+        }
+        let mut stmts: Vec<PipelineStatement<'_>> = texts
+            .iter()
+            .map(|q| PipelineStatement {
+                query: q,
+                params: if q.contains("$1") {
+                    vec![(&key as &(dyn ToSql + Sync), Type::INT8)]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        stmts.push(stmt("INSERT INTO p(n) VALUES (1)"));
+        stmts.push(stmt("COMMIT"));
+        let o = client.pipeline_typed(&stmts, false).await.unwrap();
+        let (index, error) = o.error.as_ref().expect("an error");
+        assert_eq!(*index, k, "{error:?}");
+        if k == 5 {
+            assert_eq!(error.code().map(|c| c.code()), Some("55P03"));
+        }
+        assert_eq!(o.status, Some(if k == 0 { b'I' } else { b'E' }), "k={k}");
+        client.batch_execute("ROLLBACK").await.unwrap();
+        holder.batch_execute("ROLLBACK").await.ok();
+        assert_eq!(s.count("p").await, 0, "k={k}");
+    }
 }

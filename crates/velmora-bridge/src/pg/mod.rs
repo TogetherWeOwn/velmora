@@ -19,7 +19,7 @@ use crate::{Dialect, Result, Row, Sql, SqlValue};
 use batch::Prepared;
 use params::Kind;
 
-pub use batch::{oversize_fallbacks, MAX_SINGLE_SYNC_BYTES};
+pub use batch::{oversize_fallbacks, ErrorPosition, MAX_SINGLE_SYNC_BYTES};
 
 /// Lets the Worker reject even a transitively enabled test escape hatch.
 #[doc(hidden)]
@@ -236,11 +236,15 @@ impl<C: PgConnect> PgSql<C> {
     }
 }
 
-/// What one write transaction returned: each statement's count and, when
-/// rows were collected, its decoded rows.
+/// What one write transaction returned: each statement's count, command
+/// tag and, when rows were collected, its decoded rows; or the error with
+/// the position of the first failure (`None`: refused before any I/O).
 #[cfg(feature = "testkit-pg")]
 #[doc(hidden)]
-pub type ProbeOutcome = Result<(Vec<u64>, Vec<Vec<Row>>)>;
+pub type ProbeOutcome = core::result::Result<
+    (Vec<u64>, Vec<Option<String>>, Vec<Vec<Row>>),
+    (Option<batch::ErrorPosition>, crate::BridgeError),
+>;
 
 #[cfg(feature = "testkit-pg")]
 impl<C: PgConnect> PgSql<C> {
@@ -257,23 +261,29 @@ impl<C: PgConnect> PgSql<C> {
         let prepared = stmts
             .iter()
             .map(|(sql, args)| Prepared::new(sql, args))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| (None, e))?;
+        batch::take_error_position();
         let replies = self
             .write_ending(&prepared, collect_rows, write_tx, "ROLLBACK")
-            .await?;
+            .await
+            .map_err(|e| (batch::take_error_position(), e))?;
         let counts = replies
             .iter()
             .map(batch::Reply::changed)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| (None, e))?;
+        let tags = replies.iter().map(|r| r.tag().map(str::to_owned)).collect();
         let rows = if collect_rows {
             replies
                 .into_iter()
                 .map(batch::Reply::rows)
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()
+                .map_err(|e| (None, e))?
         } else {
             Vec::new()
         };
-        Ok((counts, rows))
+        Ok((counts, tags, rows))
     }
 }
 

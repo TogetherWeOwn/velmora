@@ -390,7 +390,12 @@ impl TestPostgres {
             if !same {
                 let texts: Vec<&str> = stmts.iter().map(|(sql, _)| *sql).collect();
                 let class = |o: &ProbeOutcome| match o {
-                    Ok((counts, rows)) => format!("Ok(counts {counts:?}, {} row sets)", rows.len()),
+                    Ok((counts, tags, rows)) => {
+                        format!(
+                            "Ok(counts {counts:?}, tags {tags:?}, {} row sets)",
+                            rows.len()
+                        )
+                    }
                     Err(e) => format!("Err({e:?})"),
                 };
                 panic!(

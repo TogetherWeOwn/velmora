@@ -64,6 +64,7 @@ impl Prepared {
                 .map(|_| Reply {
                     rows: Vec::new(),
                     changed: None,
+                    tag: None,
                 });
         }
         let mut stream = pin!(
@@ -81,7 +82,8 @@ impl Prepared {
         let changed = stream
             .rows_affected()
             .map(|count| if self.statement.select { 0 } else { count });
-        Ok(Reply { rows, changed })
+        let tag = stream.command_tag().map(str::to_owned);
+        Ok(Reply { rows, changed, tag })
     }
 }
 
@@ -112,9 +114,17 @@ impl tokio_postgres::types::ToSql for RejectBind {
 pub(super) struct Reply {
     rows: Vec<Row>,
     changed: Option<u64>,
+    /// The command tag, for comparing the two transports in tests.
+    #[cfg_attr(not(feature = "testkit-pg"), allow(dead_code))]
+    tag: Option<String>,
 }
 
 impl Reply {
+    #[cfg(feature = "testkit-pg")]
+    pub(super) fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
     pub(super) fn changed(&self) -> Result<u64> {
         self.changed.ok_or_else(error::shape)
     }
@@ -165,6 +175,30 @@ async fn control(client: &Client, sql: &str) -> Result<()> {
         .map(|_| ())
         .map_err(error::from_driver)
         .map_err(error::without_guard)
+}
+
+/// Where a write transaction's first error happened, for comparing the two
+/// transports in tests. Not used otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorPosition {
+    Prelude,
+    Statement(usize),
+    Commit,
+}
+
+std::thread_local! {
+    static ERROR_POSITION: std::cell::Cell<Option<ErrorPosition>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn set_error_position(position: ErrorPosition) {
+    ERROR_POSITION.with(|p| p.set(Some(position)));
+}
+
+/// The position of the last write transaction error on this thread, taken.
+#[cfg(feature = "testkit-pg")]
+pub(super) fn take_error_position() -> Option<ErrorPosition> {
+    ERROR_POSITION.with(std::cell::Cell::take)
 }
 
 /// The statement that ends a transaction that succeeded. Only the
@@ -258,14 +292,17 @@ pub(super) async fn transaction(
 /// Error class of a single-Sync transaction by position: `done` is the
 /// index of the statement the error belongs to (the number of statements
 /// that completed before it), `server` the SQLSTATE and constraint of a
-/// server ErrorResponse, if it was one. Only a server statement's own
-/// SQLSTATE after BEGIN and before COMMIT is a known rollback. Anything
-/// that may hide a committed write is `statement failed`.
+/// server ErrorResponse, if it was one, and `status` the transaction status
+/// of the final ReadyForQuery. Only a server statement's own SQLSTATE after
+/// BEGIN and before COMMIT, followed by ReadyForQuery E, is a known
+/// rollback. Anything that may hide a committed write is `statement
+/// failed`.
 pub(super) fn message_error(
     server: Option<(&str, Option<&str>)>,
     done: usize,
     prelude: usize,
     n: usize,
+    status: Option<u8>,
 ) -> BridgeError {
     let Some((code, constraint)) = server else {
         // EOF, connection loss, or a protocol error: unknown outcome.
@@ -283,6 +320,12 @@ pub(super) fn message_error(
     if done >= prelude + n || !error::server_statement_code(code) {
         // The COMMIT position is classed exactly as a COMMIT failure on the
         // typed transport. A code no statement raises is unknown too.
+        return error::statement_failed();
+    }
+    if status != Some(b'E') {
+        // Only the server's own ReadyForQuery in a failed transaction shows
+        // that it skipped the rest, COMMIT included. Without it (the reply
+        // ended, or a pooler said idle) the write may have committed.
         return error::statement_failed();
     }
     let class = error::classify(code, constraint);
@@ -345,7 +388,17 @@ async fn single_sync(
         let server = err
             .as_db_error()
             .map(|db| (db.code().code(), db.constraint()));
-        return Err((true, message_error(server, done, prelude, n)));
+        set_error_position(if done < prelude {
+            ErrorPosition::Prelude
+        } else if done < prelude + n {
+            ErrorPosition::Statement(done - prelude)
+        } else {
+            ErrorPosition::Commit
+        });
+        return Err((
+            true,
+            message_error(server, done, prelude, n, outcome.status),
+        ));
     }
     // Committed only if every statement completed, the last with exactly
     // the end tag, and the session is out of the transaction.
@@ -371,6 +424,7 @@ async fn single_sync(
             } else {
                 reply.rows_affected
             }),
+            tag: Some(reply.tag),
         })
         .collect())
 }
@@ -419,11 +473,12 @@ where
         Poll::Ready(Err(err)) => {
             drop(begin);
             let _ = finish(false).await;
+            set_error_position(ErrorPosition::Prelude);
             return Err(err);
         }
     };
     let mut sent = Vec::with_capacity(stmts.len());
-    for s in stmts {
+    for (i, s) in stmts.into_iter().enumerate() {
         let mut s = Box::pin(s);
         let instant = match first_poll(s.as_mut()).await {
             Poll::Pending => None,
@@ -436,6 +491,7 @@ where
                 drop(sent);
                 drop(begin);
                 let _ = finish(false).await;
+                set_error_position(ErrorPosition::Statement(i));
                 return Err(err);
             }
         };
@@ -454,9 +510,9 @@ where
         }
     };
     let (commit, (start, replies)) = join(finish(true), join(begin, join_all(sent))).await;
-    let mut first_error = start.err();
+    let mut first_error = start.err().map(|err| (ErrorPosition::Prelude, err));
     let mut values = Vec::with_capacity(replies.len());
-    for reply in replies {
+    for (i, reply) in replies.into_iter().enumerate() {
         match reply {
             // After a server error aborts a transaction, another statement
             // can't succeed. A proxy may have omitted the prelude or changed
@@ -464,14 +520,18 @@ where
             Ok(_) if first_error.is_some() => return Err(error::statement_failed()),
             Ok(value) => values.push(value),
             Err(err) => {
-                first_error.get_or_insert(err);
+                first_error.get_or_insert((ErrorPosition::Statement(i), err));
             }
         }
     }
-    if let Some(err) = first_error {
+    if let Some((position, err)) = first_error {
+        set_error_position(position);
         return Err(err);
     }
-    commit.map_err(|_| error::statement_failed())?;
+    if commit.is_err() {
+        set_error_position(ErrorPosition::Commit);
+        return Err(error::statement_failed());
+    }
     Ok(values)
 }
 

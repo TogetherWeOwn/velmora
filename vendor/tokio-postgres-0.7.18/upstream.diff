@@ -41,7 +41,7 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/lib.rs b/src/l
 diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/src/pipeline.rs
 --- a/src/pipeline.rs
 +++ b/src/pipeline.rs
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,247 @@
 +//! Several extended-protocol statements sent as one request with a single
 +//! Sync (vendored addition, not part of upstream tokio-postgres 0.7.18).
 +//!
@@ -103,7 +103,10 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 +    /// transaction commits).
 +    pub error: Option<(usize, Error)>,
 +    /// The transaction status of the final ReadyForQuery (`b'I'`, `b'T'` or
-+    /// `b'E'`), or `None` if it was not received.
++    /// `b'E'`), or `None` if it was not received: the connection was lost,
++    /// or a reply could not be parsed and reading stopped there (the
++    /// connection then discards the rest of the reply up to its
++    /// ReadyForQuery).
 +    pub status: Option<u8>,
 +}
 +
@@ -289,7 +292,39 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/query.rs b/src/query.rs
 --- a/src/query.rs
 +++ b/src/query.rs
-@@ -291,7 +291,7 @@
+@@ -56,6 +56,7 @@
+         statement,
+         responses,
+         rows_affected: None,
++        command_tag: None,
+     })
+ }
+ 
+@@ -93,6 +94,7 @@
+                     statement: Statement::unnamed(vec![], vec![]),
+                     responses,
+                     rows_affected: None,
++                    command_tag: None,
+                 });
+             }
+             Message::RowDescription(row_description) => {
+@@ -113,6 +115,7 @@
+                     statement: Statement::unnamed(vec![], columns),
+                     responses,
+                     rows_affected: None,
++                    command_tag: None,
+                 });
+             }
+             _ => return Err(Error::unexpected_message()),
+@@ -189,6 +192,7 @@
+         statement: portal.statement().clone(),
+         responses,
+         rows_affected: None,
++        command_tag: None,
+     })
+ }
+ 
+@@ -291,7 +295,7 @@
      )
  }
  
@@ -298,3 +333,32 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/query.rs b/src
      statement_name: &str,
      params: I,
      portal: &str,
+@@ -338,6 +342,7 @@
+         statement: Statement,
+         responses: Responses,
+         rows_affected: Option<u64>,
++        command_tag: Option<String>,
+     }
+ }
+ 
+@@ -353,6 +358,7 @@
+                 }
+                 Message::CommandComplete(body) => {
+                     *this.rows_affected = Some(extract_row_affected(&body)?);
++                    *this.command_tag = Some(body.tag().map_err(Error::parse)?.to_string());
+                 }
+                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
+                 Message::ReadyForQuery(_) => return Poll::Ready(None),
+@@ -369,6 +375,12 @@
+     pub fn rows_affected(&self) -> Option<u64> {
+         self.rows_affected
+     }
++
++    /// Returns the command tag of the query (vendored addition), such as
++    /// `INSERT 0 1`. `None` until the stream has been exhausted.
++    pub fn command_tag(&self) -> Option<&str> {
++        self.command_tag.as_deref()
++    }
+ }
+ 
+ pub async fn sync(client: &InnerClient) -> Result<(), Error> {

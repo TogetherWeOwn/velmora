@@ -185,6 +185,12 @@ pub enum Fault {
     DropOneComplete,
     /// Replace COMMIT's CommandComplete with an error 57014.
     RejectCommit,
+    /// Relay the server's first ErrorResponse, then close the connection
+    /// without its ReadyForQuery.
+    ErrorThenClose,
+    /// Relay the server's first ErrorResponse, then a ReadyForQuery that
+    /// says idle instead of the server's E.
+    ErrorThenIdle,
     /// Replace the first DataRow with one that has no fields, which no row
     /// description of the tests matches.
     BadDataRow,
@@ -534,6 +540,15 @@ impl Ctx {
                 // ReadyForQuery relayed, real or not, ends a request.
                 let out: Option<Vec<u8>> = match active {
                     Fault::StatusInTransaction if tag == b'Z' => Some(b"Z\0\0\0\x05T".to_vec()),
+                    Fault::ErrorThenClose if tag == b'Z' && dropped => {
+                        close.notify_one();
+                        return Ok(());
+                    }
+                    Fault::ErrorThenIdle if tag == b'Z' && dropped => Some(READY_IDLE.to_vec()),
+                    Fault::ErrorThenClose | Fault::ErrorThenIdle if tag == b'E' => {
+                        dropped = true;
+                        Some(packet.clone())
+                    }
                     Fault::BadDataRow if tag == b'D' && !dropped => {
                         dropped = true;
                         Some(frame_of(b'D', &0_i16.to_be_bytes()))

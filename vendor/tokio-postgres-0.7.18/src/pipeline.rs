@@ -59,7 +59,10 @@ pub struct PipelineOutcome {
     /// transaction commits).
     pub error: Option<(usize, Error)>,
     /// The transaction status of the final ReadyForQuery (`b'I'`, `b'T'` or
-    /// `b'E'`), or `None` if it was not received.
+    /// `b'E'`), or `None` if it was not received: the connection was lost,
+    /// or a reply could not be parsed and reading stopped there (the
+    /// connection then discards the rest of the reply up to its
+    /// ReadyForQuery).
     pub status: Option<u8>,
 }
 

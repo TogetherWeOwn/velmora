@@ -12,7 +12,7 @@ dir="$root/vendor/$name"
 sha256=a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3
 # The reviewed patch. A change to upstream.diff must change this line too,
 # so it cannot pass review unseen.
-diff_sha256=e45605c22f17252201176da401d933ef053abf5de37eb2ae43ad8697da178f5d
+diff_sha256=cbbd8c9208feb1e67a948e2a78c4b197b9a9f6979a7775eef005e0088ae931b0
 write=0
 if [ "${1:-}" = "--write" ]; then write=1; shift; fi
 tmp=$(mktemp -d)

@@ -66,8 +66,10 @@ fn errors_are_classed_by_statement_position() {
     let guard = "GuardFailed";
     let constraint = "Sql(\"pg: constraint violation\")";
     let (p, n) = (6, 3);
-    let class =
-        |code: Option<(&str, Option<&str>)>, done| format!("{:?}", message_error(code, done, p, n));
+    // With the server's ReadyForQuery E after the error, as it sends it.
+    let class = |code: Option<(&str, Option<&str>)>, done| {
+        format!("{:?}", message_error(code, done, p, n, Some(b'E')))
+    };
     let tx_guard = Some(("23514", Some("tx_guard_ok")));
     // A catalogue statement: P <= index < P + n.
     for done in p..p + n {
@@ -101,6 +103,24 @@ fn errors_are_classed_by_statement_position() {
             Some(("40001", None)),
         ] {
             assert_eq!(class(code, done), failed);
+        }
+    }
+    // Without ReadyForQuery E (none, or idle) nothing is a known refusal:
+    // the server may have run the rest, COMMIT included.
+    for status in [None, Some(b'I'), Some(b'T')] {
+        for done in 1..p + n {
+            for code in [
+                tx_guard,
+                Some(("23505", None)),
+                Some(("55P03", None)),
+                Some(("57014", None)),
+            ] {
+                assert_eq!(
+                    format!("{:?}", message_error(code, done, p, n, status)),
+                    failed,
+                    "{status:?} {done} {code:?}"
+                );
+            }
         }
     }
     // BEGIN itself: a pooler's 58000 may follow forwarding.

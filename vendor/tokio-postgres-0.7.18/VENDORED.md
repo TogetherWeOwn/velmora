@@ -13,8 +13,8 @@ URL, version and upstream commit.
 ## The addition
 
 `Client::pipeline_typed` (`src/pipeline.rs`, plus a re-export in `src/lib.rs`,
-the method in `src/client.rs` and `pub(crate)` on `encode_bind_raw` in
-`src/query.rs`). It sends several extended-protocol statements (unnamed
+the method in `src/client.rs`, and in `src/query.rs` `pub(crate)` on
+`encode_bind_raw` and `RowStream::command_tag`). It sends several extended-protocol statements (unnamed
 Parse, Bind, Describe, Execute each) followed by one Sync, as one request.
 The connection's rule of one request, one Sync, one ReadyForQuery is kept,
 so its request routing is unchanged. The catalogue's write transactions use
@@ -25,9 +25,12 @@ writer lock across a network wait per statement.
 - An error is reported with the number of statements that completed before
   it: the index of the statement that raised it, or the number of
   statements for an error raised at the Sync itself (for example a deferred
-  constraint checked when an implicit transaction commits). The rest of the
-  reply is then read up to the ReadyForQuery, whose transaction status is
-  returned.
+  constraint checked when an implicit transaction commits). After a server
+  error the rest of the reply is read up to the ReadyForQuery, whose
+  transaction status is returned. After a reply that cannot be parsed, or a
+  lost connection, the status is `None`.
+- `RowStream::command_tag` returns the command tag of a typed query, so the
+  one-Sync-per-statement transport can be compared tag for tag.
 - A statement that starts with COPY is refused before sending: copy mode
   would make the server ignore the Sync.
 - Column types come from the built-in type table only. An unknown OID gets

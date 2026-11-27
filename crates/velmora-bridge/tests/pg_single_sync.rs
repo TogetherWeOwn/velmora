@@ -233,7 +233,31 @@ async fn a_reply_the_driver_cannot_parse_after_sending_still_ends_the_transactio
         matches!(&r, Err(BridgeError::Sql(e)) if e == FAILED),
         "{r:?}"
     );
-    assert_eq!(proxy.trace.lock().unwrap().rollbacks, 1, "ROLLBACK sent");
+    {
+        let trace = proxy.trace.lock().unwrap();
+        assert_eq!(trace.rollbacks, 1, "ROLLBACK sent");
+        assert_eq!(trace.rollbacks_done, 1, "and answered before the result");
+    }
+    // The malformed reply hid a committed write.
+    assert_eq!(s.count("m").await, 1);
+}
+
+#[tokio::test]
+async fn a_refusal_without_the_servers_failed_status_is_statement_failed() {
+    let Some(s) = schema().await else { return };
+    // A guard refusal is a known rollback only with the server's
+    // ReadyForQuery E after it. Cut before it, or said idle, the write
+    // may have committed: unknown, not a refusal.
+    for fault in [Fault::ErrorThenClose, Fault::ErrorThenIdle] {
+        let (_proxy, pg) = proxied(&s, fault).await;
+        let r = pg.batch(vec![insert(1), (GUARD, vec![int(0)])]).await;
+        assert!(is(&r, FAILED), "{fault:?}: {r:?}");
+    }
+    // The same refusal through an honest connection.
+    let (_proxy, pg) = proxied(&s, Fault::None).await;
+    let r = pg.batch(vec![insert(1), (GUARD, vec![int(0)])]).await;
+    assert!(matches!(r, Err(BridgeError::GuardFailed)), "{r:?}");
+    assert_eq!(s.count("m").await, 0);
 }
 
 #[tokio::test]

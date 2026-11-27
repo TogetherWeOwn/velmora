@@ -56,6 +56,7 @@ where
         statement,
         responses,
         rows_affected: None,
+        command_tag: None,
     })
 }
 
@@ -93,6 +94,7 @@ where
                     statement: Statement::unnamed(vec![], vec![]),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                 });
             }
             Message::RowDescription(row_description) => {
@@ -113,6 +115,7 @@ where
                     statement: Statement::unnamed(vec![], columns),
                     responses,
                     rows_affected: None,
+                    command_tag: None,
                 });
             }
             _ => return Err(Error::unexpected_message()),
@@ -189,6 +192,7 @@ pub async fn query_portal(
         statement: portal.statement().clone(),
         responses,
         rows_affected: None,
+        command_tag: None,
     })
 }
 
@@ -338,6 +342,7 @@ pin_project! {
         statement: Statement,
         responses: Responses,
         rows_affected: Option<u64>,
+        command_tag: Option<String>,
     }
 }
 
@@ -353,6 +358,7 @@ impl Stream for RowStream {
                 }
                 Message::CommandComplete(body) => {
                     *this.rows_affected = Some(extract_row_affected(&body)?);
+                    *this.command_tag = Some(body.tag().map_err(Error::parse)?.to_string());
                 }
                 Message::EmptyQueryResponse | Message::PortalSuspended => {}
                 Message::ReadyForQuery(_) => return Poll::Ready(None),
@@ -368,6 +374,12 @@ impl RowStream {
     /// This function will return `None` until the stream has been exhausted.
     pub fn rows_affected(&self) -> Option<u64> {
         self.rows_affected
+    }
+
+    /// Returns the command tag of the query (vendored addition), such as
+    /// `INSERT 0 1`. `None` until the stream has been exhausted.
+    pub fn command_tag(&self) -> Option<&str> {
+        self.command_tag.as_deref()
     }
 }
 
