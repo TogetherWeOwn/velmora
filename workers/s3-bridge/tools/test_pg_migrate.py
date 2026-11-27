@@ -140,6 +140,8 @@ class MigrationParser(unittest.TestCase):
         # Comments and unrelated names that merely contain the word are fine.
         harmless = "-- velmora.migration_apply\nCREATE INDEX CONCURRENTLY IF NOT EXISTS migration_apply_idx ON t (id);"
         self.assertEqual(namespace['lint_migration'](harmless, True, 'parser_flag.sql')[1], [harmless])
+        alias = "SELECT velmora.migration_ apply FROM velmora;"
+        self.assertEqual(namespace['lint_migration'](alias, False, 'parser_flag.sql')[1], [alias])
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).

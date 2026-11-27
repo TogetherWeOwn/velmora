@@ -286,7 +286,8 @@ def lint_migration(sql, no_tx, name):
         die(f'{name}: migration must contain terminated SQL statements')
     for statement in statements:
         # Comments are already gone; literals, bodies and (quoted) names remain.
-        if 'velmora.migration_apply' in ''.join(statement).lower().replace('"', ''):
+        # Token boundaries stay spaces, so "velmora.migration_ apply" is not a match.
+        if re.search(r'\bvelmora\s*\.\s*migration_apply\b', ' '.join(statement).lower().replace('"', '')):
             die(f'{name}: velmora.migration_apply belongs to the migration runner')
     for statement in statements:
         head = [token.upper() for token in statement[:7]]
