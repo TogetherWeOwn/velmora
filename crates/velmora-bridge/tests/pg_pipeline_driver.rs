@@ -528,6 +528,8 @@ async fn copy_is_refused_before_sending_and_a_sync_error_has_the_full_count() {
         "COPY p FROM STDIN",
         "  -- a comment\n copy p TO STDOUT",
         "/* a /* nested */ comment */ COPY p FROM STDIN",
+        "-- a comment ending in a carriage return\rCOPY p FROM STDIN",
+        " ; ;COPY p FROM STDIN",
     ] {
         let stmts = [stmt("SELECT 1"), stmt(copy)];
         assert!(

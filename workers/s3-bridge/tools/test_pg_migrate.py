@@ -120,20 +120,37 @@ class PgMigrate(unittest.TestCase):
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
         # Every role's default, and a server-level extension setting this
         # session sees only as a placeholder.
-        for setup, undo in [("ALTER ROLE ALL SET log_statement = 'all'", "ALTER ROLE ALL RESET log_statement"),
-                            ("ALTER SYSTEM SET auto_explain.log_min_duration = 0; SELECT pg_reload_conf()",
-                             "ALTER SYSTEM RESET auto_explain.log_min_duration; SELECT pg_reload_conf()")]:
+        def reloaded(name, expected):
+            # pg_reload_conf() only signals: wait until a new session sees it.
+            for _ in range(100):
+                seen = psql(f"SELECT coalesce(current_setting('{name}', true), '')").stdout.strip()
+                if seen == expected:
+                    return
+                time.sleep(0.1)
+            self.fail(f"configuration reload not visible: {seen!r}")
+
+        for setup, undo, value in [
+                ("ALTER ROLE ALL SET log_statement = 'all'", "ALTER ROLE ALL RESET log_statement", None),
+                ("ALTER SYSTEM SET auto_explain.log_min_duration = 0; SELECT pg_reload_conf()",
+                 "ALTER SYSTEM RESET auto_explain.log_min_duration; SELECT pg_reload_conf()",
+                 ("auto_explain.log_min_duration", "0")),
+                ("ALTER SYSTEM SET pgaudit.log = 'all'; SELECT pg_reload_conf()",
+                 "ALTER SYSTEM RESET pgaudit.log; SELECT pg_reload_conf()", ("pgaudit.log", "all"))]:
             with self.subTest(setup=setup):
                 for statement in setup.split("; "):
                     psql(statement)
                 try:
-                    time.sleep(0.5)
+                    if value is not None:
+                        reloaded(*value)
                     result = self.migrate("--verify", ok=False)
                     self.assertIn(check, result.stdout + result.stderr)
                 finally:
                     for statement in undo.split("; "):
                         psql(statement)
-                    time.sleep(0.5)
+                    if value is not None:
+                        reloaded(value[0], "")
+        # A removed extension setting leaves an empty placeholder: no longer
+        # a refusal.
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
 
     def test_import_mode_applies_the_statement_triggers_before_activation(self):

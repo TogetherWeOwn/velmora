@@ -68,14 +68,20 @@ fn column_type(oid: u32) -> Type {
         .unwrap_or_else(|| Type::new(format!("unknown oid {oid}"), oid, Kind::Pseudo, String::new()))
 }
 
-/// Whether a statement starts with COPY, after whitespace and comments. COPY
-/// would put the connection in copy mode, where the server ignores the Sync.
+/// Whether a statement starts with COPY, after whitespace, comments and
+/// empty statements. COPY would put the connection in copy mode, where the
+/// server ignores the Sync.
 fn is_copy(query: &str) -> bool {
     let mut rest = query;
     loop {
         rest = rest.trim_start();
-        if let Some(line) = rest.strip_prefix("--") {
-            rest = line.split_once('\n').map_or("", |(_, r)| r);
+        if let Some(after) = rest.strip_prefix(';') {
+            rest = after;
+        } else if let Some(line) = rest.strip_prefix("--") {
+            // A line comment ends at a newline or a carriage return.
+            rest = line
+                .find(['\n', '\r'])
+                .map_or("", |end| &line[end + 1..]);
         } else if rest.starts_with("/*") {
             // Block comments nest in PostgreSQL.
             let (mut depth, mut i) = (0_usize, 0);

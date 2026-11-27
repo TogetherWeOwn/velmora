@@ -124,7 +124,9 @@ SELECT json_build_object(
                        ORDER BY e.rank LIMIT 1) = ANY (w.ok)
             UNION ALL SELECT FROM effective WHERE name LIKE 'pgaudit.%'
             UNION ALL SELECT FROM pg_settings WHERE name LIKE 'pgaudit.%'
-            UNION ALL SELECT WHERE current_setting('pgaudit.log', true) IS NOT NULL
+            -- A configured pgaudit.log this session sees as a placeholder
+            -- (empty once removed again, 'none' when off).
+            UNION ALL SELECT WHERE coalesce(current_setting('pgaudit.log', true), '') NOT IN ('', 'none')
         ),
         'read-only role membership', pg_has_role('kofra_ro', 'pg_read_all_data', 'USAGE')
             AND NOT pg_has_role('kofra_ro', 'pg_write_all_data', 'MEMBER')
