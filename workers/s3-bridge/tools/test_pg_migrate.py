@@ -142,6 +142,12 @@ class MigrationParser(unittest.TestCase):
         self.assertEqual(namespace['lint_migration'](harmless, True, 'parser_flag.sql')[1], [harmless])
         alias = "SELECT velmora.migration_ apply FROM velmora;"
         self.assertEqual(namespace['lint_migration'](alias, False, 'parser_flag.sql')[1], [alias])
+        # The wrapper reads each statement as a literal; this setting must stay on.
+        for scs in ("SET LOCAL standard_conforming_strings = off;",
+                    "SELECT set_config('standard_conforming_strings', 'off', true);",
+                    'SET "standard_conforming_strings" TO off;'):
+            with self.subTest(scs), self.assertRaisesRegex(AssertionError, "standard_conforming_strings belongs"):
+                namespace['lint_migration'](scs, False, 'parser_scs.sql')
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
@@ -269,6 +275,17 @@ class PgMigrate(unittest.TestCase):
         self.assertIn("changed the runner apply decision", result.stderr)
         self.assertEqual(self.ledger(), ["0001", "0002"])
         self.assertEqual(self.owner_sql("SELECT to_regclass('operator_reset') IS NULL").stdout.strip(), "t")
+
+    def test_online_migration_cannot_skip_its_ledger_row(self):
+        # The lint cannot see a computed setting name; the ledger check must.
+        result = self.migrate_online_with(
+            "\nCREATE TABLE review_partial (x int);\n"
+            "SELECT set_config('velmora.' || 'migration_' || 'apply', 'off', true);\n"
+            "CREATE TABLE review_after (x int);\n", ok=False)
+        self.assertIn("changed the runner apply decision", result.stderr)
+        self.assertNotIn("0003_usage_statement_triggers.sql: already applied", result.stdout)
+        self.assertEqual(self.ledger(), ["0001", "0002"])
+        self.assertEqual(self.owner_sql("SELECT to_regclass('review_partial') IS NULL").stdout.strip(), "t")
 
     def test_already_applied_online_migration_runs_nothing(self):
         self.migrate()

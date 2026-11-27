@@ -287,8 +287,12 @@ def lint_migration(sql, no_tx, name):
     for statement in statements:
         # Comments are already gone; literals, bodies and (quoted) names remain.
         # Token boundaries stay spaces, so "velmora.migration_ apply" is not a match.
-        if re.search(r'\bvelmora\s*\.\s*migration_apply\b', ' '.join(statement).lower().replace('"', '')):
+        text = ' '.join(statement).lower().replace('"', '')
+        if re.search(r'\bvelmora\s*\.\s*migration_apply\b', text):
             die(f'{name}: velmora.migration_apply belongs to the migration runner')
+        # Online statements are read as PL/pgSQL literals, which needs this setting on.
+        if re.search(r'\bstandard_conforming_strings\b', text):
+            die(f'{name}: standard_conforming_strings belongs to the migration runner')
     for statement in statements:
         head = [token.upper() for token in statement[:7]]
         if head[0] in {'ABORT', 'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'START'} or head[:2] == ['PREPARE', 'TRANSACTION']:
@@ -695,6 +699,8 @@ $$;
             batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '')
                              + f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
                              "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+            # The lint cannot see a computed setting name, so commit only with the ledger row present.
+            batch += check(f"NOT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}')", 'VL018')
             batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
             output = run(batch, retry=True, report=name, one_message=True).splitlines()
             if not output or output[-1] not in {'applied', 'already applied'}:
