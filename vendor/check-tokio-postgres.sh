@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Prove that vendor/tokio-postgres-0.7.18 is the crate published on
 # crates.io (pinned SHA-256) plus exactly the changes in its upstream.diff.
+# Not vendored (nothing here builds or runs them): the crate's own
+# Cargo.lock, tests/ and benches/.
 # Usage: vendor/check-tokio-postgres.sh [--write] [path/to/tokio-postgres-0.7.18.crate]
 #   --write  regenerate upstream.diff instead of checking it (after a reviewed change).
 set -euo pipefail
@@ -20,6 +22,8 @@ if [ -z "$crate" ]; then
 fi
 echo "$sha256  $crate" | sha256sum -c - >/dev/null
 tar -xzf "$crate" -C "$tmp"
+# Not vendored: nothing here builds or runs them.
+rm -r -- "$tmp/$name/Cargo.lock" "$tmp/$name/tests" "$tmp/$name/benches"
 # Relative paths and no timestamps, so the diff is the same on every host.
 rc=0
 (cd "$tmp" && cp -r "$dir" "vendored" && diff -ruN --exclude=VENDORED.md --exclude=upstream.diff \

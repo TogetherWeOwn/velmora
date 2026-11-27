@@ -291,7 +291,12 @@ async fn w1_is_released_at_the_error_before_rollback() {
         release.notify_one();
         acquired
     };
-    let (r, acquired) = tokio::join!(pg.batch(vec![insert(1), ("SELECT 1/0", vec![])]), probe);
+    // A missing ROLLBACK must fail the test, not hang it.
+    let (r, acquired) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(pg.batch(vec![insert(1), ("SELECT 1/0", vec![])]), probe)
+    })
+    .await
+    .expect("the adapter sends ROLLBACK after the error");
     assert!(is(&r, FAILED), "22012: {r:?}");
     assert!(acquired, "another writer takes W1 before ROLLBACK");
     {
@@ -309,9 +314,12 @@ async fn w1_is_released_at_the_error_before_rollback() {
 async fn a_write_without_the_prelude_is_refused_by_the_read_only_default() {
     let Some(s) = schema().await else { return };
     let role = unique("velmora_a1_ro");
+    // A throwaway password, so the role also logs in where the test server
+    // asks for one.
+    let password = unique("pw");
     s.admin
         .batch_execute(&format!(
-            "CREATE ROLE {role} LOGIN; ALTER ROLE {role} SET default_transaction_read_only = on;
+            "CREATE ROLE {role} LOGIN PASSWORD '{password}'; ALTER ROLE {role} SET default_transaction_read_only = on;
              GRANT USAGE ON SCHEMA {schema} TO {role};
              GRANT SELECT, INSERT ON {schema}.m TO {role};",
             schema = s.name
@@ -319,7 +327,7 @@ async fn a_write_without_the_prelude_is_refused_by_the_read_only_default() {
         .await
         .unwrap();
     let mut config = s.config();
-    config.user(&role);
+    config.user(&role).password(password.as_bytes());
     let bare = connect(&config).await;
     let e = bare
         .batch_execute("INSERT INTO m(n) VALUES (1)")

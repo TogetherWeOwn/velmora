@@ -53,7 +53,9 @@ fn the_prelude_statement_count_matches_the_prelude() {
     }
     assert_eq!(prelude_statements(Some(1)), 6);
     assert_eq!(prelude_statements(None), 5);
-    // Bind values never reach the server's error log.
+    // The prelude keeps bind parameter values out of the server's error
+    // messages (a constraint error's DETAIL is a separate, pinned matter:
+    // tests/pg-secret-row-writes.txt).
     assert!(prelude(Some(1)).contains("SET LOCAL log_parameter_max_length_on_error = 0"));
 }
 

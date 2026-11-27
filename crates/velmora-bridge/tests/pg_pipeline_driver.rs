@@ -515,3 +515,41 @@ async fn asynchronous_messages_anywhere_in_the_reply_change_nothing() {
     }
     assert_eq!(s.count("p").await, 2);
 }
+
+#[tokio::test]
+async fn copy_is_refused_before_sending_and_a_sync_error_has_the_full_count() {
+    let Some(s) = Schema::new(SETUP).await else {
+        return;
+    };
+    let (proxy, client) = proxied(&s).await;
+    client.batch_execute("SELECT 1").await.unwrap();
+    let before = proxy.trace.lock().unwrap().frontend.len();
+    for copy in [
+        "COPY p FROM STDIN",
+        "  -- a comment\n copy p TO STDOUT",
+        "/* a /* nested */ comment */ COPY p FROM STDIN",
+    ] {
+        let stmts = [stmt("SELECT 1"), stmt(copy)];
+        assert!(
+            client.pipeline_typed(&stmts, false).await.is_err(),
+            "{copy:?}"
+        );
+    }
+    assert_eq!(
+        proxy.trace.lock().unwrap().frontend.len(),
+        before,
+        "zero bytes sent"
+    );
+    // Without BEGIN the statements run in one implicit transaction, and a
+    // deferred constraint fails at the Sync: after every statement.
+    let stmts = [
+        stmt("INSERT INTO d VALUES (5)"),
+        stmt("INSERT INTO d VALUES (5)"),
+    ];
+    let o = client.pipeline_typed(&stmts, false).await.unwrap();
+    let (index, error) = o.error.as_ref().unwrap();
+    assert_eq!((*index, error.code().map(|c| c.code())), (2, Some("23505")));
+    assert_eq!(o.replies.len(), 2);
+    assert_eq!(o.status, Some(b'I'));
+    assert_eq!(s.count("d").await, 0);
+}

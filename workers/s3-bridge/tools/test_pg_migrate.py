@@ -16,6 +16,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import tempfile
+import time
 import unittest
 
 BRIDGE = Path(__file__).resolve().parents[1]
@@ -101,7 +102,7 @@ class PgMigrate(unittest.TestCase):
         self.migrate()
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
         check = "privilege check failed: app sessions log no bind values"
-        db = os.environ["PGDATABASE"]
+        db = '"' + os.environ["PGDATABASE"].replace('"', '""') + '"'
         for setting in ["log_statement = 'all'", "log_statement = 'mod'",
                         "log_min_duration_statement = 0", "log_min_duration_sample = 0",
                         "log_transaction_sample_rate = 1", "log_parameter_max_length_on_error = -1",
@@ -116,6 +117,23 @@ class PgMigrate(unittest.TestCase):
                         self.assertIn(check, result.stdout + result.stderr)
                     finally:
                         psql(f"ALTER ROLE kofra_app {scope}RESET {name}")
+        self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        # Every role's default, and a server-level extension setting this
+        # session sees only as a placeholder.
+        for setup, undo in [("ALTER ROLE ALL SET log_statement = 'all'", "ALTER ROLE ALL RESET log_statement"),
+                            ("ALTER SYSTEM SET auto_explain.log_min_duration = 0; SELECT pg_reload_conf()",
+                             "ALTER SYSTEM RESET auto_explain.log_min_duration; SELECT pg_reload_conf()")]:
+            with self.subTest(setup=setup):
+                for statement in setup.split("; "):
+                    psql(statement)
+                try:
+                    time.sleep(0.5)
+                    result = self.migrate("--verify", ok=False)
+                    self.assertIn(check, result.stdout + result.stderr)
+                finally:
+                    for statement in undo.split("; "):
+                        psql(statement)
+                    time.sleep(0.5)
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
 
     def test_import_mode_applies_the_statement_triggers_before_activation(self):

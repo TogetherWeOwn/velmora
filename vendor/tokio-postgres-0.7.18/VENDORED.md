@@ -6,6 +6,9 @@ This directory is the `tokio-postgres` 0.7.18 crate as published on crates.io
 upstream commit `f1cb6ec0d5766b136cbd68f3010d64142a5daa66`), plus one addition.
 The workspace uses it through `[patch.crates-io]` in the root `Cargo.toml`.
 It is not a workspace member, so it keeps upstream formatting and lints.
+The crate's own `Cargo.lock`, `tests/` and `benches/` are not vendored:
+nothing here builds or runs them. `../VENDORED.json` records the package
+URL, version and upstream commit.
 
 ## The addition
 
@@ -19,9 +22,14 @@ it so that a pooler which forwards one request at a time cannot hold the
 writer lock across a network wait per statement.
 
 - An encode error in any statement returns before anything is sent.
-- An error is reported with the index of its statement (the number of
-  statements that completed before it). The rest of the reply is then read
-  up to the ReadyForQuery, whose transaction status is returned.
+- An error is reported with the number of statements that completed before
+  it: the index of the statement that raised it, or the number of
+  statements for an error raised at the Sync itself (for example a deferred
+  constraint checked when an implicit transaction commits). The rest of the
+  reply is then read up to the ReadyForQuery, whose transaction status is
+  returned.
+- A statement that starts with COPY is refused before sending: copy mode
+  would make the server ignore the Sync.
 - Column types come from the built-in type table only. An unknown OID gets
   a placeholder type that no `FromSql` accepts, and no type lookup is sent.
 - Nothing in the addition logs.
@@ -36,15 +44,19 @@ there too).
 ## Updating to a new upstream version
 
 1. Download the new `.crate` from crates.io, check its SHA-256 against the
-   crates.io index, and extract it as `vendor/tokio-postgres-<version>/`.
+   crates.io index, extract it as `vendor/tokio-postgres-<version>/`, and
+   remove its `Cargo.lock`, `tests/` and `benches/`.
 2. Apply `upstream.diff` (`patch -p1`) and resolve any conflict in the four
    files above. Keep the request one Sync, one ReadyForQuery.
 3. Update the directory name, the version and SHA-256 in
-   `vendor/check-tokio-postgres.sh` and `VENDORED` in
-   `vendor/check-advisories.py`, the `[patch.crates-io]` path and
-   `exclude` entry in the root `Cargo.toml`, and the version pins
-   (`=0.7.x`) in `crates/velmora-bridge/Cargo.toml` and
-   `workers/s3-bridge/Cargo.toml`.
+   `vendor/check-tokio-postgres.sh`, `VENDORED` in
+   `vendor/check-advisories.py`, `vendor/VENDORED.json` (version, package
+   URL, upstream commit from `.cargo_vcs_info.json`), the
+   `[patch.crates-io]` path and `exclude` entry in the root `Cargo.toml`,
+   and every version pin (`=0.7.x`): `crates/velmora-bridge/Cargo.toml`,
+   `workers/s3-bridge/Cargo.toml` and `workers/pg-load/Cargo.toml`. Then
+   regenerate `Cargo.lock` (`cargo update -p tokio-postgres`) and run the
+   locked checks, the load Worker's wasm32 check included.
 4. Regenerate the diff with `vendor/check-tokio-postgres.sh --write`, then
    review it as a whole.
 5. Run the driver tests (`tests/pg_pipeline_driver.rs`), the single-Sync

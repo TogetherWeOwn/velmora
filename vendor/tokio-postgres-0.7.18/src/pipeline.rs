@@ -51,9 +51,12 @@ pub struct PipelineReply {
 pub struct PipelineOutcome {
     /// The statements that completed, in order.
     pub replies: Vec<PipelineReply>,
-    /// The first error and the index of the statement it belongs to: the
-    /// number of statements that completed before it. A server error, the
-    /// loss of the connection or an unexpected message.
+    /// The first error and the number of statements that completed before
+    /// it: a server error, the loss of the connection or an unexpected
+    /// message. For an error raised by a statement this is its index. It
+    /// equals the number of statements for an error at the Sync itself
+    /// (for example a deferred constraint checked when an implicit
+    /// transaction commits).
     pub error: Option<(usize, Error)>,
     /// The transaction status of the final ReadyForQuery (`b'I'`, `b'T'` or
     /// `b'E'`), or `None` if it was not received.
@@ -65,11 +68,53 @@ fn column_type(oid: u32) -> Type {
         .unwrap_or_else(|| Type::new(format!("unknown oid {oid}"), oid, Kind::Pseudo, String::new()))
 }
 
+/// Whether a statement starts with COPY, after whitespace and comments. COPY
+/// would put the connection in copy mode, where the server ignores the Sync.
+fn is_copy(query: &str) -> bool {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(line) = rest.strip_prefix("--") {
+            rest = line.split_once('\n').map_or("", |(_, r)| r);
+        } else if rest.starts_with("/*") {
+            // Block comments nest in PostgreSQL.
+            let (mut depth, mut i) = (0_usize, 0);
+            let bytes = rest.as_bytes();
+            while i < bytes.len() {
+                match &bytes[i..(i + 2).min(bytes.len())] {
+                    b"/*" => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    b"*/" => {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            rest = &rest[i.min(rest.len())..];
+        } else {
+            break;
+        }
+    }
+    rest.get(..4).is_some_and(|word| word.eq_ignore_ascii_case("copy"))
+}
+
 pub(crate) async fn pipeline_typed(
     client: &Arc<InnerClient>,
     statements: &[PipelineStatement<'_>],
     collect_rows: bool,
 ) -> Result<PipelineOutcome, Error> {
+    if statements.iter().any(|s| is_copy(s.query)) {
+        return Err(Error::encode(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "COPY is not supported in a pipeline",
+        )));
+    }
     // Encode everything before sending anything: an encode error in any
     // statement returns here and no byte reaches the connection.
     let buf = client.with_buf(|buf| {

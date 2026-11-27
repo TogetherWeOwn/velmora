@@ -271,6 +271,9 @@ impl TestPostgres {
 
     fn through(last: &str, armed: bool, _record: bool, catalog_write_tx: WriteTx) -> Result<Self> {
         let script = schema_script(last)?;
+        // Read the switch before the schema exists, so an invalid value
+        // cannot leave a schema without an owner to drop it.
+        let fixture_write_tx = write_tx();
         let url = std::env::var(URL_VAR)
             .map_err(|_| BridgeError::Sql(format!("pg testkit: {URL_VAR} must be UTF-8")))?;
         let base: Config = url
@@ -332,7 +335,7 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            fixture_sql: sql(connector.clone(), write_tx()),
+            fixture_sql: sql(connector.clone(), fixture_write_tx),
             connector,
         })
     }
@@ -342,21 +345,25 @@ impl TestPostgres {
     }
 
     /// Run one write transaction on each transport against the current
-    /// catalogue state, rolling both back: (pipelined, single Sync).
+    /// catalogue state, rolling both back: (pipelined, single Sync). The
+    /// second is `None` when the transaction is over the single-Sync size
+    /// bound and so ran one Sync per statement too: nothing was compared.
     pub async fn compare_transports(
         &self,
         stmts: &[(&str, Vec<SqlValue>)],
         collect_rows: bool,
-    ) -> (ProbeOutcome, ProbeOutcome) {
+    ) -> (ProbeOutcome, Option<ProbeOutcome>) {
         let pipelined = self
             .sql
             .rolled_back(WriteTx::Pipeline, stmts, collect_rows)
             .await;
+        let before = crate::pg::oversize_fallbacks();
         let single_sync = self
             .sql
             .rolled_back(WriteTx::SingleSync, stmts, collect_rows)
             .await;
-        (pipelined, single_sync)
+        let compared = crate::pg::oversize_fallbacks() == before;
+        (pipelined, compared.then_some(single_sync))
     }
 
     /// With `VELMORA_TEST_PG_DIFFERENTIAL=1`, every catalogue write of the
@@ -373,6 +380,8 @@ impl TestPostgres {
             .collect();
         for (variant, stmts) in [("values", stmts), ("nulls", &nulls[..])] {
             let (typed, message) = self.compare_transports(stmts, collect_rows).await;
+            // Over the size bound both sides ran one Sync per statement.
+            let Some(message) = message else { continue };
             let same = match (&typed, &message) {
                 (Ok(a), Ok(b)) => a == b,
                 (Err(a), Err(b)) => format!("{a:?}") == format!("{b:?}"),

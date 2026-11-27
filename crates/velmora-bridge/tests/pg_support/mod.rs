@@ -438,6 +438,7 @@ impl Ctx {
         // Faults on the reply side, armed by the frontend side.
         let reply_fault = Arc::new(Mutex::new(VecDeque::<Fault>::new()));
         let close = Arc::new(Notify::new());
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let front = async {
             // A request is one Query, or the extended messages through Sync;
             // the proxy decides on and forwards whole requests.
@@ -459,6 +460,12 @@ impl Ctx {
                 if tag == b'X' {
                     send_server(packet)?;
                     return Ok::<(), io::Error>(());
+                }
+                if !started.load(Ordering::SeqCst) {
+                    // Authentication replies (SASL, password) go at once:
+                    // the server waits for them before its ReadyForQuery.
+                    send_server(packet)?;
+                    continue;
                 }
                 request.push(packet);
                 if !(tag == b'Q' || tag == b'S') {
@@ -520,20 +527,17 @@ impl Ctx {
                         completes = 0;
                     }
                 }
-                match active {
-                    Fault::StatusInTransaction if tag == b'Z' => {
-                        send_client(b"Z\0\0\0\x05T".to_vec())?;
-                        active = Fault::None;
-                        continue;
-                    }
+                // What goes to the client for this server message. Every
+                // ReadyForQuery relayed, real or not, ends a request.
+                let out: Option<Vec<u8>> = match active {
+                    Fault::StatusInTransaction if tag == b'Z' => Some(b"Z\0\0\0\x05T".to_vec()),
                     Fault::InjectAsync => {
-                        send_client(async_frames())?;
+                        let mut out = async_frames();
+                        out.extend(&packet);
                         if tag == b'Z' {
-                            send_client(packet)?;
-                            send_client(async_frames())?;
-                            active = Fault::None;
-                            continue;
+                            out.extend(async_frames());
                         }
+                        Some(out)
                     }
                     Fault::DescribeError => {
                         // Fail the Describe of the statement after BEGIN
@@ -545,15 +549,11 @@ impl Ctx {
                         }
                         if tag == b't' && !dropped && completes >= 1 {
                             dropped = true;
-                            send_client(error_frame("42P18"))?;
-                            continue;
-                        }
-                        if dropped {
-                            if tag == b'Z' {
-                                send_client(b"Z\0\0\0\x05E".to_vec())?;
-                                active = Fault::None;
-                            }
-                            continue;
+                            Some(error_frame("42P18"))
+                        } else if dropped {
+                            (tag == b'Z').then(|| b"Z\0\0\0\x05E".to_vec())
+                        } else {
+                            Some(packet.clone())
                         }
                     }
                     Fault::LostAfterForward => {
@@ -562,23 +562,25 @@ impl Ctx {
                             close.notify_one();
                             return Ok(());
                         }
-                        continue;
+                        None
                     }
                     Fault::DropOneComplete if tag == b'C' && !dropped => {
                         dropped = true;
-                        continue;
+                        None
                     }
                     Fault::RejectCommit if tag == b'C' && &packet[5..] == b"COMMIT\0" => {
-                        send_client(error_frame("57014"))?;
-                        continue;
+                        Some(error_frame("57014"))
                     }
-                    _ => {}
-                }
+                    _ => Some(packet.clone()),
+                };
                 if tag == b'Z' {
                     active = Fault::None;
                 }
-                send_client(packet)?;
+                let Some(out) = out else { continue };
+                send_client(out)?;
                 if tag == b'Z' {
+                    // Startup is over at the first ReadyForQuery.
+                    started.store(true, Ordering::SeqCst);
                     if let Some(d) = per_request {
                         let turn = turn.clone();
                         tokio::spawn(async move {

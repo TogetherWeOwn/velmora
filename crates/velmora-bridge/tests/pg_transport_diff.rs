@@ -133,6 +133,7 @@ async fn both_transports_return_the_same_for_every_manifest_statement() {
                 };
                 let variant = format!("{variant}, {shape}");
                 let (pipelined, single_sync) = pg.compare_transports(&stmts, collect_rows).await;
+                let single_sync = single_sync.expect("manifest statements fit one request");
                 runs += 1;
                 if !same(&pipelined, &single_sync) {
                     differences.push(format!(
