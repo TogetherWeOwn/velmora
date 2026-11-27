@@ -924,17 +924,18 @@ async fn removal_during_the_prior_record(case: Removed) {
         }
         sql.stall_batch_key.set(Some(prior_extent));
         let remove = async {
-            for _ in 0..HOLD_TURNS {
-                if sql.stall_batch_key.get().is_none() {
-                    store.inner.lose(&name);
-                    sql.selected_batch.release();
-                    // The tripwire observes the release on its next poll.
-                    tokio::task::yield_now().await;
-                    return;
-                }
+            let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
+            while sql.stall_batch_key.get().is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prior record never reached its staging batch"
+                );
                 tokio::task::yield_now().await;
             }
-            panic!("the prior record never reached its staging batch");
+            store.inner.lose(&name);
+            sql.selected_batch.release();
+            // The tripwire observes the release on its next poll.
+            tokio::task::yield_now().await;
         };
         let (step, ()) = futures_util::future::join(
             rig.bridge.replay_step(ReplayCursor::start(UnixMs(0))),
