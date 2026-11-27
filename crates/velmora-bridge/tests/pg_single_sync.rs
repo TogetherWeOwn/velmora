@@ -78,7 +78,9 @@ async fn a_write_transaction_is_one_request_with_one_sync() {
 async fn a_guard_at_statement_k_is_a_refusal_and_leaves_no_rows() {
     let Some(s) = schema().await else { return };
     let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
-    for k in 0..3 {
+    // Every position, the last catalogue statement (just before COMMIT)
+    // included.
+    for k in 0..=3 {
         let mut stmts = vec![insert(10), insert(11), insert(12)];
         stmts.insert(k, (GUARD, vec![int(0)]));
         let r = pg.batch(stmts).await;
@@ -209,6 +211,16 @@ async fn a_missing_command_complete_is_an_unknown_outcome() {
 }
 
 #[tokio::test]
+async fn a_commit_without_an_idle_session_is_an_unexpected_shape() {
+    let Some(s) = schema().await else { return };
+    // Every reply arrives, COMMIT's included, but the ReadyForQuery says
+    // the session is still in a transaction: not a confirmed commit.
+    let (_proxy, pg) = proxied(&s, Fault::StatusInTransaction).await;
+    let r = pg.batch(vec![insert(1)]).await;
+    assert!(is(&r, "pg: unexpected result shape"), "{r:?}");
+}
+
+#[tokio::test]
 async fn an_error_in_place_of_commit_is_statement_failed() {
     let Some(s) = schema().await else { return };
     let (_proxy, pg) = proxied(&s, Fault::RejectCommit).await;
@@ -220,7 +232,12 @@ async fn an_error_in_place_of_commit_is_statement_failed() {
 #[tokio::test]
 async fn the_prelude_settings_hold_and_statement_timeout_is_per_statement() {
     let Some(s) = schema().await else { return };
-    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
+    // A session whose default would log bind values on error: the prelude
+    // must override it for the transaction.
+    let mut config = s.config();
+    let options = config.get_options().unwrap_or_default().to_owned();
+    config.options(format!("{options} -c log_parameter_max_length_on_error=-1"));
+    let pg = s.pg(Direct(config), WriteTx::SingleSync);
     let settings = "INSERT INTO tx_guard(ok) SELECT CASE WHEN \
         current_setting('statement_timeout') = '20s' AND current_setting('lock_timeout') = '2s' \
         AND current_setting('idle_in_transaction_session_timeout') = '5s' \

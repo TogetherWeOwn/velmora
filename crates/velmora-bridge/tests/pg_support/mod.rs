@@ -185,6 +185,9 @@ pub enum Fault {
     DropOneComplete,
     /// Replace COMMIT's CommandComplete with an error 57014.
     RejectCommit,
+    /// Relay every reply, but with ReadyForQuery status T (in a
+    /// transaction) instead of the server's.
+    StatusInTransaction,
     /// Put a NoticeResponse, a ParameterStatus and a NotificationResponse
     /// before every reply message, and after the last one.
     InjectAsync,
@@ -518,6 +521,11 @@ impl Ctx {
                     }
                 }
                 match active {
+                    Fault::StatusInTransaction if tag == b'Z' => {
+                        send_client(b"Z\0\0\0\x05T".to_vec())?;
+                        active = Fault::None;
+                        continue;
+                    }
                     Fault::InjectAsync => {
                         send_client(async_frames())?;
                         if tag == b'Z' {
