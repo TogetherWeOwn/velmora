@@ -169,15 +169,15 @@ pub enum Delay {
     PerRequest(Duration),
 }
 
-/// A fault applied to the first one-message write transaction (a Query
-/// that starts with `BEGIN READ WRITE` and ends with COMMIT).
+/// A fault applied to the first single-Sync write transaction (a request
+/// that starts with `BEGIN READ WRITE` and ends with COMMIT and one Sync).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fault {
     None,
-    /// Reply 58000 without forwarding the message.
+    /// Reply 58000 without forwarding the request.
     Refuse58000,
     /// Forward it, swallow every reply, then send 08006 and close: the
-    /// server committed and the client saw no CommandComplete.
+    /// server committed and the client saw no reply.
     LostAfterForward,
     /// Forward it and close the client connection at once.
     CutAfterForward,
@@ -185,6 +185,12 @@ pub enum Fault {
     DropOneComplete,
     /// Replace COMMIT's CommandComplete with an error 57014.
     RejectCommit,
+    /// Put a NoticeResponse, a ParameterStatus and a NotificationResponse
+    /// before every reply message, and after the last one.
+    InjectAsync,
+    /// Answer the Describe of the statement after BEGIN with an error, then
+    /// discard the server's replies up to its ReadyForQuery (status E).
+    DescribeError,
 }
 
 #[derive(Default)]
@@ -195,8 +201,16 @@ pub struct Trace {
     pub rollbacks: usize,
     /// ROLLBACK replies (CommandComplete) relayed back.
     pub rollbacks_done: usize,
-    /// Query messages that were one-message write transactions.
-    pub messages: usize,
+    /// Requests that were single-Sync write transactions.
+    pub single_syncs: usize,
+    /// Sync messages.
+    pub syncs: usize,
+    /// Query (simple protocol) messages.
+    pub queries: usize,
+    /// Parse messages with a statement name.
+    pub named_parses: usize,
+    /// Bytes of the last single-Sync write transaction request.
+    pub last_request_bytes: usize,
 }
 
 pub struct Proxy {
@@ -308,6 +322,23 @@ async fn frame(input: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+fn frame_of(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(((4 + body.len()) as u32).to_be_bytes());
+    out.extend(body);
+    out
+}
+
+/// A NoticeResponse, a ParameterStatus and a NotificationResponse.
+fn async_frames() -> Vec<u8> {
+    let mut out = frame_of(b'N', b"SNOTICE\0C00000\0Mtest proxy notice\0\0");
+    out.extend(frame_of(b'S', b"application_name\0proxy\0"));
+    let mut notify = 4242_i32.to_be_bytes().to_vec();
+    notify.extend(b"proxy_channel\0payload\0");
+    out.extend(frame_of(b'A', &notify));
+    out
+}
+
 fn error_frame(code: &str) -> Vec<u8> {
     let fields = format!("SERROR\0C{code}\0Mtest proxy fault\0\0");
     let mut out = vec![b'E'];
@@ -318,10 +349,23 @@ fn error_frame(code: &str) -> Vec<u8> {
 
 const READY_IDLE: &[u8] = b"Z\0\0\0\x05I";
 
-fn is_message_tx(packet: &[u8]) -> bool {
-    packet[0] == b'Q'
-        && packet[5..].starts_with(b"BEGIN READ WRITE")
-        && packet.ends_with(b"\n;\nCOMMIT\0")
+/// The query text of an unnamed Parse frame.
+fn parse_text(packet: &[u8]) -> Option<&[u8]> {
+    (packet[0] == b'P' && packet[5] == 0).then(|| {
+        let text = &packet[6..];
+        &text[..text.iter().position(|&b| b == 0).unwrap_or(text.len())]
+    })
+}
+
+/// A write transaction sent as one request: it begins with BEGIN READ
+/// WRITE and ends with COMMIT before its only Sync.
+fn is_single_sync_tx(request: &[Vec<u8>]) -> bool {
+    let texts: Vec<&[u8]> = request.iter().filter_map(|p| parse_text(p)).collect();
+    request.last().is_some_and(|p| p[0] == b'S')
+        && texts
+            .first()
+            .is_some_and(|t| t.starts_with(b"BEGIN READ WRITE"))
+        && texts.last() == Some(&&b"COMMIT"[..])
 }
 
 /// Writes frames in order, each no earlier than its due time.
@@ -392,28 +436,48 @@ impl Ctx {
         let reply_fault = Arc::new(Mutex::new(VecDeque::<Fault>::new()));
         let close = Arc::new(Notify::new());
         let front = async {
-            let mut in_request = false;
+            // A request is one Query, or the extended messages through Sync;
+            // the proxy decides on and forwards whole requests.
+            let mut request: Vec<Vec<u8>> = Vec::new();
             loop {
                 let packet = frame(&mut client_read).await?;
                 let tag = packet[0];
-                self.trace.lock().unwrap().frontend.push(tag);
+                {
+                    let mut trace = self.trace.lock().unwrap();
+                    trace.frontend.push(tag);
+                    match tag {
+                        b'S' => trace.syncs += 1,
+                        b'Q' => trace.queries += 1,
+                        // An unnamed Parse starts with an empty name.
+                        b'P' if packet[5] != 0 => trace.named_parses += 1,
+                        _ => {}
+                    }
+                }
                 if tag == b'X' {
                     send_server(packet)?;
                     return Ok::<(), io::Error>(());
                 }
-                if let (Some(_), false) = (per_request, in_request) {
+                request.push(packet);
+                if !(tag == b'Q' || tag == b'S') {
+                    continue;
+                }
+                let request = std::mem::take(&mut request);
+                if per_request.is_some() {
                     turn.acquire().await.unwrap().forget();
                 }
-                in_request = !(tag == b'Q' || tag == b'S');
-                if tag == b'Q' && &packet[5..] == b"ROLLBACK\0" {
+                if request.len() == 1 && &request[0][5..] == b"ROLLBACK\0" {
                     self.trace.lock().unwrap().rollbacks += 1;
                     if *self.hold_rollback.lock().unwrap() {
                         self.held.notify_one();
                         self.release.notified().await;
                     }
                 }
-                if is_message_tx(&packet) {
-                    self.trace.lock().unwrap().messages += 1;
+                if is_single_sync_tx(&request) {
+                    {
+                        let mut trace = self.trace.lock().unwrap();
+                        trace.single_syncs += 1;
+                        trace.last_request_bytes = request.iter().map(Vec::len).sum();
+                    }
                     match self.take_fault() {
                         Fault::None => {}
                         Fault::Refuse58000 => {
@@ -426,19 +490,20 @@ impl Ctx {
                             continue;
                         }
                         Fault::CutAfterForward => {
-                            send_server(packet)?;
+                            send_server(request.concat())?;
                             close.notify_one();
                             return Ok(());
                         }
                         fault => reply_fault.lock().unwrap().push_back(fault),
                     }
                 }
-                send_server(packet)?;
+                send_server(request.concat())?;
             }
         };
         let back = async {
             let mut active = Fault::None;
             let mut dropped = false;
+            let mut completes = 0;
             loop {
                 let packet = frame(&mut server_read).await?;
                 let tag = packet[0];
@@ -449,9 +514,40 @@ impl Ctx {
                     if let Some(f) = reply_fault.lock().unwrap().pop_front() {
                         active = f;
                         dropped = false;
+                        completes = 0;
                     }
                 }
                 match active {
+                    Fault::InjectAsync => {
+                        send_client(async_frames())?;
+                        if tag == b'Z' {
+                            send_client(packet)?;
+                            send_client(async_frames())?;
+                            active = Fault::None;
+                            continue;
+                        }
+                    }
+                    Fault::DescribeError => {
+                        // Fail the Describe of the statement after BEGIN
+                        // (the first ParameterDescription after a
+                        // CommandComplete), then end the request as the
+                        // server would after an error: ReadyForQuery E.
+                        if tag == b'C' && !dropped {
+                            completes += 1;
+                        }
+                        if tag == b't' && !dropped && completes >= 1 {
+                            dropped = true;
+                            send_client(error_frame("42P18"))?;
+                            continue;
+                        }
+                        if dropped {
+                            if tag == b'Z' {
+                                send_client(b"Z\0\0\0\x05E".to_vec())?;
+                                active = Fault::None;
+                            }
+                            continue;
+                        }
+                    }
                     Fault::LostAfterForward => {
                         if tag == b'Z' {
                             send_client(error_frame("08006"))?;

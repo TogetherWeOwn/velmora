@@ -61,14 +61,6 @@ impl Backend {
     }
 }
 
-/// One line per write transaction over the one-message bound, which then
-/// goes pipelined. No SQL and no values.
-fn log_oversize(statements: usize) {
-    worker::console_warn!(
-        "pg: oversize write transaction sent pipelined ({statements} statements)"
-    );
-}
-
 fn optional_text(
     env: &Env,
     name: &str,
@@ -83,6 +75,14 @@ fn optional_text(
         .as_string()
         .map(Some)
         .ok_or(invalid)
+}
+
+/// One line per write transaction over the single-Sync size bound, which
+/// then goes one Sync per statement. No SQL and no values.
+fn log_oversize(statements: usize) {
+    worker::console_warn!(
+        "pg: oversize write transaction sent one Sync per statement ({statements} statements)"
+    );
 }
 
 pub enum CatalogSql {
@@ -214,11 +214,11 @@ mod tests {
             Backend::parse(Some("postgres")),
             Err("invalid CATALOG_BACKEND")
         );
-        assert_eq!(WriteTx::parse(None), Ok(WriteTx::Message));
-        assert_eq!(WriteTx::parse(Some("message")), Ok(WriteTx::Message));
+        assert_eq!(WriteTx::parse(None), Ok(WriteTx::SingleSync));
+        assert_eq!(WriteTx::parse(Some("single-sync")), Ok(WriteTx::SingleSync));
         assert_eq!(WriteTx::parse(Some("pipeline")), Ok(WriteTx::Pipeline));
         // The sequential transport is gone; its old switch values are typos.
-        for old in ["0", "1", "sequential", "Message"] {
+        for old in ["0", "1", "sequential", "message", "SingleSync"] {
             assert_eq!(WriteTx::parse(Some(old)), Err("invalid PG_WRITE_TX"));
         }
     }

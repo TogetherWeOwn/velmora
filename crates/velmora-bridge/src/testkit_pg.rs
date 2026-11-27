@@ -69,8 +69,8 @@ static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 pub const URL_VAR: &str = "VELMORA_TEST_PG_URL";
 
-/// `VELMORA_TEST_PG_WRITE_TX=pipeline` runs the suite on the typed write
-/// transport; unset or `message` on the default one-message transport.
+/// `VELMORA_TEST_PG_WRITE_TX=pipeline` runs the suite on the one-Sync-per-
+/// statement transport; unset or `single-sync` on the default transport.
 pub const WRITE_TX_VAR: &str = "VELMORA_TEST_PG_WRITE_TX";
 
 /// Run the transport comparison on every catalogue write (see
@@ -261,9 +261,9 @@ impl TestPostgres {
         Self::through(last, armed, false, write_tx())
     }
 
-    /// A schema whose catalogue writes use the typed transport, for tests
-    /// of the pooled session's driver state (type lookups, prepared
-    /// statements) that the one-message transport never creates.
+    /// A schema whose catalogue writes use the one-Sync-per-statement
+    /// transport, for tests of the pooled session's driver state (type
+    /// lookups) that the single-Sync transport never creates.
     pub fn with_typed_writes() -> Result<Self> {
         let last = &STAGES[STAGES.len() - 1].0[..4];
         Self::through(last, true, false, WriteTx::Pipeline)
@@ -332,9 +332,7 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            // Fixture SQL is test text, not a catalogue statement with
-            // declared results: it uses the typed transport.
-            fixture_sql: sql(connector.clone(), WriteTx::Pipeline),
+            fixture_sql: sql(connector.clone(), write_tx()),
             connector,
         })
     }
@@ -344,21 +342,21 @@ impl TestPostgres {
     }
 
     /// Run one write transaction on each transport against the current
-    /// catalogue state, rolling both back: (typed, one message).
+    /// catalogue state, rolling both back: (pipelined, single Sync).
     pub async fn compare_transports(
         &self,
         stmts: &[(&str, Vec<SqlValue>)],
         collect_rows: bool,
     ) -> (ProbeOutcome, ProbeOutcome) {
-        let typed = self
+        let pipelined = self
             .sql
             .rolled_back(WriteTx::Pipeline, stmts, collect_rows)
             .await;
-        let message = self
+        let single_sync = self
             .sql
-            .rolled_back(WriteTx::Message, stmts, collect_rows)
+            .rolled_back(WriteTx::SingleSync, stmts, collect_rows)
             .await;
-        (typed, message)
+        (pipelined, single_sync)
     }
 
     /// With `VELMORA_TEST_PG_DIFFERENTIAL=1`, every catalogue write of the
@@ -387,7 +385,7 @@ impl TestPostgres {
                     Err(e) => format!("Err({e:?})"),
                 };
                 panic!(
-                    "transport difference ({variant}): typed {}, message {}: {texts:?}",
+                    "transport difference ({variant}): pipelined {}, single Sync {}: {texts:?}",
                     class(&typed),
                     class(&message)
                 );
@@ -414,7 +412,7 @@ impl TestPostgres {
                 connector,
                 PgConfig {
                     lock_key,
-                    write_tx: WriteTx::Pipeline,
+                    write_tx: write_tx(),
                     ..PgConfig::default()
                 },
             );

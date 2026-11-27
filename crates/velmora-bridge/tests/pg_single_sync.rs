@@ -1,4 +1,4 @@
-//! Failure semantics of the one-message write transport on a real server
+//! Failure semantics of the single-Sync write transport on a real server
 //! (`VELMORA_TEST_PG_URL`), some through a framing proxy that injects the
 //! faults a pooler can cause. Each case names the outcome the caller sees
 //! and what is left in the database.
@@ -10,7 +10,9 @@ mod pg_support;
 use std::time::{Duration, Instant};
 
 use pg_support::{connect, unique, Delay, Direct, Fault, Proxy, Schema};
-use velmora_bridge::pg::{oversize_fallbacks, PgSql, WriteTx, MAX_WRITE_MESSAGE_BYTES};
+use velmora_bridge::pg::{
+    oversize_fallbacks, single_sync_request_bytes, PgSql, WriteTx, MAX_SINGLE_SYNC_BYTES,
+};
 use velmora_bridge::{BridgeError, Sql, SqlValue};
 
 const SETUP: &str = "CREATE TABLE m (n bigint PRIMARY KEY, t text, b bytea);
@@ -40,12 +42,12 @@ async fn schema() -> Option<Schema> {
 
 async fn proxied(s: &Schema, fault: Fault) -> (Proxy, PgSql<Direct>) {
     let proxy = Proxy::start(&s.base, Delay::None, fault).await;
-    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::Message);
+    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::SingleSync);
     (proxy, pg)
 }
 
 #[tokio::test]
-async fn a_write_transaction_is_one_query_message() {
+async fn a_write_transaction_is_one_request_with_one_sync() {
     let Some(s) = schema().await else { return };
     let (proxy, pg) = proxied(&s, Fault::None).await;
     let counts = pg
@@ -62,16 +64,20 @@ async fn a_write_transaction_is_one_query_message() {
         .unwrap();
     assert_eq!(counts, [1, 1, 2, 0]);
     let trace = proxy.trace.lock().unwrap();
-    assert_eq!(trace.messages, 1);
-    assert_eq!(trace.frontend.iter().filter(|t| **t == b'Q').count(), 1);
-    assert!(!trace.frontend.contains(&b'P'), "no extended request");
+    assert_eq!(trace.single_syncs, 1);
+    assert_eq!(trace.syncs, 1, "one Sync for the whole transaction");
+    assert_eq!(trace.queries, 0, "no simple query on the success path");
+    // Prelude (6), four statements, COMMIT: one unnamed Parse each.
+    let parses = trace.frontend.iter().filter(|t| **t == b'P').count();
+    assert_eq!(parses, 6 + 4 + 1);
+    assert_eq!(trace.named_parses, 0);
     assert_eq!(trace.rollbacks, 0);
 }
 
 #[tokio::test]
 async fn a_guard_at_statement_k_is_a_refusal_and_leaves_no_rows() {
     let Some(s) = schema().await else { return };
-    let pg = s.pg(Direct(s.config()), WriteTx::Message);
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
     for k in 0..3 {
         let mut stmts = vec![insert(10), insert(11), insert(12)];
         stmts.insert(k, (GUARD, vec![int(0)]));
@@ -100,7 +106,7 @@ async fn w1_held_elsewhere_is_overloaded_and_leaves_no_rows() {
         ))
         .await
         .unwrap();
-    let pg = s.pg(Direct(s.config()), WriteTx::Message);
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
     let start = Instant::now();
     let r = pg.batch(vec![insert(1)]).await;
     assert!(is(&r, "pg: overloaded"), "{r:?}");
@@ -115,7 +121,7 @@ async fn w1_held_elsewhere_is_overloaded_and_leaves_no_rows() {
 #[tokio::test]
 async fn type_and_syntax_errors_are_statement_failed_and_leave_no_rows() {
     let Some(s) = schema().await else { return };
-    let pg = s.pg(Direct(s.config()), WriteTx::Message);
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
     let bad_type = (
         "INSERT INTO m(n) VALUES (?1)",
         vec![SqlValue::Text("x".into())],
@@ -137,7 +143,7 @@ async fn type_and_syntax_errors_are_statement_failed_and_leave_no_rows() {
 #[tokio::test]
 async fn a_deferred_constraint_failure_at_commit_is_statement_failed() {
     let Some(s) = schema().await else { return };
-    for write_tx in [WriteTx::Message, WriteTx::Pipeline] {
+    for write_tx in [WriteTx::SingleSync, WriteTx::Pipeline] {
         let pg = s.pg(Direct(s.config()), write_tx);
         let dup = "INSERT INTO d(n) VALUES (?1)";
         let r = pg
@@ -159,7 +165,7 @@ async fn an_error_the_proxy_makes_up_after_forwarding_is_statement_failed() {
     let (proxy, pg) = proxied(&s, Fault::LostAfterForward).await;
     let r = pg.batch(vec![insert(1)]).await;
     assert!(is(&r, FAILED), "{r:?}");
-    assert_eq!(proxy.trace.lock().unwrap().messages, 1);
+    assert_eq!(proxy.trace.lock().unwrap().single_syncs, 1);
     assert_eq!(
         s.count("m").await,
         1,
@@ -191,12 +197,14 @@ async fn a_58000_before_any_reply_is_statement_failed_until_proven_earlier() {
 }
 
 #[tokio::test]
-async fn a_missing_command_complete_is_an_unexpected_shape() {
+async fn a_missing_command_complete_is_an_unknown_outcome() {
     let Some(s) = schema().await else { return };
     let (_proxy, pg) = proxied(&s, Fault::DropOneComplete).await;
     let r = pg.batch(vec![insert(1), insert(2)]).await;
-    assert!(is(&r, "pg: unexpected result shape"), "{r:?}");
-    // The server committed; the reply count told the adapter it cannot know.
+    // The replies no longer match the statements: a protocol error, so the
+    // outcome is unknown, never a refusal.
+    assert!(is(&r, FAILED), "{r:?}");
+    // The server committed.
     assert_eq!(s.count("m").await, 2);
 }
 
@@ -212,18 +220,18 @@ async fn an_error_in_place_of_commit_is_statement_failed() {
 #[tokio::test]
 async fn the_prelude_settings_hold_and_statement_timeout_is_per_statement() {
     let Some(s) = schema().await else { return };
-    let pg = s.pg(Direct(s.config()), WriteTx::Message);
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
     let settings = "INSERT INTO tx_guard(ok) SELECT CASE WHEN \
         current_setting('statement_timeout') = '20s' AND current_setting('lock_timeout') = '2s' \
         AND current_setting('idle_in_transaction_session_timeout') = '5s' \
-        AND current_setting('bytea_output') = 'hex' \
+        AND current_setting('log_parameter_max_length_on_error') = '0' \
         AND current_setting('transaction_isolation') = 'read committed' \
         AND current_setting('transaction_read_only') = 'off' \
         AND EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted) \
         THEN 1 ELSE 0 END";
     assert_eq!(pg.batch(vec![(settings, vec![])]).await.unwrap(), [1]);
-    // A later statement of the same message runs under a timeout set by an
-    // earlier one: each statement gets its own timer.
+    // A later statement of the same Sync group runs under a timeout set by
+    // an earlier one: each statement gets its own timer.
     let start = Instant::now();
     let r = pg
         .batch(vec![
@@ -246,7 +254,7 @@ async fn w1_is_released_at_the_error_before_rollback() {
     let Some(s) = schema().await else { return };
     let proxy = Proxy::start(&s.base, Delay::None, Fault::None).await;
     *proxy.hold_rollback.lock().unwrap() = true;
-    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::Message);
+    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::SingleSync);
     let held = proxy.held.clone();
     let release = proxy.release.clone();
     let other = connect(&s.config()).await;
@@ -301,7 +309,7 @@ async fn a_write_without_the_prelude_is_refused_by_the_read_only_default() {
         .await
         .unwrap_err();
     assert_eq!(e.code().map(|c| c.code()), Some("25006"));
-    let pg = s.pg(Direct(config), WriteTx::Message);
+    let pg = s.pg(Direct(config), WriteTx::SingleSync);
     assert_eq!(pg.batch(vec![insert(2)]).await.unwrap(), [1]);
     assert_eq!(s.count("m").await, 1);
     drop(bare);
@@ -317,7 +325,7 @@ async fn a_write_without_the_prelude_is_refused_by_the_read_only_default() {
 #[tokio::test]
 async fn statements_may_end_in_a_comment_or_a_semicolon() {
     let Some(s) = schema().await else { return };
-    let pg = s.pg(Direct(s.config()), WriteTx::Message);
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
     let counts = pg
         .batch(vec![
             (
@@ -343,11 +351,11 @@ async fn statements_may_end_in_a_comment_or_a_semicolon() {
 }
 
 #[tokio::test]
-async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
+async fn large_values_round_trip_in_one_request() {
     let Some(s) = schema().await else { return };
     let proxy = Proxy::start(&s.base, Delay::None, Fault::None).await;
-    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::Message);
-    // A 2 MB placement-sized JSON text and a 2 MB blob: one message.
+    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::SingleSync);
+    // A 2 MB placement-sized JSON text and a 2 MB blob.
     let json: String = (0..)
         .map(|i| format!("{{\"p\":{i},\"e\":\"x_{i:08}\"}},"))
         .take_while({
@@ -359,7 +367,6 @@ async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
         })
         .collect();
     let blob: Vec<u8> = (0..2_000_000_u32).map(|i| (i * 7 % 251) as u8).collect();
-    let before = oversize_fallbacks();
     let counts = pg
         .batch(vec![(
             "INSERT INTO m(n, t, b) VALUES (?1, ?2, ?3)",
@@ -372,7 +379,6 @@ async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
         .await
         .unwrap();
     assert_eq!(counts, [1]);
-    assert_eq!(oversize_fallbacks(), before);
     let row = s
         .admin
         .query_one(&format!("SELECT t, b FROM {}.m WHERE n = 1", s.name), &[])
@@ -380,11 +386,8 @@ async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
         .unwrap();
     assert_eq!(row.get::<_, String>(0), json);
     assert_eq!(row.get::<_, Vec<u8>>(1), blob);
-    assert_eq!(proxy.trace.lock().unwrap().messages, 1);
-    // Five 2 MB blobs render to about 20 MB, over the bound: the batch uses
-    // the typed transport and still commits.
-    assert!(5 * (2 * blob.len()) > MAX_WRITE_MESSAGE_BYTES);
-    let stmts = (10..15)
+    // Five 2 MB blobs (10 MB of binds) are still one request.
+    let stmts: Vec<(&'static str, Vec<SqlValue>)> = (10..15)
         .map(|n| {
             (
                 "INSERT INTO m(n, b) VALUES (?1, ?2)",
@@ -392,14 +395,98 @@ async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
             )
         })
         .collect();
+    let sized = stmts.clone();
+    let before = oversize_fallbacks();
     assert_eq!(pg.batch(stmts).await.unwrap(), [1; 5]);
+    {
+        let trace = proxy.trace.lock().unwrap();
+        assert_eq!((trace.single_syncs, trace.syncs, trace.queries), (2, 2, 0));
+        // The size bound is computed exactly, before anything is sent.
+        let expected = single_sync_request_bytes(Some(s.lock_key), &sized).unwrap();
+        assert_eq!(trace.last_request_bytes, expected);
+    }
+    assert_eq!(oversize_fallbacks(), before);
+    // Nine 2 MB blobs (18 MB) are over the bound: the transaction uses the
+    // one-Sync-per-statement transport and still commits.
+    let stmts: Vec<(&'static str, Vec<SqlValue>)> = (20..29)
+        .map(|n| {
+            (
+                "INSERT INTO m(n, b) VALUES (?1, ?2)",
+                vec![int(n), SqlValue::Blob(blob.clone())],
+            )
+        })
+        .collect();
+    assert!(single_sync_request_bytes(Some(s.lock_key), &stmts).unwrap() > MAX_SINGLE_SYNC_BYTES);
+    assert_eq!(pg.batch(stmts).await.unwrap(), [1; 9]);
     assert_eq!(oversize_fallbacks(), before + 1);
     {
         let trace = proxy.trace.lock().unwrap();
-        assert_eq!(trace.messages, 1, "the oversize batch was not one message");
-        assert!(trace.frontend.contains(&b'P'), "typed requests");
+        assert_eq!(trace.single_syncs, 2, "not sent as one request");
+        assert_eq!(trace.syncs, 2 + 9, "one Sync per statement");
     }
-    assert_eq!(s.count("m").await, 6);
+    assert_eq!(s.count("m").await, 15);
+}
+
+#[tokio::test]
+async fn write_query_rows_keep_their_binary_types() {
+    let Some(s) = schema().await else { return };
+    let pg = s.pg(Direct(s.config()), WriteTx::SingleSync);
+    let rows = pg
+        .query(
+            "INSERT INTO m(n, t, b) VALUES (?1, ?2, ?3) \
+             RETURNING n, t, b, 1::int2, 2::int4, true, 5.00::numeric, 'v'::varchar, 'n'::name, NULL::text",
+            &[int(9), SqlValue::Text("1".into()), SqlValue::Blob(vec![0, 255])],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        [vec![
+            int(9),
+            SqlValue::Text("1".into()),
+            SqlValue::Blob(vec![0, 255]),
+            int(1),
+            int(2),
+            int(1),
+            int(5),
+            SqlValue::Text("v".into()),
+            SqlValue::Text("n".into()),
+            SqlValue::Null,
+        ]]
+    );
+    // A type the driver's built-in table does not know: no lookup, and the
+    // decoder refuses it as today, after the write committed.
+    s.admin
+        .batch_execute(&format!("CREATE TYPE {}.mood AS ENUM ('ok')", s.name))
+        .await
+        .unwrap();
+    let proxy = Proxy::start(&s.base, Delay::None, Fault::None).await;
+    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::SingleSync);
+    let r = pg
+        .query(
+            "INSERT INTO m(n) VALUES (?1) RETURNING 'ok'::mood",
+            &[int(10)],
+        )
+        .await;
+    assert!(
+        matches!(&r, Err(BridgeError::Sql(e)) if e == "pg: unexpected result shape"),
+        "{r:?}"
+    );
+    // exec takes no rows: the same statement succeeds.
+    let n = pg
+        .exec(
+            "INSERT INTO m(n) VALUES (?1) RETURNING 'ok'::mood",
+            &[int(11)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        proxy.trace.lock().unwrap().named_parses,
+        0,
+        "no type lookup"
+    );
+    assert_eq!(s.count("m").await, 3);
 }
 
 #[cfg(feature = "pg-test-unlocked")]
@@ -407,7 +494,7 @@ async fn large_values_round_trip_and_an_oversize_batch_goes_typed() {
 async fn the_unlocked_negative_control_has_five_prelude_statements() {
     let Some(s) = schema().await else { return };
     let pg = s
-        .pg(Direct(s.config()), WriteTx::Message)
+        .pg(Direct(s.config()), WriteTx::SingleSync)
         .without_write_lock_for_test();
     // A wrong prelude count would be an unexpected result shape.
     assert_eq!(pg.batch(vec![insert(1), insert(2)]).await.unwrap(), [1, 1]);

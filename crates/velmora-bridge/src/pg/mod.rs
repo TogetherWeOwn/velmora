@@ -4,13 +4,11 @@ mod batch;
 mod error;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod finish_tests;
-mod literal;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod message_tests;
 mod params;
 #[cfg(feature = "pg-test-record")]
 mod registry;
-mod results;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod single_sync_tests;
 #[cfg(test)]
 mod tests;
 mod value;
@@ -21,10 +19,7 @@ use crate::{Dialect, Result, Row, Sql, SqlValue};
 use batch::Prepared;
 use params::Kind;
 
-pub use batch::oversize_fallbacks;
-pub use literal::MAX_WRITE_MESSAGE_BYTES;
-#[doc(hidden)]
-pub use results::{Declared, ResultType, WRITE_RESULTS};
+pub use batch::{oversize_fallbacks, MAX_SINGLE_SYNC_BYTES};
 
 /// Lets the Worker reject even a transitively enabled test escape hatch.
 #[doc(hidden)]
@@ -41,21 +36,18 @@ pub fn is_postgres_read_only(sql: &str) -> bool {
     params::statement(sql).is_ok_and(|s| s.kind == Kind::Read)
 }
 
-/// Test only: the literal the one-message transport sends for `value`.
+/// Test only: the encoded size of the single-Sync request for `stmts`.
 #[cfg(feature = "testkit-pg")]
 #[doc(hidden)]
-pub fn literal_for_test(value: &SqlValue) -> Result<String> {
-    literal::render_value(value)
-}
-
-/// Test only: whether `sql` with `params` goes as one ASCII message.
-#[cfg(all(test, feature = "pg-test-record"))]
-pub(crate) fn renders_as_one_message(sql: &str, params: &[SqlValue]) -> Result<bool> {
-    let prepared = [Prepared::new(sql, params)?];
-    Ok(matches!(
-        batch::plan(WriteTx::Message, Some(1), &prepared, false, batch::COMMIT, None)?,
-        batch::Plan::Message(m) if m.is_ascii()
-    ))
+pub fn single_sync_request_bytes(
+    lock_key: Option<i64>,
+    stmts: &[(&str, Vec<SqlValue>)],
+) -> Result<usize> {
+    let prepared = stmts
+        .iter()
+        .map(|(sql, args)| Prepared::new(sql, args))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(batch::single_sync_bytes(lock_key, &prepared, batch::COMMIT))
 }
 
 /// Redact connection failures before they leave a runtime connector.
@@ -115,23 +107,22 @@ pub trait PgConnect {
 /// How a W1-guarded write transaction travels to the server.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WriteTx {
-    /// One simple-Query message: BEGIN, the prelude and the W1 lock, every
-    /// statement with typed literals, COMMIT. The server runs it without
-    /// waiting on the client between statements. A transaction above
-    /// [`MAX_WRITE_MESSAGE_BYTES`] uses [`WriteTx::Pipeline`].
+    /// One extended-protocol request with a single Sync: BEGIN, the prelude
+    /// and the W1 lock, every statement with its typed binds, COMMIT. The
+    /// server runs it without waiting on the client between statements.
     #[default]
-    Message,
-    /// Typed parameters, every request enqueued before the first reply.
-    /// A proxy that forwards one request at a time holds W1 across each
-    /// request's wait.
+    SingleSync,
+    /// Typed parameters, one Sync per statement, every request enqueued
+    /// before the first reply. A proxy that forwards one request at a time
+    /// holds W1 across each request's wait.
     Pipeline,
 }
 
 impl WriteTx {
-    /// `PG_WRITE_TX`: unset or `message`, or `pipeline`.
+    /// `PG_WRITE_TX`: unset or `single-sync`, or `pipeline`.
     pub fn parse(value: Option<&str>) -> core::result::Result<Self, &'static str> {
         match value {
-            None | Some("message") => Ok(Self::Message),
+            None | Some("single-sync") => Ok(Self::SingleSync),
             Some("pipeline") => Ok(Self::Pipeline),
             _ => Err("invalid PG_WRITE_TX"),
         }
@@ -143,8 +134,8 @@ pub struct PgConfig {
     pub lock_key: i64,
     pub write_tx: WriteTx,
     /// Called with the statement count when a write transaction exceeds
-    /// the message bound and uses the typed transport. It receives no SQL
-    /// and no values.
+    /// [`MAX_SINGLE_SYNC_BYTES`] and uses the one-Sync-per-statement
+    /// transport. It receives no SQL and no values.
     pub on_oversize: Option<fn(usize)>,
 }
 
@@ -152,7 +143,7 @@ impl Default for PgConfig {
     fn default() -> Self {
         Self {
             lock_key: 7_413_000_001,
-            write_tx: WriteTx::Message,
+            write_tx: WriteTx::SingleSync,
             on_oversize: None,
         }
     }
@@ -228,24 +219,16 @@ impl<C: PgConnect> PgSql<C> {
         end: &'static str,
     ) -> Result<Vec<batch::Reply>> {
         let lock_key = self.lock_key();
-        // Everything that can refuse the transaction runs before connecting.
-        let plan = batch::plan(
-            write_tx,
-            lock_key,
-            prepared,
-            collect_rows,
-            end,
-            self.config.on_oversize,
-        )?;
         let conn = self.writer.connect().await.map_err(error::without_guard)?;
         let result = batch::transaction(
             conn.client(),
             lock_key,
-            &plan,
+            write_tx,
             prepared,
             collect_rows,
             self.recording(),
             end,
+            self.config.on_oversize,
         )
         .await;
         finish_connection!(write conn, result);

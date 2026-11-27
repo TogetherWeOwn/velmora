@@ -10,24 +10,6 @@ pub(crate) struct Statement {
     pub text: String,
     pub kind: Kind,
     pub select: bool,
-    /// Every bind marker of `text`, in order: its byte range there and
-    /// its 1-based ordinal. Only code tokens are markers, never text in a
-    /// string, quoted identifier or comment.
-    pub binds: Vec<Bind>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Bind {
-    pub start: usize,
-    pub end: usize,
-    pub ordinal: usize,
-}
-
-impl Statement {
-    /// The highest bind ordinal, or 0 without binds.
-    pub fn max_bind(&self) -> usize {
-        self.binds.iter().map(|b| b.ordinal).max().unwrap_or(0)
-    }
 }
 
 fn untranslated() -> BridgeError {
@@ -97,7 +79,6 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
     let mut writes = false;
     let mut ended = false;
     let mut previous = String::new();
-    let mut binds = Vec::new();
     while i < bytes.len() {
         let start = i;
         match bytes[i] {
@@ -201,14 +182,8 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
                             .ok_or_else(untranslated)?
                     };
                     ordinal = ordinal.max(n);
-                    let at = text.len();
                     text.push('$');
                     text.push_str(&n.to_string());
-                    binds.push(Bind {
-                        start: at,
-                        end: text.len(),
-                        ordinal: n,
-                    });
                     previous.clear();
                     continue;
                 }
@@ -287,6 +262,5 @@ fn scan(sql: &str, postgres: bool) -> Result<Statement> {
             Kind::Write
         },
         select,
-        binds,
     })
 }

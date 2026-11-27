@@ -71,20 +71,20 @@ impl Params {
             .map(Self)
     }
 
+    /// The number of values and their encoded bytes, for sizing a request.
+    pub(super) fn wire_size(&self) -> (usize, usize) {
+        let bytes = self
+            .0
+            .iter()
+            .map(|(b, _)| b.0.as_ref().map_or(0, Vec::len))
+            .sum();
+        (self.0.len(), bytes)
+    }
+
     pub(super) fn typed(&self) -> impl Iterator<Item = (&(dyn ToSql + Sync), Type)> {
         self.0
             .iter()
             .map(|(b, t)| (b as &(dyn ToSql + Sync), t.clone()))
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// The checked values, for the literal renderer. INT8 is 8 big-endian
-    /// bytes, TEXT is UTF-8 without NUL, BYTEA is raw, UNKNOWN is SQL NULL.
-    pub(super) fn wire(&self) -> impl Iterator<Item = (Option<&[u8]>, &Type)> {
-        self.0.iter().map(|(b, t)| (b.0.as_deref(), t))
     }
 
     #[cfg(any(test, feature = "pg-test-record"))]

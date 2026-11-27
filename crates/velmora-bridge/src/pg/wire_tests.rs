@@ -338,7 +338,7 @@ async fn pg_sql_faults_preserve_transaction_outcomes_on_the_wire() {
     let (res, _) = through_proxy(port, Fault::ChunkReplies, vec![insert(6)]).await;
     assert_eq!(res.unwrap(), [1]);
     assert_eq!(stored(&root).await, 3);
-    for write_tx in [WriteTx::Message, WriteTx::Pipeline] {
+    for write_tx in [WriteTx::SingleSync, WriteTx::Pipeline] {
         let c = Connector(config(port, "wp1_fault_writer"));
         let pg = PgSql::new(
             c.clone(),

@@ -1,7 +1,7 @@
 //! The W1 hold through a proxy that forwards one request at a time, as
-//! Hyperdrive did in the E0 probe: the typed transport holds the writer
-//! lock across every request's wait, and the one-message transport does
-//! not. 16 writers for 10 s per case, a 1-statement write and an
+//! Hyperdrive did in the E0 probe: the one-Sync-per-statement transport
+//! holds the writer lock across every request's wait, and the single-Sync
+//! transport does not. 16 writers for 10 s per case, a 1-statement write and an
 //! 11-statement batch shaped like `commit_generation`, with a 2 ms
 //! sampler of the W1 holder's wait state. Needs `VELMORA_TEST_PG_URL`.
 
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pg_support::{connect, Delay, Direct, Fault, Proxy, Schema};
-use velmora_bridge::pg::{oversize_fallbacks, WriteTx};
+use velmora_bridge::pg::WriteTx;
 use velmora_bridge::{Sql, SqlValue};
 
 const D: Duration = Duration::from_millis(5);
@@ -33,6 +33,9 @@ struct Outcome {
     held_samples: u64,
     client_read: u64,
     acked: Vec<(i64, i64)>,
+    /// Frontend Sync and Query messages the proxy saw.
+    syncs: usize,
+    queries: usize,
 }
 
 impl Outcome {
@@ -125,8 +128,14 @@ async fn run(s: &Schema, write_tx: WriteTx, delay: Delay, next: Arc<AtomicI64>) 
     let ((held, client_read), acked, ()) =
         tokio::join!(sampler, futures_util::future::join_all(writers), timer);
     let _ = started;
+    let (syncs, queries) = {
+        let trace = proxy.trace.lock().unwrap();
+        (trace.syncs, trace.queries)
+    };
     drop(proxy);
     Outcome {
+        syncs,
+        queries,
         singles: singles.load(Ordering::Relaxed),
         batches: batches.load(Ordering::Relaxed),
         held_samples: held,
@@ -168,17 +177,18 @@ fn report(name: &str, o: &Outcome) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_message_writes_do_not_hold_w1_across_proxy_waits() {
+async fn single_sync_writes_do_not_hold_w1_across_proxy_waits() {
     let Some(s) = Schema::new(SETUP).await else {
         return;
     };
     let next = Arc::new(AtomicI64::new(1));
     let typed_per_request = run(&s, WriteTx::Pipeline, Delay::PerRequest(D), next.clone()).await;
-    report("typed, per-request proxy", &typed_per_request);
+    report("pipelined, per-request proxy", &typed_per_request);
     let typed_faithful = run(&s, WriteTx::Pipeline, Delay::Faithful(D), next.clone()).await;
-    report("typed, faithful latency", &typed_faithful);
-    let message_per_request = run(&s, WriteTx::Message, Delay::PerRequest(D), next.clone()).await;
-    report("one message, per-request proxy", &message_per_request);
+    report("pipelined, faithful latency", &typed_faithful);
+    let single_sync_per_request =
+        run(&s, WriteTx::SingleSync, Delay::PerRequest(D), next.clone()).await;
+    report("single Sync, per-request proxy", &single_sync_per_request);
 
     // 1. The reproduction: W1 waits on the client, at most 1/(2d).
     assert!(typed_per_request.share() >= 0.5, "{typed_per_request:?}");
@@ -187,49 +197,29 @@ async fn one_message_writes_do_not_hold_w1_across_proxy_waits() {
     assert!(Outcome::per_second(typed_per_request.singles) <= ceiling);
     // 2. Latency alone, with requests in one flight, does not cause it.
     assert!(typed_faithful.total() >= 3.0 * typed_per_request.total());
-    // 3. One message per transaction removes it.
+    // 3. One Sync per transaction removes it: exactly one Sync for each
+    // write transaction, and no simple query on the success path.
     assert!(
-        message_per_request.share() <= 0.05,
+        single_sync_per_request.share() <= 0.05,
         "{:.3}",
-        message_per_request.share()
+        single_sync_per_request.share()
     );
-    assert!(message_per_request.total() >= 3.0 * typed_per_request.total());
+    assert!(single_sync_per_request.total() >= 3.0 * typed_per_request.total());
+    let transactions = (single_sync_per_request.singles + single_sync_per_request.batches) as usize;
+    assert_eq!(single_sync_per_request.syncs, transactions);
+    assert_eq!(single_sync_per_request.queries, 0);
+    // The typed transport sends a Sync per statement and two simple queries.
+    assert!(
+        typed_per_request.syncs > (typed_per_request.singles + typed_per_request.batches) as usize
+    );
     // 4. Nothing acknowledged is missing and nothing is half applied.
-    let acked: Vec<_> = [&typed_per_request, &typed_faithful, &message_per_request]
-        .iter()
-        .flat_map(|o| o.acked.iter().copied())
-        .collect();
+    let acked: Vec<_> = [
+        &typed_per_request,
+        &typed_faithful,
+        &single_sync_per_request,
+    ]
+    .iter()
+    .flat_map(|o| o.acked.iter().copied())
+    .collect();
     assert_all_or_nothing(&s, &acked).await;
-}
-
-#[tokio::test]
-async fn an_oversize_batch_through_the_per_request_proxy_takes_the_typed_path() {
-    let Some(s) = Schema::new(SETUP).await else {
-        return;
-    };
-    let proxy = Proxy::start(&s.base, Delay::PerRequest(D), Fault::None).await;
-    let pg = s.pg(Direct(proxy.config(&s.config())), WriteTx::Message);
-    // Nine 1 MB-blob rows render to about 18 MB, over the bound.
-    s.admin
-        .batch_execute(&format!("ALTER TABLE {}.w ADD COLUMN b bytea", s.name))
-        .await
-        .unwrap();
-    let blob = vec![0x5a_u8; 1_000_000];
-    let stmts = (0..BATCH_ROWS)
-        .map(|i| {
-            (
-                "INSERT INTO w VALUES (?1, ?2, ?3)",
-                vec![
-                    SqlValue::Int(1),
-                    SqlValue::Int(i),
-                    SqlValue::Blob(blob.clone()),
-                ],
-            )
-        })
-        .collect();
-    let before = oversize_fallbacks();
-    assert_eq!(pg.batch(stmts).await.unwrap(), [1; BATCH_ROWS as usize]);
-    assert_eq!(oversize_fallbacks(), before + 1);
-    assert_eq!(proxy.trace.lock().unwrap().messages, 0);
-    assert_all_or_nothing(&s, &[(1, BATCH_ROWS)]).await;
 }
