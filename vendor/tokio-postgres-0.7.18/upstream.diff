@@ -41,7 +41,7 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/lib.rs b/src/l
 diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/src/pipeline.rs
 --- a/src/pipeline.rs
 +++ b/src/pipeline.rs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,244 @@
 +//! Several extended-protocol statements sent as one request with a single
 +//! Sync (vendored addition, not part of upstream tokio-postgres 0.7.18).
 +//!
@@ -105,6 +105,21 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 +    /// The transaction status of the final ReadyForQuery (`b'I'`, `b'T'` or
 +    /// `b'E'`), or `None` if it was not received.
 +    pub status: Option<u8>,
++}
++
++/// Records an error that arrives after the request was sent as the
++/// outcome's error, so the caller still knows something was sent (and, for
++/// a transaction, must end it).
++macro_rules! or_record {
++    ($outcome:ident, $result:expr) => {
++        match $result {
++            Ok(value) => value,
++            Err(error) => {
++                $outcome.error = Some(($outcome.replies.len(), error));
++                return Ok($outcome);
++            }
++        }
++    };
 +}
 +
 +fn column_type(oid: u32) -> Type {
@@ -221,7 +236,7 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 +            Message::RowDescription(body) if columns.is_none() => {
 +                let mut described = Vec::new();
 +                let mut fields = body.fields();
-+                while let Some(field) = fields.next().map_err(Error::parse)? {
++                while let Some(field) = or_record!(outcome, fields.next().map_err(Error::parse)) {
 +                    described.push(Column {
 +                        name: field.name().to_string(),
 +                        table_oid: Some(field.table_oid()).filter(|n| *n != 0),
@@ -233,7 +248,9 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 +                columns = Some(Statement::unnamed(vec![], described));
 +            }
 +            Message::DataRow(body) => match &columns {
-+                Some(statement) if collect_rows => rows.push(Row::new(statement.clone(), body)?),
++                Some(statement) if collect_rows => {
++                    rows.push(or_record!(outcome, Row::new(statement.clone(), body)));
++                }
 +                Some(_) => {}
 +                None => {
 +                    outcome.error = Some((outcome.replies.len(), Error::unexpected_message()));
@@ -241,9 +258,10 @@ diff -ruN '--exclude=VENDORED.md' '--exclude=upstream.diff' a/src/pipeline.rs b/
 +                }
 +            },
 +            Message::CommandComplete(body) if columns.is_some() => {
-+                let tag = body.tag().map_err(Error::parse)?.to_string();
++                let tag = or_record!(outcome, body.tag().map_err(Error::parse)).to_string();
++                let rows_affected = or_record!(outcome, extract_row_affected(&body));
 +                outcome.replies.push(PipelineReply {
-+                    rows_affected: extract_row_affected(&body)?,
++                    rows_affected,
 +                    tag,
 +                    rows: std::mem::take(&mut rows),
 +                });

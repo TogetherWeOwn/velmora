@@ -63,6 +63,21 @@ pub struct PipelineOutcome {
     pub status: Option<u8>,
 }
 
+/// Records an error that arrives after the request was sent as the
+/// outcome's error, so the caller still knows something was sent (and, for
+/// a transaction, must end it).
+macro_rules! or_record {
+    ($outcome:ident, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => {
+                $outcome.error = Some(($outcome.replies.len(), error));
+                return Ok($outcome);
+            }
+        }
+    };
+}
+
 fn column_type(oid: u32) -> Type {
     Type::from_oid(oid)
         .unwrap_or_else(|| Type::new(format!("unknown oid {oid}"), oid, Kind::Pseudo, String::new()))
@@ -177,7 +192,7 @@ pub(crate) async fn pipeline_typed(
             Message::RowDescription(body) if columns.is_none() => {
                 let mut described = Vec::new();
                 let mut fields = body.fields();
-                while let Some(field) = fields.next().map_err(Error::parse)? {
+                while let Some(field) = or_record!(outcome, fields.next().map_err(Error::parse)) {
                     described.push(Column {
                         name: field.name().to_string(),
                         table_oid: Some(field.table_oid()).filter(|n| *n != 0),
@@ -189,7 +204,9 @@ pub(crate) async fn pipeline_typed(
                 columns = Some(Statement::unnamed(vec![], described));
             }
             Message::DataRow(body) => match &columns {
-                Some(statement) if collect_rows => rows.push(Row::new(statement.clone(), body)?),
+                Some(statement) if collect_rows => {
+                    rows.push(or_record!(outcome, Row::new(statement.clone(), body)));
+                }
                 Some(_) => {}
                 None => {
                     outcome.error = Some((outcome.replies.len(), Error::unexpected_message()));
@@ -197,9 +214,10 @@ pub(crate) async fn pipeline_typed(
                 }
             },
             Message::CommandComplete(body) if columns.is_some() => {
-                let tag = body.tag().map_err(Error::parse)?.to_string();
+                let tag = or_record!(outcome, body.tag().map_err(Error::parse)).to_string();
+                let rows_affected = or_record!(outcome, extract_row_affected(&body));
                 outcome.replies.push(PipelineReply {
-                    rows_affected: extract_row_affected(&body)?,
+                    rows_affected,
                     tag,
                     rows: std::mem::take(&mut rows),
                 });

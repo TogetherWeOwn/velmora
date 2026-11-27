@@ -555,3 +555,35 @@ async fn copy_is_refused_before_sending_and_a_sync_error_has_the_full_count() {
     assert_eq!(o.status, Some(b'I'));
     assert_eq!(s.count("d").await, 0);
 }
+
+#[tokio::test]
+async fn a_reply_error_after_sending_is_an_outcome_not_an_err() {
+    let Some(s) = Schema::new(SETUP).await else {
+        return;
+    };
+    let proxy = Proxy::start(&s.base, Delay::None, Fault::BadDataRow).await;
+    let client = connect(&proxy.config(&s.config())).await;
+    let stmts = [
+        stmt("BEGIN READ WRITE"),
+        stmt("SELECT 1::int8"),
+        stmt("COMMIT"),
+    ];
+    // Sent: the caller must learn that, with the index, to end the
+    // transaction.
+    let o = client
+        .pipeline_typed(&stmts, true)
+        .await
+        .expect("sent, so an outcome");
+    let (index, error) = o.error.as_ref().expect("the malformed row");
+    assert_eq!(*index, 1);
+    assert!(error.as_db_error().is_none());
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT 6::int8", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        6
+    );
+}

@@ -381,6 +381,16 @@ class PgMigrate(unittest.TestCase):
         # A removed extension setting leaves an empty placeholder: no longer
         # a refusal.
         self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        # An explicit pgaudit.log = 'none' logs nothing: accepted.
+        psql("ALTER SYSTEM SET pgaudit.log = 'none'")
+        psql("SELECT pg_reload_conf()")
+        try:
+            reloaded("pgaudit.log", "none")
+            self.assertIn("Schema matches D1", self.migrate("--verify").stdout)
+        finally:
+            psql("ALTER SYSTEM RESET pgaudit.log")
+            psql("SELECT pg_reload_conf()")
+            reloaded("pgaudit.log", "")
 
     def test_import_mode_applies_the_statement_triggers_before_activation(self):
         self.migrate("--to", "0001", "--import-mode")

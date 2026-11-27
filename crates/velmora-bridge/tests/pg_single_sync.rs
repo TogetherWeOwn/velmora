@@ -221,6 +221,22 @@ async fn a_commit_without_an_idle_session_is_an_unexpected_shape() {
 }
 
 #[tokio::test]
+async fn a_reply_the_driver_cannot_parse_after_sending_still_ends_the_transaction() {
+    let Some(s) = schema().await else { return };
+    // The request was sent (and here committed); a malformed row in the
+    // reply is an unknown outcome, and the adapter still sends ROLLBACK.
+    let (proxy, pg) = proxied(&s, Fault::BadDataRow).await;
+    let r = pg
+        .query("INSERT INTO m(n) VALUES (?1) RETURNING n", &[int(1)])
+        .await;
+    assert!(
+        matches!(&r, Err(BridgeError::Sql(e)) if e == FAILED),
+        "{r:?}"
+    );
+    assert_eq!(proxy.trace.lock().unwrap().rollbacks, 1, "ROLLBACK sent");
+}
+
+#[tokio::test]
 async fn an_error_in_place_of_commit_is_statement_failed() {
     let Some(s) = schema().await else { return };
     let (_proxy, pg) = proxied(&s, Fault::RejectCommit).await;

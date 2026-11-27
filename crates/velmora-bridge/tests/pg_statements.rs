@@ -625,12 +625,24 @@ async fn statements_constraints_and_triggers_that_can_log_secret_rows_are_pinned
             row.get::<_, String>(1)
         ));
     }
-    let pinned: BTreeSet<String> = SECRET_ROW_WRITES
+    let mut pinned = BTreeSet::new();
+    for line in SECRET_ROW_WRITES
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_owned)
-        .collect();
+    {
+        let (entry, reason) = match line.split_once(" # ") {
+            Some((entry, reason)) => (entry, reason.trim()),
+            None => (line, ""),
+        };
+        let needs_reason = entry.starts_with("not-null ")
+            || (entry.starts_with("constraint ") && entry.ends_with(" c"));
+        assert!(
+            !needs_reason || !reason.is_empty(),
+            "no reason for: {entry}"
+        );
+        pinned.insert(entry.to_owned());
+    }
     let added: Vec<_> = actual.difference(&pinned).collect();
     let removed: Vec<_> = pinned.difference(&actual).collect();
     assert!(
