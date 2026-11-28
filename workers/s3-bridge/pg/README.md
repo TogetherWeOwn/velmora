@@ -171,7 +171,9 @@ exactly stages `0001`–`0003`.
 
 PostgreSQL backups include this table. CORS configuration is not part of
 object recovery records; after rebuilding from those records, submit the
-configuration again with `put-bucket-cors`.
+configuration again with `put-bucket-cors`. Turning `BUCKET_CORS` off leaves
+stored configurations in place, so use `delete-bucket-cors` first if you want
+to remove them.
 
 ## Usage counters
 
