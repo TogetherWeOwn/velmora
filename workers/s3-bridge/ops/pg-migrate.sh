@@ -233,11 +233,13 @@ def execute_migration(source_statements):
 
 SQL_TOKEN = re.compile(r'''\s+|--[^\n]*|/\*|\$(?:[A-Za-z_]\w*)?\$|
     [eE]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'|"(?:""|[^"])*"|
-    [\w$]+|::|<>|!=|>=|<=|!~|.''', re.X | re.S)
+    [\w$]+|::|<>|!=|>=|<=|!~|.''', re.X | re.S | re.ASCII)
 
 
-def sql_tokens_with_spans(sql):
+def sql_tokens_with_spans(sql, *, ascii_only=True):
     """Keep literals and dollar bodies intact; omit comments with source spans."""
+    if ascii_only and not sql.isascii():
+        raise ValueError('non-ASCII SQL cannot be tokenized')
     i = 0
     while i < len(sql):
         start = i
@@ -269,7 +271,9 @@ def sql_tokens_with_spans(sql):
 
 
 def sql_tokens(sql):
-    for token, _, _ in sql_tokens_with_spans(sql):
+    # Read-only schema comparison also consumes historical SQLite metadata.
+    # It can contain non-ASCII comments and is never sent to psql.
+    for token, _, _ in sql_tokens_with_spans(sql, ascii_only=False):
         yield token
 
 
@@ -558,7 +562,14 @@ def main():
     migrations, declarations = {}, {}
     post_cutover = {kind: set() for kind in ('tables', 'columns', 'indexes')}
     for version, (name, body) in files.items():
-        sql = body.decode()
+        # Limit all numbered PostgreSQL files before parsing or reading any
+        # connection file. SQLite-only inputs never reach psql.
+        bad = re.search(rb'[\x00\\\x80-\xff]', body)
+        if bad:
+            kind = {b'\x00': 'NUL byte', b'\\': 'backslash'}.get(bad[0], 'non-ASCII byte')
+            line = body.count(b'\n', 0, bad.start()) + 1
+            die(f'{name}:{line}: {kind} in migration SQL')
+        sql = body.decode('ascii')
         no_tx = sql.splitlines()[:1] == ['-- velmora: no-transaction']
         if no_tx and version in {'0001', '0002'}:
             die('baseline stages must be transactional')
@@ -598,12 +609,15 @@ SET LOCAL client_min_messages = error;
 
     one_message_checked = False
 
-    def run(sql, *, retry=False, report=None, one_message=False):
+    def run(sql, *, retry=False, report=None, one_message=False, concurrent=False):
         nonlocal one_message_checked
+        messages = (sql,) if one_message else sql if concurrent else ()
         # Linux rejects one argv string of 128 KiB or more (MAX_ARG_STRLEN, with its NUL).
-        if one_message and len(sql.encode()) >= 128 * 1024:
-            die(f'{report}: one-message batch is {len(sql.encode())} bytes; psql -c takes under 128 KiB, '
-                'so split the migration into smaller files')
+        for message in messages:
+            size = len(message.encode())
+            if size >= 128 * 1024:
+                die(f'{report}: one-message batch is {size} bytes; psql -c takes under 128 KiB, '
+                    'so split the migration into smaller files')
         if one_message and not one_message_checked:
             version = subprocess.run(['psql', '--version'], stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, check=False)
@@ -615,8 +629,10 @@ SET LOCAL client_min_messages = error;
             command = ['psql', '-X', '-qAtw', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate']
             kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True,
                       'encoding': 'utf-8', 'errors': 'replace', 'env': env, 'check': False}
-            if one_message:
-                command += ['-c', sql]
+            if messages:
+                for message in messages:
+                    command.extend(('-c', message))
+                kwargs['stdin'] = subprocess.DEVNULL
             else:
                 kwargs['input'] = prefix + sql
             result = subprocess.run(command, **kwargs)
@@ -626,6 +642,8 @@ SET LOCAL client_min_messages = error;
             # The severity word comes from the server's locale even in SQLSTATE mode.
             states = re.findall(r':[^\S\n]+([0-9A-Z]{5})[^\S\n]*$', result.stderr, re.M)
             state = states[-1] if states else None
+            if concurrent and state == 'VL020':
+                return 'already applied'  # Caller independently confirms the ledger row.
             if state == '55P03' and retry and attempt < 5:
                 print(f'{report}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                 time.sleep(0.25 * (2 ** attempt))
@@ -640,14 +658,6 @@ SET LOCAL client_min_messages = error;
     migrator_session = ("SET lock_timeout = '3s';\n"
                         f"SELECT pg_try_advisory_lock('{migration_lock}'::bigint) AS migrator_locked \\gset\n"
                         '\\if :migrator_locked\n\\else\n' + check('true', '55P03') + '\\endif\n')
-    online_limits = f'''SELECT {USAGE} AS online, current_setting('server_version_num')::int >= 170000 AS pg17 \\gset
-\\if :online
-    SET LOCAL statement_timeout = '3s';
-    \\if :pg17
-        SET LOCAL transaction_timeout = '3s';
-    \\endif
-\\endif
-'''
     ledger_create, ledger_revoke = LEDGER.rstrip().split(';\n', 1)
     online_migrator_session = ("SET lock_timeout = '3s';\nDO $velmora_migrator$ BEGIN IF NOT pg_try_advisory_lock('" +
                                f"{migration_lock}'::bigint) THEN RAISE EXCEPTION USING ERRCODE = '55P03'; END IF; END $velmora_migrator$;\n")
@@ -656,7 +666,7 @@ SET LOCAL client_min_messages = error;
                          "IF current_setting('server_version_num')::int >= 170000 THEN "
                          "EXECUTE 'SET LOCAL transaction_timeout = ''3s'''; END IF; "
                          "END IF; END $velmora_limits$;\n")
-    migration_tx = begin + ('' if args.import_mode else online_limits)
+    concurrent_tx = begin + ('' if args.import_mode else online_limits_sql)
     ledger_exists = "to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL"
     fingerprints = ', '.join(f"('{v}', '{digest(body)}')" for v, (_, body) in files.items())
     history = check(f'''EXISTS (SELECT FROM schema_migrations m WHERE NOT EXISTS (
@@ -713,8 +723,33 @@ $$;
         if version > target:
             break
         sql, no_tx, parsed = migrations[version]
-        statements, source_statements = parsed
-        if not args.import_mode and not no_tx:
+        _, source_statements = parsed
+        record = (f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
+                  "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+        if no_tx:
+            # Each statement gets a SQL-only -c in one psql session. W1 is
+            # released during CIC; the session migrator lock stays held.
+            applied = f"EXISTS (SELECT FROM schema_migrations WHERE version = '{version}')"
+            prepare = (prefix + online_migrator_session + concurrent_tx
+                       + check(f'NOT ({ledger_exists})', 'VL017') + history)
+            if args.import_mode:
+                prepare += check(f'{MARKER} IS NULL OR {USAGE} OR NOT ({SEEDS})', 'VL013')
+            else:
+                prepare += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+            # ON_ERROR_STOP ends the session without running any queued -c if
+            # this version is already applied. Confirm that outcome separately.
+            prepare += check(applied, 'VL020') + check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
+            finish = concurrent_tx + check(BAD_INDEX, 'VL015') + record + "\nCOMMIT;\nSELECT 'applied';\n"
+            output = run([prepare, *source_statements, finish], retry=True, report=name, concurrent=True).splitlines()
+            if output == ['already applied']:
+                confirmed = run(read_history + f'SELECT {applied};\nCOMMIT;\n', report=name)
+                if confirmed != 't':
+                    die(f'{name}: ledger does not confirm the concurrent migration was already applied')
+            elif not output or output[-1] != 'applied':
+                die(f'{name}: no migration status returned')
+            print(f'{name}: {output[-1]}', flush=True)
+            continue
+        if not args.import_mode:
             # psql metacommands cannot be part of a -c simple-query message.
             # Keep the branch and status inside SQL so the wrapper and every
             # migration statement reach the server in one network message.
@@ -737,9 +772,7 @@ $$;
                           "RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;\n")
             batch += "    PERFORM set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
             batch += execute_migration(source_statements)
-            batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '')
-                             + f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
-                             "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+            batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '') + record)
             # The lint cannot see a computed setting name, so commit only with the ledger row present.
             batch += check(f"NOT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}')", 'VL018')
             batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
@@ -748,39 +781,27 @@ $$;
                 die(f'{name}: no migration status returned')
             print(f'{name}: {output[-1]}', flush=True)
             continue
-        batch = migrator_session + migration_tx
+        # Transactional offline/import stages keep the existing stdin runner.
+        # Only the runner's own text can contain psql metacommands.
+        batch = migrator_session + begin
         batch += f'SELECT {ledger_exists} AS ledger_exists \\gset\n\\if :ledger_exists\n\\else\n'
         batch += LEDGER + '\n\\endif\n' if version == '0001' else check('true', 'VL017') + '\\endif\n'
         batch += history
         batch += f"SELECT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') AS applied \\gset\n"
-        if version >= '0002' and args.import_mode:
+        if version >= '0002':
             batch += check(f'{MARKER} IS NULL OR {USAGE} OR NOT ({SEEDS})', 'VL013')
-        if not args.import_mode:
-            batch += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
         batch += '\\if :applied\n'
-        if args.import_mode and target == '0001':
+        if target == '0001':
             batch += import_pre
         batch += '\\echo already applied\n\\else\n'
         if version == '0001':
             batch += check(f'{USAGE} OR {MARKER} IS NOT NULL', 'VL012')
-        if version == '0002' and not args.import_mode:
-            batch += check(f'{MARKER} IS NOT NULL OR NOT ({SEEDS})', 'VL014')
-        if no_tx:
-            # Release W1 before CIC may wait for old snapshots; keep only the
-            # session migrator lock until the ledger transaction commits.
-            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
         batch += sql + '\n'
-        if no_tx:
-            batch += migration_tx + check(BAD_INDEX, 'VL015')
-        if version == '0002' and args.import_mode:
+        if version == '0002':
             batch += RESTART_IDENTITIES
         if version == '0001':
-            batch += import_pre if args.import_mode else ''
-            if not args.import_mode:
-                batch += 'INSERT INTO usage_global(id) VALUES (1), (2);\n'
-        batch += (f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
-                  f"(extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
-                  '\\echo applied\n\\endif\nCOMMIT;\n')
+            batch += import_pre
+        batch += record + '\n\\echo applied\n\\endif\nCOMMIT;\n'
         output = run(batch, retry=True, report=name).splitlines()
         if not output or output[-1] not in {'applied', 'already applied'}:
             die(f'{name}: no migration status returned')

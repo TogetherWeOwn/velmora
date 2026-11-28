@@ -80,7 +80,8 @@ DDL; it is not the import activation procedure.
 
 Each numbered PostgreSQL file is applied once and recorded with its SHA-256.
 Do not edit an applied migration. Ordinary files are atomic; leave transaction
-control and psql metacommands to the runner. Use dollar-quoted routine bodies
+control and psql metacommands to the runner. Numbered PostgreSQL migrations
+must be ASCII and cannot contain backslashes or NUL bytes. Use dollar-quoted routine bodies
 and unqualified catalogue object names so the same DDL works in each target
 schema. A `55P03` lock timeout retries up to five times after the initial
 attempt, with backoff. A statement or transaction budget expiry is not retried.
@@ -97,6 +98,8 @@ count against the budget; this needs psql 15 or newer and a batch under
 
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
+Each statement travels through a separate SQL `psql -c` argument in the same
+session, not through the psql command interpreter on stdin.
 Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
 session lock without waiting in PostgreSQL with a snapshot. A failed

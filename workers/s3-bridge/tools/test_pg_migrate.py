@@ -265,6 +265,22 @@ class MigrationParser(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('SQLite twin 0004_example.sql does not add the declared columns', result.stderr)
 
+    def test_pg_file_refuses_non_ascii_bytes_and_every_backslash(self):
+        cases = (
+            ('CREATE\u00a0INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id);', 'non-ASCII byte'),
+            ('-- \\!\nCREATE INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id);', 'backslash'),
+            ('\\!\nCREATE INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id);', 'backslash'),
+            ('-- \x00\nCREATE INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id);', 'NUL byte'),
+        )
+        for sql, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic, comment=sql.startswith('--')), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_bad.sql', '-- velmora: no-transaction\n' + sql,
+                              'CREATE INDEX fixture_idx ON extents(id);')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'0004_bad.sql:2: {diagnostic} in migration SQL', result.stderr)
+
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
         # This fails before any connection, so the port need not be listening.
@@ -451,6 +467,56 @@ class PgMigrate(unittest.TestCase):
         self.owner_sql('CREATE TABLE extra_extents () INHERITS (extents);')
         verify = self.migrate('--verify', ok=False)
         self.assertIn('historical catalogue tables cannot have inherited children: extents', verify.stderr)
+
+    def test_concurrent_indexes_are_separate_sql_arguments_in_one_psql_session(self):
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_concurrent.sql'
+            sql = ('CREATE INDEX IF NOT EXISTS fixture_extent_id ON extents(id);\n'
+                   'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n')
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            shim = Path(tmp) / 'psql'
+            observations = Path(tmp) / 'observations.txt'
+            shim.write_text(f"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+commands = [value for flag, value in zip(sys.argv, sys.argv[1:]) if flag == '-c']
+counts = [command.count('CREATE INDEX CONCURRENTLY') for command in commands
+          if 'CREATE INDEX CONCURRENTLY' in command]
+if counts:
+    with Path({str(observations)!r}).open('a') as log:
+        log.write(str(counts) + '\\n')
+os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
+""")
+            shim.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}")
+            self.assertIn(f'{name}: applied', self.migrate(script=script, env=env).stdout)
+            self.assertTrue(observations.exists(), 'concurrent SQL did not travel in -c arguments')
+            self.assertEqual(observations.read_text().splitlines(), ['[1, 1]'])
+            self.assertIn(f'{name}: already applied', self.migrate(script=script, env=env).stdout)
+            self.assertEqual(self.ledger(), [*STAGES, '0004'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script, env=env).stdout)
+
+    def test_failed_concurrent_statement_leaves_migration_pending(self):
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_concurrent.sql'
+            twin = ('CREATE INDEX fixture_extent_id ON extents(id);\n'
+                    'CREATE INDEX fixture_extent_bucket ON extents(bucket_id);\n')
+            pg = ('-- velmora: no-transaction\n' + twin.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY IF NOT EXISTS')
+                  .replace('(bucket_id)', '(missing_test_column)'))
+            add_migration(script, name, pg, twin)
+            result = self.migrate(script=script, ok=False)
+            self.assertIn(f'{name}: SQLSTATE 42703', result.stderr)
+            self.assertEqual(self.ledger(), STAGES)
+            pending = self.migrate('--pending', script=script, ok=False)
+            self.assertEqual((pending.returncode, pending.stdout), (3, name + '\n'))
 
     def test_full_shipped_chain_verifies(self):
         self.migrate(script=MIGRATE)
