@@ -532,9 +532,9 @@ impl BlobStore for R2Blobs {
             };
             let page = req.execute().await.map_err(blob_err("list"))?;
             keys.extend(page.objects().iter().map(worker::Object::key));
-            cursor = match (page.truncated(), page.cursor()) {
-                (true, Some(c)) => Some(c),
-                _ => break,
+            cursor = match next_cursor(page.truncated(), page.cursor())? {
+                Some(c) => Some(c),
+                None => break,
             };
         }
         Ok(keys)
@@ -567,21 +567,41 @@ impl BlobStore for R2Blobs {
                 size: o.size(),
                 md5: o.etag(),
             }));
-            cursor = match (page.truncated(), page.cursor()) {
-                (true, Some(c)) => Some(c),
-                (true, None) => {
-                    return Err(BridgeError::Blob("list: more to come and no cursor".into()))
-                }
-                (false, _) => break,
+            cursor = match next_cursor(page.truncated(), page.cursor())? {
+                Some(c) => Some(c),
+                None => break,
             };
         }
         Ok(entries)
     }
 }
 
+/// Where a listing goes on after a page: `Some` = ask again from this
+/// cursor, `None` = the last page. A page that says "more to come"
+/// (`truncated`) and gives no cursor is an error, never the end: a
+/// listing that stopped there would be silently incomplete.
+fn next_cursor(truncated: bool, cursor: Option<String>) -> Result<Option<String>> {
+    match (truncated, cursor) {
+        (true, Some(c)) => Ok(Some(c)),
+        (true, None) => Err(BridgeError::Blob("list: more to come and no cursor".into())),
+        (false, _) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_with_more_and_no_cursor_is_an_error() {
+        assert_eq!(
+            next_cursor(true, Some("c1".into())).unwrap(),
+            Some("c1".into())
+        );
+        assert_eq!(next_cursor(false, None).unwrap(), None);
+        assert_eq!(next_cursor(false, Some("stale".into())).unwrap(), None);
+        assert!(matches!(next_cursor(true, None), Err(BridgeError::Blob(_))));
+    }
     use velmora_bridge::{BucketId, ExtentId};
 
     #[test]
