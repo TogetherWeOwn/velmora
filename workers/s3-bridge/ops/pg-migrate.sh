@@ -820,7 +820,7 @@ SET {scope}client_min_messages = error;
         candidates = [(i, pos) for i, parts in enumerate(statements)
                       if (pos := index_guard_position(parts)) is not None]
         if not candidates:
-            return None, source_statements
+            return None, source_statements, ()
         try:
             expected = [index_definition(statements[i], schema, source=True) for i, _ in candidates]
             snapshot = pending_index_snapshot([definition[0] for definition in expected])
@@ -832,26 +832,31 @@ SET {scope}client_min_messages = error;
             if not isinstance(observed, list) or len(observed) != len(expected):
                 # The already-applied read-only fast path also lands here.
                 # The locked apply decision must confirm applied, not run DDL.
-                return 'true', []
+                return 'true', [], ()
             commands = list(source_statements)
+            reused = []
             for (i, pos), definition, actual in zip(candidates, expected, observed):
                 if actual is None:
                     commands[i] = require_new_index(commands[i], pos)
-                elif (isinstance(actual, list) and len(actual) == 2 and isinstance(actual[1], str)
+                elif (isinstance(actual, list) and len(actual) == 2 and isinstance(actual[0], str)
+                      and re.fullmatch(r'[0-9]{1,10}', actual[0])
+                      and isinstance(actual[1], str)
                       and index_definition([token for token, _, _ in sql_tokens_with_spans(actual[1])], schema)
                       == definition):
                     commands[i] = None
+                    # Table, index OID, name and the digest of the raw deparse.
+                    reused.append((definition[2], actual[0], definition[0], digest(actual[1].encode('utf-8'))))
                 else:
-                    return 'true', []
+                    return 'true', [], ()
         except ValueError:
-            return 'true', []
+            return 'true', [], ()
         # Revalidate the same OIDs, raw deparse text, and absences after
         # acquiring the migrator lock. Hex keeps catalog text out of the SQL
         # grammar and the wrapper's dollar quote.
         raw = raw_snapshot.encode('utf-8').hex()
         expected_snapshot = f"pg_catalog.convert_from(pg_catalog.decode('{raw}', 'hex'), 'UTF8')"
         changed = f'{snapshot}::pg_catalog.text COLLATE pg_catalog."C" IS DISTINCT FROM {expected_snapshot}'
-        return changed, [statement for statement in commands if statement is not None]
+        return changed, [statement for statement in commands if statement is not None], tuple(reused)
 
     def index_fence(condition, code, *, online=False):
         if condition is None:
@@ -859,6 +864,29 @@ SET {scope}client_min_messages = error;
         if online:
             condition = f'{APPLY} AND ({condition})'
         return index_deparse_path + check(condition, code) + f'SET LOCAL search_path TO "{schema}", pg_temp;\n'
+
+    def reuse_guard(reused, code, *, online=False):
+        """In the ledger transaction, hold every reused index's table against
+        DROP INDEX [CONCURRENTLY], then require the OID, validity and raw
+        deparse recorded at the fence. Without this, an index dropped after
+        the fence would still be recorded as applied."""
+        if not reused:
+            return ''
+        tables = ', '.join(f'"{schema}"."{table}"' for table in sorted({table for table, *_ in reused}))
+        lock = f'LOCK TABLE ONLY {tables} IN SHARE UPDATE EXCLUSIVE MODE;'
+        if online:
+            lock = f'IF {APPLY} THEN {lock} END IF;'
+        # A digest keeps the deparse text out of the size-capped arguments.
+        changed = ' OR '.join(f'''NOT EXISTS (SELECT FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+            WHERE c.oid = '{oid}'::pg_catalog.oid AND c.relnamespace = {namespace} AND c.relname = '{name}'
+                AND i.indisvalid AND i.indisready AND pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+                    pg_catalog.pg_get_indexdef(c.oid), 'UTF8')), 'hex') = '{definition}')'''
+            for _, oid, name, definition in reused)
+        return ("SET LOCAL lock_timeout = '30s';\n"
+                f'DO $velmora_reuse$ BEGIN {lock} EXCEPTION WHEN lock_not_available OR undefined_table THEN '
+                f"RAISE EXCEPTION USING ERRCODE = '{code}'; END $velmora_reuse$;\n"
+                "SET LOCAL lock_timeout = '3s';\n" + index_fence(changed, code, online=online))
 
     if args.pending:
         applied = set(run(read_history + f"SELECT version FROM {ledger};\nCOMMIT;\n",
@@ -909,9 +937,9 @@ $$;
             break
         sql, no_tx, parsed = migrations[version]
         statements, source_statements = parsed
-        index_condition = None
+        index_condition, reused = None, ()
         if no_tx or version > CUTOVER_BASELINE:
-            index_condition, source_statements = index_plan(version, name, statements, source_statements)
+            index_condition, source_statements, reused = index_plan(version, name, statements, source_statements)
         record = (f"INSERT INTO {ledger} VALUES ('{version}', '{digest(body)}', "
                   "(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::bigint);")
         if no_tx:
@@ -928,7 +956,8 @@ $$;
             # this version is already applied. Confirm that outcome separately.
             prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
             prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
-            finish = (concurrent_tx + check(bad_index, 'VL015') + path_check + record
+            # Check reused indexes first: a reused index made invalid is VL021, not VL015.
+            finish = (concurrent_tx + reuse_guard(reused, 'VL021') + check(bad_index, 'VL015') + path_check + record
                       + "\nCOMMIT;\nSELECT 'applied';\n")
             output = run([prepare, *source_statements, finish], retry=True, report=name, concurrent=True).splitlines()
             if output == ['already applied']:
@@ -965,7 +994,7 @@ $$;
             batch += execute_migration(source_statements)
             if version == '0001':
                 batch += guarded(f'INSERT INTO {usage_global}(id) VALUES (1), (2);')
-            batch += path_check + guarded(record)
+            batch += reuse_guard(reused, 'VL022', online=True) + path_check + guarded(record)
             # The lint cannot see a computed setting name, so commit only with the ledger row present.
             batch += check(f"NOT EXISTS (SELECT FROM {ledger} WHERE version = '{version}')", 'VL018')
             batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
@@ -995,7 +1024,7 @@ $$;
             batch += RESTART_IDENTITIES.format(schema=schema)
         if version == '0001':
             batch += import_pre
-        batch += path_check + record + '\n\\echo applied\n\\endif\nCOMMIT;\n'
+        batch += reuse_guard(reused, 'VL022') + path_check + record + '\n\\echo applied\n\\endif\nCOMMIT;\n'
         output = run(batch, retry=True, report=name).splitlines()
         if not output or output[-1] not in {'applied', 'already applied'}:
             die(f'{name}: no migration status returned')
