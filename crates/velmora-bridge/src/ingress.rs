@@ -42,8 +42,9 @@ use velmora_s3_proto::{is_aws_chunked, DecodedUpload, ErrorCode, UploadValidator
 
 use crate::config::BridgeConfig;
 use crate::crypto::{ExtentSealer, SealedStream};
-use crate::service::{classify, Route};
-use crate::types::{Body, BridgeError, ByteStream, S3Request, S3Response};
+use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::service::{classify, preflight_bucket, ActualRequest, Route};
+use crate::types::{Body, BridgeError, ByteStream, Method, S3Request, S3Response};
 
 /// How long a request may wait for budget before `503 SlowDown`.
 pub const CHARGE_WAIT_MS: u32 = 20_000;
@@ -571,6 +572,73 @@ where
     F: FnOnce(S3Request) -> Fut,
     Fut: core::future::Future<Output = S3Response>,
 {
+    front_inner(req, cfg, https, false, handle, |_, error| async move {
+        error.response()
+    })
+    .await
+}
+
+/// Worker ingress using the bridge's effective CORS switch and cache.
+/// The only unsigned S3 exception is the shared, bodyless preflight route.
+pub async fn front_with_bucket_cors<C, B, N, J, K, T, F, Fut>(
+    req: S3Request,
+    bridge: &Bridge<C, B, N, J, K, T>,
+    https: bool,
+    handle: F,
+) -> S3Response
+where
+    C: Catalog,
+    B: BlobStore,
+    N: NntpConnector,
+    J: JobSink,
+    K: Kek,
+    T: Clock,
+    F: FnOnce(S3Request) -> Fut,
+    Fut: core::future::Future<Output = S3Response>,
+{
+    let enabled = bridge.catalog.bucket_cors_enabled();
+    let vary_read = enabled && matches!(req.method, Method::Get | Method::Head);
+    let mut response = front_inner(
+        req,
+        &bridge.cfg,
+        https,
+        enabled,
+        handle,
+        |req, error| async move {
+            let mut response = error.response();
+            let actual = if enabled && error != IngressError::InsecureTransport {
+                ActualRequest::from_request(&bridge.cfg, &req)
+            } else {
+                None
+            };
+            drop(req);
+            if let Some(actual) = actual {
+                actual.apply(bridge, &mut response).await;
+            }
+            response
+        },
+    )
+    .await;
+    if vary_read {
+        response.vary_on_origin();
+    }
+    response
+}
+
+async fn front_inner<F, Fut, R, Refused>(
+    req: S3Request,
+    cfg: &BridgeConfig,
+    https: bool,
+    bucket_cors: bool,
+    handle: F,
+    refuse: R,
+) -> S3Response
+where
+    F: FnOnce(S3Request) -> Fut,
+    Fut: core::future::Future<Output = S3Response>,
+    R: FnOnce(S3Request, IngressError) -> Refused,
+    Refused: core::future::Future<Output = S3Response>,
+{
     // A sub-range request between invocations carries no S3 credential:
     // its token is its whole authority, and the handler checks it.
     if crate::fanout::is_internal_target(&req.raw_target) {
@@ -579,10 +647,10 @@ where
     let admin = is_admin_target(&req.raw_target);
     let checked = {
         let route = classify(&req.method, &req.raw_target);
-        precheck(&route, &req, cfg, https)
+        precheck_inner(&route, &req, cfg, https, bucket_cors)
     };
     let mut resp = match checked {
-        Err(e) => e.response(),
+        Err(e) => refuse(req, e).await,
         Ok(()) => handle(req).await,
     };
     if admin {
@@ -603,13 +671,24 @@ pub fn precheck(
     cfg: &BridgeConfig,
     https: bool,
 ) -> Result<(), IngressError> {
+    precheck_inner(route, req, cfg, https, false)
+}
+
+fn precheck_inner(
+    route: &Route<'_>,
+    req: &S3Request,
+    cfg: &BridgeConfig,
+    https: bool,
+    bucket_cors: bool,
+) -> Result<(), IngressError> {
     if !https && !cfg.dev_trust_http {
         return Err(IngressError::InsecureTransport);
     }
     match route {
         Route::Admin { .. } => check_admin(req, cfg)?,
-        _ if !has_s3_credential(req) => return Err(IngressError::AccessDenied),
-        _ => {}
+        _ if has_s3_credential(req) => {}
+        _ if bucket_cors && preflight_bucket(cfg, req).is_some() => {}
+        _ => return Err(IngressError::AccessDenied),
     }
     // A copy names its source in a header and has no body, so it need not
     // declare a length. The handler refuses one that declares a body.

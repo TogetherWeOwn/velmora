@@ -156,7 +156,7 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     let permits = PermitMode::from_var(get(PERMITS).as_deref())?;
     let sharding = GateSharding::from_var(get(PERMIT_GATES).as_deref())?;
     let shards = shards_from_var(get(PERMIT_SHARDS).as_deref())?;
-    let catalog = match env.durable_object(GATE_BINDING) {
+    let mut catalog = match env.durable_object(GATE_BINDING) {
         Ok(namespace) => SqlCatalog::with_gate(
             catalog,
             GateClient::new(
@@ -174,6 +174,11 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
         }
         Err(_) => SqlCatalog::new(catalog),
     };
+    match get("BUCKET_CORS").as_deref().map(str::trim) {
+        None | Some("") | Some("off") => {}
+        Some("on") => catalog.enable_bucket_cors().map_err(|e| e.to_string())?,
+        Some(_) => return Err("invalid BUCKET_CORS".into()),
+    }
     Ok(Bridge {
         catalog,
         safety: R2Blobs::new(env.bucket("SAFETY").map_err(binding("SAFETY"))?)

@@ -1805,6 +1805,18 @@ pub fn local_request_id(now_ms: u64, random: u32) -> String {
 }
 
 impl S3Response {
+    /// Add the Origin cache selector without changing an existing Vary value.
+    pub fn vary_on_origin(&mut self) {
+        if !self.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("vary")
+                && value
+                    .split(',')
+                    .any(|v| v.trim() == "*" || v.trim().eq_ignore_ascii_case("Origin"))
+        }) {
+            self.headers.push(("vary".into(), "Origin".into()));
+        }
+    }
+
     /// S3 XML error document. `code` and `message` must be static text,
     /// never request data.
     pub fn error(status: u16, code: &str, message: &str) -> S3Response {

@@ -141,23 +141,26 @@ pub(super) async fn bucket_in_use<S: Sql>(c: &SqlCatalog<S>, bucket: &BucketId) 
     }
 }
 
-/// See [`crate::ports::Catalog::delete_bucket`]. The guards and the two
-/// deletes are one batch: a write that raises a floor, opens an upload
-/// or stages an extent commits before it (and the guard then fails) or
-/// after it (and then finds no bucket).
+/// See [`crate::ports::Catalog::delete_bucket`]. The guards and deletes
+/// are one batch: a write commits before it (and this batch either cleans
+/// up CORS or refuses a nonempty bucket) or after it (and finds no bucket).
 pub(super) async fn delete_bucket<S: Sql>(c: &SqlCatalog<S>, b: &Bucket) -> Result<Guard<()>> {
     let id = || vec![text(b.id.as_str())];
-    guarded(
-        c,
-        vec![
-            (GUARD_BUCKET_ID, vec![text(b.id.as_str()), text(&b.name)]),
-            guard_no_replay(),
-            (GUARD_EMPTY_BUCKET, id()),
-            (DELETE_BUCKET_GRANTS, id()),
-            (DELETE_BUCKET, id()),
-        ],
-    )
-    .await
+    let mut stmts = vec![
+        guard_bucket_id(b),
+        guard_no_replay(),
+        (GUARD_EMPTY_BUCKET, id()),
+        (DELETE_BUCKET_GRANTS, id()),
+    ];
+    if c.cors_enabled {
+        stmts.push((super::cors::DELETE_BUCKET_CORS, id()));
+    }
+    stmts.push((DELETE_BUCKET, id()));
+    guarded(c, stmts).await
+}
+
+pub(super) fn guard_bucket_id(b: &Bucket) -> (&'static str, Vec<SqlValue>) {
+    (GUARD_BUCKET_ID, vec![text(b.id.as_str()), text(&b.name)])
 }
 
 /// Buckets the key holds a grant on, by name. Empty for a disabled key.

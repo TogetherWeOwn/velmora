@@ -145,6 +145,7 @@ impl Target {
                     | "uploadId"
                     | "partNumber"
                     | "location"
+                    | "cors"
                     | "delete"
                     | "list-type"
                     | "prefix"

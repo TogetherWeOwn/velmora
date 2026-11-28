@@ -183,6 +183,34 @@ fn error_class(e: FanoutError) -> &'static str {
     }
 }
 
+fn carry_cors_on_error(
+    mut error: S3Response,
+    original: &[(String, String)],
+    enabled: bool,
+) -> S3Response {
+    if enabled {
+        // Only copy decorations from the original CORS GET. The error
+        // supplies its own entity headers and retry instructions.
+        let names = [
+            "vary",
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "access-control-expose-headers",
+        ];
+        error.headers.extend(
+            original
+                .iter()
+                .filter(|(name, _)| {
+                    names
+                        .iter()
+                        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                })
+                .cloned(),
+        );
+    }
+    error
+}
+
 /// The client's response and its status. Any body but one in sub-ranges
 /// is converted as it is. For a body in sub-ranges the
 /// first sub-range is opened before the status line is sent: an object
@@ -195,6 +223,7 @@ pub async fn respond(
     resp: S3Response,
     request_id: &str,
     observed: &mut GetObservation,
+    bucket_cors_enabled: bool,
 ) -> (u16, Response) {
     let (status, headers) = (resp.status, resp.headers);
     let fan = match resp.body {
@@ -210,6 +239,7 @@ pub async fn respond(
     };
     // `resp` came with its request ID; a refusal made here gets it too.
     let refuse = |resp: S3Response| {
+        let resp = carry_cors_on_error(resp, &headers, bucket_cors_enabled);
         (
             resp.status,
             crate::http::to_response(resp.with_request_id(request_id)),
@@ -263,4 +293,46 @@ pub async fn respond(
         }
     });
     (status, resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_errors_preserve_cors_and_vary_but_not_object_headers() {
+        let decoration = [
+            ("Access-Control-Allow-Origin", "https://app.example.test"),
+            ("access-control-allow-credentials", "true"),
+            ("access-control-expose-headers", "ETag"),
+            ("Vary", "Accept-Encoding, Origin"),
+        ]
+        .map(|(n, v)| (n.to_owned(), v.to_owned()));
+        let mut original = decoration.to_vec();
+        original.extend(
+            [
+                ("content-type", "video/mp4"),
+                ("content-length", "4194304"),
+                ("content-encoding", "gzip"),
+                ("etag", "\"object-etag\""),
+                ("cache-control", "public"),
+                ("access-control-not-a-response-header", "ignore"),
+            ]
+            .map(|(n, v)| (n.to_owned(), v.to_owned())),
+        );
+        for status in [500, 503] {
+            let error = || S3Response::error(status, "Error", "Could not read the object.");
+            let baseline = error().headers;
+            let enabled = carry_cors_on_error(error(), &original, true);
+            assert_eq!(enabled.status, status);
+            assert_eq!(
+                enabled.headers,
+                [baseline.as_slice(), decoration.as_slice()].concat()
+            );
+            assert_eq!(
+                carry_cors_on_error(error(), &original, false).headers,
+                baseline
+            );
+        }
+    }
 }
