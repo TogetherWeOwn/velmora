@@ -1,4 +1,4 @@
--- velmora: sqlite-twin 0005_scrub.sql 837269065d0fd65fbb424cf497d59c56aa1091cc630e386380acdbd90e693e68
+-- velmora: sqlite-twin 0005_scrub.sql 1eb71d77a8ac883c3093b34059e8d6da72bb7f8b860b830a1bb9b4f9518e6372
 -- Additive only. The extents indexes follow in 0006, built concurrently.
 -- No extent rewrite: all new summary columns are nullable.
 ALTER TABLE extents
@@ -53,4 +53,3 @@ ALTER TABLE scrub_state
     ADD COLUMN cadence_epoch BIGINT,
     ADD COLUMN incident_clean_by TEXT COLLATE "C",
     ADD COLUMN incident_body_by TEXT COLLATE "C";
-UPDATE scrub_state SET incident_body_by = last_incident WHERE id = 1;

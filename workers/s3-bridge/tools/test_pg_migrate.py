@@ -223,6 +223,32 @@ class SqliteTwins(unittest.TestCase):
             for table in re.findall(r"CREATE\s+UNIQUE\s+INDEX\b[^;]*?\bON\s+([a-z_0-9]+)", text, re.I):
                 self.assertNotIn(table.lower(), historical, f"{stage.name} uniquely indexes {table}")
 
+    def test_later_stages_use_only_additive_statement_forms(self):
+        # After the baseline: new tables, indexes, added columns and literal
+        # rows of new tables. No UPDATE, DELETE, or INSERT ... SELECT.
+        stages = sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        historical = set()
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                historical.update(t.lower() for t in re.findall(
+                    r"CREATE TABLE (?:IF NOT EXISTS )?([a-z_0-9]+)", stage.read_text(), re.I))
+        forms = [
+            r"CREATE TABLE ([a-z_0-9]+) \(.*",
+            r"CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?[a-z_0-9]+ ON [a-z_0-9]+ ?\(.*",
+            r"ALTER TABLE [a-z_0-9]+ ADD COLUMN .*",
+            r"INSERT INTO ([a-z_0-9]+) ?\([a-z_0-9, ]+\) VALUES \([0-9, ]+\)",
+        ]
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                continue
+            text = re.sub(r"--[^\n]*", "", stage.read_text())
+            for statement in filter(None, (" ".join(s.split()) for s in text.split(";"))):
+                match = next((re.fullmatch(f, statement, re.I | re.S) for f in forms
+                              if re.fullmatch(f, statement, re.I | re.S)), None)
+                self.assertIsNotNone(match, f"{stage.name}: {statement[:80]}")
+                if statement.upper().startswith(("CREATE TABLE", "INSERT")):
+                    self.assertNotIn(match.group(1).lower(), historical, f"{stage.name}: {statement[:80]}")
+
     def test_stages_and_twins_are_plain_ascii(self):
         # Printable ASCII, tab and newline only: no backslash, no NUL,
         # comments included.

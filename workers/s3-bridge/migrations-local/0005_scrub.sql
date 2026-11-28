@@ -75,5 +75,3 @@ ALTER TABLE scrub_state ADD COLUMN cadence_after TEXT;
 ALTER TABLE scrub_state ADD COLUMN cadence_epoch INTEGER;
 ALTER TABLE scrub_state ADD COLUMN incident_clean_by TEXT;
 ALTER TABLE scrub_state ADD COLUMN incident_body_by TEXT;
--- Legacy incidents did not distinguish STAT from BODY. Require BODY evidence.
-UPDATE scrub_state SET incident_body_by = last_incident WHERE id = 1;
