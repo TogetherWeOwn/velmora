@@ -126,10 +126,11 @@ class MigrationParser(unittest.TestCase):
         python = source.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         tree = ast.parse(python)
         wanted = []
-        names = {'SQL_TOKEN', 'sql_tokens_with_spans', 'sql_tokens', 'lint_migration'}
+        names = {'sql_tokens_with_spans', 'sql_tokens', 'lint_migration', 'check_concurrent_arguments'}
+        constants = {'SQL_TOKEN', 'PSQL_ARGUMENT_LIMIT', 'PSQL_CONCURRENT_ARGUMENTS_LIMIT'}
         for node in tree.body:
             if isinstance(node, ast.Assign) and any(
-                    isinstance(target, ast.Name) and target.id in {'SQL_TOKEN', 'PSQL_ARGUMENT_LIMIT'} for target in node.targets):
+                    isinstance(target, ast.Name) and target.id in constants for target in node.targets):
                 wanted.append(node)
             elif isinstance(node, ast.FunctionDef) and node.name in names:
                 wanted.append(node)
@@ -209,7 +210,7 @@ class MigrationParser(unittest.TestCase):
             "CREATE TABLE extra (name text DEFAULT E'plain')": 'escape strings',
             'CREATE TABLE IF NOT EXISTS sample (id bigint, new_col text)': 'already declared',
             'CREATE INDEX repeat_name ON sample(id); CREATE INDEX IF NOT EXISTS repeat_name ON sample(id)': 'already declared',
-            'CREATE INDEX bad ON extents(least(id, id))': 'function must be allowlisted',
+            'CREATE INDEX bad ON extents(least(id, id))': 'historical index key',
             "CREATE TABLE extra (label text CHECK ((label || label) <> ''))": 'expected )',
         }
         for sql, error in cases.items():
@@ -220,6 +221,36 @@ class MigrationParser(unittest.TestCase):
                 result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(error, result.stderr)
+
+    def test_historical_index_allows_plain_keys_and_simple_partial_predicates(self):
+        cases = (
+            ("id) WHERE safety_state = 'released' AND (last_read_at IS NOT NULL OR cipher_size <= 1)", None),
+            ("id) WHERE cipher_size + 1 > 3", 'historical index predicate'),
+            ("id) WHERE safety_state = 'released'::text", 'historical index predicate'),
+            ("cipher_size + 1)", 'historical index keys must be plain columns'),
+        )
+        for body, error in cases:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_probe.sql', f'CREATE INDEX probe_idx ON extents({body};',
+                              'CREATE INDEX probe_idx ON extents(id);')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                if error is None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stderr)
+
+    def test_index_refuses_now_in_post_cutover_key_and_predicate(self):
+        for body in ('(now())', '(id) WHERE now() IS NOT NULL'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_probe.sql', 'CREATE TABLE sample (id bigint); '
+                              f'CREATE INDEX probe_idx ON sample{body};',
+                              'CREATE TABLE sample (id INTEGER); CREATE INDEX probe_idx ON sample(id);')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('function must be allowlisted', result.stderr)
 
     def test_allowlist_refuses_literal_insert_into_historical_table(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,10 +445,12 @@ class MigrationParser(unittest.TestCase):
                           'ALTER TABLE extents\n'
                           ' ADD COLUMN fixture_array bigint[] DEFAULT ARRAY[1, 2],\n'
                           ' ADD COLUMN fixture_ratio numeric NOT NULL DEFAULT 1e-3,\n'
-                          ' ADD COLUMN fixture_label text NOT NULL DEFAULT \'\' COLLATE "C";\n',
+                          ' ADD COLUMN fixture_label text NOT NULL DEFAULT \'\' COLLATE "C",\n'
+                          ' ADD COLUMN fixture_order text NOT NULL COLLATE "C" DEFAULT \'x\';\n',
                           "ALTER TABLE extents ADD COLUMN fixture_array TEXT DEFAULT '[1, 2]';\n"
                           'ALTER TABLE extents ADD COLUMN fixture_ratio REAL NOT NULL DEFAULT 1e-3;\n'
-                          "ALTER TABLE extents ADD COLUMN fixture_label TEXT NOT NULL DEFAULT '';\n")
+                          "ALTER TABLE extents ADD COLUMN fixture_label TEXT NOT NULL DEFAULT '';\n"
+                          "ALTER TABLE extents ADD COLUMN fixture_order TEXT NOT NULL DEFAULT 'x';\n")
             result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -431,6 +464,30 @@ class MigrationParser(unittest.TestCase):
             result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('0004_concurrent.sql: concurrent statement exceeds the psql -c argument limit', result.stderr)
+
+    def test_concurrent_index_requires_no_transaction_header_offline(self):
+        for optional in ('', 'IF NOT EXISTS '):
+            with self.subTest(optional=optional), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_concurrent.sql',
+                              f'CREATE INDEX CONCURRENTLY {optional}fixture_idx ON extents(id);',
+                              'CREATE INDEX fixture_idx ON extents(id);')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('no-transaction', result.stderr)
+
+    def test_oversized_concurrent_argument_list_is_refused_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            names = [f'fixture_{i}_idx' for i in range(24)]
+            pg = '-- velmora: no-transaction\n' + ''.join(
+                f'-- {"x" * (96 * 1024)}\nCREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON extents(id);\n'
+                for name in names)
+            twin = ''.join(f'CREATE INDEX {name} ON extents(id);\n' for name in names)
+            add_migration(script, '0004_oversize.sql', pg, twin)
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn('aggregate', result.stderr)
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
@@ -688,6 +745,37 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertEqual(self.ledger(), STAGES)
             pending = self.migrate('--pending', script=script, ok=False)
             self.assertEqual((pending.returncode, pending.stdout), (3, name + '\n'))
+
+            unchanged = pg.replace('missing_test_column', 'bucket_id')
+            changed = unchanged.replace('fixture_extent_id ON extents(id)',
+                                        'fixture_extent_id ON extents(bucket_id)')
+            add_migration(script, name, changed, twin.replace('fixture_extent_id ON extents(id)',
+                                                             'fixture_extent_id ON extents(bucket_id)'))
+            mismatch = self.migrate(script=script, ok=False)
+            self.assertIn('index definition does not match', mismatch.stderr)
+            self.assertEqual(self.ledger(), STAGES)
+            self.assertEqual(self.owner_sql("SELECT to_regclass('fixture_extent_bucket') IS NULL").stdout.strip(), 't')
+            self.assertIn('(id)', self.owner_sql("SELECT pg_get_indexdef('fixture_extent_id'::regclass)").stdout)
+
+            add_migration(script, name, unchanged, twin)
+            self.assertIn(f'{name}: applied', self.migrate(script=script).stdout)
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+
+    def test_ordinary_index_if_not_exists_checks_the_existing_definition(self):
+        self.migrate()
+        self.owner_sql('CREATE INDEX fixture_existing ON extents(id);')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_ordinary.sql'
+            wrong = 'CREATE INDEX IF NOT EXISTS fixture_existing ON extents(bucket_id);'
+            add_migration(script, name, wrong, wrong)
+            mismatch = self.migrate(script=script, ok=False)
+            self.assertIn('index definition does not match', mismatch.stderr)
+            self.assertEqual(self.ledger(), STAGES)
+            same = wrong.replace('(bucket_id)', '(id)')
+            add_migration(script, name, same, same)
+            self.assertIn(f'{name}: applied', self.migrate(script=script).stdout)
+            self.assertEqual(self.ledger(), [*STAGES, '0004'])
 
     def test_full_shipped_chain_verifies(self):
         self.migrate(script=MIGRATE)

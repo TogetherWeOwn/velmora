@@ -26,6 +26,7 @@ from pg_catalog import CUTOVER_BASELINE, Failure, lint_additive, replay_sqlite_t
 W1 = 7413000001
 MIGRATOR = 7413000002
 PSQL_ARGUMENT_LIMIT = 128 * 1024  # Linux MAX_ARG_STRLEN includes the terminating NUL.
+PSQL_CONCURRENT_ARGUMENTS_LIMIT = 256 * 1024
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
             'PGSSLMODE', 'PGSSLROOTCERT', 'PGCONNECT_TIMEOUT'}
 ERRORS = {
@@ -38,6 +39,8 @@ ERRORS = {
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
     'VL018': 'a migration statement changed the runner apply decision; the migration was rolled back',
+    'VL021': 'existing concurrent index definition does not match the migration',
+    'VL022': 'existing index definition does not match the migration',
     'VLM01': 'migration changed schema or search_path',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
     '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
@@ -277,6 +280,21 @@ def sql_tokens(sql):
         yield token
 
 
+def concurrent_index_head(tokens):
+    head = [t.upper() for t in tokens[:4]]
+    if head[:3] == ['CREATE', 'INDEX', 'CONCURRENTLY']:
+        return 3
+    if head == ['CREATE', 'UNIQUE', 'INDEX', 'CONCURRENTLY']:
+        return 4
+    return None
+
+
+def check_concurrent_arguments(commands, name):
+    # Each SQL string and its -c flag contribute their terminating NUL.
+    if sum(len(command.encode('utf-8')) + 4 for command in commands) > PSQL_CONCURRENT_ARGUMENTS_LIMIT:
+        die(f'{name}: concurrent psql -c arguments exceed the 256 KiB aggregate limit')
+
+
 def lint_migration(sql, no_tx, name, *, additive_objects=None):
     statements, source_statements, pending = [], [], []
     segment_start = 0
@@ -300,9 +318,13 @@ def lint_migration(sql, no_tx, name, *, additive_objects=None):
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
-    if no_tx and any(len(command) >= PSQL_ARGUMENT_LIMIT for command in source_statements):
-        die(f'{name}: concurrent statement exceeds the psql -c argument limit (must be under 128 KiB)')
+    if no_tx:
+        if any(len(command) >= PSQL_ARGUMENT_LIMIT for command in source_statements):
+            die(f'{name}: concurrent statement exceeds the psql -c argument limit (must be under 128 KiB)')
+        check_concurrent_arguments(source_statements, name)
     if additive_objects is not None:
+        if not no_tx and any(concurrent_index_head(statement) is not None for statement in statements):
+            die(f'{name}: CREATE INDEX CONCURRENTLY requires the exact first-line -- velmora: no-transaction header')
         lint_additive(sql, source_statements, sql_tokens_with_spans, name, additive_objects)
     for statement in statements:
         # Comments are already gone; literals, bodies and (quoted) names remain.
@@ -323,6 +345,74 @@ def lint_migration(sql, no_tx, name, *, additive_objects=None):
             if head[:6] != ['CREATE', 'INDEX', 'CONCURRENTLY', 'IF', 'NOT', 'EXISTS']:
                 die(f'{name}: only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed')
     return statements, source_statements
+
+
+def index_identifier(token):
+    if re.fullmatch(r'"[a-z_][a-z0-9_]{0,62}"', token):
+        return token[1:-1]
+    if re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', token):
+        return token
+    raise ValueError('expected an unqualified index or table identifier')
+
+
+def index_definition(tokens, schema, *, source=False):
+    """Compare deparse syntax, not just keys or names. Do not erase casts,
+    literal syntax, collation, operator classes, ordering, or inner grouping."""
+    tokens = [t.lower() if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9$]*', t) else t for t in tokens]
+    unique = tokens[:2] == ['create', 'unique']
+    head = ['create', 'unique', 'index'] if unique else ['create', 'index']
+    if source:
+        if tokens[len(head):len(head) + 1] == ['concurrently']:
+            head += ['concurrently']
+        head += ['if', 'not', 'exists']
+    if tokens[:len(head)] != head:
+        raise ValueError('unexpected index command')
+    name, on, *target = tokens[len(head):]
+    if on != 'on':
+        raise ValueError('expected an index target')
+    if not source:
+        qualifier, dot, *target = target
+        if dot != '.' or index_identifier(qualifier) != schema:
+            raise ValueError('unexpected index target schema')
+    table, *tail = target
+    if source and tail[:1] == ['(']:
+        tail[:0] = ['using', 'btree']
+    if tail[:1] != ['using']:
+        raise ValueError('expected an index access method and keys')
+    # pg_get_indexdef can wrap the entire WHERE expression in one pair of
+    # parentheses. Remove one outer pair only, never inner grouping.
+    depth = 0
+    for i, token in enumerate(tail):
+        if token == 'where' and depth == 0 and tail[i + 1:i + 2] == ['(']:
+            depth = 0
+            for j in range(i + 1, len(tail)):
+                depth += (tail[j] == '(') - (tail[j] == ')')
+                if depth == 0:
+                    if j == len(tail) - 1:
+                        tail = tail[:i + 1] + tail[i + 2:j]
+                    break
+            break
+        depth += (token == '(') - (token == ')')
+    return index_identifier(name), unique, index_identifier(table), tuple(tail)
+
+
+def index_guard_position(tokens):
+    words = [token.upper() for token in tokens[:7]]
+    pos = concurrent_index_head(words)
+    if pos is None and words[:3] == ['CREATE', 'UNIQUE', 'INDEX']:
+        pos = 3
+    if pos is None and words[:2] == ['CREATE', 'INDEX']:
+        pos = 2
+    if pos is not None and words[pos:pos + 3] == ['IF', 'NOT', 'EXISTS']:
+        return pos
+    return None
+
+
+def require_new_index(source, pos):
+    # For observed absence, never let a relation that appears after prepare
+    # turn CREATE INDEX into a silent no-op. Remove only IF NOT EXISTS.
+    spans = list(sql_tokens_with_spans(source))
+    return source[:spans[pos][1]] + source[spans[pos + 2][2]:]
 
 
 def predicate(text):
@@ -553,7 +643,11 @@ def test_triggers(run, begin, history, complete, d1):
 
 def main():
     p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --pending | --verify | --test] '
-                                     '[--import-mode | --activate], or %(prog)s --check-migrations')
+                                     '[--import-mode | --activate], or %(prog)s --check-migrations',
+        epilog='If a pending concurrent index is refused, inspect its pg_catalog.pg_get_indexdef output. '
+               'A PostgreSQL rewrite of an otherwise matching definition may be refused. '
+               'After review, use DROP INDEX CONCURRENTLY on the pending index only, in a controlled rebuild, '
+               'then rerun the migration. Never drop an index created by an applied migration or edit the migration ledger by hand.')
     p.add_argument('env_file', nargs='?')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--to')
@@ -642,6 +736,8 @@ SET {scope}client_min_messages = error;
     def run(sql, *, retry=False, report=None, one_message=False, concurrent=False):
         nonlocal one_message_checked
         messages = (sql,) if one_message else sql if concurrent else ()
+        if concurrent:
+            check_concurrent_arguments(messages, report)
         # Linux rejects one argv string of 128 KiB or more (MAX_ARG_STRLEN, with its NUL).
         for message in messages:
             size = len(message.encode())
@@ -706,6 +802,64 @@ SET {scope}client_min_messages = error;
     complete = check(f'(SELECT pg_catalog.count(*) FROM {ledger}) <> {len(files)}', 'VL017')
     read_history = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n' + transactional_prefix
                     + check(f'NOT ({ledger_exists})', 'VL017') + history)
+    # Force pg_get_indexdef to qualify the target table with its schema and
+    # avoid hiding a non-catalog function/operator behind the migration path.
+    index_deparse_path = 'SET LOCAL search_path TO pg_catalog, pg_temp;\n'
+
+    def pending_index_snapshot(indexes):
+        candidates = ', '.join(f'({i}, {pg_literal(index)}::pg_catalog.name)' for i, index in enumerate(indexes))
+        # Null = no relation by this name. An array with a null definition is
+        # still a relation (e.g. a table) and must not be treated as absence.
+        return f'''(SELECT pg_catalog.jsonb_agg((SELECT pg_catalog.jsonb_build_array(c.oid,
+                    CASE WHEN i.indisvalid AND i.indisready THEN pg_catalog.pg_get_indexdef(c.oid) END)
+                  FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+                  WHERE c.relnamespace = {namespace} AND c.relname = x.name)
+                 ORDER BY x.position) FROM (VALUES {candidates}) x(position, name))'''
+
+    def index_plan(version, report, statements, source_statements):
+        candidates = [(i, pos) for i, parts in enumerate(statements)
+                      if (pos := index_guard_position(parts)) is not None]
+        if not candidates:
+            return None, source_statements
+        try:
+            expected = [index_definition(statements[i], schema, source=True) for i, _ in candidates]
+            snapshot = pending_index_snapshot([definition[0] for definition in expected])
+            applied = f"EXISTS (SELECT FROM {ledger} WHERE version = '{version}')"
+            raw_snapshot = run(read_history + index_deparse_path
+                + f"SELECT CASE WHEN {applied} THEN 'null'::pg_catalog.jsonb ELSE {snapshot} END;\nCOMMIT;\n",
+                report=report)
+            observed = json.loads(raw_snapshot)
+            if not isinstance(observed, list) or len(observed) != len(expected):
+                # The already-applied read-only fast path also lands here.
+                # The locked apply decision must confirm applied, not run DDL.
+                return 'true', []
+            commands = list(source_statements)
+            for (i, pos), definition, actual in zip(candidates, expected, observed):
+                if actual is None:
+                    commands[i] = require_new_index(commands[i], pos)
+                elif (isinstance(actual, list) and len(actual) == 2 and isinstance(actual[1], str)
+                      and index_definition([token for token, _, _ in sql_tokens_with_spans(actual[1])], schema)
+                      == definition):
+                    commands[i] = None
+                else:
+                    return 'true', []
+        except ValueError:
+            return 'true', []
+        # Revalidate the same OIDs, raw deparse text, and absences after
+        # acquiring the migrator lock. Hex keeps catalog text out of the SQL
+        # grammar and the wrapper's dollar quote.
+        raw = raw_snapshot.encode('utf-8').hex()
+        expected_snapshot = f"pg_catalog.convert_from(pg_catalog.decode('{raw}', 'hex'), 'UTF8')"
+        changed = f'{snapshot}::pg_catalog.text COLLATE pg_catalog."C" IS DISTINCT FROM {expected_snapshot}'
+        return changed, [statement for statement in commands if statement is not None]
+
+    def index_fence(condition, code, *, online=False):
+        if condition is None:
+            return ''
+        if online:
+            condition = f'{APPLY} AND ({condition})'
+        return index_deparse_path + check(condition, code) + f'SET LOCAL search_path TO "{schema}", pg_temp;\n'
+
     if args.pending:
         applied = set(run(read_history + f"SELECT version FROM {ledger};\nCOMMIT;\n",
                           report='pending migrations').splitlines())
@@ -754,7 +908,10 @@ $$;
         if version > target:
             break
         sql, no_tx, parsed = migrations[version]
-        _, source_statements = parsed
+        statements, source_statements = parsed
+        index_condition = None
+        if no_tx or version > CUTOVER_BASELINE:
+            index_condition, source_statements = index_plan(version, name, statements, source_statements)
         record = (f"INSERT INTO {ledger} VALUES ('{version}', '{digest(body)}', "
                   "(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::bigint);")
         if no_tx:
@@ -769,7 +926,8 @@ $$;
                 prepare += check(f'{marker} IS NOT NULL', 'VL016' if args.activate else 'VL014')
             # ON_ERROR_STOP ends the session without running any queued -c if
             # this version is already applied. Confirm that outcome separately.
-            prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + 'COMMIT;\n'
+            prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
+            prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
             finish = (concurrent_tx + check(bad_index, 'VL015') + path_check + record
                       + "\nCOMMIT;\nSELECT 'applied';\n")
             output = run([prepare, *source_statements, finish], retry=True, report=name, concurrent=True).splitlines()
@@ -803,6 +961,7 @@ $$;
                 batch += (f"    IF ({usage} OR {marker} IS NOT NULL) THEN "
                           "RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;\n")
             batch += "    PERFORM pg_catalog.set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
+            batch += index_fence(index_condition, 'VL022', online=True)
             batch += execute_migration(source_statements)
             if version == '0001':
                 batch += guarded(f'INSERT INTO {usage_global}(id) VALUES (1), (2);')
@@ -830,7 +989,8 @@ $$;
         batch += '\\echo already applied\n\\else\n'
         if version == '0001':
             batch += check(f'{usage} OR {marker} IS NOT NULL', 'VL012')
-        batch += sql + '\n'
+        batch += index_fence(index_condition, 'VL022')
+        batch += (sql if index_condition is None else '\n'.join(source_statements)) + '\n'
         if version == '0002':
             batch += RESTART_IDENTITIES.format(schema=schema)
         if version == '0001':

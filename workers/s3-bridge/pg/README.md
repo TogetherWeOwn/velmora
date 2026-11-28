@@ -100,16 +100,20 @@ count against the budget; this needs psql 15 or newer and a batch under
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
 Each statement travels through a separate SQL `psql -c` argument in the same
-session, not through the psql command interpreter on stdin. Each argument must
-be under 128 KiB; `--check-migrations` rejects an oversized concurrent
-statement without opening a database connection.
+session, not through the psql command interpreter on stdin. Concurrent SQL
+requires the exact first-line directive. Each argument must be under 128 KiB;
+concurrent commands also have a 256 KiB aggregate SQL argument limit.
+`--check-migrations` rejects oversized concurrent SQL without connecting.
 Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
 session lock without waiting in PostgreSQL with a snapshot. A failed
 concurrent index build can leave an invalid index (including after a lock
 timeout). The tool refuses
-to record the file or skip the invalid index on retry. Inspect and repair the
-index before rerunning.
+to record the file or skip the invalid index on retry. Before reusing an
+existing index in a pending migration, the runner compares its PostgreSQL
+definition to the reviewed SQL, not just its name and validity. If the
+normalization cannot establish a match, inspect and reconcile the index
+before retrying.
 
 `ops/pg-migrate.sh --check-migrations` is offline. The D1 migration set is
 frozen at the PostgreSQL cutover baseline (`0003`); do not add D1 migrations
@@ -126,8 +130,10 @@ fixture lists in the same feature PR. A pre-merge change must be safe with
 old code still running. The post-cutover SQL allowlist is:
 
 - Create a new named table or index. Table constraints must refer only to
-  new tables; unique indexes cannot target a historical table. Declared table
-  columns and names are checked against the SQLite replay and live manifest.
+  new tables. A historical table permits only non-unique indexes with plain
+  column keys; a partial predicate may combine column-to-literal comparisons
+  and `IS [NOT] NULL` with `AND` or `OR`. Declared table columns and names are
+  checked against the SQLite replay and live manifest.
 - Add a new nullable column, or a new `NOT NULL` column with a non-null
   literal default. No other `ALTER` is allowed.
 - Seed a post-cutover table with `INSERT ... VALUES` containing only literals.
@@ -135,8 +141,8 @@ old code still running. The post-cutover SQL allowlist is:
 
 Defaults and check/index expressions accept only the supported literal,
 operator, and built-in cast syntax and the functions `now`, `lower`, `length`,
-and `coalesce`. `least` and `greatest` are also allowed in index keys and
-checks on post-cutover tables. Escape strings and Unicode escape syntax are
+and `coalesce`. `now` is not allowed in indexes. `least` and `greatest` are
+also allowed in index keys and checks on post-cutover tables. Escape strings and Unicode escape syntax are
 not allowed. Any other form needs review before it can be used.
 
 `ops/pg-migrate.sh "$CONNECTION_FILE" --pending` reads the SHA-256-checked

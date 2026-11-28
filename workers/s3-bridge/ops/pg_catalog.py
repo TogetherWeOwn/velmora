@@ -68,6 +68,8 @@ TYPES = {"BIGINT", "INT8", "INTEGER", "INT", "INT4", "SMALLINT", "INT2", "TEXT",
          "REAL", "FLOAT4", "FLOAT8", "DOUBLE", "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIME"}
 PURE_CALLS = {"NOW": 0, "LOWER": 1, "LENGTH": 1, "COALESCE": None}
 POST_TABLE_CALLS = {"LEAST": None, "GREATEST": None}
+INDEX_CALLS = {name: arity for name, arity in PURE_CALLS.items() if name != "NOW"}
+HISTORICAL_COMPARISONS = {"=", "<>", "<", ">", "<=", ">="}
 BINARY = {"+", "-", "*", "/", "%", "=", "!=", "<>", "<", ">", "<=", ">=", "AND", "OR"}
 SQL_VALUES = {"CURRENT_CATALOG", "CURRENT_DATE", "CURRENT_ROLE", "CURRENT_SCHEMA", "CURRENT_TIME",
               "CURRENT_TIMESTAMP", "CURRENT_USER", "LOCALTIME", "LOCALTIMESTAMP", "SESSION_USER",
@@ -303,15 +305,47 @@ class AdditiveStatement:
             self.refuse("expected CREATE TABLE with a column definition")
         self.tables.add(table)
 
+    def historical_index_predicate(self):
+        # Build-time and future inserts must not evaluate a function, cast or
+        # arithmetic against existing data. Compare bare columns to literals.
+        error = "historical index predicate must use plain column comparisons or IS [NOT] NULL"
+
+        def term():
+            if self.take("("):
+                self.historical_index_predicate()
+                self.need(")")
+            else:
+                self.identifier()
+                if self.take("IS"):
+                    self.take("NOT")
+                    if not self.take("NULL"):
+                        self.refuse(error)
+                elif self.peek() in HISTORICAL_COMPARISONS:
+                    self.i += 1
+                    if self.take("-") or self.take("+"):
+                        if not NUMBER.fullmatch(self.peek()):
+                            self.refuse(error)
+                        self.i += 1
+                    elif not self.atom()[0]:
+                        self.refuse(error)
+                else:
+                    self.refuse(error)
+            if self.peek() not in {"AND", "OR", ")", ""}:
+                self.refuse(error)
+
+        term()
+        while self.take("AND") or self.take("OR"):
+            term()
+
     def create_index(self, unique):
         self.take("CONCURRENTLY")
         self.take("IF", "NOT", "EXISTS")
         index = self.new_relation()
         self.need("ON")
         table = self.existing_table()
-        if unique and table not in self.tables:
+        historical = table not in self.tables
+        if unique and historical:
             self.refuse("UNIQUE index on a historical or undeclared table requires review", 1)
-        calls = PURE_CALLS | (POST_TABLE_CALLS if table in self.tables else {})
         if self.take("USING"):
             method = self.peek()
             if method not in {"BTREE", "HASH", "GIN", "GIST", "SPGIST", "BRIN"}:
@@ -320,7 +354,12 @@ class AdditiveStatement:
         self.need("(")
 
         def key():
-            self.expression(names=True, calls=calls)
+            if historical:
+                self.identifier()
+                if self.peek() not in {"ASC", "DESC", "NULLS", ",", ")"}:
+                    self.refuse("historical index keys must be plain columns")
+            else:
+                self.expression(names=True, calls=INDEX_CALLS | POST_TABLE_CALLS)
             self.take("ASC") or self.take("DESC")
             if self.take("NULLS") and not (self.take("FIRST") or self.take("LAST")):
                 self.refuse("expected NULLS FIRST or NULLS LAST")
@@ -328,8 +367,11 @@ class AdditiveStatement:
         if self.take("INCLUDE", "("):
             self.comma_list(self.identifier, ")")
         if self.take("WHERE"):
-            # LEAST/GREATEST are restricted to index keys and CHECKs.
-            self.expression(names=True, calls=PURE_CALLS)
+            if historical:
+                self.historical_index_predicate()
+            else:
+                # LEAST/GREATEST are restricted to index keys and CHECKs.
+                self.expression(names=True, calls=INDEX_CALLS)
         self.indexes.add((table, index))
 
     def add_column(self, table, column):
@@ -364,11 +406,14 @@ class AdditiveStatement:
             if guarded:
                 self.refuse("ADD COLUMN IF NOT EXISTS requires review", pos)
             self.type_name()
-            if self.take("COLLATE"):
+            collated = self.take("COLLATE")
+            if collated:
                 self.collation()
             not_null = self.take("NOT", "NULL")
             if not not_null:
                 self.take("NULL")
+            if not collated and self.take("COLLATE"):
+                self.collation()
             nonnull = False
             if self.take("DEFAULT"):
                 try:
