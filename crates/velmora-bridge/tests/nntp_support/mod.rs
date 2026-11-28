@@ -777,6 +777,47 @@ fn unused<T>() -> Result<T> {
 }
 
 impl Catalog for MemCatalog {
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_create(
+        &self,
+        _external_ref: &str,
+        _display_name: Option<&str>,
+        _now: UnixMs,
+    ) -> Result<Tenant> {
+        unused()
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_get(&self, _id: &str) -> Result<Option<Tenant>> {
+        unused()
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_by_external_ref(&self, _external_ref: &str) -> Result<Option<Tenant>> {
+        unused()
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn buckets_by_owner(
+        &self,
+        _owner: &str,
+        _after_name: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<Bucket>> {
+        unused()
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_is_disabled(&self, _sha256: &str) -> Result<bool> {
+        unused()
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_disable(
+        &self,
+        _sha256: &str,
+        _token_class: &str,
+        _reason: &str,
+        _now: UnixMs,
+    ) -> Result<()> {
+        unused()
+    }
+
     async fn claim(
         &self,
         extent: &ExtentId,

@@ -80,6 +80,8 @@ mod publish;
 mod recovery;
 mod replay;
 mod scrub;
+#[cfg(feature = "tenancy-catalogue")]
+mod tenancy;
 mod uploads;
 pub mod usage;
 
@@ -208,6 +210,50 @@ impl<S: Sql> SqlCatalog<S> {
 impl<S: Sql> Catalog for SqlCatalog<S> {
     fn is_frozen(&self) -> bool {
         self.sql.is_frozen()
+    }
+
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_create(
+        &self,
+        external_ref: &str,
+        display_name: Option<&str>,
+        now: UnixMs,
+    ) -> Result<crate::types::Tenant> {
+        tenancy::tenant_create(self, external_ref, display_name, now).await
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_get(&self, id: &str) -> Result<Option<crate::types::Tenant>> {
+        tenancy::tenant_get(self, id).await
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_by_external_ref(
+        &self,
+        external_ref: &str,
+    ) -> Result<Option<crate::types::Tenant>> {
+        tenancy::tenant_by_external_ref(self, external_ref).await
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn buckets_by_owner(
+        &self,
+        owner: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Bucket>> {
+        tenancy::buckets_by_owner(self, owner, after_name, limit).await
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_is_disabled(&self, sha256: &str) -> Result<bool> {
+        tenancy::mgmt_token_is_disabled(self, sha256).await
+    }
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_disable(
+        &self,
+        sha256: &str,
+        token_class: &str,
+        reason: &str,
+        now: UnixMs,
+    ) -> Result<()> {
+        tenancy::mgmt_token_disable(self, sha256, token_class, reason, now).await
     }
 
     // admin + auth
@@ -1311,6 +1357,8 @@ pub fn pg_datapath_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
         objects::pg_statements(),
         publish::pg_statements(),
         recovery::pg_statements(),
+        #[cfg(feature = "tenancy-catalogue")]
+        tenancy::pg_statements(),
         uploads::pg_statements(),
     ]
     .into_iter()

@@ -15,7 +15,9 @@ path = "src/lib.rs"
 [features]
 # Native test doubles (`testkit`): rusqlite-backed `Sql`, in-memory blobs,
 # fixed clock, fake job sink, test KEK. Never enabled in the Worker build.
-testkit = ["dep:rusqlite"]
+testkit = ["dep:rusqlite", "tenancy-catalogue"]
+# The management catalogue is unused by shipped Workers. Its tests opt in.
+tenancy-catalogue = []
 pg = ["dep:tokio-postgres", "dep:bytes"]
 # Native/drill-only negative control. Never enable in the S3 Worker.
 pg-test-unlocked = ["pg"]

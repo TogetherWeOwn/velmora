@@ -313,6 +313,10 @@ pub const MIGRATION_SCRUB: &str =
 /// The scrub's extents indexes: the twin of PostgreSQL stage 0006.
 pub const MIGRATION_SCRUB_INDEXES: &str =
     include_str!("../../../workers/s3-bridge/migrations-local/0006_scrub_indexes.sql");
+const MIGRATION_TENANTS: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0007_tenants.sql");
+const MIGRATION_TENANT_INDEXES: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0008_tenant_indexes.sql");
 
 /// Per-bucket S3 CORS configuration in the local SQLite schema.
 pub const MIGRATION_BUCKET_CORS: &str =
@@ -548,6 +552,8 @@ impl RusqliteSql {
         db.apply(MIGRATION_BUCKET_CORS)?;
         db.apply(MIGRATION_SCRUB)?;
         db.apply(MIGRATION_SCRUB_INDEXES)?;
+        db.apply(MIGRATION_TENANTS)?;
+        db.apply(MIGRATION_TENANT_INDEXES)?;
         Ok(db)
     }
 
