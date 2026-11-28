@@ -114,15 +114,16 @@ the table) would make later reads and writes wait; the migrator lock keeps
 other migrations out, so run no manual DDL on the table while a migration runs.
 The limit is 90 s per lock wait, and a lock timeout of the build itself is
 not retried: the runner refuses at once (`55P03`), naming the indexes of the
-file. A build cancelled after it created its index leaves it invalid; repair
-it as for `VL015` before retrying. The 3 s prepare and ledger waits, and
-`VL023`, are retried as before. One apply's bound is about 26 s of prepare
-retries, 90 s for the table lock, and up to 90 s per wait phase for each
-long-lived non-app session, plus build time. With only app sessions
-(`transaction_timeout` 30 s, PostgreSQL 17+) that is about 3 x 30 s. Several
+file. Any of its indexes a cancelled build left invalid must be repaired as
+for `VL015` before retrying. The 3 s prepare and ledger waits, and
+`VL023`, are retried as before. The bound per index build is about 26 s of
+prepare retries, 90 s for the table lock, and up to 90 s per wait phase for
+each long-lived non-app session, plus build time. With only app sessions
+(`transaction_timeout` 30 s, PostgreSQL 17+) that is about 3 x 30 s. A file
+with many concurrent builds multiplies it: split such migrations so that each
+apply fits the caller's budget (the merge gate gives one apply 600 s). Several
 non-app sessions (an operator, `kofra_ro`) holding transactions for minutes
-can still push one apply past a caller's 600 s budget (the merge gate's):
-end such sessions before a migration merge.
+can still push one build past it: end such sessions before a migration merge.
 A failed concurrent index build can leave an invalid index (including after
 that lock timeout). The tool refuses
 to record the file or skip the invalid index on retry. Before reusing an

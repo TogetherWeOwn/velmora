@@ -1019,14 +1019,16 @@ $$;
                 # build would fail and leave an INVALID index (VL015 on every
                 # retry). It takes only SHARE UPDATE EXCLUSIVE, which by itself
                 # blocks no reads or writes, so it waits up to 90 s per lock
-                # wait, and a timeout of the build itself is not retried. One
-                # apply's bound: about 26 s of prepare retries, 90 s for the
-                # table lock, and up to 90 s per wait phase for each long-lived
-                # non-app session, plus build time. With only app sessions
-                # (transaction_timeout 30 s, PostgreSQL 17+) that is about
-                # 3 x 30 s. Several non-app sessions (an operator, kofra_ro)
-                # holding transactions for minutes can still push one apply
-                # past a caller's 600 s budget: end them before a migration
+                # wait, and a timeout of the build itself is not retried. The
+                # bound per index build: about 26 s of prepare retries, 90 s for
+                # the table lock, and up to 90 s per wait phase for each
+                # long-lived non-app session, plus build time. With only app
+                # sessions (transaction_timeout 30 s, PostgreSQL 17+) that is
+                # about 3 x 30 s. A file with many concurrent builds multiplies
+                # it: split such migrations to fit the caller's budget (the
+                # merge gate gives one apply 600 s). Several non-app sessions
+                # (an operator, kofra_ro) holding transactions for minutes can
+                # still push one build past it: end them before a migration
                 # merge. The ledger transaction sets its own timeouts (SET
                 # LOCAL), and the session is back at 3 s before it.
                 # The markers tell a lock timeout of the build itself (between
@@ -1039,7 +1041,9 @@ $$;
                         messages.append(record_built(*after[n]))
                 messages += ["SET lock_timeout = '3s'", "SELECT 'velmora-built'"]
                 try:
-                    output = run([*messages, finish], busy=attempt < 5, report=name, concurrent=True)
+                    # busy=True on every attempt, the last included, so that the
+                    # phase markers are read on each one.
+                    output = run([*messages, finish], busy=True, report=name, concurrent=True)
                     break
                 except Busy as busy:
                     printed = busy.stdout.splitlines()
@@ -1049,8 +1053,10 @@ $$;
                         # index leaves that index INVALID.
                         indexes = ', '.join(index for _, _, index in built) or 'none'
                         die(f'{name}: SQLSTATE 55P03: a concurrent index build timed out waiting for a lock '
-                            f'(not retried); an index it created is left INVALID ({indexes}): repair it as for '
-                            'VL015 before retrying')
+                            f'(not retried); any of its indexes ({indexes}) left INVALID must be repaired as '
+                            'for VL015 before retrying')
+                    if attempt == 5:
+                        die(f'{name}: {ERRORS.get(busy.state) or f"SQLSTATE {busy.state}"}')
                     print(f'{name}: SQLSTATE {busy}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                     time.sleep(0.25 * (2 ** attempt))
             output = output.splitlines()
