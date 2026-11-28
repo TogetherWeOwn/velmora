@@ -33,17 +33,20 @@ fn request<T: DeserializeOwned + Serialize + Validate>(json: &str) {
 }
 
 fn check_request(ex: &Example) {
-    let Some(json) = ex.request else { return };
+    let body = || {
+        ex.request
+            .unwrap_or_else(|| panic!("{} fixture requires a request body", ex.call))
+    };
     match ex.call {
-        "Tenancy::create_tenant" => request::<TenantCreate>(json),
-        "Tenancy::create_principal" => request::<PrincipalCreate>(json),
-        "restore_tenant" => request::<TenantRestore>(json),
-        "create_bucket" => request::<BucketCreate>(json),
-        "create_key" => request::<KeyCreate>(json),
-        "update_key" => request::<KeyUpdate>(json),
-        "objects" => request::<ObjectList>(json),
-        "presign" => request::<Presign>(json),
-        other => panic!("no request type for {other}"),
+        "Tenancy::create_tenant" => request::<TenantCreate>(body()),
+        "Tenancy::create_principal" => request::<PrincipalCreate>(body()),
+        "restore_tenant" => request::<TenantRestore>(body()),
+        "create_bucket" => request::<BucketCreate>(body()),
+        "create_key" => request::<KeyCreate>(body()),
+        "update_key" => request::<KeyUpdate>(body()),
+        "objects" => request::<ObjectList>(body()),
+        "presign" => request::<Presign>(body()),
+        other => assert!(ex.request.is_none(), "no request type for {other}"),
     }
 }
 
@@ -333,11 +336,14 @@ fn request_checks() {
         Err(Code::BadRequest)
     );
     assert_eq!(tc("not json"), Err(Code::BadRequest));
-    let huge = format!(
-        r#"{{"external_ref":"ws_1","jurisdiction":"eu","rate_class":"{}"}}"#,
-        "a".repeat(MAX_REQUEST_BYTES)
+    let unpadded = r#"{"external_ref":"ws_1"}"#;
+    let at_limit = format!(
+        "{unpadded}{}",
+        " ".repeat(MAX_REQUEST_BYTES - unpadded.len())
     );
-    assert_eq!(tc(&huge), Err(Code::BadRequest));
+    assert_eq!(at_limit.len(), MAX_REQUEST_BYTES);
+    assert_eq!(tc(&at_limit), Ok(()));
+    assert_eq!(tc(&format!("{at_limit} ")), Err(Code::BadRequest));
 
     let restore = |n: u64| {
         parse_request::<TenantRestore>(format!(r#"{{"deletion_seq":{n}}}"#).as_bytes()).map(|_| ())

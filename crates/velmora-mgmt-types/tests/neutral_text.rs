@@ -515,9 +515,8 @@ fn a_name_is_checked_as_the_checker_sees_it() {
     );
     // `.rs` alone has no extension for the checker: prose, not Rust.
     assert!(!checked_name(src, &src.join(".rs")).1);
-    // A backslash stays, so a Windows user folder is still found.
-    let (name, _) = checked_name(src, &src.join("C:\\Users\\1.rs"));
-    assert!(home_path(&name), "{name}");
+    // Scan a Windows path as text, without native path joining.
+    assert!(home_path(r"C:\Users\1.rs"));
 }
 
 /// Positive controls: each class finds a term this repository may name

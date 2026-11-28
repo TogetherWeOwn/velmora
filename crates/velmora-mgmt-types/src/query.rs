@@ -181,9 +181,11 @@ impl List {
 
 /// `GET …/buckets`: a page in name order, or the exact lookup of up to
 /// [`MAX_NAMES`] names (`?name=a&name=b`), which takes neither `after`
-/// nor `limit`. The lookup answers one bucket per name found, in name
-/// order, with `next: null`; a name that is no bucket of the tenant, or
-/// no valid bucket name, is not in the answer.
+/// nor `limit`. Each decoded `name` must be 1–255 bytes; if any name is
+/// outside this range the whole lookup answers `400 bad_request`. A valid
+/// lookup answers one bucket per name found, in name order, with
+/// `next: null`. Names that are not valid bucket names or do not name a
+/// bucket of the tenant are omitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BucketQuery {
     Page(List),

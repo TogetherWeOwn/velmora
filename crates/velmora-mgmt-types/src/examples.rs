@@ -1,7 +1,8 @@
 //! One example per call of the contract: the request a caller sends and
-//! the answer the plane gives. A caller's contract tests can build a fake
-//! plane from them; this crate's tests parse each body into its type and
-//! back.
+//! the answer the plane gives when the call is served. These are wire
+//! fixtures, not a list of routes available at launch. Fakes of the initial
+//! release should answer `404 not_found` for [`crate::paths::NOT_SERVED`]
+//! instead of using those routes' success fixtures.
 //!
 //! The ids, names and the secret are made up.
 
