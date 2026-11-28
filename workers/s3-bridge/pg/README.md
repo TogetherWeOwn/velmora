@@ -112,17 +112,17 @@ transactions and takes only `SHARE UPDATE EXCLUSIVE`, which by itself blocks no
 reads or writes. An `ACCESS EXCLUSIVE` request queued behind it (other DDL on
 the table) would make later reads and writes wait; the migrator lock keeps
 other migrations out, so run no manual DDL on the table while a migration runs.
-The limit is 90 s per lock wait, and a build can wait more than once: for its
-table lock, then for each older transaction, in each of its phases. App
-transactions end within 30 s of their start (`transaction_timeout`), so app
-writers alone end a phase's waits within 30 s, well inside the 600 s a caller
-gives one apply (the merge gate's budget). Each session without that timeout
-(an operator, a read-only session) can add up to 90 s per wait; with several,
-the caller's budget can run out first. A blocker held longer than 90 s ends in
-the runner's own `55P03`. If the build had already created its index, that
-index is invalid and the retry refuses with `VL015`; if it timed out taking
-the table lock, nothing was created and the retry builds again or ends with
-`55P03`.
+The limit is 90 s per lock wait, and a lock timeout of the build itself is
+not retried: the runner refuses at once (`55P03`), naming the indexes of the
+file. A build cancelled after it created its index leaves it invalid; repair
+it as for `VL015` before retrying. The 3 s prepare and ledger waits, and
+`VL023`, are retried as before. One apply's bound is about 26 s of prepare
+retries, 90 s for the table lock, and up to 90 s per wait phase for each
+long-lived non-app session, plus build time. With only app sessions
+(`transaction_timeout` 30 s, PostgreSQL 17+) that is about 3 x 30 s. Several
+non-app sessions (an operator, `kofra_ro`) holding transactions for minutes
+can still push one apply past a caller's 600 s budget (the merge gate's):
+end such sessions before a migration merge.
 A failed concurrent index build can leave an invalid index (including after
 that lock timeout). The tool refuses
 to record the file or skip the invalid index on retry. Before reusing an
