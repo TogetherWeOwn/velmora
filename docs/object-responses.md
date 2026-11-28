@@ -3,7 +3,8 @@
 GetObject and HeadObject answers pass through the Cloudflare edge before
 they reach the client. Two settings keep them byte-exact, with the
 `Content-Length` and the strong `ETag` that S3 clients read the size and
-the MD5 from.
+the MD5 from. Two more headers keep a browser from treating an object as
+a page of the service.
 
 ## `Cache-Control: no-transform` (bridge, `service/get.rs`)
 
@@ -30,6 +31,27 @@ The stored metadata is not changed, and the directive only forbids changing
 the bytes. This is a deliberate deviation from returning the stored value
 verbatim: a client that compares HeadObject's `CacheControl` with what it
 uploaded sees the appended directive.
+
+## `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox` (bridge, `service/get.rs`)
+
+Every object answer (`200`, `206`, `304`, and HEAD) carries both. An
+object is data, never a page of the host that serves it:
+
+- `nosniff`: the browser takes the stored `Content-Type` as it is and does
+  not guess a more powerful one (an upload named `.jpg` that holds HTML
+  stays an image or a download).
+- `sandbox`: an object opened as a document, HTML or SVG for one, runs no
+  script, submits no form and gets an origin of its own, so it reads no
+  cookie and no storage of the serving site's origin.
+
+A stored header of either name is replaced (an object cannot store one
+today). `Content-Disposition` is left as stored, so audio and video play
+and downloads work as before. Error answers are unchanged.
+
+Known costs: a document view that needs script (a browser's built-in PDF
+viewer, for one) may not run inside a sandboxed document; downloading the
+object works. An object stored without a `Content-Type` is served without
+one, which a browser shows as text under `nosniff`.
 
 ## `encodeBody: "manual"` (Worker, `workers/s3-bridge/src/http.rs`)
 
