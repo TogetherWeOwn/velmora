@@ -18,8 +18,12 @@
 // provenance notes (`UploadMetadata`, `CommitResult`).
 
 mod control;
+mod cors;
 pub use control::{
     completion_result, delete_result, parse_complete, parse_delete, DeleteOutcome, DeleteRequest,
+};
+pub use cors::{
+    valid_cors_header, valid_cors_origin, CorsConfiguration, CorsMatch, MAX_CORS_BYTES,
 };
 
 use std::collections::BTreeMap;

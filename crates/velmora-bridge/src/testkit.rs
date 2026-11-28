@@ -314,6 +314,10 @@ pub const MIGRATION_SCRUB: &str =
 pub const MIGRATION_SCRUB_INDEXES: &str =
     include_str!("../../../workers/s3-bridge/migrations-local/0006_scrub_indexes.sql");
 
+/// Per-bucket S3 CORS configuration in the local SQLite schema.
+pub const MIGRATION_BUCKET_CORS: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0004_bucket_cors.sql");
+
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
 pub const ARM_USAGE: &str = "UPDATE usage_global SET all_x = 1, all_o = 1, all_g = 1 WHERE id = 1";
@@ -541,6 +545,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0022)?;
         db.apply(MIGRATION_0025)?;
         db.apply(MIGRATION_0026)?;
+        db.apply(MIGRATION_BUCKET_CORS)?;
         db.apply(MIGRATION_SCRUB)?;
         db.apply(MIGRATION_SCRUB_INDEXES)?;
         Ok(db)

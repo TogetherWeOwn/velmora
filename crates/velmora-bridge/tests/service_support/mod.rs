@@ -637,6 +637,7 @@ impl BlobStore for Blobs {
 /// A database whose writes can be made to fail; reads keep working.
 pub struct FailSql {
     pub inner: TestSql,
+    pub cors_queries: Cell<u32>,
     pub fail_writes: Cell<bool>,
     pub frozen: Cell<bool>,
     pub frozen_write_attempts: Cell<u32>,
@@ -762,6 +763,9 @@ impl Sql for FailSql {
     }
 
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        if sql.contains("FROM bucket_cors") || sql.contains("JOIN bucket_cors") {
+            self.cors_queries.set(self.cors_queries.get() + 1);
+        }
         if self.frozen.get() {
             // Some writes use query for RETURNING, not exec or batch.
             let readonly = match &self.inner {
@@ -1012,6 +1016,7 @@ fn rig_on<N: NntpConnector + 'static>(
             catalog: SqlCatalog::new(FailSql {
                 trip: trip.clone(),
                 inner: db,
+                cors_queries: Cell::new(0),
                 fail_writes: Cell::new(false),
                 frozen: Cell::new(false),
                 frozen_write_attempts: Cell::new(0),

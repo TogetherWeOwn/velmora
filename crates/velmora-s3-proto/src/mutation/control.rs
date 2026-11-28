@@ -16,20 +16,20 @@ pub struct DeleteRequest {
     pub quiet: bool,
 }
 
-struct Node {
-    name: String,
+pub(super) struct Node {
+    pub name: String,
     text: String,
-    children: Vec<Node>,
+    pub children: Vec<Node>,
 }
 
 impl Node {
-    fn leaf(&self) -> Result<&str> {
+    pub(super) fn leaf(&self) -> Result<&str> {
         if !self.children.is_empty() {
             return Err(ErrorCode::MalformedXML);
         }
         Ok(&self.text)
     }
-    fn container(&self) -> Result<()> {
+    pub(super) fn container(&self) -> Result<()> {
         if !xml_space(&self.text) {
             return Err(ErrorCode::MalformedXML);
         }
@@ -52,8 +52,8 @@ pub(super) fn xml_char(c: char) -> bool {
 /// `max_nodes` caps the elements the document may open: a document of
 /// tiny elements would otherwise build a tree many times its own size
 /// before any count of its entries is taken.
-fn tree(bytes: &[u8], policy: &Policy, max_nodes: usize) -> Result<Node> {
-    if bytes.len() > policy.limits.control_xml_bytes {
+pub(super) fn tree(bytes: &[u8], max_bytes: usize, max_nodes: usize) -> Result<Node> {
+    if bytes.len() > max_bytes {
         return Err(ErrorCode::InvalidRequest);
     }
     let mut nodes = 0usize;
@@ -185,7 +185,11 @@ fn tree(bytes: &[u8], policy: &Policy, max_nodes: usize) -> Result<Node> {
 
 pub fn parse_delete(bytes: &[u8], policy: &Policy, maximum: usize) -> Result<DeleteRequest> {
     // The root, one `Quiet`, and an `Object` with its `Key` per entry.
-    let root = tree(bytes, policy, 2 * maximum.min(1000) + 2)?;
+    let root = tree(
+        bytes,
+        policy.limits.control_xml_bytes,
+        2 * maximum.min(1000) + 2,
+    )?;
     if root.name != "Delete" {
         return Err(ErrorCode::MalformedXML);
     }
@@ -288,7 +292,7 @@ pub fn parse_complete(
     maximum: u16,
     checksum: MultipartChecksum,
 ) -> Result<Vec<PartEvidence>> {
-    let root = tree(bytes, policy, usize::MAX)?;
+    let root = tree(bytes, policy.limits.control_xml_bytes, usize::MAX)?;
     if root.name != "CompleteMultipartUpload" {
         return Err(ErrorCode::MalformedXML);
     }
@@ -349,7 +353,7 @@ pub fn parse_complete(
 /// Client-side classification: an HTTP 200 with an embedded Error is failure,
 /// not a completed upload. This reference server never emits an early 200.
 pub fn completion_result(status: u16, bytes: &[u8], policy: &Policy) -> Result<String> {
-    let root = tree(bytes, policy, usize::MAX)?;
+    let root = tree(bytes, policy.limits.control_xml_bytes, usize::MAX)?;
     root.container()?;
     if root.name == "Error" {
         let code = root

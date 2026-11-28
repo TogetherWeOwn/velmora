@@ -67,6 +67,7 @@ macro_rules! part_ref {
 }
 
 mod auth;
+mod cors;
 mod gc;
 mod health;
 mod hot;
@@ -151,14 +152,29 @@ pub struct SqlCatalog<S: Sql> {
     /// When this catalogue last ran the rollout step after an acquire
     /// that found nothing.
     nudged: Cell<i64>,
+    cors_enabled: bool,
+    cors_cache: cors::Cache,
 }
 
 impl<S: Sql> SqlCatalog<S> {
+    /// Enable bucket CORS after the PostgreSQL or local SQLite migration is present.
+    pub fn enable_bucket_cors(&mut self) -> Result<()> {
+        if !self.sql.supports_bucket_cors() {
+            return Err(BridgeError::Sql(
+                "bucket CORS requires PostgreSQL outside local tests".into(),
+            ));
+        }
+        self.cors_enabled = true;
+        Ok(())
+    }
+
     pub fn new(sql: S) -> Self {
         SqlCatalog {
             sql,
             gate: None,
             nudged: Cell::new(0),
+            cors_enabled: false,
+            cors_cache: cors::Cache::default(),
         }
     }
 
@@ -169,6 +185,8 @@ impl<S: Sql> SqlCatalog<S> {
             sql,
             gate: Some(gate),
             nudged: Cell::new(0),
+            cors_enabled: false,
+            cors_cache: cors::Cache::default(),
         }
     }
 
@@ -194,7 +212,11 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
 
     // admin + auth
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>> {
-        auth::create_bucket(self, b).await
+        let result = auth::create_bucket(self, b).await;
+        if self.cors_enabled {
+            self.cors_cache.invalidate(&b.name);
+        }
+        result
     }
     async fn create_access_key(&self, k: &AccessKeyRow) -> Result<()> {
         auth::create_access_key(self, k).await
@@ -214,7 +236,34 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         auth::bucket_in_use(self, bucket).await
     }
     async fn delete_bucket(&self, bucket: &Bucket) -> Result<Guard<()>> {
-        auth::delete_bucket(self, bucket).await
+        let result = auth::delete_bucket(self, bucket).await;
+        if self.cors_enabled {
+            self.cors_cache.invalidate(&bucket.name);
+        }
+        result
+    }
+    fn bucket_cors_enabled(&self) -> bool {
+        self.cors_enabled
+    }
+    async fn bucket_cors(&self, id: &BucketId) -> Result<Option<String>> {
+        cors::document(self, id.as_str()).await
+    }
+    async fn cached_bucket_cors(
+        &self,
+        name: &str,
+        now: UnixMs,
+    ) -> Result<Option<Rc<velmora_s3_proto::mutation::CorsConfiguration>>> {
+        cors::cached(self, name, now).await
+    }
+    async fn set_bucket_cors(
+        &self,
+        bucket: &Bucket,
+        doc_and_rules: Option<(&str, usize)>,
+        now: UnixMs,
+    ) -> Result<Guard<()>> {
+        let result = cors::set(self, bucket, doc_and_rules, now).await;
+        self.cors_cache.invalidate(&bucket.name);
+        result
     }
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>> {
         auth::bucket_by_name(self, name).await
@@ -1257,6 +1306,7 @@ pub fn pg_datapath_statements() -> Vec<(&'static str, Vec<SqlValue>)> {
     [
         pg_statements(),
         auth::pg_statements(),
+        cors::pg_statements(),
         intents::pg_statements(),
         objects::pg_statements(),
         publish::pg_statements(),
