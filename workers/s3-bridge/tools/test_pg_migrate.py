@@ -515,7 +515,7 @@ class MigrationParser(unittest.TestCase):
 #           for a concurrent file, after the first message containing inject_after);
 #   between: SQL (as between_user) in another session before a concurrent
 #            migration's ledger transaction, which then runs in a new session
-#            after replaying the runner's per-build records;
+#            with the per-build records the first session made;
 #   hold_w1: hold the W1 advisory key in another session during the first
 #            concurrent ledger transaction, which runs in a new session;
 #   replace: [old, new] pairs applied to the runner's SQL, each recorded when seen.
@@ -524,6 +524,7 @@ HOOK_PSQL = r'''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -561,6 +562,28 @@ def held(key):
     probe = subprocess.run([real, '-X', '-qAt', '-c', f"SELECT pg_try_advisory_xact_lock('{key}'::bigint)"],
                            env=env, capture_output=True, text=True)
     return probe.stdout.strip() == 'f'
+
+
+def split_head(options, messages):
+    # Read back what the runner recorded after each build in this session,
+    # so the new session gets those values, not a fresh sample.
+    names = [n for m in messages if m.startswith('DO $velmora_built$')
+             for n in re.findall(r"'(velmora[.]built_[0-9]+)'", m)]
+    show = [f"SELECT 'velmora-hook {n} ' || pg_catalog.current_setting('{n}', true)" for n in names]
+    head = psql(options + [x for m in [*messages[:-1], *show] for x in ('-c', m)])
+    lines = head.stdout.splitlines()
+    head.records = [line.split(' ', 2)[1:] for line in lines if line.startswith('velmora-hook ')]
+    head.stdout = ''.join(line + '\n' for line in lines if not line.startswith('velmora-hook '))
+    return head
+
+
+def split_setup(head):
+    setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
+             'SET client_min_messages = error;')
+    if head.records:
+        setup += (' DO $hook$ BEGIN ' + ' '.join(f"PERFORM pg_catalog.set_config('{name}', '{value}', false);"
+                                              for name, value in head.records) + ' END $hook$;')
+    return ['-c', setup]
 
 
 def psql(argv, stdin=None):
@@ -603,16 +626,14 @@ if len(messages) > 1 and record in messages[-1]:
         at = 1 if marker is None else next(i for i, m in enumerate(messages) if marker in m) + 1
         messages.insert(at, config['inject'])
     if once('between'):
-        head = psql(options + [x for m in messages[:-1] for x in ('-c', m)])
+        head = split_head(options, messages)
         if head.returncode:
             finish(head)
         side_session(config['between'], config.get('between_user', 'kofra_migrate'))
-        setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
-                 'SET client_min_messages = error;')
-        setup = [x for m in [setup, *(m for m in messages if m.startswith('DO $velmora_built$'))] for x in ('-c', m)]
+        setup = split_setup(head)
         finish(head, psql(options + setup + ['-c', messages[-1]]))
     if once('hold_w1'):
-        head = psql(options + [x for m in messages[:-1] for x in ('-c', m)])
+        head = split_head(options, messages)
         if head.returncode:
             finish(head)
         holder = subprocess.Popen([real, '-X', '-qAt'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -626,9 +647,7 @@ if len(messages) > 1 and record in messages[-1]:
         else:
             note('hook failed: W1 was not held')
             sys.exit(97)
-        setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
-                 'SET client_min_messages = error;')
-        setup = [x for m in [setup, *(m for m in messages if m.startswith('DO $velmora_built$'))] for x in ('-c', m)]
+        setup = split_setup(head)
         tail = psql(options + setup + ['-c', messages[-1]])
         holder.stdin.close()
         holder.wait()
@@ -1119,13 +1138,15 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
     def test_busy_index_table_is_retried_until_free_online(self):
         self.busy_until_retry('online')
 
-    def built_race(self, inject, *, recovers):
-        """Build kofra_a, then kofra_b; inject runs after kofra_a's build."""
+    def built_race(self, inject, *, recovers, side_session=False):
+        """Build kofra_a, then kofra_b; inject runs after kofra_a's build, in
+        the runner's session or, after both builds, in another session."""
         with tempfile.TemporaryDirectory() as tmp:
             script, _ = self.reuse_setup(tmp, REUSE_BOTH, mode='concurrent', existing=False)
-            env, log = self.hooked(tmp, inject=inject, inject_after="velmora.built_0'")
+            hooks = dict(between=inject) if side_session else dict(inject=inject, inject_after="velmora.built_0'")
+            env, log = self.hooked(tmp, **hooks)
             result = self.migrate(script=script, env=env, ok=False)
-            self.assertIn('fired inject', log.read_text())
+            self.assertIn('fired between' if side_session else 'fired inject', log.read_text())
             self.assert_refused_without_ledger_row(result, script, CONCURRENT_MISMATCH)
             self.assertNotEqual(self.index_oid('kofra_b'), '0')
             if recovers:
@@ -1141,6 +1162,10 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
 
     def test_index_built_by_this_run_replaced_before_ledger_write_is_refused(self):
         self.built_race('DROP INDEX kofra_a; CREATE INDEX kofra_a ON kofra_t (a);', recovers=False)
+
+    def test_index_built_by_this_run_replaced_by_another_session_is_refused(self):
+        self.built_race('DROP INDEX kofra_a; CREATE INDEX kofra_a ON kofra_t (a);', recovers=False,
+                        side_session=True)
 
     def test_same_name_index_created_after_snapshot_is_refused_at_the_fence(self):
         with tempfile.TemporaryDirectory() as tmp:
