@@ -844,6 +844,36 @@ impl ByteSpan {
     }
 }
 
+/// State stored by the management catalogue. Enforcement is a caller concern.
+#[cfg(feature = "tenancy-catalogue")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantState {
+    Active,
+    Suspended,
+    Deleting,
+}
+
+/// Access restriction for a suspended tenant.
+#[cfg(feature = "tenancy-catalogue")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantSuspensionMode {
+    ReadOnly,
+    Blocked,
+}
+
+/// A `tenants` row.
+#[cfg(feature = "tenancy-catalogue")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tenant {
+    pub id: String,
+    pub external_ref: String,
+    pub state: TenantState,
+    pub suspension_mode: Option<TenantSuspensionMode>,
+    pub display_name: Option<String>,
+    pub created_at: UnixMs,
+    pub updated_at: UnixMs,
+}
+
 /// `buckets` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bucket {

@@ -46,6 +46,14 @@ pub(crate) const STAGES: &[(&str, &str)] = &[
         "0006_scrub_indexes.sql",
         include_str!("../../../workers/s3-bridge/pg/0006_scrub_indexes.sql"),
     ),
+    (
+        "0007_tenants.sql",
+        include_str!("../../../workers/s3-bridge/pg/0007_tenants.sql"),
+    ),
+    (
+        "0008_tenant_indexes.sql",
+        include_str!("../../../workers/s3-bridge/pg/0008_tenant_indexes.sql"),
+    ),
 ];
 const SEED: &str = "INSERT INTO usage_global(id) VALUES (1),(2)";
 

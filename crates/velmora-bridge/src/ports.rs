@@ -765,6 +765,42 @@ pub trait Catalog {
         false
     }
 
+    /// Insert a new account or adopt the unchanged account for this reference.
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_create(
+        &self,
+        external_ref: &str,
+        display_name: Option<&str>,
+        now: UnixMs,
+    ) -> Result<crate::types::Tenant>;
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_get(&self, id: &str) -> Result<Option<crate::types::Tenant>>;
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn tenant_by_external_ref(
+        &self,
+        external_ref: &str,
+    ) -> Result<Option<crate::types::Tenant>>;
+    /// An ordered page within one tenant, starting strictly after `after_name`.
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn buckets_by_owner(
+        &self,
+        owner: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Bucket>>;
+    /// The input is the lowercase hex SHA-256 digest, never the token itself.
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_is_disabled(&self, sha256: &str) -> Result<bool>;
+    /// Idempotently disable the digest. A retry never changes the first record.
+    #[cfg(feature = "tenancy-catalogue")]
+    async fn mgmt_token_disable(
+        &self,
+        sha256: &str,
+        token_class: &str,
+        reason: &str,
+        now: UnixMs,
+    ) -> Result<()>;
+
     // admin + auth
     /// `Lost` = name taken.
     async fn create_bucket(&self, b: &Bucket) -> Result<Guard<()>>;
