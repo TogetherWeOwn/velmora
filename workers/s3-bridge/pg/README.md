@@ -161,6 +161,20 @@ types and non-null PKs, the three identities, the `yenc_name` regex,
 functions, and the statement-level usage triggers (`0003`). Source PKs that
 were nullable in SQLite require a copy census.
 
+## Bucket CORS
+
+Stage `0004` adds `bucket_cors`, keyed by bucket ID. Apply and verify it
+before deploying the Worker that supports bucket CORS. Its matching SQLite
+stage is for local development and tests, not the frozen D1 catalogue.
+The historical `pg-copy.py` import still requires the cutover checkout with
+exactly stages `0001`–`0003`.
+
+PostgreSQL backups include this table. CORS configuration is not part of
+object recovery records; after rebuilding from those records, submit the
+configuration again with `put-bucket-cors`. Turning `BUCKET_CORS` off leaves
+stored configurations in place, so use `delete-bucket-cors` first if you want
+to remove them.
+
 ## Usage counters
 
 D1 moves the usage counters with per-row triggers (migrations 0020 and
