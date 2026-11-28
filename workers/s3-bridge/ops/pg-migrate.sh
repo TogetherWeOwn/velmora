@@ -95,7 +95,12 @@ BUSY = {'55P03', 'VL023'}
 
 
 class Busy(Exception):
-    pass
+    """A retryable lock wait; `stdout` is what the session printed first."""
+
+    def __init__(self, state, stdout=''):
+        super().__init__(state)
+        self.state = state
+        self.stdout = stdout
 
 
 def digest(data):
@@ -781,7 +786,7 @@ SET {scope}client_min_messages = error;
             if concurrent and state == 'VL020':
                 return 'already applied'  # Caller independently confirms the ledger row.
             if state in BUSY and busy:
-                raise Busy(state)  # The caller re-plans before it retries.
+                raise Busy(state, result.stdout)  # The caller re-plans before it retries.
             if state in BUSY and retry and attempt < 5:
                 print(f'{report}: SQLSTATE {state}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                 time.sleep(0.25 * (2 ** attempt))
@@ -1009,16 +1014,50 @@ $$;
                 # Check reused indexes first: a reused index made invalid is VL021, not VL015.
                 finish = (concurrent_tx + reuse_guard(reused, 'VL021', built=built) + check(bad_index, 'VL015')
                           + path_check + record + "\nCOMMIT;\nSELECT 'applied';\n")
-                messages = [prepare]
+                # CREATE INDEX CONCURRENTLY waits out older transactions
+                # through lock waits: under the session's 3 s lock_timeout the
+                # build would fail and leave an INVALID index (VL015 on every
+                # retry). It takes only SHARE UPDATE EXCLUSIVE, which by itself
+                # blocks no reads or writes, so it waits up to 90 s per lock
+                # wait, and a timeout of the build itself is not retried. The
+                # bound is per index build: 90 s for the table lock and up to
+                # 90 s per wait phase for each long-lived non-app session, plus
+                # build time, and about 26 s of prepare retries per file. With
+                # only app sessions (transaction_timeout 30 s, PostgreSQL 17+) a
+                # build waits about 3 x 30 s. A caller's deadline covers every
+                # build applied in one invocation (the merge gate applies all
+                # pending versions of one PR in one 600 s run): land a migration
+                # with many concurrent builds in separate PRs, not just separate
+                # files. Several non-app sessions (an operator, kofra_ro)
+                # holding transactions for minutes can still push one build past
+                # it: end them before a migration merge. The ledger transaction sets its own timeouts (SET
+                # LOCAL), and the session is back at 3 s before it.
+                # The markers tell a lock timeout of the build itself (between
+                # them) from one of the 3 s prepare or finish waits.
+                messages = [prepare, "SET lock_timeout = '90s'", "SELECT 'velmora-building'"]
                 after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
                 for n, statement in enumerate(source_statements):
                     messages.append(statement)
                     if n in after:
                         messages.append(record_built(*after[n]))
+                messages += ["SET lock_timeout = '3s'", "SELECT 'velmora-built'"]
                 try:
-                    output = run([*messages, finish], busy=attempt < 5, report=name, concurrent=True)
+                    # busy=True on every attempt, the last included, so that the
+                    # phase markers are read on each one.
+                    output = run([*messages, finish], busy=True, report=name, concurrent=True)
                     break
                 except Busy as busy:
+                    printed = busy.stdout.splitlines()
+                    if busy.state == '55P03' and 'velmora-building' in printed and 'velmora-built' not in printed:
+                        # Not retried: another 90 s per attempt would overrun the
+                        # caller's budget. A build cancelled after it created its
+                        # index leaves that index INVALID.
+                        indexes = ', '.join(index for _, _, index in built) or 'none'
+                        die(f'{name}: SQLSTATE 55P03: a concurrent index build timed out waiting for a lock '
+                            f'(not retried); any of its indexes ({indexes}) left INVALID must be repaired as '
+                            'for VL015 before retrying')
+                    if attempt == 5:
+                        die(f'{name}: {ERRORS.get(busy.state) or f"SQLSTATE {busy.state}"}')
                     print(f'{name}: SQLSTATE {busy}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                     time.sleep(0.25 * (2 ** attempt))
             output = output.splitlines()
