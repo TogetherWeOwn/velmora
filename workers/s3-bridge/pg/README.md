@@ -118,8 +118,10 @@ additions; they are not Wrangler migrations. A pre-merge change must be safe
 with the old code still running. The lint allows named tables and indexes,
 additive columns, and seeds/backfills on post-cutover tables. It refuses
 `DROP`, `RENAME`, type changes, `SET NOT NULL`, `ADD COLUMN NOT NULL` without
-a default, and unsupported forms. Lint is not a substitute for reviewing
-backward compatibility, defaults, indexes and constraints.
+a non-null literal default, and unsupported forms. New objects cannot inherit,
+partition, or add foreign keys, `LIKE` copies or unique indexes that depend
+on a historical table. Lint is not a substitute for reviewing backward
+compatibility, defaults, indexes and constraints.
 
 `ops/pg-migrate.sh "$CONNECTION_FILE" --pending` reads the SHA-256-checked
 ledger without taking either writer lock or changing the database. It prints

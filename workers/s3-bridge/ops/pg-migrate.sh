@@ -668,6 +668,8 @@ SET LOCAL client_min_messages = error;
     if args.pending:
         applied = set(run(read_history + "SELECT version FROM schema_migrations;\nCOMMIT;\n",
                           report='pending migrations').splitlines())
+        if applied != set(list(files)[:len(applied)]):
+            die('pending migrations: applied migration history is not an ordered prefix')
         pending = [name for version, (name, _) in files.items() if version not in applied]
         if pending:
             print('\n'.join(pending))
@@ -678,6 +680,9 @@ SET LOCAL client_min_messages = error;
 
     def verify(report):
         manifest = json.loads(run(verify_sql, report=report))
+        inherited = set(manifest['inherited_tables'] or ()) - post_cutover['tables']
+        if inherited:
+            die('historical catalogue tables cannot have inherited children: ' + ', '.join(sorted(inherited)))
         if declarations:
             verify_post_cutover(manifest, post_cutover)
         compare(manifest, d1, {v: migrations[v] for v in baseline})

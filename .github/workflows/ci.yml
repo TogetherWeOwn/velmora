@@ -1202,8 +1202,8 @@ jobs:
           print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
           PY
       # Check the same top-level config that all Wrangler calls below use.
-      # Never set a Worker secret named CATALOG_BACKEND. With no binding,
-      # the runtime and this guard both default to writable D1.
+      # Never set a Worker secret named CATALOG_BACKEND. Production requires
+      # an explicit backend; a missing binding must not select writable D1.
       - id: d1-migrations
         name: Check the D1 migration policy
         if: steps.fresh.outputs.fresh == 'true'

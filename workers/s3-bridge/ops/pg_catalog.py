@@ -52,6 +52,12 @@ F7_PREFIX = "cutover_f7:"
 R1B_PREFIX = "cutover_r1b:"
 # Last PG migration shipped at the D1 freeze (2026-11-28, c7b955e9).
 CUTOVER_BASELINE = "0003"
+# These baseline relation names are not visible in the D1 replay: SQLite
+# uses different implicit index names and does not have identity sequences.
+HISTORICAL_PG_RELATIONS = {
+    f"{table}_pkey" for table in TABLES if table not in UNKEYED | {"tx_guard"}
+} | {"buckets_name_key", "articles_message_id_key", "outbox_seq_key", "schema_migrations_pkey",
+     "gc_id_seq", "usage_recounts_id_seq", "outbox_seq_seq"}
 
 
 def lint_additive(sql, source_statements, tokens_with_spans, name, objects):
@@ -79,20 +85,47 @@ def lint_additive(sql, source_statements, tokens_with_spans, name, objects):
         def optional(i, clause):
             return i + len(clause) if words[i:i + len(clause)] == clause else i
 
+        def new_relation(i):
+            value = identifier(i)
+            if value in HISTORICAL_PG_RELATIONS:
+                refuse(f"{value} is a historical PostgreSQL name", i)
+            return value
+
         if words[0] == "DROP":
             refuse("DROP is not additive")
         if words[:2] == ["CREATE", "TABLE"]:
             i = optional(2, ["IF", "NOT", "EXISTS"])
-            table = identifier(i)
+            table = new_relation(i)
+            if words[i + 1:i + 3] == ["PARTITION", "OF"]:
+                refuse("PARTITION OF changes the parent table and requires review", i + 1)
             if words[i + 1:i + 2] != ["("]:
                 refuse("expected CREATE TABLE with a column definition")
+            depth = 1
+            for j in range(i + 2, len(words)):
+                word = words[j]
+                if depth == 0:
+                    if word == "INHERITS":
+                        refuse("INHERITS changes which rows existing catalogue queries read", j)
+                    refuse("unsupported clause after CREATE TABLE column definitions", j)
+                # LIKE is a table element here, not a predicate inside CHECK.
+                if word == "REFERENCES" or (word == "LIKE" and depth == 1 and words[j - 1] in {"(", ","}):
+                    target = identifier(j + 1)
+                    if words[j + 2:j + 3] == ["."]:
+                        refuse(f"{word} requires an unqualified post-cutover table", j)
+                    if target not in tables and not (word == "REFERENCES" and target == table):
+                        refuse(f"{word} targets a historical or undeclared table and requires review", j)
+                depth += (word == "(") - (word == ")")
             tables.add(table)
         elif words[:2] == ["CREATE", "INDEX"] or words[:3] == ["CREATE", "UNIQUE", "INDEX"]:
+            unique = words[1] == "UNIQUE"
             i = optional(optional(words.index("INDEX") + 1, ["CONCURRENTLY"]), ["IF", "NOT", "EXISTS"])
-            index = identifier(i)
+            index = new_relation(i)
             if words[i + 1:i + 2] != ["ON"] or len(words) <= i + 3 or words[i + 3] == ".":
                 refuse("expected a named index on an unqualified catalogue table")
-            indexes.add((identifier(i + 2), index))
+            table = identifier(i + 2)
+            if unique and table not in tables:
+                refuse("UNIQUE index on a historical or undeclared table requires review", 1)
+            indexes.add((table, index))
         elif words[:2] == ["ALTER", "TABLE"]:
             i = optional(2, ["IF", "EXISTS"])
             table = identifier(i)
@@ -122,18 +155,29 @@ def lint_additive(sql, source_statements, tokens_with_spans, name, objects):
                 if k + 1 >= hi or words[k] in {"CONSTRAINT", "CHECK", "UNIQUE", "PRIMARY", "FOREIGN", "EXCLUDE"}:
                     refuse("expected ADD COLUMN, not a table constraint", lo)
                 column = identifier(k)
-                attrs, depth, default_at = [], 0, hi
+                if (table, column) == ("outbox", "seq"):
+                    refuse("outbox.seq is a historical PostgreSQL column", k)
+                attrs, not_null, depth, default_at = [], [], 0, hi
                 for j in range(k + 1, hi):
                     word = words[j]
                     if depth == 0:
                         attrs.append(word)
+                        if words[j:j + 2] == ["NOT", "NULL"]:
+                            not_null.append(j)
                         if word == "DEFAULT":
                             default_at = j + 1
                     depth += (word == "(") - (word == ")")
-                not_null = any(a == "NOT" and b == "NULL" for a, b in zip(attrs, attrs[1:]))
-                default_value = next((token for token in words[default_at:hi] if token != "("), None)
-                if not_null and default_value in {None, "NULL"}:
-                    refuse("NOT NULL without DEFAULT providing a value cannot run before a merge", lo)
+                if not_null:
+                    # The running Worker omits new columns. Require a literal
+                    # non-NULL default, not a cast or expression we cannot prove.
+                    end = next((j for j in not_null if j >= default_at), hi)
+                    literal = words[default_at:end]
+                    while literal[:1] == ["("] and literal[-1:] == [")"]:
+                        literal = literal[1:-1]
+                    if not (len(literal) == 1 and (literal[0] in {"TRUE", "FALSE"} or
+                                                  literal[0].startswith(("'", "E'"))) or
+                            re.fullmatch(r"[+-]?\s*[0-9]+(?:\s*\.\s*[0-9]+)?", " ".join(literal))):
+                        refuse("NOT NULL without DEFAULT supplying a non-NULL literal cannot run before a merge", lo)
                 if set(attrs) & {"CHECK", "CONSTRAINT", "UNIQUE", "PRIMARY", "REFERENCES", "GENERATED"}:
                     refuse("ADD COLUMN with constraints beyond NOT NULL requires review", lo)
                 columns.add((table, column))
@@ -178,6 +222,8 @@ def replay_sqlite_twins(d1, twins, declarations):
             finally:
                 db.set_authorizer(None)
             after = inventory(db)
+            require(expected["columns"] <= after["columns"] - before["columns"],
+                    f"{name}: SQLite twin {twin} does not add the declared columns")
             for kind, original in before.items():
                 added, wanted = after[kind] - original, expected[kind]
                 if kind == "columns":  # CREATE TABLE is checked by name; ALTER additions are explicit.

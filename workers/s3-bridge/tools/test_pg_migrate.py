@@ -55,10 +55,15 @@ def psql(sql, *, user=None, schema=None, check=True):
 
 
 def clone_bridge(tmp, appended=None):
-    """Copy what pg-migrate.sh reads, appending SQL to named PG migrations."""
+    """Copy only the cutover baseline so synthetic versions are always free."""
     clone = Path(tmp) / "s3-bridge"
-    for part in ("ops", "pg", "migrations"):
+    for part in ("ops", "migrations"):
         shutil.copytree(BRIDGE / part, clone / part)
+
+    def after_cutover(_, names):
+        return {name for name in names if re.fullmatch(r"[0-9]{4}_.*\.sql", name) and name[:4] not in STAGES}
+
+    shutil.copytree(BRIDGE / "pg", clone / "pg", ignore=after_cutover)
     for name, sql in (appended or {}).items():
         migration = clone / "pg" / name
         migration.write_text(migration.read_text() + sql)
@@ -171,7 +176,17 @@ class MigrationParser(unittest.TestCase):
             'ALTER TABLE extents ALTER COLUMN plan SET NOT NULL': 'SET NOT NULL',
             'ALTER TABLE extents ADD COLUMN bad INTEGER NOT NULL': 'NOT NULL without DEFAULT',
             'ALTER TABLE extents ADD COLUMN bad INTEGER NOT NULL DEFAULT (NULL)': 'NOT NULL without DEFAULT',
+            'ALTER TABLE extents ADD COLUMN bad TEXT NOT NULL DEFAULT CAST(NULL AS text)': 'NOT NULL without DEFAULT',
+            'ALTER TABLE extents ADD COLUMN bad INTEGER NOT NULL DEFAULT (0 + NULL)': 'NOT NULL without DEFAULT',
             "ALTER TABLE extents ADD COLUMN bad TEXT NOT NULL CHECK (bad <> 'DEFAULT')": 'NOT NULL without DEFAULT',
+            'CREATE TABLE derived (extra text) INHERITS (extents)': 'INHERITS',
+            'CREATE TABLE derived PARTITION OF extents DEFAULT': 'PARTITION OF',
+            'CREATE TABLE derived (LIKE extents INCLUDING DEFAULTS)': 'LIKE targets a historical',
+            'CREATE TABLE derived (extent_id text REFERENCES extents(id) ON DELETE CASCADE)':
+                'REFERENCES targets a historical',
+            'CREATE TABLE derived (extent_id text, FOREIGN KEY (extent_id) REFERENCES extents(id))':
+                'REFERENCES targets a historical',
+            'CREATE UNIQUE INDEX unique_probe ON extents(created_at)': 'UNIQUE index on a historical',
         }
         for sql, diagnostic in cases.items():
             with self.subTest(sql=sql), tempfile.TemporaryDirectory() as tmp:
@@ -224,6 +239,32 @@ class MigrationParser(unittest.TestCase):
                     self.assertIn(message, result.stderr)
                     self.assertFalse(other_db.exists())
 
+    def test_post_cutover_lint_rejects_pg_only_baseline_names(self):
+        cases = [
+            ('ALTER TABLE outbox ADD COLUMN IF NOT EXISTS seq bigint;',
+             'ALTER TABLE outbox ADD COLUMN seq INTEGER;', 'outbox.seq is a historical PostgreSQL column'),
+            ('-- velmora: no-transaction\nCREATE INDEX CONCURRENTLY IF NOT EXISTS outbox_seq_key ON outbox(seq);',
+             'CREATE INDEX outbox_seq_key ON outbox(extent_id);', 'outbox_seq_key is a historical PostgreSQL name'),
+        ]
+        for pg, sqlite, expected in cases:
+            with self.subTest(pg=pg), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_collision.sql', pg, sqlite)
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
+    def test_post_cutover_twin_includes_explicit_columns_on_new_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_example.sql',
+                          'CREATE TABLE kofra_example (id bigint); '
+                          'ALTER TABLE kofra_example ADD COLUMN note text;',
+                          'CREATE TABLE kofra_example (id INTEGER);')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('SQLite twin 0004_example.sql does not add the declared columns', result.stderr)
+
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
         # This fails before any connection, so the port need not be listening.
@@ -258,6 +299,7 @@ class PgMigrate(unittest.TestCase):
         self.assertEqual(roles.returncode, 0, roles.stderr)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.baseline_script = clone_bridge(tmp.name)
         self.env = Path(tmp.name) / "pg.env"
         lock = 7_413_100_000 + secrets.randbelow(1_000_000)
         lines = [f"PGHOST={host}", f"PGDATABASE={os.environ['PGDATABASE']}", "PGUSER=kofra_migrate",
@@ -267,8 +309,8 @@ class PgMigrate(unittest.TestCase):
         self.env.write_text("\n".join(lines) + "\n")
         self.env.chmod(0o600)
 
-    def migrate(self, *args, ok=True, script=MIGRATE, env_file=None, env=None):
-        result = subprocess.run(["bash", str(script), str(env_file or self.env), *args],
+    def migrate(self, *args, ok=True, script=None, env_file=None, env=None):
+        result = subprocess.run(["bash", str(script or self.baseline_script), str(env_file or self.env), *args],
                                 capture_output=True, text=True, env=env)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -395,6 +437,25 @@ class PgMigrate(unittest.TestCase):
             self.assertNotIn(bad_history.returncode, (0, 3))
             self.assertEqual(bad_history.stdout, '')
             self.assertIn('applied migration history does not match', bad_history.stderr)
+
+    def test_pending_refuses_a_gap_in_applied_migration_history(self):
+        self.migrate()
+        self.owner_sql("DELETE FROM schema_migrations WHERE version = '0002'")
+        pending = self.migrate('--pending', ok=False)
+        self.assertNotEqual(pending.returncode, 3)
+        self.assertEqual(pending.stdout, '')
+        self.assertIn('applied migration history is not an ordered prefix', pending.stderr)
+
+    def test_verify_rejects_inheritance_from_historical_catalogue(self):
+        self.migrate()
+        self.owner_sql('CREATE TABLE extra_extents () INHERITS (extents);')
+        verify = self.migrate('--verify', ok=False)
+        self.assertIn('historical catalogue tables cannot have inherited children: extents', verify.stderr)
+
+    def test_full_shipped_chain_verifies(self):
+        self.migrate(script=MIGRATE)
+        self.assertEqual(self.migrate('--pending', script=MIGRATE).stdout, '')
+        self.assertIn('Schema matches D1', self.migrate('--verify', script=MIGRATE).stdout)
 
     def test_verify_checks_pg_only_objects_without_masking_baseline_drift(self):
         self.migrate()

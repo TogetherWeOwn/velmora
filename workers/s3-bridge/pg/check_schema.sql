@@ -16,6 +16,8 @@ WITH ns AS (
 )
 SELECT json_build_object(
     'tables', (SELECT json_agg(t.relname) FROM tbl t),
+    'inherited_tables', (SELECT json_agg(DISTINCT parent.relname)
+        FROM pg_inherits i JOIN tbl parent ON i.inhparent = parent.oid),
     'columns', (SELECT json_agg(json_build_array(t.relname, a.attname,
         format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity,
         co.collname, pg_get_expr(d.adbin, d.adrelid)))

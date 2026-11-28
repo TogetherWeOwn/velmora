@@ -72,7 +72,9 @@ def should_apply(config_path, frozen_at, manifest_sha256):
     variables = config.get("vars", {})
     if not isinstance(variables, dict):
         sys.exit("D1 deploy guard: rendered vars must be a table")
-    backend = variables.get("CATALOG_BACKEND", "d1")
+    if "CATALOG_BACKEND" not in variables:
+        sys.exit("D1 deploy guard: rendered CATALOG_BACKEND must be explicit")
+    backend = variables["CATALOG_BACKEND"]
     if backend not in ("d1", "d1-frozen", "pg", "pg-frozen"):
         sys.exit("D1 deploy guard: invalid CATALOG_BACKEND in rendered vars")
 

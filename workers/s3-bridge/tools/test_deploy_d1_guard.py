@@ -66,8 +66,8 @@ class DeployD1GuardTest(unittest.TestCase):
         self.assertIn(error, result.stderr)
         self.assertFalse(self.output.exists())
 
-    def test_unset_defaults_to_writable_d1(self):
-        self.allowed(self.policy(), "true")
+    def test_unset_never_defaults_to_writable_d1_in_deploy(self):
+        self.refused(self.policy(), "rendered CATALOG_BACKEND must be explicit")
 
     def test_explicit_d1_leaves_new_migrations_for_wrangler(self):
         (self.migrations / "9999_new.sql").write_text("SELECT 1;\n", encoding="utf-8")
