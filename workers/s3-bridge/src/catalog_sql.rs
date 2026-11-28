@@ -1,6 +1,6 @@
 //! Selects the SQL adapter for both the Worker and the PermitGate object.
 
-use velmora_bridge::pg::{is_postgres_read_only, is_read_only, PgConfig, PgSql};
+use velmora_bridge::pg::{is_postgres_read_only, is_read_only, PgConfig, PgSql, WriteTx};
 use velmora_bridge::{BridgeError, Dialect, Result, Row, Sql, SqlValue};
 use worker::{js_sys::Reflect, wasm_bindgen::JsValue, Env};
 
@@ -61,14 +61,6 @@ impl Backend {
     }
 }
 
-fn pipeline(value: Option<&str>) -> core::result::Result<bool, &'static str> {
-    match value {
-        None | Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        _ => Err("invalid PG_PIPELINE"),
-    }
-}
-
 fn optional_text(
     env: &Env,
     name: &str,
@@ -85,6 +77,14 @@ fn optional_text(
         .ok_or(invalid)
 }
 
+/// One line per write transaction over the single-Sync size bound, which
+/// then goes one Sync per statement. No SQL and no values.
+fn log_oversize(statements: usize) {
+    worker::console_warn!(
+        "pg: oversize write transaction sent one Sync per statement ({statements} statements)"
+    );
+}
+
 pub enum CatalogSql {
     D1(D1Sql),
     D1Frozen(D1Sql),
@@ -99,9 +99,10 @@ impl CatalogSql {
             Backend::D1 | Backend::D1Frozen => Self::d1_from_env(env, backend.is_frozen()),
             Backend::Pg | Backend::PgFrozen => {
                 let config = PgConfig {
-                    pipeline: pipeline(
-                        optional_text(env, "PG_PIPELINE", "invalid PG_PIPELINE")?.as_deref(),
+                    write_tx: WriteTx::parse(
+                        optional_text(env, "PG_WRITE_TX", "invalid PG_WRITE_TX")?.as_deref(),
                     )?,
+                    on_oversize: Some(log_oversize),
                     ..PgConfig::default()
                 };
                 let writer = HyperdriveConnect::new(
@@ -213,9 +214,13 @@ mod tests {
             Backend::parse(Some("postgres")),
             Err("invalid CATALOG_BACKEND")
         );
-        assert_eq!(pipeline(None), Ok(true));
-        assert_eq!(pipeline(Some("0")), Ok(false));
-        assert_eq!(pipeline(Some("false")), Err("invalid PG_PIPELINE"));
+        assert_eq!(WriteTx::parse(None), Ok(WriteTx::SingleSync));
+        assert_eq!(WriteTx::parse(Some("single-sync")), Ok(WriteTx::SingleSync));
+        assert_eq!(WriteTx::parse(Some("pipeline")), Ok(WriteTx::Pipeline));
+        // The sequential transport is gone; its old switch values are typos.
+        for old in ["0", "1", "sequential", "message", "SingleSync"] {
+            assert_eq!(WriteTx::parse(Some(old)), Err("invalid PG_WRITE_TX"));
+        }
     }
 
     #[test]

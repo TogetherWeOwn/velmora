@@ -120,10 +120,11 @@ Limits to know:
     is listed again after a DeleteObject of the key, and by a replay
     into an empty database, which reads the record before the newer
     ones; the key ends as the newer records say all the same.
-  - Every replay that lists such a record exits with status 2, and for
-    a record that stays listed that does not end. Exit status 2 from
-    this list alone is then no new damage: compare the list with the
-    list of the replay before.
+  - Every replay that lists such a record exits with status 2 (status 3
+    if the script sent a call again, Restore step 4), and for a record
+    that stays listed that does not end. Exit status 2 from this list
+    alone is then no new damage: compare the list with the list of the
+    replay before.
 - A CompleteMultipartUpload that got no answer from the catalogue and
   was sent again can leave two records of one object. The replay
   publishes one and counts the other in `duplicate`; nothing is missing.
@@ -153,7 +154,8 @@ Limits to know:
   of this, because the stale bucket has its old grants again and one
   client write into it would keep it for good:
   1. run the replay to its end (`catalog-replay.sh` exits with status 2
-     because of the `other_bucket` list; that is expected here);
+     because of the `other_bucket` list, or 3 if it sent a call again;
+     that is expected here);
   2. delete the stale bucket with `DELETE /<bucket>` and the admin
      token. This one change is accepted under maintenance once no replay
      is unfinished. The answer is `204`. Do not delete a bucket after
@@ -184,7 +186,8 @@ Limits to know:
   (it does not open, and is then listed under `unreadable`). The tenant
   name is listed under `twins` either way. A write stores its record
   under one name only, so a twin is the trace of a blob that was put
-  into `SAFETY` by hand; `catalog-replay.sh` exits with status 2 for it.
+  into `SAFETY` by hand; `catalog-replay.sh` exits with status 2 for it
+  (status 3 if it sent a call again).
 - An empty bucket that never had a write is not in the records.
 
 ## Revoking an access key
@@ -408,6 +411,17 @@ older Worker cannot enforce it on a direct replay call.
      `SAFETY_MIN_AGE_SECS` is likely to need it, and with the shipped 0 a
      copy of any age can, because a copy may be released minutes after
      its post.
+   - Set `REPLAY_READ_AHEAD = "on"` on the restore Worker to enable
+     bounded parallel reads and steps of up to 250 records and 1,000
+     extents. Unset or `"off"` retains sequential reads and the 50-record,
+     100-extent limits. The script prints the running rate after each call.
+   - A call that gets no answer is sent again by the script after a
+     wait. Leave that wait in place: the Worker may still be at work
+     on the call it did not answer.
+     If a replay completed after any retry, the script exits with
+     status 3, also where this guide expects status 2. A retry can see a later catalogue state and omit damage
+     that the lost response reported. Inspect the returned lists, but
+     do not treat empty lists as proof that the replay found no damage.
 5. Check: `GET /_admin/status` (`replay_unfinished` must be `false`), a
    listing, and a GET of a recent object.
 6. Set `MAINTENANCE = "off"` and deploy. Issue access keys again if the

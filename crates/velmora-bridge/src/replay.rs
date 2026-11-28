@@ -16,6 +16,14 @@
 //! extents spans several calls; it is published by the call that
 //! finishes its last extent.
 //!
+//! The time of a replay is the time of its reads of the store, so a
+//! call asks the store ahead of its step and for several things at
+//! once: the records it listed and what the store has of their
+//! extents. Only the reads are moved. The step itself is unchanged: it
+//! takes one record after the other in id order, writes the catalogue
+//! in that order, and decides on an answer the store gave in the same
+//! call. A read that failed ahead is made again by the step.
+//!
 //! A segmented record ([`GenerationHead`]) is replayed the same way,
 //! with its extents read from its segments: a call reads the head and
 //! the segment its cursor is in. Before the first extent of such a
@@ -38,28 +46,61 @@
 //! reported as `damaged_unpublished`. Those entries carry the name of
 //! the bucket and the object key beside the id; no other list does.
 
+use std::collections::{HashMap, HashSet};
+use std::pin::pin;
+use std::sync::Mutex;
+
+use futures_util::future::{self, Either, FutureExt};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
+use crate::ports::{
+    BlobEntry, BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector,
+    ReadAheadBlob,
+};
 use crate::recovery::{
     read_article_plan, read_segment, read_stored_generation, read_tombstone, record_name,
-    start_after, ExtentRecord, GenerationHead, Layout, StoredGeneration, GENERATION_PREFIX,
-    MAX_SEGMENTS, TOMBSTONE_PREFIX,
+    start_after, ExtentRecord, GenerationHead, Layout, PlanRead, StoredGeneration, Unpublished,
+    GENERATION_PREFIX, MAX_SEGMENTS, TOMBSTONE_PREFIX,
 };
 use crate::types::{
-    ArticleRow, ArticleState, BridgeError, BucketId, ExtentPlacement, ExtentRow, GenerationId,
-    Result, UnixMs,
+    ArticleRow, ArticleState, BridgeError, BucketId, ByteSpan, ExtentId, ExtentPlacement,
+    ExtentRow, GenerationId, Result, UnixMs,
 };
 
-/// How much one call does. The default keeps a call far below a Worker
-/// invocation's subrequest limit.
+/// How much one call does. A record costs two blob reads (the record,
+/// and, with read-ahead on, whether it is still there when the step
+/// comes to it) and up to seven catalogue calls, an extent two blob reads (three when its
+/// plan is looked for in a second layout) and a share of a catalogue
+/// batch. With the default that is about 3,500 blob reads and 2,000
+/// catalogue calls, a little over half of a Worker invocation's
+/// subrequest limit (10,000). The most a call can come to is higher:
+/// the extents asked ahead are no more than `extents`, but those of a
+/// record the step then leaves out (it belongs to a bucket made again
+/// under the same name) were asked for nothing, and the step asks for
+/// as many again: up to 3,000 blob reads more with the default, which
+/// is still below the limit.
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayLimits {
     /// Records listed and finished at most.
     pub records: u32,
-    /// Extents checked at most (two blob reads each).
+    /// Extents checked at most.
     pub extents: usize,
 }
+
+/// Extents a call asks the blob store about ahead at the same time.
+/// An extent is two reads at once (its pinned copy and its article
+/// plan), so that is twelve reads, beside the ones of the step itself.
+/// A Worker invocation holds six connections open at most and queues
+/// the rest, so more than that is not faster there.
+pub const STORE_READS: usize = 6;
+
+/// Where the pinned copies are stored: [`ExtentId::safety_key`].
+const PINNED_PREFIX: &str = "x/";
+/// Keys asked of one listing of the pinned copies, and listings a call
+/// makes at most.
+const HELD_PAGE: u32 = 1000;
+const HELD_PAGES: u32 = 4;
 
 /// Damaged generations the last call lists by id.
 const DAMAGED_LISTED: u32 = 100;
@@ -300,8 +341,15 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     /// is an error and changes nothing that the same cursor would not
     /// redo.
     pub async fn replay_step(&self, cursor: ReplayCursor) -> Result<ReplayReport> {
-        self.replay_step_within(cursor, ReplayLimits::default())
-            .await
+        let limits = if self.cfg.replay_read_ahead {
+            ReplayLimits {
+                records: 250,
+                extents: 1_000,
+            }
+        } else {
+            ReplayLimits::default()
+        };
+        self.replay_step_within(cursor, limits).await
     }
 
     /// [`Self::replay_step`] with explicit limits (both at least 1).
@@ -333,10 +381,102 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         let names = self
             .listed(GENERATION_PREFIX, &cursor.after, limits.records, report)
             .await?;
-        let mut budget = limits.extents;
-        // Segments read by this call.
-        let mut reads = 0;
-        for listed in &names {
+        // From here on the store is asked through `store`: what the
+        // records below need of it is asked ahead, several at a time,
+        // one run of records while the run before it is written to the
+        // catalogue. The catalogue is written by one record after the
+        // other, in the order of their ids, as before: only the store
+        // is asked ahead, and it is only read.
+        let store = &Ahead::new(&self.safety);
+        let mut call = Call {
+            budget: limits.extents,
+            reads: 0,
+            buckets: HashMap::new(),
+        };
+        let more = if self.cfg.replay_read_ahead {
+            self.replay_runs_ahead(store, &names, &mut cursor, &mut call, report)
+                .await?
+        } else {
+            self.replay_run(store, &names, &mut cursor, &mut call, report)
+                .await?
+        };
+        if more || names.len() as u64 == u64::from(limits.records) {
+            return Ok(Some(cursor));
+        }
+        Ok(Some(ReplayCursor {
+            phase: ReplayPhase::Tombstones,
+            after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
+            // A count in a record that is not listed any more is of nothing.
+            extent: 0,
+            name: String::new(),
+            ..cursor
+        }))
+    }
+
+    async fn replay_runs_ahead(
+        &self,
+        store: &Ahead<'_, B>,
+        names: &[Listed],
+        cursor: &mut ReplayCursor,
+        call: &mut Call,
+        report: &mut ReplayReport,
+    ) -> Result<bool> {
+        // Extents asked ahead so far: no more than the call can handle.
+        let extents = call.budget;
+        let mut asked = self
+            .ahead_manifests(
+                store,
+                names.get(..AHEAD_RECORDS.min(names.len())).unwrap_or(&[]),
+                Some(cursor),
+                extents,
+            )
+            .await;
+        for (run, next) in names
+            .chunks(AHEAD_RECORDS)
+            .zip(names.chunks(AHEAD_RECORDS).skip(1).map(Some).chain([None]))
+        {
+            let left = extents.saturating_sub(asked);
+            let (more, ahead) = {
+                let step = pin!(self.replay_run(store, run, cursor, call, report));
+                let ahead = pin!(async move {
+                    match next {
+                        Some(next) if left > 0 => {
+                            self.ahead_manifests(store, next, None, left).await
+                        }
+                        _ => 0,
+                    }
+                });
+                // The run that is asked ahead is waited for when this
+                // one is done and the call goes on; a call that ends
+                // here does not wait for it.
+                match future::select(step, ahead).await {
+                    Either::Left((more, ahead)) => {
+                        let more = more?;
+                        (more, if more { 0 } else { ahead.await })
+                    }
+                    Either::Right((ahead, step)) => (step.await?, ahead),
+                }
+            };
+            asked += ahead;
+            if more {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The step for the records of `run`, one after the other. `true` =
+    /// the call is out of extents or of segment reads inside a record;
+    /// the cursor says where the next one goes on.
+    async fn replay_run(
+        &self,
+        store: &Ahead<'_, B>,
+        run: &[Listed],
+        cursor: &mut ReplayCursor,
+        call: &mut Call,
+        report: &mut ReplayReport,
+    ) -> Result<bool> {
+        for listed in run {
             let flat = &listed.flat;
             // The name the cursor counts extents in: the one it holds,
             // or, when it holds none (a cursor of an older build, which
@@ -367,7 +507,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 if *name != owner {
                     cursor.extent = 0;
                 }
-                let record = match read_stored_generation(&self.safety, &self.kek, name).await {
+                let record = match read_stored_generation(store, &self.kek, name).await {
                     Ok(Some(record)) => record,
                     // Removed by an operator since the listing.
                     Ok(None) => continue,
@@ -387,9 +527,8 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // count is not used in another when this one is gone
                 // by the next call.
                 cursor.name.clone_from(name);
-                let mut budget = (&mut budget, &mut reads);
                 match self
-                    .replay_manifest(&record, layout, &mut cursor, &mut budget, report)
+                    .replay_manifest(store, &record, layout, cursor, call, report)
                     .await?
                 {
                     Replayed::Done => {
@@ -397,7 +536,12 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         break;
                     }
                     // Out of budget inside this record.
-                    Replayed::More => return Ok(Some(cursor)),
+                    Replayed::More => return Ok(true),
+                    // As a record that was removed before it was read.
+                    Replayed::Gone => {
+                        cursor.extent = 0;
+                        cursor.name.clear();
+                    }
                     Replayed::Unreadable(segment) => {
                         for unread in [segment, name.clone()] {
                             if !report.unreadable.contains(&unread) {
@@ -411,20 +555,85 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     }
                 }
             }
-            cursor = finished(cursor, flat);
+            *cursor = finished(cursor.clone(), flat);
         }
-        if names.len() as u64 == u64::from(limits.records) {
-            return Ok(Some(cursor));
-        }
-        Ok(Some(ReplayCursor {
-            phase: ReplayPhase::Tombstones,
-            after: start_after(TOMBSTONE_PREFIX, UnixMs(cursor.since_ms)),
-            // A count in a record that is not listed any more is of
-            // nothing.
-            extent: 0,
-            name: String::new(),
-            ..cursor
+        Ok(false)
+    }
+
+    /// Asks the store ahead for what the step needs of `names`: the
+    /// record under the first name of each id, and, of the records in
+    /// one part, the pinned copy and the article plan of the extents
+    /// this call can come to, several at a time. Nothing is decided
+    /// here and nothing is reported. The step then reads the same
+    /// names through `store`, in the order of the records, with the
+    /// code that reads them from the store itself; whatever was not
+    /// asked ahead, or could not be, is asked then. `cursor` = the
+    /// cursor of the call, when `names` are its first records. Returns
+    /// the number of extents asked about.
+    async fn ahead_manifests(
+        &self,
+        store: &Ahead<'_, B>,
+        names: &[Listed],
+        cursor: Option<&ReplayCursor>,
+        extents: usize,
+    ) -> usize {
+        let keep = &store.keeping();
+        // The extents of each record in one part, in the order of the
+        // records, until no more is kept. A record that does not open
+        // here does not open in the step either, which reports it.
+        let records: Vec<Vec<ExtentId>> = stream::iter(names.iter().map(|listed| async move {
+            let record = read_stored_generation(keep, &self.kek, &listed.name).await;
+            let Ok(Some(StoredGeneration::Single(m))) = record else {
+                return Vec::new();
+            };
+            // The step asks nothing about the extents of a record that
+            // a newer one of the object is over. The catalogue is only
+            // read here; the step asks it again and decides.
+            let superseded = match m.generation() {
+                Ok(generation) => matches!(
+                    self.catalog.replay_probe(&generation).await,
+                    Ok(ReplayProbe::Superseded)
+                ),
+                Err(_) => true,
+            };
+            if superseded {
+                return Vec::new();
+            }
+            m.extents
+                .iter()
+                .map(|e| ExtentId::new(e.id.clone()))
+                .collect()
         }))
+        .buffered(STORE_READS)
+        .take_while(|_| std::future::ready(!store.full()))
+        .collect()
+        .await;
+        // The step takes up the first record at the extent of its
+        // cursor, when the count is of that name.
+        let skip = match (cursor, names.first()) {
+            (Some(cursor), Some(first)) if cursor.name.is_empty() || cursor.name == first.name => {
+                cursor.extent as usize
+            }
+            _ => 0,
+        };
+        let wanted = names
+            .iter()
+            .zip(&records)
+            .enumerate()
+            .flat_map(|(at, (listed, ids))| {
+                let skip = if at == 0 { skip } else { 0 };
+                ids.iter().skip(skip).map(move |id| (id, &listed.layout))
+            })
+            .take(extents);
+        // Each answer is kept by `keep` and dropped inside its read, so
+        // the ordered queue holds nothing outside the byte budget.
+        stream::iter(
+            wanted.map(|(id, layout)| self.probe_replay_extent(keep, id, layout).map(drop)),
+        )
+        .buffered(STORE_READS)
+        .take_while(|_| std::future::ready(!store.full()))
+        .count()
+        .await
     }
 
     /// Reads every segment of `head`, one at a time, and holds each to
@@ -434,13 +643,14 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     /// of its extents, when `placed`; empty otherwise.
     async fn read_segments(
         &self,
+        store: &Ahead<'_, B>,
         head: &GenerationHead,
         layout: &Layout,
         placed: bool,
     ) -> Result<std::result::Result<Vec<ExtentPlacement>, String>> {
         let mut placements = Vec::new();
         for index in 0..head.segments.len() {
-            match read_segment(&self.safety, &self.kek, layout, head, index).await {
+            match read_segment(store, &self.kek, layout, head, index).await {
                 Ok(extents) if placed => {
                     // Room for what the head counts, once a segment of
                     // it is what the head says.
@@ -457,23 +667,85 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         Ok(Ok(placements))
     }
 
+    /// What the store has of one extent: whether its pinned copy is
+    /// there, and its article plan record. When read-ahead is enabled,
+    /// the two are asked at once.
+    async fn probe_replay_extent<S: BlobStore>(
+        &self,
+        store: &S,
+        extent: &ExtentId,
+        layout: &Layout,
+    ) -> Result<(bool, PlanRead)> {
+        let key = extent.safety_key();
+        if !self.cfg.replay_read_ahead {
+            let pinned = store.head(&key).await?.is_some();
+            let plan = read_article_plan(store, &self.kek, extent, layout).await?;
+            return Ok((pinned, plan));
+        }
+        let (pinned, plan) = future::try_join(
+            store.head(&key),
+            read_article_plan(store, &self.kek, extent, layout),
+        )
+        .await?;
+        Ok((pinned.is_some(), plan))
+    }
+
     async fn replay_manifest(
         &self,
+        store: &Ahead<'_, B>,
         record: &StoredGeneration,
         // The layout the record is stored in: where its segments are,
         // and where the article plans of its extents are looked for
         // first.
         layout: &Layout,
         cursor: &mut ReplayCursor,
-        // Extents this call may still handle, and segments it has read.
-        (budget, reads): &mut (&mut usize, &mut usize),
+        call: &mut Call,
         report: &mut ReplayReport,
     ) -> Result<Replayed> {
+        let Call {
+            budget,
+            reads,
+            buckets,
+        } = call;
         let (generation, bucket) = match record {
             StoredGeneration::Single(m) => (m.generation()?, m.bucket()),
             StoredGeneration::Segmented(head) => (head.generation(), head.bucket()),
         };
-        let probe = self.catalog.replay_probe(&generation).await?;
+        // With read-ahead on, the record was read at the start of its
+        // run, some time before the step comes to it, and a write that
+        // was under way when the restore began removes its record when
+        // the catalogue refuses it. So at the record's turn the store
+        // itself, never what was read ahead, is asked whether it still
+        // has the record, at the same time as the catalogue is asked
+        // about it. A record that is gone then is skipped whatever the
+        // catalogue says of it, also when the probe failed, before
+        // anything is counted or written,
+        // as main skips a record its GET at the turn does not find. Off,
+        // the record was read just now, as on main. A failed HEAD fails
+        // the step, except for a record the catalogue has: that one is
+        // replayed from the body read ahead, which writes nothing new.
+        let probe = if self.cfg.replay_read_ahead {
+            let (probe, there) = future::join(
+                self.catalog.replay_probe(&generation),
+                self.safety.head(&cursor.name),
+            )
+            .await;
+            // Gone first: main asks the catalogue nothing about a
+            // record its GET does not find, so a failed probe of such a
+            // record fails nothing.
+            if let Ok(None) = there {
+                return Ok(Replayed::Gone);
+            }
+            let probe = probe?;
+            match there {
+                Err(_) if probe == ReplayProbe::Present => {}
+                Err(e) => return Err(e),
+                Ok(_) => {}
+            }
+            probe
+        } else {
+            self.catalog.replay_probe(&generation).await?
+        };
         if probe == ReplayProbe::Superseded {
             report.superseded += 1;
             return Ok(Replayed::Done);
@@ -482,8 +754,26 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // another id and another data key. Nothing of the record can go
         // into it, and its rows cannot go in beside it: the name is
         // unique. The operator decides which of the two stays.
-        if let Some(named) = self.catalog.bucket_by_name(&bucket.name).await? {
-            if named.id != bucket.id {
+        // The id a name was found under is the one it has for the rest
+        // of the call: nothing but this replay writes, and it adds no
+        // bucket under a name that has one. A name that was not found
+        // is asked for again: the record's own bucket goes in with its
+        // first extent.
+        let named = match buckets.get(&bucket.name) {
+            Some(id) => Some(id.clone()),
+            None => {
+                let named = self.catalog.bucket_by_name(&bucket.name).await?;
+                let id = named.map(|b| b.id);
+                if self.cfg.replay_read_ahead {
+                    if let Some(id) = &id {
+                        buckets.insert(bucket.name.clone(), id.clone());
+                    }
+                }
+                id
+            }
+        };
+        if let Some(named) = named {
+            if named != bucket.id {
                 report.other_bucket_total += 1;
                 if report.other_bucket.len() < OTHER_BUCKET_LISTED {
                     report.other_bucket.push(generation.id.as_str().to_owned());
@@ -491,6 +781,9 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 return Ok(Replayed::Done);
             }
         }
+        // The presence answer above does not fence the removal of a
+        // refused record after it; main has the same window after its
+        // record GET.
         let now = self.clock.now();
         let total = generation.extent_count as usize;
         let mut at = cursor.extent as usize;
@@ -502,10 +795,10 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             // and no sweep removes them; a replay of the record, once
             // it reads again, writes the same rows.)
             if at == 0 {
-                if **budget == 0 || !fits(reads, head.segments.len()) {
+                if *budget == 0 || !fits(reads, head.segments.len()) {
                     return Ok(Replayed::More);
                 }
-                if let Err(segment) = self.read_segments(head, layout, false).await? {
+                if let Err(segment) = self.read_segments(store, head, layout, false).await? {
                     return Ok(Replayed::Unreadable(segment));
                 }
             }
@@ -513,7 +806,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
         // The segment the cursor is in: its index and its extents.
         let mut held: Option<(usize, Vec<ExtentRecord>)> = None;
         while at < total {
-            if **budget == 0 {
+            if *budget == 0 {
                 return Ok(Replayed::More);
             }
             // The run of extents the cursor is in, and the `seq` of its
@@ -532,7 +825,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         if !fits(reads, 1) {
                             return Ok(Replayed::More);
                         }
-                        match read_segment(&self.safety, &self.kek, layout, head, index).await {
+                        match read_segment(store, &self.kek, layout, head, index).await {
                             Ok(extents) => held = Some((index, extents)),
                             Err(BridgeError::Blob(e)) => return Err(BridgeError::Blob(e)),
                             Err(_) => {
@@ -544,14 +837,26 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     (head.segments[index].seq as usize, extents)
                 }
             };
-            let end = total.min(at + **budget).min(first + run.len());
-            let mut chunk = Vec::with_capacity(end - at);
-            for index in at..end {
-                let mut row = match record {
+            let end = total.min(at + *budget).min(first + run.len());
+            // Take results in record order and stage the chunk only
+            // after every answer. With read-ahead off, validate and
+            // read each extent before starting the next one.
+            let reads_at_once = if self.cfg.replay_read_ahead {
+                STORE_READS
+            } else {
+                1
+            };
+            let mut probes = pin!(stream::iter((at..end).map(|index| async move {
+                let row = match record {
                     StoredGeneration::Single(m) => m.extent(index),
                     StoredGeneration::Segmented(head) => head.extent(&run[index - first]),
                 }?;
-                let safety_present = self.safety.head(&row.id.safety_key()).await?.is_some();
+                let found = self.probe_replay_extent(store, &row.id, layout).await?;
+                Ok::<_, BridgeError>((row, found))
+            }))
+            .buffered(reads_at_once));
+            let mut chunk = Vec::with_capacity(end - at);
+            while let Some((mut row, (safety_present, read))) = probes.try_next().await? {
                 // A plan in an existing catalogue row is kept; this one
                 // fills the gap when the row or its plan is missing.
                 let state = if safety_present {
@@ -566,7 +871,6 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                 // The plan may be in the other layout than the record:
                 // an extent is posted after its object is published,
                 // and a copy names the extents of an older object.
-                let read = read_article_plan(&self.safety, &self.kek, &row.id, layout).await?;
                 let mut unopened = read.unreadable;
                 let record = read.record;
                 let mut packed = None;
@@ -621,7 +925,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                     report.unreadable.push(layout.article_key(&extent));
                 }
             }
-            **budget -= end - at;
+            *budget -= end - at;
             at = end;
             cursor.extent = u32::try_from(at).unwrap_or(u32::MAX);
         }
@@ -640,7 +944,7 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
                         if !fits(reads, head.segments.len()) {
                             return Ok(Replayed::More);
                         }
-                        match self.read_segments(head, layout, true).await? {
+                        match self.read_segments(store, head, layout, true).await? {
                             Ok(placements) => placements,
                             Err(segment) => return Ok(Replayed::Unreadable(segment)),
                         }
@@ -698,12 +1002,17 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
             .listed(TOMBSTONE_PREFIX, &cursor.after, limits.records, report)
             .await?;
         let now = self.clock.now();
+        let store = &Ahead::new(&self.safety);
+        if self.cfg.replay_read_ahead {
+            // The record under the first name of every id, asked ahead.
+            read_whole_ahead(store, names.iter().map(|listed| listed.name.as_str())).await;
+        }
         for listed in &names {
             let flat = &listed.flat;
             // As for a generation: the first name of the id that opens.
             let mut opened = None;
             for (name, _) in listed.names() {
-                match read_tombstone(&self.safety, &self.kek, name).await {
+                match read_tombstone(store, &self.kek, name).await {
                     Ok(Some(t)) => {
                         opened = Some(t);
                         break;
@@ -813,9 +1122,53 @@ impl<C: Catalog, B: BlobStore, N: NntpConnector, J: JobSink, K: Kek, T: Clock>
     ) -> Result<Option<ReplayCursor>> {
         let limit = u32::try_from(limits.extents).unwrap_or(u32::MAX);
         let ids = self.catalog.held_extents(&cursor.after, limit).await?;
-        for id in &ids {
+        // The pinned copies are listed over the span of the ids, in the
+        // order of both: one call of the store for a thousand of them.
+        // A copy the listing names is there. One it does not name is
+        // asked for by its own key: only that answer says it is
+        // missing, as before. So a listing that ends early, because
+        // copies of extents the catalogue does not hold lie in between,
+        // costs time and changes nothing.
+        let mut listed: HashSet<String> = HashSet::new();
+        if let Some(last) = ids
+            .last()
+            .filter(|_| self.cfg.replay_read_ahead)
+            .map(ExtentId::safety_key)
+        {
+            let mut at = ExtentId::new(cursor.after.clone()).safety_key();
+            for _ in 0..HELD_PAGES {
+                // Listing is only an optimization. If it fails, keep
+                // prior pages and ask the uncovered keys individually.
+                let Ok(keys) = self.safety.list(PINNED_PREFIX, &at, HELD_PAGE).await else {
+                    break;
+                };
+                let end = (keys.len() as u64) < u64::from(HELD_PAGE);
+                if let Some(key) = keys.last() {
+                    at.clone_from(key);
+                }
+                listed.extend(keys);
+                if end || at >= last {
+                    break;
+                }
+            }
+        }
+        let listed = &listed;
+        // Several at a time when enabled, taken in the order of the ids.
+        let reads_at_once = if self.cfg.replay_read_ahead {
+            STORE_READS
+        } else {
+            1
+        };
+        let present: Vec<bool> = stream::iter(ids.iter().map(|id| async move {
+            let key = id.safety_key();
+            Ok::<_, BridgeError>(listed.contains(&key) || self.safety.head(&key).await?.is_some())
+        }))
+        .buffered(reads_at_once)
+        .try_collect()
+        .await?;
+        for (id, present) in ids.iter().zip(present) {
             report.held_checked += 1;
-            if self.safety.head(&id.safety_key()).await?.is_none() {
+            if !present {
                 report.held_missing_total += 1;
                 if report.held_missing.len() < HELD_MISSING_LISTED {
                     report.held_missing.push(id.as_str().to_owned());
@@ -854,6 +1207,289 @@ fn fits(reads: &mut usize, all: usize) -> bool {
     true
 }
 
+/// Records in a run: what the store has for a run is asked while the
+/// run before it is written to the catalogue.
+const AHEAD_RECORDS: usize = 16;
+
+/// What a call has left and what it has learned.
+struct Call {
+    /// Extents the call may still handle.
+    budget: usize,
+    /// Segments it has read.
+    reads: usize,
+    /// The id of each bucket name the catalogue was found to have.
+    buckets: HashMap<String, BucketId>,
+}
+
+/// Aggregate budget for retained and in-flight speculative bodies.
+/// Reserve against response metadata before reading bytes. A response
+/// that will not fit is left for the ordered replay step.
+const AHEAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The blob store of one replay call, with the answers the call asked
+/// for ahead of their use. What is read through [`Ahead::keeping`] is
+/// kept: the answer to a `get` of a whole blob or to a `head`. What
+/// the step reads through the store itself is answered from what is
+/// kept, once, when the answer is there, and by the store otherwise.
+/// So an answer the step works with is one the store gave earlier in
+/// the same call. A call that failed is not kept: the step asks again
+/// and fails as it would have. A replay only reads this store, and
+/// nothing else writes to it while a restore runs; a write through
+/// this one drops what is kept, and what was asked before it is not
+/// kept after it.
+struct Ahead<'a, B> {
+    store: &'a B,
+    kept: Mutex<Kept>,
+}
+
+/// The side of an [`Ahead`] that reads ahead: its answers are kept.
+struct Keeping<'s, 'a, B>(&'s Ahead<'a, B>);
+
+#[derive(Default)]
+struct Kept {
+    gets: HashMap<String, Option<Vec<u8>>>,
+    heads: HashMap<String, Option<u64>>,
+    /// The bytes of `gets`.
+    bytes: usize,
+    /// Bytes reserved for in-flight reads and their cache copies.
+    reserved: usize,
+    /// Counts the writes: an answer asked for before a write is not
+    /// kept after it.
+    writes: u64,
+}
+
+impl Kept {
+    fn drop_get(&mut self, key: &str) -> Option<Option<Vec<u8>>> {
+        let answer = self.gets.remove(key)?;
+        self.bytes -= answer.as_ref().map_or(0, Vec::len);
+        Some(answer)
+    }
+
+    fn written(&mut self) {
+        *self = Kept {
+            writes: self.writes + 1,
+            reserved: self.reserved,
+            ..Kept::default()
+        };
+    }
+}
+
+/// Release a reservation on error, completion, or cancellation of the
+/// speculative future. No lock is held across the adapter's await.
+struct Reservation<'a> {
+    kept: &'a Mutex<Kept>,
+    bytes: usize,
+}
+
+impl Reservation<'_> {
+    fn claim(&mut self, size: u64) -> bool {
+        // Reserve the body, its cached copy, and a byte for the R2 EOF
+        // check. The caller uses the returned body before yielding again.
+        let Some(bytes) = usize::try_from(size)
+            .ok()
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(1))
+        else {
+            return false;
+        };
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes > AHEAD_BYTES - (kept.bytes + kept.reserved) {
+            return false;
+        }
+        kept.reserved += bytes;
+        self.bytes = bytes;
+        true
+    }
+
+    fn release(&mut self, kept: &mut Kept) {
+        kept.reserved -= std::mem::take(&mut self.bytes);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            self.release(&mut kept);
+        }
+    }
+}
+
+impl<'a, B: BlobStore> Ahead<'a, B> {
+    fn new(store: &'a B) -> Self {
+        Ahead {
+            store,
+            kept: Mutex::new(Kept::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Kept> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether as much is kept as a call may hold.
+    fn full(&self) -> bool {
+        let kept = self.lock();
+        kept.bytes + kept.reserved >= AHEAD_BYTES
+    }
+
+    /// The store for what is read ahead.
+    fn keeping(&self) -> Keeping<'_, 'a, B> {
+        Keeping(self)
+    }
+}
+
+impl<B: BlobStore> BlobStore for Ahead<'_, B> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.lock().written();
+        self.store.put(key, bytes, meta).await
+    }
+
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if span.is_none() {
+            if let Some(answer) = self.lock().drop_get(key) {
+                return Ok(answer);
+            }
+        }
+        self.store.get(key, span).await
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        let kept = self.lock().heads.remove(key);
+        match kept {
+            Some(answer) => Ok(answer),
+            None => self.store.head(key).await,
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.lock().written();
+        self.store.delete(key).await
+    }
+
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        self.lock().written();
+        self.store.delete_record(refused).await
+    }
+
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.store.list(prefix, start_after, limit).await
+    }
+
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        self.store.list_entries(prefix, start_after, limit).await
+    }
+}
+
+impl<B: BlobStore> BlobStore for Keeping<'_, '_, B> {
+    async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()> {
+        self.0.put(key, bytes, meta).await
+    }
+
+    async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        // Only whole objects are useful to the speculative reader.
+        if span.is_some() {
+            return Ok(None);
+        }
+        let writes = {
+            let kept = self.0.lock();
+            if let Some(answer) = kept.gets.get(key) {
+                let size = answer.as_ref().map_or(0, Vec::len);
+                return if size <= AHEAD_BYTES - (kept.bytes + kept.reserved) {
+                    Ok(answer.clone())
+                } else {
+                    Ok(None)
+                };
+            }
+            kept.writes
+        };
+        let mut reservation = Reservation {
+            kept: &self.0.kept,
+            bytes: 0,
+        };
+        let answer = match self
+            .0
+            .store
+            .get_for_read_ahead(key, |size| reservation.claim(size))
+            .await?
+        {
+            ReadAheadBlob::Missing => None,
+            // Only a genuine miss belongs in the cache.
+            ReadAheadBlob::Skipped => return Ok(None),
+            ReadAheadBlob::Body(bytes) => Some(bytes),
+        };
+        let mut kept = self.0.lock();
+        if kept.writes == writes && !kept.gets.contains_key(key) {
+            kept.bytes += answer.as_ref().map_or(0, Vec::len);
+            kept.gets.insert(key.to_owned(), answer.clone());
+        }
+        reservation.release(&mut kept);
+        Ok(answer)
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<u64>> {
+        let writes = {
+            let kept = self.0.lock();
+            if let Some(answer) = kept.heads.get(key) {
+                return Ok(*answer);
+            }
+            kept.writes
+        };
+        let answer = self.0.store.head(key).await?;
+        let mut kept = self.0.lock();
+        if kept.writes == writes {
+            kept.heads.insert(key.to_owned(), answer);
+        }
+        Ok(answer)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0.delete(key).await
+    }
+
+    async fn delete_record(&self, refused: &Unpublished) -> Result<()> {
+        self.0.delete_record(refused).await
+    }
+
+    async fn list(&self, prefix: &str, start_after: &str, limit: u32) -> Result<Vec<String>> {
+        self.0.store.list(prefix, start_after, limit).await
+    }
+
+    async fn list_entries(
+        &self,
+        prefix: &str,
+        start_after: &str,
+        limit: u32,
+    ) -> Result<Vec<BlobEntry>> {
+        self.0.store.list_entries(prefix, start_after, limit).await
+    }
+}
+
+/// Asks the store ahead for the whole blobs at `keys`, several at a
+/// time, so that `store` keeps the answers for the step. The ordered
+/// queue holds no body: each read drops the copy it is given before it
+/// is done, so a slow read at the head of the queue does not leave the
+/// bodies of the reads after it held outside the byte budget.
+async fn read_whole_ahead<'k, B: BlobStore>(
+    store: &Ahead<'_, B>,
+    keys: impl Iterator<Item = &'k str>,
+) {
+    let keep = &store.keeping();
+    stream::iter(keys.map(|key| async move {
+        // A failed read is asked again by the step.
+        drop(keep.get(key, None).await);
+    }))
+    .buffered(STORE_READS)
+    .take_while(|()| std::future::ready(!store.full()))
+    .for_each(|()| std::future::ready(()))
+    .await;
+}
+
 /// What a call made of one generation record.
 enum Replayed {
     /// Nothing is left to do for it.
@@ -864,6 +1500,9 @@ enum Replayed {
     /// It is segmented, and the segment stored at this name is missing
     /// or is not the one its head names. Nothing of it was published.
     Unreadable(String),
+    /// The record was removed since it was read. No row of it was
+    /// written in this call, and it was not published.
+    Gone,
 }
 
 /// Where a generation has the extent of a record.
@@ -930,5 +1569,354 @@ mod segment_reads {
         // Whatever a head says, the first of a call is read.
         let mut reads = 0;
         assert!(fits(&mut reads, SEGMENT_READS + 1));
+    }
+}
+
+#[cfg(test)]
+mod heap {
+    //! Counts the bytes each thread has allocated and not freed, and the
+    //! most it had at once. A test on a current-thread runtime reads its
+    //! own numbers, whatever the tests beside it do.
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    fn moved(by: isize) {
+        let _ = LIVE.try_with(|live| {
+            let now = live.get() + by;
+            live.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    // SAFETY: every call goes to the system allocator unchanged; the
+    // counters are plain thread-local cells that allocate nothing.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            moved(layout.size() as isize);
+            System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            moved(-(layout.size() as isize));
+            System.dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            moved(new_size as isize - layout.size() as isize);
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    /// Starts a new measurement: the peak is what is held now.
+    pub fn mark() -> isize {
+        let now = LIVE.with(Cell::get);
+        PEAK.with(|peak| peak.set(now));
+        now
+    }
+
+    /// The most this thread held since the last [`mark`].
+    pub fn peak() -> isize {
+        PEAK.with(Cell::get)
+    }
+
+    #[global_allocator]
+    static HEAP: Counting = Counting;
+}
+
+#[cfg(test)]
+mod ahead {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    /// A store that answers one turn of the executor later, and notes
+    /// what it was asked and how many calls were under way at once.
+    #[derive(Default)]
+    struct Slow {
+        blobs: RefCell<BTreeMap<String, Vec<u8>>>,
+        asked: RefCell<Vec<String>>,
+        flying: Cell<usize>,
+        most: Cell<usize>,
+        fail: Cell<bool>,
+        /// Turns of the executor a read of this key waits beyond the one
+        /// every read waits.
+        late: RefCell<BTreeMap<String, usize>>,
+    }
+
+    impl Slow {
+        fn with(blobs: &[(&str, usize)]) -> Self {
+            let slow = Slow::default();
+            for (key, size) in blobs {
+                slow.blobs
+                    .borrow_mut()
+                    .insert((*key).to_owned(), vec![7; *size]);
+            }
+            slow
+        }
+
+        async fn turn(&self, what: &str, key: &str) -> Result<()> {
+            self.asked.borrow_mut().push(format!("{what} {key}"));
+            self.flying.set(self.flying.get() + 1);
+            self.most.set(self.most.get().max(self.flying.get()));
+            tokio::task::yield_now().await;
+            let late = self.late.borrow().get(key).copied().unwrap_or(0);
+            for _ in 0..late {
+                tokio::task::yield_now().await;
+            }
+            self.flying.set(self.flying.get() - 1);
+            if self.fail.get() {
+                return Err(BridgeError::Blob("down".into()));
+            }
+            Ok(())
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl BlobStore for Slow {
+        async fn put(&self, key: &str, bytes: Vec<u8>, _: &BlobMeta<'_>) -> Result<()> {
+            self.turn("put", key).await?;
+            self.blobs.borrow_mut().insert(key.to_owned(), bytes);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+            self.turn(if span.is_some() { "range" } else { "get" }, key)
+                .await?;
+            Ok(self.blobs.borrow().get(key).cloned())
+        }
+
+        async fn get_for_read_ahead(
+            &self,
+            key: &str,
+            reserve: impl FnOnce(u64) -> bool,
+        ) -> Result<ReadAheadBlob> {
+            let size = self.blobs.borrow().get(key).map(Vec::len);
+            let accepted = size.map(|n| reserve(n as u64));
+            // Model a response whose metadata arrives before its body.
+            self.turn("get", key).await?;
+            Ok(match accepted {
+                Some(true) => ReadAheadBlob::Body(self.blobs.borrow()[key].clone()),
+                Some(false) => ReadAheadBlob::Skipped,
+                None => ReadAheadBlob::Missing,
+            })
+        }
+
+        async fn head(&self, key: &str) -> Result<Option<u64>> {
+            self.turn("head", key).await?;
+            Ok(self.blobs.borrow().get(key).map(|b| b.len() as u64))
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.turn("delete", key).await?;
+            self.blobs.borrow_mut().remove(key);
+            Ok(())
+        }
+
+        async fn delete_record(&self, _: &Unpublished) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _: &str, _: &str, _: u32) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An answer asked for ahead is the store's, is given to the step
+    /// once, and the store is asked again after that.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_answer_kept_is_given_once() {
+        let slow = Slow::with(&[("a", 3)]);
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        assert_eq!(keep.get("a", None).await.unwrap(), Some(vec![7; 3]));
+        assert_eq!(keep.get("none", None).await.unwrap(), None);
+        assert_eq!(keep.head("a").await.unwrap(), Some(3));
+        assert_eq!(keep.head("none").await.unwrap(), None);
+        // Asked again ahead: not of the store.
+        assert_eq!(keep.get("a", None).await.unwrap(), Some(vec![7; 3]));
+        assert_eq!(keep.head("a").await.unwrap(), Some(3));
+        let once = ["get a", "get none", "head a", "head none"];
+        assert_eq!(slow.asked(), once);
+
+        assert_eq!(ahead.get("a", None).await.unwrap(), Some(vec![7; 3]));
+        assert_eq!(ahead.get("none", None).await.unwrap(), None);
+        assert_eq!(ahead.head("a").await.unwrap(), Some(3));
+        assert_eq!(ahead.head("none").await.unwrap(), None);
+        assert_eq!(slow.asked(), once, "the step is answered from what is kept");
+        assert_eq!(ahead.lock().bytes, 0);
+
+        // Each answer was given once: the store is asked from here on,
+        // and what it says to the step is not kept.
+        slow.blobs.borrow_mut().remove("a");
+        assert_eq!(ahead.get("a", None).await.unwrap(), None);
+        assert_eq!(ahead.head("a").await.unwrap(), None);
+        assert_eq!(ahead.get("a", None).await.unwrap(), None);
+        assert_eq!(slow.asked().len(), once.len() + 3);
+        assert!(ahead.lock().gets.is_empty() && ahead.lock().heads.is_empty());
+    }
+
+    /// A call the store failed is not an answer: the step asks again,
+    /// and fails if the store still does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_call_is_not_kept() {
+        let slow = Slow::with(&[("a", 3)]);
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        slow.fail.set(true);
+        assert!(matches!(
+            keep.get("a", None).await,
+            Err(BridgeError::Blob(_))
+        ));
+        assert!(matches!(keep.head("a").await, Err(BridgeError::Blob(_))));
+        assert!(matches!(
+            ahead.get("a", None).await,
+            Err(BridgeError::Blob(_))
+        ));
+        assert!(matches!(ahead.head("a").await, Err(BridgeError::Blob(_))));
+        slow.fail.set(false);
+        assert_eq!(ahead.get("a", None).await.unwrap(), Some(vec![7; 3]));
+        assert_eq!(ahead.head("a").await.unwrap(), Some(3));
+        assert_eq!(slow.asked().len(), 6);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_damaged_48_mib_record_is_not_buffered_ahead() {
+        let key = "m/g_0000018bcfe5680000000000000000ff";
+        let size = 48 * 1024 * 1024;
+        let slow = Slow::with(&[(key, size)]);
+        let ahead = Ahead::new(&slow);
+        let answer = ahead.keeping().get(key, None).await.unwrap();
+        assert_eq!(
+            answer.as_ref().map(Vec::len),
+            None,
+            "oversized speculative answer"
+        );
+        assert_eq!(ahead.lock().bytes, 0);
+        // The authoritative step still sees the full damaged record.
+        let read = read_stored_generation(&ahead, &crate::testkit::TestKek::new(), key).await;
+        assert!(matches!(
+            read,
+            Err(BridgeError::Crypto(_)) | Err(BridgeError::Invalid(_))
+        ));
+    }
+
+    /// No more is kept than a call may hold; a part of a blob is never
+    /// kept; and a write through the wrapper voids what is kept, also
+    /// what was asked for before it and answered after it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_is_kept_is_bounded() {
+        let slow = Slow::with(&[("big", AHEAD_BYTES), ("b", 5), ("c", 5)]);
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        keep.get("b", None).await.unwrap();
+        assert!(!ahead.full());
+        assert!(keep.get("big", None).await.unwrap().is_none());
+        assert!(!ahead.lock().gets.contains_key("big"));
+        keep.get("c", None).await.unwrap();
+        assert_eq!(ahead.lock().bytes, 10);
+        let span = ByteSpan { start: 0, len: 2 };
+        assert!(keep.get("b", Some(span)).await.unwrap().is_none());
+        ahead.get("b", Some(span)).await.unwrap();
+        assert_eq!(slow.asked().last().unwrap(), "range b");
+
+        let (bucket, extent) = (BucketId::new("b".to_owned()), ExtentId::new("x".to_owned()));
+        let meta = BlobMeta {
+            bucket: &bucket,
+            extent: &extent,
+            cipher_sha256: &[0; 32],
+        };
+        // A read ahead of `b` and of the head of `c` that the store
+        // answers only after the write.
+        let (old, old_head, put) = future::join3(
+            keep.get("b", None),
+            keep.head("c"),
+            ahead.put("b", vec![1], &meta),
+        )
+        .await;
+        put.unwrap();
+        assert_eq!(old.unwrap(), Some(vec![7; 5]));
+        assert_eq!(old_head.unwrap(), Some(5));
+        assert_eq!(ahead.lock().bytes, 0);
+        assert!(ahead.lock().gets.is_empty() && ahead.lock().heads.is_empty());
+        assert_eq!(ahead.get("b", None).await.unwrap(), Some(vec![1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_flight_reads_share_the_byte_budget_and_release_on_cancel() {
+        let part = AHEAD_BYTES / 3;
+        let slow = Slow::with(&[("a", part), ("b", part)]);
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        {
+            let mut pending = pin!(keep.get("a", None));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(ahead.lock().reserved, 2 * part + 1);
+            assert!(keep.get("b", None).await.unwrap().is_none());
+        }
+        assert_eq!(ahead.lock().reserved, 0);
+        let answer = keep.get("b", None).await.unwrap();
+        assert_eq!(answer.as_ref().map(Vec::len), Some(part));
+        assert_eq!(ahead.lock().reserved, 0);
+        assert_eq!(ahead.lock().bytes, part);
+    }
+
+    /// A slow read at the head of the ordered queue does not hold back
+    /// the bodies of the fast reads after it outside the byte budget.
+    /// Six reads start at once and the second is slow: the others, and
+    /// the read that starts when the first is taken, finish while it
+    /// waits. What the read ahead holds at once (kept, in flight or
+    /// waiting in the queue) stays within the budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_read_holds_no_bodies_outside_the_budget() {
+        // Six reads fit in flight at once: 2 bytes reserved per byte.
+        const SIZE: usize = 780 * 1024;
+        let keys: Vec<String> = (0..12).map(|i| format!("t{i:02}")).collect();
+        let blobs: Vec<(&str, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), if i == 1 { 1024 } else { SIZE }))
+            .collect();
+        let slow = Slow::with(&blobs);
+        slow.late.borrow_mut().insert(keys[1].clone(), 50);
+        let ahead = Ahead::new(&slow);
+        let before = heap::mark();
+        read_whole_ahead(&ahead, keys.iter().map(String::as_str)).await;
+        let held = heap::peak() - before;
+        // The read that started behind the slow one was kept.
+        assert!(ahead.lock().gets.contains_key("t06"), "{:?}", slow.asked());
+        assert!(
+            held <= AHEAD_BYTES as isize,
+            "{held} bytes held at once, budget {AHEAD_BYTES}"
+        );
+    }
+
+    /// The store is asked for several things at once, and never for
+    /// more than [`STORE_READS`].
+    #[tokio::test(flavor = "current_thread")]
+    async fn reads_ahead_run_several_at_a_time() {
+        let keys: Vec<String> = (0..40).map(|i| format!("k{i:02}")).collect();
+        let slow = Slow::default();
+        let ahead = Ahead::new(&slow);
+        let keep = ahead.keeping();
+        stream::iter(keys.iter().map(|key| keep.get(key, None)))
+            .buffered(STORE_READS)
+            .for_each(|_| std::future::ready(()))
+            .await;
+        assert_eq!(slow.most.get(), STORE_READS);
+        assert_eq!(slow.asked().len(), 40);
+        assert_eq!(ahead.lock().gets.len(), 40);
     }
 }

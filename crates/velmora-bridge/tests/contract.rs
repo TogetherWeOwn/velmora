@@ -553,6 +553,25 @@ fn recovery_copy_is_off_by_default_and_cannot_stop_the_service() {
     }
 }
 
+#[test]
+fn replay_read_ahead_requires_explicit_opt_in() {
+    let (prod, dev) = wrangler_vars();
+    for shipped in [&prod, &dev] {
+        assert!(!shipped.contains_key("REPLAY_READ_AHEAD"));
+    }
+    let mut vars = with_secrets(prod, &prod_providers());
+    assert!(!load(&vars).unwrap().replay_read_ahead);
+    for (setting, expected) in [("", false), ("off", false), ("on", true)] {
+        vars.insert("REPLAY_READ_AHEAD".into(), setting.into());
+        assert_eq!(load(&vars).unwrap().replay_read_ahead, expected);
+    }
+    vars.insert("REPLAY_READ_AHEAD".into(), "true".into());
+    assert_eq!(
+        load(&vars).unwrap_err(),
+        ConfigError::Invalid("REPLAY_READ_AHEAD".into()),
+    );
+}
+
 /// `RECORD_LAYOUT` chooses where new recovery records are written. The
 /// shipped configuration does not set it, so a deploy keeps the flat
 /// names until an operator turns the tenant layout on, and a value that
@@ -594,7 +613,7 @@ fn missing_secret_fails_closed() {
     // Worker-only optional variables, validated by the Worker catalogue
     // selector instead of BridgeConfig. Nothing BridgeConfig reads may
     // be added here to bypass its missing-variable checks.
-    const WORKER_ONLY_OPTIONAL: [&str; 2] = ["CATALOG_BACKEND", "PG_PIPELINE"];
+    const WORKER_ONLY_OPTIONAL: [&str; 2] = ["CATALOG_BACKEND", "PG_WRITE_TX"];
     let (prod, dev) = wrangler_vars();
     let full = with_secrets(prod, &prod_providers());
     let dev = with_secrets(dev, PROVIDER_PLAIN);

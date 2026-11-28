@@ -44,7 +44,7 @@ applying the baseline. Seed `usage_global(id)` with `1, 2` only for fresh tests.
 
 ```sh
 ops/pg-migrate.sh "$CONNECTION_FILE" --to 0001  # tables, constraints and fresh seeds
-ops/pg-migrate.sh "$CONNECTION_FILE"            # secondary indexes and triggers
+ops/pg-migrate.sh "$CONNECTION_FILE"            # secondary indexes, triggers, later stages
 ops/pg-migrate.sh "$CONNECTION_FILE" --verify   # read-only, no writer lock
 ops/pg-migrate.sh "$CONNECTION_FILE" --test     # standalone fixture; rolls back
 ops/pg-migrate.sh "$CONNECTION_FILE" --activate # opt-in, never while an import marker exists
@@ -89,7 +89,11 @@ at a shipped stage. Online migrations (app schema access granted) use a 3 s
 statement timeout and, on PostgreSQL 17+, a 3 s transaction timeout so an
 acquired exclusive lock cannot stall readers indefinitely. Split changes that
 cannot fit the budget, or run them with the app offline. Inactive/import
-migrations are not subject to the 3 s execution budget.
+migrations are not subject to the 3 s execution budget. Outside
+`--import-mode`, each transactional migration (fresh or online) and the
+activation reach the server as one message, so network round trips do not
+count against the budget; this needs psql 15 or newer and a batch under
+128 KiB. `--verify` and `--import-mode` keep the older transport.
 
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
@@ -108,11 +112,32 @@ later Postgres translation declares each corresponding D1 file using a comment
 `-- velmora: d1-twin <D1 filename> <sha256 of raw D1 file>`. Missing coverage,
 renamed files and byte changes fail the gate. `--verify` also compares the live
 Postgres manifest against a replay of all shipped D1 migrations in memory;
-update the comparison explicitly for any future intentional engine difference.
+update the comparison explicitly for any future intentional engine difference
+(`STATEMENT_TRIGGERS` in `ops/pg-migrate.sh` is one).
 
 The only baseline structural differences from D1 are PostgreSQL's mapped
 column types and non-null PKs, the three identities, the `yenc_name` regex,
-`tx_guard_ok`, documented index keys/null ordering, and the translated
-trigger functions. Source PKs that were nullable in SQLite require a copy
+`tx_guard_ok`, documented index keys/null ordering, the translated
+trigger functions, and the statement-level usage triggers (0003). Source PKs that were nullable in SQLite require a copy
 census. The verifier ignores only the migration ledger and import-marker
 tables as host-tool metadata.
+
+## Usage counters
+
+D1 moves the usage counters with per-row triggers (migrations 0020 and
+0025). PostgreSQL writes a new row version per UPDATE and a transaction
+cannot prune its own versions, so the same per-row triggers cost O(N^2) for
+N rows changed in one transaction. Stage 0003 replaces them with statement
+triggers over transition tables: each statement writes each `usage_global`
+row at most once, each `usage_buckets` key once and each `usage_hours` row
+once per rolled hour, with the same values at every statement boundary.
+No query joins the two transition tables. PostgreSQL has no statistics
+for them: a join may be cached with the first firing's (often one-row)
+size and run as a nested loop, and any join is estimated at about
+N*M/200 rows, which crosses the JIT thresholds. Deltas are summed over
+`new_rows UNION ALL old_rows`, and rows are paired by key with GROUP BY
+over the same union. `usage_outbox_failure` keeps its `last_error` column list to see SET
+targets; it marks the statement and `usage_outbox_stage` counts the
+failures in the same ascending-hour pass. `--test` compares the shared
+fixture with SQLite, including mixed-hour statements that SQLite applies in
+key order (checked with `EXPLAIN QUERY PLAN`).

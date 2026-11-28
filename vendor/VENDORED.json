@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    {
+      "purl": "pkg:cargo/tokio-postgres@0.7.18",
+      "version": "0.7.18",
+      "upstream_commit": "f1cb6ec0d5766b136cbd68f3010d64142a5daa66"
+    }
+  ]
+}

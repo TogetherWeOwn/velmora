@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio_postgres::{config::SslMode, Config, NoTls};
 
-use super::{PgConfig, PgConnect, PgConnection, PgSql};
+use super::{PgConfig, PgConnect, PgConnection, PgSql, WriteTx};
 use crate::{BridgeError, Result, Sql, SqlValue};
 
 #[derive(Clone, Copy)]
@@ -87,7 +87,8 @@ async fn send(out: &mut DuplexStream, tag: u8, body: &[u8]) -> io::Result<()> {
 }
 
 /// Just enough of a backend for the adapter's statements: trust startup,
-/// simple queries, and extended Parse/Bind/Describe/Execute/Sync.
+/// simple queries, and extended Parse/Bind/Describe/Execute/Sync, one
+/// statement per Sync or several (the single-Sync transaction).
 async fn backend(mut io: DuplexStream, commit: CommitReply) {
     let _ = serve(&mut io, commit).await;
 }
@@ -98,7 +99,7 @@ async fn serve(io: &mut DuplexStream, commit: CommitReply) -> io::Result<()> {
     io.read_exact(&mut skip).await?;
     send(io, b'R', &0_u32.to_be_bytes()).await?;
     send(io, b'Z', b"I").await?;
-    let mut select = false;
+    let mut text = Vec::new();
     loop {
         let tag = io.read_u8().await?;
         let len = io.read_u32().await?;
@@ -122,13 +123,28 @@ async fn serve(io: &mut DuplexStream, commit: CommitReply) -> io::Result<()> {
             }
             b'P' => {
                 // Unnamed statement: an empty name, then the SQL text.
-                select = body.get(1..7) == Some(b"SELECT");
+                text = body[1..].split(|&b| b == 0).next().unwrap_or(&[]).to_vec();
                 send(io, b'1', b"").await?;
             }
             b'B' => send(io, b'2', b"").await?,
             b'D' => send(io, b'n', b"").await?,
-            b'E' if select => send(io, b'C', b"SELECT 0\0").await?,
-            b'E' => send(io, b'C', b"INSERT 0 1\0").await?,
+            b'E' => {
+                let tag: &[u8] = match () {
+                    _ if text.starts_with(b"COMMIT") => {
+                        if commit == CommitReply::Vanish {
+                            return Ok(());
+                        }
+                        b"COMMIT\0"
+                    }
+                    _ if text.starts_with(b"BEGIN") => b"BEGIN\0",
+                    _ if text.starts_with(b"SET") => b"SET\0",
+                    _ if text.starts_with(b"SELECT") => b"SELECT 1\0",
+                    _ => b"INSERT 0 1\0",
+                };
+                send(io, b'C', tag).await?;
+            }
+            // After a single-Sync COMMIT the session is idle again.
+            b'S' if text.starts_with(b"COMMIT") => send(io, b'Z', b"I").await?,
             b'S' => send(io, b'Z', b"T").await?,
             b'X' => {
                 // Keep the pipe open: the client's close is what is tested.
@@ -202,33 +218,35 @@ impl PgConnect for &Fake {
     }
 }
 
-fn pg(fake: &Fake, pipeline: bool) -> PgSql<&Fake> {
+fn pg(fake: &Fake, write_tx: WriteTx) -> PgSql<&Fake> {
     PgSql::new(
         fake,
         fake,
         PgConfig {
-            pipeline,
+            write_tx,
             ..PgConfig::default()
         },
     )
 }
 
+const BOTH: [WriteTx; 2] = [WriteTx::SingleSync, WriteTx::Pipeline];
+
 /// Far beyond the in-memory exchange, even on a loaded runner.
 const DEADLINE: Duration = Duration::from_secs(5);
 
-async fn insert(fake: &Fake, pipeline: bool) -> Result<Vec<u64>> {
+async fn insert(fake: &Fake, write_tx: WriteTx) -> Result<Vec<u64>> {
     let stmts = vec![("INSERT INTO t VALUES (?1)", vec![SqlValue::Int(1)])];
-    tokio::time::timeout(DEADLINE, pg(fake, pipeline).batch(stmts))
+    tokio::time::timeout(DEADLINE, pg(fake, write_tx).batch(stmts))
         .await
         .expect("the result must not wait for the connection to close")
 }
 
 #[tokio::test]
 async fn a_close_that_never_resolves_does_not_delay_a_confirmed_commit() {
-    for pipeline in [true, false] {
+    for write_tx in BOTH {
         let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-        let result = insert(&fake, pipeline).await;
-        assert_eq!(result.unwrap(), [1], "pipeline={pipeline}");
+        let result = insert(&fake, write_tx).await;
+        assert_eq!(result.unwrap(), [1], "{write_tx:?}");
         // Returned with the driver stopped and before the graceful close
         // (Terminate, then the socket's shutdown) was even started.
         assert!(fake.stopped.load(Ordering::SeqCst));
@@ -240,9 +258,9 @@ async fn a_close_that_never_resolves_does_not_delay_a_confirmed_commit() {
 
 #[tokio::test]
 async fn a_close_error_after_a_confirmed_commit_is_success() {
-    for pipeline in [true, false] {
+    for write_tx in BOTH {
         let fake = Fake::new(Close::Fail, CommitReply::Confirm);
-        assert_eq!(insert(&fake, pipeline).await.unwrap(), [1]);
+        assert_eq!(insert(&fake, write_tx).await.unwrap(), [1]);
         assert!(fake.transport_released().await);
         assert_eq!(fake.connects.get(), 1);
     }
@@ -251,12 +269,12 @@ async fn a_close_error_after_a_confirmed_commit_is_success() {
 #[tokio::test]
 async fn an_error_before_the_commit_is_confirmed_still_propagates() {
     for close in [Close::Hang, Close::Fail] {
-        for pipeline in [true, false] {
+        for write_tx in BOTH {
             let fake = Fake::new(close, CommitReply::Vanish);
-            let result = insert(&fake, pipeline).await;
+            let result = insert(&fake, write_tx).await;
             assert!(
                 matches!(&result, Err(BridgeError::Sql(s)) if s == "pg: statement failed"),
-                "pipeline={pipeline}"
+                "{write_tx:?}"
             );
             assert_eq!(fake.connects.get(), 1);
         }
@@ -266,9 +284,12 @@ async fn an_error_before_the_commit_is_confirmed_still_propagates() {
 #[tokio::test]
 async fn a_read_does_not_wait_for_the_connection_to_close() {
     let fake = Fake::new(Close::Hang, CommitReply::Confirm);
-    let rows = tokio::time::timeout(DEADLINE, pg(&fake, true).query("SELECT 1", &[]))
-        .await
-        .expect("the result must not wait for the connection to close");
+    let rows = tokio::time::timeout(
+        DEADLINE,
+        pg(&fake, WriteTx::SingleSync).query("SELECT 1", &[]),
+    )
+    .await
+    .expect("the result must not wait for the connection to close");
     assert!(rows.unwrap().is_empty());
     assert!(fake.transport_released().await);
 }

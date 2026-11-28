@@ -71,6 +71,16 @@ impl Params {
             .map(Self)
     }
 
+    /// The number of values and their encoded bytes, for sizing a request.
+    pub(super) fn wire_size(&self) -> (usize, usize) {
+        let bytes = self
+            .0
+            .iter()
+            .map(|(b, _)| b.0.as_ref().map_or(0, Vec::len))
+            .sum();
+        (self.0.len(), bytes)
+    }
+
     pub(super) fn typed(&self) -> impl Iterator<Item = (&(dyn ToSql + Sync), Type)> {
         self.0
             .iter()

@@ -10,7 +10,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use velmora::article::assemble_article;
@@ -27,6 +27,8 @@ use velmora_bridge::*;
 use velmora_test_nntp::{ServerConfig, TestNntpServer, UserConfig};
 
 pub const T0: UnixMs = UnixMs(1_800_000_000_000);
+/// Real-time budget for test interleavings involving the fake server.
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub use velmora_bridge::LEASE_SECS;
 
 thread_local! {
@@ -241,7 +243,9 @@ impl NntpSession for CountedSession {
         let hold =
             BEFORE_POST.with(|g| g.borrow_mut().as_mut().and_then(|f| f(&self.provider, &id)));
         if let Some(go) = hold {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
             while !go.get() {
+                assert!(Instant::now() < deadline, "the held POST was never started");
                 tokio::task::yield_now().await;
             }
         }
@@ -250,7 +254,12 @@ impl NntpSession for CountedSession {
         let posted = NntpSession::post_observed(self.client(), message_id, article, written).await;
         let parked = self.park.borrow_mut().take();
         if let Some(release) = parked {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
             while !release.get() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the parked POST was never released"
+                );
                 tokio::task::yield_now().await;
             }
         }
@@ -2095,6 +2104,7 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         intent_sweep: false,
         gc_orphans: false,
         records: velmora_bridge::recovery::Layout::flat(),
+        replay_read_ahead: false,
         packed_plans: false,
         parity: false,
         required_backbones: 1,

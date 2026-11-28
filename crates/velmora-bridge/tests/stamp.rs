@@ -355,10 +355,12 @@ where
     safety.hold_list.set(true);
     let between = async {
         // Bounded: a `checked` that makes no list call fails the test.
-        let mut turns = 0;
+        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
         while !safety.list_held.get() {
-            turns += 1;
-            assert!(turns < HOLD_TURNS, "no list call was made");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no list call was made"
+            );
             tokio::task::yield_now().await;
         }
         between.await;

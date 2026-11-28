@@ -1762,8 +1762,13 @@ impl Rig {
             outcome
         };
         let interrupt = async {
+            let deadline = std::time::Instant::now() + WAIT_TIMEOUT;
             while self.bridge.nntp.calls().len() < after {
                 assert!(!done.get(), "the stage ended before call {after}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the stage did not reach call {after} before the deadline"
+                );
                 tokio::task::yield_now().await;
             }
             then();

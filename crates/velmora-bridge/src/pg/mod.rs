@@ -7,6 +7,8 @@ mod finish_tests;
 mod params;
 #[cfg(feature = "pg-test-record")]
 mod registry;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod single_sync_tests;
 #[cfg(test)]
 mod tests;
 mod value;
@@ -16,6 +18,8 @@ mod wire_tests;
 use crate::{Dialect, Result, Row, Sql, SqlValue};
 use batch::Prepared;
 use params::Kind;
+
+pub use batch::{oversize_fallbacks, ErrorPosition, MAX_SINGLE_SYNC_BYTES};
 
 /// Lets the Worker reject even a transitively enabled test escape hatch.
 #[doc(hidden)]
@@ -30,6 +34,20 @@ pub fn is_read_only(sql: &str) -> bool {
 /// Like [`is_read_only`], with PostgreSQL literal and denylist semantics.
 pub fn is_postgres_read_only(sql: &str) -> bool {
     params::statement(sql).is_ok_and(|s| s.kind == Kind::Read)
+}
+
+/// Test only: the encoded size of the single-Sync request for `stmts`.
+#[cfg(feature = "testkit-pg")]
+#[doc(hidden)]
+pub fn single_sync_request_bytes(
+    lock_key: Option<i64>,
+    stmts: &[(&str, Vec<SqlValue>)],
+) -> Result<usize> {
+    let prepared = stmts
+        .iter()
+        .map(|(sql, args)| Prepared::new(sql, args))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(batch::single_sync_bytes(lock_key, &prepared, batch::COMMIT))
 }
 
 /// Redact connection failures before they leave a runtime connector.
@@ -86,17 +104,47 @@ pub trait PgConnect {
     async fn connect(&self) -> Result<PgConnection>;
 }
 
+/// How a W1-guarded write transaction travels to the server.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteTx {
+    /// One extended-protocol request with a single Sync: BEGIN, the prelude
+    /// and the W1 lock, every statement with its typed binds, COMMIT. The
+    /// server runs it without waiting on the client between statements.
+    #[default]
+    SingleSync,
+    /// Typed parameters, one Sync per statement, every request enqueued
+    /// before the first reply. A proxy that forwards one request at a time
+    /// holds W1 across each request's wait.
+    Pipeline,
+}
+
+impl WriteTx {
+    /// `PG_WRITE_TX`: unset or `single-sync`, or `pipeline`.
+    pub fn parse(value: Option<&str>) -> core::result::Result<Self, &'static str> {
+        match value {
+            None | Some("single-sync") => Ok(Self::SingleSync),
+            Some("pipeline") => Ok(Self::Pipeline),
+            _ => Err("invalid PG_WRITE_TX"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PgConfig {
     pub lock_key: i64,
-    pub pipeline: bool,
+    pub write_tx: WriteTx,
+    /// Called with the statement count when a write transaction exceeds
+    /// [`MAX_SINGLE_SYNC_BYTES`] and uses the one-Sync-per-statement
+    /// transport. It receives no SQL and no values.
+    pub on_oversize: Option<fn(usize)>,
 }
 
 impl Default for PgConfig {
     fn default() -> Self {
         Self {
             lock_key: 7_413_000_001,
-            pipeline: true,
+            write_tx: WriteTx::SingleSync,
+            on_oversize: None,
         }
     }
 }
@@ -150,23 +198,92 @@ impl<C: PgConnect> PgSql<C> {
         }
     }
 
-    async fn write(&self, prepared: &[Prepared], collect_rows: bool) -> Result<Vec<batch::Reply>> {
+    fn lock_key(&self) -> Option<i64> {
         #[cfg(feature = "pg-test-unlocked")]
         let lock_key = (!self.unlocked).then_some(self.config.lock_key);
         #[cfg(not(feature = "pg-test-unlocked"))]
         let lock_key = Some(self.config.lock_key);
+        lock_key
+    }
+
+    async fn write(&self, prepared: &[Prepared], collect_rows: bool) -> Result<Vec<batch::Reply>> {
+        self.write_ending(prepared, collect_rows, self.config.write_tx, batch::COMMIT)
+            .await
+    }
+
+    async fn write_ending(
+        &self,
+        prepared: &[Prepared],
+        collect_rows: bool,
+        write_tx: WriteTx,
+        end: &'static str,
+    ) -> Result<Vec<batch::Reply>> {
+        let lock_key = self.lock_key();
         let conn = self.writer.connect().await.map_err(error::without_guard)?;
         let result = batch::transaction(
             conn.client(),
             lock_key,
-            self.config.pipeline,
+            write_tx,
             prepared,
             collect_rows,
             self.recording(),
+            end,
+            self.config.on_oversize,
         )
         .await;
         finish_connection!(write conn, result);
         result
+    }
+}
+
+/// What one write transaction returned: each statement's count, command
+/// tag and, when rows were collected, its decoded rows; or the error with
+/// the position of the first failure (`None`: refused before any I/O).
+#[cfg(feature = "testkit-pg")]
+#[doc(hidden)]
+pub type ProbeOutcome = core::result::Result<
+    (Vec<u64>, Vec<Option<String>>, Vec<Vec<Row>>),
+    (Option<batch::ErrorPosition>, crate::BridgeError),
+>;
+
+#[cfg(feature = "testkit-pg")]
+impl<C: PgConnect> PgSql<C> {
+    /// Test only: run one write transaction on `write_tx`, ending it with
+    /// ROLLBACK instead of COMMIT, and return what the caller would get.
+    /// Used to compare the two transports on the same catalogue state.
+    #[doc(hidden)]
+    pub async fn rolled_back(
+        &self,
+        write_tx: WriteTx,
+        stmts: &[(&str, Vec<SqlValue>)],
+        collect_rows: bool,
+    ) -> ProbeOutcome {
+        let prepared = stmts
+            .iter()
+            .map(|(sql, args)| Prepared::new(sql, args))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| (None, e))?;
+        batch::take_error_position();
+        let replies = self
+            .write_ending(&prepared, collect_rows, write_tx, "ROLLBACK")
+            .await
+            .map_err(|e| (batch::take_error_position(), e))?;
+        let counts = replies
+            .iter()
+            .map(batch::Reply::changed)
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| (None, e))?;
+        let tags = replies.iter().map(|r| r.tag().map(str::to_owned)).collect();
+        let rows = if collect_rows {
+            replies
+                .into_iter()
+                .map(batch::Reply::rows)
+                .collect::<Result<Vec<_>>>()
+                .map_err(|e| (None, e))?
+        } else {
+            Vec::new()
+        };
+        Ok((counts, tags, rows))
     }
 }
 

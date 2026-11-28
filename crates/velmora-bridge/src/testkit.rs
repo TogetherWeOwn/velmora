@@ -21,8 +21,9 @@ use sha2::{Digest, Sha256};
 use crate::meter::Meter;
 pub use crate::meter::{Tally, WriteOp, WriteReport};
 use crate::ports::{
-    BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, Row, Sql, SqlValue,
-    UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_INT, MAX_SQL_PARAMS, MAX_SQL_VALUE_BYTES,
+    BlobMeta, BlobStore, Catalog, Clock, Guard, JobSink, Kek, PublishOutcome, ReadAheadBlob, Row,
+    Sql, SqlValue, UploadTarget, MAX_QUEUE_DELAY_SECS, MAX_SQL_INT, MAX_SQL_PARAMS,
+    MAX_SQL_VALUE_BYTES,
 };
 use crate::recovery::{is_protected_key, tombstone_id, Recorded, Unpublished, ERR_RECORD_DELETE};
 use crate::types::{
@@ -179,7 +180,12 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.query(sql, params).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.query(sql, params).await,
+            Self::Postgres(db) => {
+                if !crate::pg::is_postgres_read_only(sql) {
+                    Box::pin(db.differential(&[(sql, params.to_vec())], true)).await;
+                }
+                db.sql.query(sql, params).await
+            }
         }
     }
 
@@ -187,7 +193,10 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.exec(sql, params).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.exec(sql, params).await,
+            Self::Postgres(db) => {
+                Box::pin(db.differential(&[(sql, params.to_vec())], false)).await;
+                db.sql.exec(sql, params).await
+            }
         }
     }
 
@@ -195,7 +204,16 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.batch(stmts).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.batch(stmts).await,
+            Self::Postgres(db) => {
+                if !stmts.is_empty() {
+                    let probe: Vec<(&str, Vec<SqlValue>)> = stmts
+                        .iter()
+                        .map(|(sql, args)| (*sql, args.clone()))
+                        .collect();
+                    Box::pin(db.differential(&probe, false)).await;
+                }
+                db.sql.batch(stmts).await
+            }
         }
     }
 }
@@ -769,6 +787,25 @@ impl BlobStore for MemBlobStore {
                 ))
             }
         }
+    }
+
+    async fn get_for_read_ahead(
+        &self,
+        key: &str,
+        reserve: impl FnOnce(u64) -> bool,
+    ) -> Result<ReadAheadBlob> {
+        if let Some((clock, ms)) = self.read_time.borrow().as_ref() {
+            clock.advance_ms(*ms);
+        }
+        self.gets.set(self.gets.get() + 1);
+        self.got.borrow_mut().push(key.to_owned());
+        Ok(match self.blobs.borrow().get(key) {
+            Some(blob) if reserve(blob.bytes.len() as u64) => {
+                ReadAheadBlob::Body(blob.bytes.clone())
+            }
+            Some(_) => ReadAheadBlob::Skipped,
+            None => ReadAheadBlob::Missing,
+        })
     }
 
     async fn head(&self, key: &str) -> Result<Option<u64>> {

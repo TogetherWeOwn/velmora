@@ -57,7 +57,7 @@ SELECT json_build_object(
         t.tgtype, ARRAY(SELECT a.attname FROM unnest(t.tgattr) WITH ORDINALITY k(attnum, ord)
                         JOIN pg_attribute a ON a.attrelid = r.oid AND a.attnum = k.attnum ORDER BY k.ord),
         p.proname, encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex'), pg_get_triggerdef(t.oid),
-        p.pronamespace = r.relnamespace))
+        p.pronamespace = r.relnamespace, t.tgoldtable, t.tgnewtable))
         FROM tbl r JOIN pg_trigger t ON t.tgrelid = r.oid AND NOT t.tgisinternal
         JOIN pg_proc p ON p.oid = t.tgfoid),
     'tx_guard', EXISTS (SELECT FROM tbl t JOIN pg_constraint c ON c.conrelid = t.oid
@@ -83,6 +83,51 @@ SELECT json_build_object(
         'app role timeouts', (SELECT 'idle_in_transaction_session_timeout=5s' = ANY(rolconfig)
             AND (current_setting('server_version_num')::int < 170000
                  OR 'transaction_timeout=30s' = ANY(rolconfig)) FROM app),
+        -- Write binds stay out of the server logs: no setting may log
+        -- statements with their parameters for an app session. Effective
+        -- value per setting: database and role, role, database, all roles,
+        -- then the server value as this session sees it (an override of
+        -- this session fails the check). An extension setting that this
+        -- session has only as a placeholder is read with current_setting
+        -- (empty once a configured value was removed again).
+        'app sessions log no bind values', NOT EXISTS (
+            WITH wanted(name, ok) AS (VALUES
+                ('log_statement', ARRAY['none']),
+                ('log_min_duration_statement', ARRAY['-1']),
+                ('log_min_duration_sample', ARRAY['-1']),
+                ('log_transaction_sample_rate', ARRAY['0']),
+                ('log_parameter_max_length_on_error', ARRAY['0']),
+                ('auto_explain.log_min_duration', ARRAY['-1', '', '<absent>']),
+                ('pginsights.raw_queries', ARRAY['off', '', '<absent>'])
+            ), setting AS (
+                SELECT 1 AS rank, c.setting FROM pg_db_role_setting s
+                    JOIN pg_database d ON d.oid = s.setdatabase, LATERAL unnest(s.setconfig) AS c(setting)
+                    WHERE s.setrole = (SELECT oid FROM app) AND d.datname = current_database()
+                UNION ALL SELECT 2, c.setting FROM app, LATERAL unnest(app.rolconfig) AS c(setting)
+                UNION ALL SELECT 3, c.setting FROM pg_db_role_setting s
+                    JOIN pg_database d ON d.oid = s.setdatabase, LATERAL unnest(s.setconfig) AS c(setting)
+                    WHERE s.setrole = 0 AND d.datname = current_database()
+                UNION ALL SELECT 4, c.setting FROM pg_db_role_setting s, LATERAL unnest(s.setconfig) AS c(setting)
+                    WHERE s.setrole = 0 AND s.setdatabase = 0
+            ), effective AS (
+                SELECT rank, split_part(setting, '=', 1) AS name,
+                       substr(setting, strpos(setting, '=') + 1) AS v FROM setting
+                UNION ALL SELECT 5, w.name, CASE
+                        WHEN p.name IS NULL THEN coalesce(current_setting(w.name, true), '<absent>')
+                        WHEN p.source IN ('default', 'configuration file', 'command line',
+                            'environment variable') THEN p.reset_val
+                        ELSE '<session override>' END
+                    FROM wanted w LEFT JOIN pg_settings p ON p.name = w.name
+            )
+            SELECT FROM wanted w
+            WHERE NOT (SELECT e.v FROM effective e WHERE e.name = w.name
+                       ORDER BY e.rank LIMIT 1) = ANY (w.ok)
+            UNION ALL SELECT FROM effective WHERE name LIKE 'pgaudit.%'
+            UNION ALL SELECT FROM pg_settings WHERE name LIKE 'pgaudit.%'
+            -- A configured pgaudit.log this session sees as a placeholder
+            -- (empty once removed again, 'none' when off).
+            UNION ALL SELECT WHERE coalesce(current_setting('pgaudit.log', true), '') NOT IN ('', 'none')
+        ),
         'read-only role membership', pg_has_role('kofra_ro', 'pg_read_all_data', 'USAGE')
             AND NOT pg_has_role('kofra_ro', 'pg_write_all_data', 'MEMBER')
             AND NOT pg_has_role('kofra_ro', 'kofra_migrate', 'MEMBER')

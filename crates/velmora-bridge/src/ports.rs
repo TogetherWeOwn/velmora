@@ -249,6 +249,13 @@ pub async fn put_stream_whole<B: BlobStore + ?Sized>(
     Ok(stored)
 }
 
+/// Outcome of a whole-object read requested only for replay read-ahead.
+pub enum ReadAheadBlob {
+    Missing,
+    Skipped,
+    Body(Vec<u8>),
+}
+
 /// R2 `SAFETY`/`CACHE` now; any S3-compatible store later.
 pub trait BlobStore {
     async fn put(&self, key: &str, bytes: Vec<u8>, meta: &BlobMeta<'_>) -> Result<()>;
@@ -281,6 +288,17 @@ pub trait BlobStore {
     }
     /// `None` = absent. With a span, exactly that range.
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>>;
+    /// Speculative whole-object read. Call `reserve` with the size of
+    /// the same response before buffering its body and validate that size.
+    /// An adapter without that guarantee, or a refused reservation,
+    /// returns `Skipped`, not `Missing`.
+    async fn get_for_read_ahead(
+        &self,
+        _key: &str,
+        _reserve: impl FnOnce(u64) -> bool,
+    ) -> Result<ReadAheadBlob> {
+        Ok(ReadAheadBlob::Skipped)
+    }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
     /// Idempotent. Refuses a recovery record (any key under `m/`, which

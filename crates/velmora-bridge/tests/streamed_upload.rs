@@ -692,7 +692,7 @@ async fn whole_extents_are_stored_at_once_within_a_small_budget() {
         // Every upload has given its whole stream and waits in the store.
         // An upload that never gets there fails the test instead of
         // leaving it waiting.
-        let mut turns = 0u32;
+        let deadline = std::time::Instant::now() + HOLD_TIMEOUT;
         while rig.bridge.safety.streams.borrow().len() < AT_ONCE as usize
             || rig
                 .bridge
@@ -702,8 +702,7 @@ async fn whole_extents_are_stored_at_once_within_a_small_budget() {
                 .iter()
                 .any(|s| s.taken() < s.len)
         {
-            turns += 1;
-            if turns > 1_000_000 {
+            if std::time::Instant::now() >= deadline {
                 let streams = rig.bridge.safety.streams.borrow();
                 let seen: Vec<_> = streams
                     .iter()

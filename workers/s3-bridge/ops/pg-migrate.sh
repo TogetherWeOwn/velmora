@@ -31,7 +31,27 @@ ERRORS = {
     'VL015': 'catalogue contains an invalid index; repair it before retrying',
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
+    'VL018': 'a migration statement changed the runner apply decision; the migration was rolled back',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
+    '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
+}
+# Declared engine difference (0003): these D1 per-row usage triggers are
+# PostgreSQL statement triggers. Each entry is the column list (KEEP_COLUMNS:
+# the D1 trigger's own) and the OLD and NEW transition table names. Every
+# other trigger must stay per-row and have no transition tables.
+KEEP_COLUMNS = object()
+STATEMENT_TRIGGERS = {
+    'usage_extents_insert': ((), None, 'new_rows'),
+    'usage_extents_update': ((), 'old_rows', 'new_rows'),
+    'usage_extents_delete': ((), 'old_rows', None),
+    'usage_generations_insert': ((), None, 'new_rows'),
+    'usage_generations_update': ((), 'old_rows', 'new_rows'),
+    'usage_generations_delete': ((), 'old_rows', None),
+    'usage_outbox_insert': ((), None, 'new_rows'),
+    'usage_outbox_delete': ((), 'old_rows', None),
+    # Fires before usage_outbox_stage (name order) for the same statement.
+    'usage_outbox_failure': (KEEP_COLUMNS, None, None),
+    'usage_outbox_stage': ((), 'old_rows', 'new_rows'),
 }
 MARKER = "to_regclass(format('%I._velmora_import_incomplete', current_schema()))"
 USAGE = "has_schema_privilege('kofra_app', current_schema(), 'USAGE')"
@@ -176,15 +196,45 @@ def check(condition, code):
     return f"DO $$ BEGIN IF ({condition}) THEN RAISE EXCEPTION USING ERRCODE = '{code}'; END IF; END $$;\n"
 
 
+def pg_literal(text):
+    """Quote migration text for a server-side EXECUTE without client parsing."""
+    return "'" + text.replace("'", "''") + "'"
+
+
+# Set exactly once per online batch, under the locks, before any guarded
+# statement; current_setting without missing_ok fails closed if it is absent.
+APPLY = "current_setting('velmora.migration_apply') = 'on'"
+SKIP = "current_setting('velmora.migration_apply') = 'off'"
+
+
+def guarded(body):
+    """A top-level DO running body when APPLY holds. Any value other than on or
+    off (RESET ALL clears it) aborts the transaction. Its dollar tag is chosen
+    to be absent from the body, so no migration text can end the quote."""
+    body = f"BEGIN IF {APPLY} THEN {body} ELSIF NOT {SKIP} THEN RAISE EXCEPTION USING ERRCODE = 'VL018'; END IF; END"
+    suffix = 0
+    while f'$velmora_{suffix}$' in body:
+        suffix += 1
+    return f'DO $velmora_{suffix}$ {body} $velmora_{suffix}$;\n'
+
+
+def execute_migration(source_statements):
+    """Send each original statement as its own top-level DO in the batch. PostgreSQL
+    13+ restarts statement_timeout for each statement of a simple-query message,
+    so each migration statement keeps its own 3 s budget, as over stdin."""
+    return ''.join(guarded(f'EXECUTE {pg_literal(statement)};') for statement in source_statements)
+
+
 SQL_TOKEN = re.compile(r'''\s+|--[^\n]*|/\*|\$(?:[A-Za-z_]\w*)?\$|
     [eE]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'|"(?:""|[^"])*"|
     [\w$]+|::|<>|!=|>=|<=|!~|.''', re.X | re.S)
 
 
-def sql_tokens(sql):
-    """Keep literals and dollar bodies intact; omit line and nested block comments."""
+def sql_tokens_with_spans(sql):
+    """Keep literals and dollar bodies intact; omit comments with source spans."""
     i = 0
     while i < len(sql):
+        start = i
         token = SQL_TOKEN.match(sql, i).group()
         i += len(token)
         if token.isspace() or token.startswith('--'):
@@ -209,23 +259,40 @@ def sql_tokens(sql):
             raise ValueError('unterminated quoted value')
         elif token == '\\':
             raise ValueError('psql metacommands are not allowed')
+        yield token, start, i
+
+
+def sql_tokens(sql):
+    for token, _, _ in sql_tokens_with_spans(sql):
         yield token
 
 
 def lint_migration(sql, no_tx, name):
-    statements, pending = [], []
+    statements, source_statements, pending = [], [], []
+    segment_start = 0
     try:
-        for token in sql_tokens(sql):
+        for token, _, end in sql_tokens_with_spans(sql):
             if token == ';':
                 if pending:
                     statements.append(pending)
+                    source_statements.append(sql[segment_start:end])
                 pending = []
+                segment_start = end
             else:
                 pending.append(token)
     except ValueError as e:
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
+    for statement in statements:
+        # Comments are already gone; literals, bodies and (quoted) names remain.
+        # Token boundaries stay spaces, so "velmora.migration_ apply" is not a match.
+        text = ' '.join(statement).lower().replace('"', '')
+        if re.search(r'\bvelmora\s*\.\s*migration_apply\b', text):
+            die(f'{name}: velmora.migration_apply belongs to the migration runner')
+        # Online statements are read as PL/pgSQL literals, which needs this setting on.
+        if re.search(r'\bstandard_conforming_strings\b', text):
+            die(f'{name}: standard_conforming_strings belongs to the migration runner')
     for statement in statements:
         head = [token.upper() for token in statement[:7]]
         if head[0] in {'ABORT', 'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'START'} or head[:2] == ['PREPARE', 'TRANSACTION']:
@@ -235,7 +302,7 @@ def lint_migration(sql, no_tx, name):
                 del head[1]
             if head[:6] != ['CREATE', 'INDEX', 'CONCURRENTLY', 'IF', 'NOT', 'EXISTS']:
                 die(f'{name}: only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed')
-    return statements
+    return statements, source_statements
 
 
 def predicate(text):
@@ -307,8 +374,8 @@ def pg_trigger_bodies(migrations):
     # The D1 replay identifies which triggers should exist; the PG DDL that
     # supplies their translated PL/pgSQL also pins their installed bodies.
     functions, triggers = {}, {}
-    for _, _, statements in migrations.values():
-        for statement in statements:
+    for _, _, parsed in migrations.values():
+        for statement in parsed[0]:
             head = [token.upper() for token in statement]
             if head[:3] == ['CREATE', 'OR', 'REPLACE']:
                 statement = statement[:1] + statement[3:]
@@ -383,8 +450,16 @@ def compare(actual, d1, migrations):
                 r'\b(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([a-z_0-9,\s]+?))?\s+ON\b', sql, re.I
             ).groups()
             kind = 1 + (2 if timing.upper() == 'BEFORE' else 0) + {'INSERT': 4, 'DELETE': 8, 'UPDATE': 16}[event.upper()]
-            expected['triggers'].add((table, name, 'O', kind, tuple(re.findall(r'\w+', updates or ''))))
+            columns, transition = tuple(re.findall(r'\w+', updates or '')), (None, None)
+            if name in STATEMENT_TRIGGERS:
+                declared, *transition = STATEMENT_TRIGGERS[name]
+                kind &= ~1
+                columns = columns if declared is KEEP_COLUMNS else declared
+            expected['triggers'].add((table, name, 'O', kind, columns, *transition))
 
+    unknown = STATEMENT_TRIGGERS.keys() - {r[1] for r in expected['triggers']}
+    if unknown:
+        die('declared statement triggers are not D1 triggers: ' + ', '.join(sorted(unknown)))
     expected['columns'].add(('outbox', 'seq', 'bigint', True, 'd', None, None))
     expected['indexes'].add(('outbox', 'outbox_seq_key', False, True, True, 'btree', (('seq', False, False),), None))
     actual['tables'] = set(actual['tables'] or ())
@@ -397,7 +472,7 @@ def compare(actual, d1, migrations):
     actual['foreign_keys'] = {tuple(r[:2]) + (tuple(r[2]), tuple(r[3])) + tuple(r[4:])
                               for r in (actual['foreign_keys'] or ())}
     actual_triggers = actual['triggers'] or ()
-    actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) for r in actual_triggers}
+    actual['triggers'] = {tuple(r[:4]) + (tuple(r[4]),) + tuple(r[9:11]) for r in actual_triggers}
     expected_bodies = pg_trigger_bodies(migrations)
     actual_bodies = {r[1]: (r[5], r[6], trigger_condition(list(sql_tokens(r[7])))) for r in actual_triggers if r[8]}
     actual['checks'] = {(t, predicate(expr), valid) for t, expr, valid in (actual['checks'] or ())}
@@ -434,6 +509,17 @@ def test_triggers(run, begin, history, complete, d1):
     db.executescript('ALTER TABLE outbox ADD COLUMN seq INTEGER; '
                      'CREATE TABLE wp2_usage_trace(step TEXT,target TEXT,values_ TEXT);')
     db.executescript(fixture)
+    # SQLite applies a multi-row statement's rows in its plan's order, PG
+    # in ascending hour order. A marked mixed-hour statement must visit
+    # outbox rows in key order, which the fixture makes the hour order.
+    ordered = re.findall(r'^-- velmora: sqlite-key-order\n(.*?);$', fixture, re.M | re.S)
+    for statement in ordered:
+        plan = [row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + statement)]
+        if len(plan) != 1 or not re.fullmatch(
+                r'SEARCH outbox USING (?:COVERING )?INDEX sqlite_autoindex_outbox_1 \(extent_id=\?\)', plan[0]):
+            die(f'fixture statement is not applied in key order by SQLite: {plan}')
+    if len(ordered) < 2:
+        die('fixture lost its key-order mixed-hour statements')
     expected = {(s, t): v for s, t, v in db.execute('SELECT * FROM wp2_usage_trace')}
     actual = {(s, t): v for s, t, v in json.loads(run(begin + history + complete + sql + '\nROLLBACK;\n',
                                                    report='trigger tests'))}
@@ -441,7 +527,8 @@ def test_triggers(run, begin, history, complete, d1):
         mismatches = [f'{s}/{t}: SQLite={expected.get((s,t))}, PG={actual.get((s,t))}'
                       for s, t in sorted(expected.keys() | actual.keys()) if expected.get((s,t)) != actual.get((s,t))]
         die('trigger parity differences (synthetic fixture):\n' + '\n'.join(mismatches))
-    print(f'Trigger tests passed: 8 refusals, insert/adopt and {len(expected)} SQLite parity checkpoints; rolled back')
+    print(f'Trigger tests passed: 8 refusals, insert/adopt and {len(expected)} SQLite parity checkpoints '
+          f'({len(ordered)} key-order mixed-hour statements); rolled back')
 
 
 def main():
@@ -484,11 +571,35 @@ SET standard_conforming_strings = on;
 SET client_min_messages = error;
 ''' + check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
 
-    def run(sql, *, retry=False, report=None):
+    transactional_prefix = f'''SET LOCAL search_path TO "{schema}", pg_temp;
+SET LOCAL standard_conforming_strings = on;
+SET LOCAL client_min_messages = error;
+''' + check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
+
+    one_message_checked = False
+
+    def run(sql, *, retry=False, report=None, one_message=False):
+        nonlocal one_message_checked
+        # Linux rejects one argv string of 128 KiB or more (MAX_ARG_STRLEN, with its NUL).
+        if one_message and len(sql.encode()) >= 128 * 1024:
+            die(f'{report}: one-message batch is {len(sql.encode())} bytes; psql -c takes under 128 KiB, '
+                'so split the migration into smaller files')
+        if one_message and not one_message_checked:
+            version = subprocess.run(['psql', '--version'], stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, check=False)
+            match = re.search(r'\b(\d+)(?:\.\d+)?\b', version.stdout)
+            if version.returncode != 0 or not match or int(match.group(1)) < 15:
+                die('one-message mode requires psql 15 or newer')
+            one_message_checked = True
         for attempt in range(6):
-            result = subprocess.run(['psql', '-X', '-qAtw', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
-                                    input=prefix + sql, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding='utf-8', errors='replace', env=env, check=False)
+            command = ['psql', '-X', '-qAtw', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate']
+            kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True,
+                      'encoding': 'utf-8', 'errors': 'replace', 'env': env, 'check': False}
+            if one_message:
+                command += ['-c', sql]
+            else:
+                kwargs['input'] = prefix + sql
+            result = subprocess.run(command, **kwargs)
             if result.returncode == 0:
                 return result.stdout.strip()
             # Do not forward libpq messages, SQL, or row contents from a live database.
@@ -517,6 +628,14 @@ SET client_min_messages = error;
     \\endif
 \\endif
 '''
+    ledger_create, ledger_revoke = LEDGER.rstrip().split(';\n', 1)
+    online_migrator_session = ("SET lock_timeout = '3s';\nDO $velmora_migrator$ BEGIN IF NOT pg_try_advisory_lock('" +
+                               f"{migration_lock}'::bigint) THEN RAISE EXCEPTION USING ERRCODE = '55P03'; END IF; END $velmora_migrator$;\n")
+    online_limits_sql = ("DO $velmora_limits$ BEGIN IF " + USAGE + " THEN "
+                         "EXECUTE 'SET LOCAL statement_timeout = ''3s'''; "
+                         "IF current_setting('server_version_num')::int >= 170000 THEN "
+                         "EXECUTE 'SET LOCAL transaction_timeout = ''3s'''; END IF; "
+                         "END IF; END $velmora_limits$;\n")
     migration_tx = begin + ('' if args.import_mode else online_limits)
     ledger_exists = "to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL"
     fingerprints = ', '.join(f"('{v}', '{digest(body)}')" for v, (_, body) in files.items())
@@ -525,8 +644,11 @@ SET client_min_messages = error;
         WHERE shipped.version = m.version AND shipped.sha256 = m.sha256))''', 'VL011')
     complete = check(f'(SELECT count(*) FROM schema_migrations) <> {len(files)}', 'VL017')
     verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
-                  + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
+                  + transactional_prefix + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
                   + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
+    # Verification has no execution budget, so it keeps the stdin transport:
+    # psql 14 still works, and the session prefix sets standard_conforming_strings
+    # before the server parses check_schema.sql.
     if args.verify:
         compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
         return
@@ -549,7 +671,42 @@ $$;
     for version, (name, body) in files.items():
         if version > target:
             break
-        sql, no_tx, _ = migrations[version]
+        sql, no_tx, parsed = migrations[version]
+        statements, source_statements = parsed
+        if not args.import_mode and not no_tx:
+            # psql metacommands cannot be part of a -c simple-query message.
+            # Keep the branch and status inside SQL so the wrapper and every
+            # migration statement reach the server in one network message.
+            batch = online_migrator_session + begin + transactional_prefix + online_limits_sql
+            if version == '0001':
+                batch += ("DO $velmora_ledger$ BEGIN IF NOT " + ledger_exists + " THEN EXECUTE " +
+                          pg_literal(ledger_create) + "; EXECUTE " + pg_literal(ledger_revoke) + "; END IF; END $velmora_ledger$;\n")
+            else:
+                batch += check(f'NOT ({ledger_exists})', 'VL017')
+            batch += history
+            batch += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+            # Decide apply or skip once, then guard every statement and the ledger on it.
+            batch += (f"DO $velmora_decide$ BEGIN IF EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') THEN "
+                      "PERFORM set_config('velmora.migration_apply', 'off', true); ELSE\n")
+            if version == '0002':
+                batch += (f"    IF ({MARKER} IS NOT NULL OR NOT ({SEEDS})) THEN "
+                          "RAISE EXCEPTION USING ERRCODE = 'VL014'; END IF;\n")
+            if version == '0001':
+                batch += (f"    IF ({USAGE} OR {MARKER} IS NOT NULL) THEN "
+                          "RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;\n")
+            batch += "    PERFORM set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
+            batch += execute_migration(source_statements)
+            batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '')
+                             + f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
+                             "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+            # The lint cannot see a computed setting name, so commit only with the ledger row present.
+            batch += check(f"NOT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}')", 'VL018')
+            batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
+            output = run(batch, retry=True, report=name, one_message=True).splitlines()
+            if not output or output[-1] not in {'applied', 'already applied'}:
+                die(f'{name}: no migration status returned')
+            print(f'{name}: {output[-1]}', flush=True)
+            continue
         batch = migrator_session + migration_tx
         batch += f'SELECT {ledger_exists} AS ledger_exists \\gset\n\\if :ledger_exists\n\\else\n'
         batch += LEDGER + '\n\\endif\n' if version == '0001' else check('true', 'VL017') + '\\endif\n'
@@ -589,8 +746,10 @@ $$;
         print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
         compare(json.loads(run(verify_sql, report='pre-activation verification')), d1, migrations)
-        run(migrator_session + migration_tx + history + complete + check(f'{MARKER} IS NOT NULL', 'VL016')
-            + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True, report='activation')
+        run(online_migrator_session + begin + transactional_prefix + online_limits_sql + history + complete
+            + check(f'{MARKER} IS NOT NULL', 'VL016')
+            + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True,
+            report='activation', one_message=True)
         print('App schema USAGE granted')
 
 
