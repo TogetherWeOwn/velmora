@@ -106,11 +106,9 @@ concurrent commands also have a 256 KiB aggregate SQL argument limit.
 `--check-migrations` rejects oversized concurrent SQL without connecting.
 Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
-session lock without waiting in PostgreSQL with a snapshot. The index statements run under a
-10-minute `lock_timeout` instead of 3 s: a concurrent build waits out older
-transactions (app transactions may run 30 s) and takes only `SHARE UPDATE
-EXCLUSIVE`, which blocks no reads or writes. A failed concurrent index build
-can still leave an invalid index (including after that lock timeout). The tool refuses
+session lock without waiting in PostgreSQL with a snapshot. A failed
+concurrent index build can leave an invalid index (including after a lock
+timeout). The tool refuses
 to record the file or skip the invalid index on retry. Before reusing an
 existing index in a pending migration, the runner compares its PostgreSQL
 definition to the reviewed SQL, not just its name and validity. If the
