@@ -6045,6 +6045,46 @@ async fn a_cold_fill_replaces_a_safety_blob_that_is_not_the_extents() {
     );
 }
 
+/// With a loss on record, a blob under the safety key that is not the
+/// extent's is the scrub repair's to delete: the cold fill leaves it, so
+/// its write cannot land between the repair's check and its delete.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cold_fill_leaves_a_wrong_safety_blob_to_a_repair_on_record() {
+    let mut w = world().await;
+    let o = w.released("a", 168).await;
+    let key = o.extent.safety_key();
+    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+    assert!(w.bridge().safety.corrupt(&key, |b| {
+        let mid = b.len() / 2;
+        b[mid] ^= 1
+    }));
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_exec(
+            "UPDATE scrub_copies SET full_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'alpha'",
+            &[
+                SqlValue::Text(o.extent.as_str().to_owned()),
+                SqlValue::Int(w.bridge().clock.now().0),
+            ],
+        )
+        .await
+        .unwrap();
+    cfg_mut(&mut w).providers[1].release = false;
+    let puts = w.bridge().safety.puts.borrow().len();
+    read_cold(&w, &o, "a").await;
+    assert_eq!(w.bridge().safety.puts.borrow().len(), puts, "no write");
+    assert_ne!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher),
+        "left to the repair"
+    );
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("fill-protect-left-to-scrub ")));
+}
+
 /// A releasable extent's cold fill writes nothing to the safety store: no
 /// cost for the common case.
 #[tokio::test(flavor = "current_thread")]
@@ -6153,4 +6193,54 @@ fn no_catalogue_statement_deletes_an_extent_row() {
         }
     }
     assert!(found.is_empty(), "{found:?}");
+}
+
+/// The frozen D1 catalogue has none of the scrub's schema, and on D1 the
+/// Worker runs with `SCRUB` off. Then nothing needs that schema: an
+/// object's whole life runs on a catalogue without it (upload, release,
+/// the first sweep and a drain, a cold read, a delete and its GC).
+#[tokio::test(flavor = "current_thread")]
+async fn with_the_scrub_off_nothing_needs_the_scrub_schema() {
+    let mut w = world_on(true, |cfg| {
+        cfg.scrub.on = false;
+        cfg.gc_mode = velmora_bridge::config::GcMode::Disposable;
+    })
+    .await;
+    // As D1: the scrub's twins never applied.
+    w.bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_script(
+            "DROP INDEX extents_scrub_pending; DROP INDEX extents_scrub_enrolled; \
+             DROP INDEX extents_scrub_watch; DROP TABLE scrub_copies; DROP TABLE scrub_state; \
+             ALTER TABLE extents DROP COLUMN scrub_enrolled; \
+             ALTER TABLE extents DROP COLUMN last_scrubbed_at; \
+             ALTER TABLE extents DROP COLUMN scrub_result; \
+             ALTER TABLE extents DROP COLUMN scrub_next_at;",
+        )
+        .unwrap();
+    let o = w.released_unenrolled("a", 169).await;
+    evict_check_now(&w).await;
+    usenet_only(&w, &o).await;
+    read_cold(&w, &o, "a").await;
+    assert!(w.bridge().cache.contains(&o.extent.cache_key()), "filled");
+    cfg_mut(&mut w).hot_cap_bytes = 1;
+    evict_check_now(&w).await;
+    assert!(!w.bridge().cache.contains(&o.extent.cache_key()), "evicted");
+    w.rig
+        .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+        .await
+        .expect(204);
+    for _ in 0..4 {
+        if w.safety_state(&o).await == "deleted" {
+            break;
+        }
+        assert_eq!(
+            w.bridge().run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        w.advance_secs(3600);
+    }
+    assert_eq!(w.safety_state(&o).await, "deleted", "collected");
 }

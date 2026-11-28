@@ -260,6 +260,36 @@ class SqliteTwins(unittest.TestCase):
                 if statement.upper().startswith(("CREATE TABLE", "INSERT")):
                     self.assertNotIn(match.group(1).lower(), historical, f"{stage.name}: {statement[:80]}")
 
+    def test_later_indexes_on_historical_tables_are_plain(self):
+        # Keys: plain columns. WHERE: <column> <op> <literal> or
+        # <column> IS [NOT] NULL, joined by AND or OR.
+        stages = sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        historical = set()
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                historical.update(t.lower() for t in re.findall(
+                    r"CREATE TABLE (?:IF NOT EXISTS )?([a-z_0-9]+)", stage.read_text(), re.I))
+        index = re.compile(r"CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?[a-z_0-9]+ "
+                           r"ON ([a-z_0-9]+) ?\((.*?)\)(?: WHERE (.*))?", re.I | re.S)
+        literal = r"(?:'[^'\\]*'|-?[0-9]+|TRUE|FALSE)"
+        term = rf"[a-z_0-9]+ (?:(?:=|<>|<|<=|>|>=) {literal}|IS (?:NOT )?NULL)"
+        predicate = re.compile(rf"{term}(?: (?:AND|OR) {term})*", re.I)
+        checked = 0
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                continue
+            text = re.sub(r"--[^\n]*", "", stage.read_text())
+            for statement in filter(None, (" ".join(s.split()) for s in text.split(";"))):
+                found = index.fullmatch(statement)
+                if not found or found.group(1).lower() not in historical:
+                    continue
+                checked += 1
+                for key in found.group(2).split(","):
+                    self.assertRegex(key.strip(), r"^[a-z_0-9]+(?: (?:ASC|DESC))?$", f"{stage.name}: {statement}")
+                if found.group(3):
+                    self.assertIsNotNone(predicate.fullmatch(found.group(3).strip()), f"{stage.name}: {statement}")
+        self.assertTrue(checked, "a later stage indexes a historical table")
+
     def test_stages_and_twins_are_plain_ascii(self):
         # Printable ASCII, tab and newline only: no backslash, no NUL,
         # comments included.
