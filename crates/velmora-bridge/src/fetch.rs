@@ -2810,9 +2810,12 @@ where
     /// write-ahead intent, with the collection guard after it, and
     /// counted. A blob the store checked as the extent's is kept;
     /// anything else under the key (other bytes, or a streamed put whose
-    /// digest the store never checked) is replaced: the scrub never
-    /// deletes a safety object of a referenced extent, so nothing can
-    /// delete this write. It never fails the read: when the write cannot
+    /// digest the store never checked) is replaced. The scrub deletes a
+    /// safety object only at a repair, after a sequence-checked uncount
+    /// and the re-pin to held; fills and evictions count a copy only on a
+    /// released extent, so a fill write it removes there is not a counted
+    /// copy, and it came from a verified Usenet read, so the next read
+    /// fills again. It never fails the read: when the write cannot
     /// be made, nothing is written anywhere, and the next read of the
     /// extent fills it again. `true` = the copy is there.
     async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {

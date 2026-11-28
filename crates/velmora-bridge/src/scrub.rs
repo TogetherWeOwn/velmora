@@ -1931,8 +1931,9 @@ where
                     walk.run.unrecoverable += 1;
                     crate::trace::alert(|| {
                         format!(
-                            "scrub-unrecoverable {} re-pinned, its safety copy is gone and no \
-                             intact copy is on Usenet or in the cache",
+                            "scrub-unrecoverable {} re-pinned, no intact safety copy (one that \
+                             is not the extent's is kept, uncounted) and no intact copy is on \
+                             Usenet or in the cache",
                             extent.id.as_str()
                         )
                     });
