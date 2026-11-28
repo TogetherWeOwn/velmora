@@ -518,7 +518,12 @@ class MigrationParser(unittest.TestCase):
 #            with the per-build records the first session made;
 #   hold_w1: hold the W1 advisory key in another session during the first
 #            concurrent ledger transaction, which runs in a new session;
-#   replace: [old, new] pairs applied to the runner's SQL, each recorded when seen.
+#   replace: [old, new] pairs applied to the runner's SQL, each recorded when seen;
+#   hold_w1_prepare: hold the W1 advisory key in another session while the
+#            first concurrent batch runs (its prepare then times out), and
+#            let it go when that batch ends;
+#   fail_batches: answer this many concurrent batches with a 55P03 before any
+#            SQL runs, as a prepare that timed out on W1 does.
 # Each hook fires once, and only for the configured version.
 HOOK_PSQL = r'''#!/usr/bin/env python3
 import json
@@ -621,6 +626,30 @@ def after_fence(text):
 
 
 if len(messages) > 1 and record in messages[-1]:
+    if "SELECT 'velmora-building'" in messages and 'fail_batches' in config:
+        failed = here / 'fail_batches.count'
+        count = int(failed.read_text()) if failed.exists() else 0
+        if count < int(config['fail_batches']):
+            failed.write_text(str(count + 1))
+            note('failed batch ' + str(count + 1))
+            sys.stderr.write('psql:<stdin>:1: ERROR:  55P03\n')
+            sys.exit(1)
+    if "SELECT 'velmora-building'" in messages and once('hold_w1_prepare'):
+        holder = subprocess.Popen([real, '-X', '-qAt'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                  text=True, env=dict(os.environ, PGAPPNAME='velmora-test-hook'))
+        holder.stdin.write(f"SELECT pg_advisory_lock('{config['hold_w1_prepare']}'::bigint);\n")
+        holder.stdin.flush()
+        for _ in range(200):
+            if held(config['hold_w1_prepare']):
+                break
+            time.sleep(0.05)
+        else:
+            note('hook failed: W1 was not held')
+            sys.exit(97)
+        batch = psql(options + [x for m in messages for x in ('-c', m)])
+        holder.stdin.close()
+        holder.wait()
+        finish(batch)
     if once('inject'):
         marker = config.get('inject_after')
         at = 1 if marker is None else next(i for i, m in enumerate(messages) if marker in m) + 1
@@ -899,6 +928,174 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertEqual(self.ledger(), [*STAGES, '0004'])
             self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script, env=env).stdout)
 
+    def hold_extents(self, mode="ROW EXCLUSIVE"):
+        """A transaction holding `mode` on extents (by default what an app
+        writer holds), begun now: older than anything the migrator starts.
+        It commits when `migrate_while_held` says so."""
+        holder = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=libpq_env())
+        holder.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
+                           f"BEGIN; LOCK TABLE extents IN {mode} MODE;\n")
+        holder.stdin.flush()
+        self.addCleanup(holder.stderr.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(lambda: holder.stdin.closed or holder.stdin.close())
+        for _ in range(100):
+            held = psql(f"SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                        f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{self.schema}' "
+                        f"AND c.relname = 'extents' AND l.mode = '{mode.title().replace(' ', '')}Lock' "
+                        "AND l.granted").stdout
+            if held.strip() == "1":
+                return holder
+            time.sleep(0.05)
+        self.fail("the writer never took its lock")
+
+    def migrate_while_held(self, holder, script, hold, env=None):
+        """Runs the migrator with `holder` open. Once a concurrent build is
+        seen waiting on a lock, the writer stays open `hold` more seconds
+        (or until the migrator exits), then commits. Returns the migrator's
+        result and whether a build was seen waiting."""
+        runner = subprocess.Popen(["bash", str(script), str(self.env)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, env=env)
+        waited = False
+        deadline = time.monotonic() + 120
+        while runner.poll() is None and time.monotonic() < deadline:
+            waiting = psql("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                           "AND pid <> pg_backend_pid() AND query ILIKE '%CREATE INDEX CONCURRENTLY%' "
+                           "AND wait_event_type = 'Lock'").stdout
+            if waiting.strip() != "0":
+                waited = True
+                break
+            time.sleep(0.05)
+        if waited:
+            until = time.monotonic() + hold
+            while runner.poll() is None and time.monotonic() < until:
+                time.sleep(0.05)
+        holder.stdin.write("COMMIT;\n")
+        holder.stdin.close()
+        try:
+            out, err = runner.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            # Reaped before the schema cleanup, which would wait on its locks.
+            runner.kill()
+            runner.communicate()
+            raise
+        self.assertEqual(holder.wait(), 0, holder.stderr.read())
+        return subprocess.CompletedProcess(runner.args, runner.returncode, out, err), waited
+
+    def test_a_concurrent_index_stage_waits_out_a_long_writer(self):
+        # An app writer transaction older than the build and longer than the
+        # migrator's 3 s lock timeout: CREATE INDEX CONCURRENTLY waits for it,
+        # and must not fail and leave an INVALID index.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_concurrent.sql'
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            # Held 5 s past the moment the build is seen waiting: longer than
+            # the old 3 s timeout, however long the runner took to get there.
+            result, waited = self.migrate_while_held(self.hold_extents(), script, 5)
+            self.assertTrue(waited, 'the build waited for the writer')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f'{name}: applied', result.stdout)
+            self.assertEqual(self.ledger(), [*STAGES, '0004'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+
+    def cut_build_timeout(self, script):
+        """The clone's build lock_timeout cut to 1 s, so a test does not wait
+        90 s; production has no such knob."""
+        runner = script.read_text()
+        self.assertEqual(runner.count("SET lock_timeout = '90s'"), 1)
+        script.write_text(runner.replace("SET lock_timeout = '90s'", "SET lock_timeout = '1s'"))
+
+    def assert_one_build_refusal(self, refused, name):
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        lines = [line for line in refused.stderr.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, refused.stderr)
+        self.assertNotRegex(refused.stderr, r'retry [0-9]/5')
+        self.assertTrue(lines[0].startswith(f'pg-migrate: {name}: SQLSTATE 55P03: a concurrent index build '
+                                            'timed out waiting for a lock (not retried)'), lines[0])
+        self.assertIn('any of its indexes (fixture_extent_bucket) left INVALID must be repaired as for VL015',
+                      lines[0])
+        self.assertEqual(self.ledger(), STAGES, 'no ledger row')
+
+    def test_a_blocker_held_past_the_build_timeout_ends_in_the_runners_refusal(self):
+        # A writer older than the build and held longer than the build's
+        # lock_timeout: the build times out in its wait for older transactions
+        # and is refused at once, not retried, with no ledger row.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            self.cut_build_timeout(script)
+            name = '0004_concurrent.sql'
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            refused, waited = self.migrate_while_held(self.hold_extents(), script, 5)
+            self.assertTrue(waited, 'the build waited for the writer')
+            self.assert_one_build_refusal(refused, name)
+            # The build had created its index: the next run names it invalid.
+            self.assertIn(f'{name}: catalogue contains an invalid index; repair it before retrying',
+                          self.migrate(script=script, ok=False).stderr)
+
+    def test_a_table_lock_held_past_the_build_timeout_is_refused_once(self):
+        # A session holding SHARE UPDATE EXCLUSIVE (a manual VACUUM or
+        # ANALYZE, another index build): the build times out taking its table
+        # lock. Refused at once, with no retry, no index and no ledger row.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            self.cut_build_timeout(script)
+            name = '0004_concurrent.sql'
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            refused, waited = self.migrate_while_held(self.hold_extents("SHARE UPDATE EXCLUSIVE"), script, 5)
+            self.assertTrue(waited, 'the build waited for the table lock')
+            self.assert_one_build_refusal(refused, name)
+            self.assertEqual(self.owner_sql("SELECT count(*) FROM pg_class WHERE relname = 'fixture_extent_bucket' "
+                                            "AND relnamespace = current_schema()::regnamespace").stdout.strip(),
+                             '0', 'no index')
+
+    def test_a_live_cutover_schema_takes_later_stages_online_over_a_delayed_network(self):
+        # Smoke coverage: latency only, no lock contention; the lock-wait
+        # bounds are tested by test_a_concurrent_index_stage_waits_out_a_long_writer
+        # and test_a_blocker_held_past_the_build_timeout_ends_in_the_runners_refusal.
+        # The production upgrade: a schema at the cutover baseline with app
+        # access granted takes a later transactional stage and a later
+        # concurrent-index stage online, over a network with round-trip
+        # latency, ledger and verification included.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_fixture_table.sql',
+                          'CREATE TABLE fixture_later (id BIGINT PRIMARY KEY, note TEXT COLLATE "C");\n',
+                          'CREATE TABLE fixture_later (id INTEGER PRIMARY KEY, note TEXT);\n')
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, '0005_fixture_index.sql', '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            original = self.env.read_text()
+            with delayed_pg() as proxy_port:
+                lines = [f"PGHOST=127.0.0.1" if line.startswith("PGHOST=") else line
+                         for line in original.splitlines() if not line.startswith("PGPORT=")]
+                lines.append(f"PGPORT={proxy_port}")
+                self.env.write_text("\n".join(lines) + "\n")
+                try:
+                    applied = self.migrate(script=script).stdout
+                finally:
+                    self.env.write_text(original)
+            self.assertIn('0004_fixture_table.sql: applied', applied)
+            self.assertIn('0005_fixture_index.sql: applied', applied)
+            self.assertEqual(self.migrate('--pending', script=script).stdout, '')
+            self.assertEqual(self.ledger(), [*STAGES, '0004', '0005'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+
     def test_failed_concurrent_statement_leaves_migration_pending(self):
         self.migrate()
         self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
@@ -1012,6 +1209,46 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
         with tempfile.TemporaryDirectory() as tmp:
             self.concurrent_reuse_race(tmp, 'DROP INDEX CONCURRENTLY kofra_a;')
             self.assertEqual(self.index_oid('kofra_a'), '0')
+
+    def test_a_prepare_lock_timeout_is_retried_not_taken_for_the_build(self):
+        # W1 busy past the 3 s lock_timeout during the first concurrent
+        # prepare only: that 55P03 comes before 'velmora-building', so it is
+        # retried, not refused as a timeout of the build itself.
+        with tempfile.TemporaryDirectory() as tmp:
+            script, _ = self.reuse_setup(tmp, REUSE_BOTH, mode='concurrent')
+            env, log = self.hooked(tmp, hold_w1_prepare=str(self.lock))
+            result = self.migrate(script=script, env=env)
+            self.assertIn('fired hold_w1_prepare', log.read_text())
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE 55P03, retry 1/5', result.stderr)
+            self.assertNotIn('concurrent index build timed out', result.stderr)
+            self.assertIn('0005_kofra_indexes.sql: applied', result.stdout)
+            self.assertEqual(self.ledger(), [*STAGES, '0004', '0005'])
+
+    def test_a_build_timeout_on_the_last_attempt_gets_the_build_diagnosis(self):
+        # Five prepares refused (55P03 before any SQL), then the sixth and last
+        # attempt's build times out behind a writer: the same build-timeout
+        # refusal as on any other attempt, not a bare 55P03.
+        with tempfile.TemporaryDirectory() as tmp:
+            script, _ = self.reuse_setup(tmp, REUSE_BOTH, mode='concurrent')
+            self.cut_build_timeout(script)
+            env, log = self.hooked(tmp, fail_batches='5')
+            writer = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                      env=libpq_env())
+            writer.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
+                               "BEGIN; LOCK TABLE kofra_u IN ROW EXCLUSIVE MODE;\n")
+            writer.stdin.flush()
+            self.addCleanup(writer.stderr.close)
+            self.addCleanup(writer.wait)
+            self.addCleanup(lambda: writer.stdin.closed or writer.stdin.close())
+            refused, waited = self.migrate_while_held(writer, script, 5, env=env)
+            self.assertTrue(waited, 'the last attempt built and waited')
+            self.assertIn('failed batch 5', log.read_text())
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE 55P03, retry 5/5', refused.stderr)
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE 55P03: a concurrent index build timed out waiting '
+                          'for a lock (not retried)', refused.stderr)
+            self.assertEqual(self.ledger(), [*STAGES, '0004'])
 
     def test_concurrent_ledger_lock_timeout_retries_with_a_fresh_plan(self):
         # W1 is busy past the 3 s lock_timeout after kofra_b was built. The
