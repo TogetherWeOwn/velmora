@@ -39,7 +39,7 @@ use velmora_bridge::ingress;
 use velmora_bridge::keepalive;
 use velmora_bridge::metrics::{FailureStage as Stage, Fault, RequestObservation};
 use velmora_bridge::{
-    BridgeError, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
+    BridgeError, Catalog, Job, JobOutcome, OutboxStage, RespBody, S3Response, UnixMs, JOB_VERSION,
 };
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt,
@@ -238,11 +238,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
             return Ok(out);
         }
     };
+    let cors_enabled = bridge.catalog.bucket_cors_enabled();
     let incoming = match http::to_s3_request(req) {
         Ok(incoming) => incoming,
         Err(e) => {
             // The answer first: the line has the status the client got.
-            let out = early(e.response());
+            let mut response = e.response();
+            if cors_enabled && matches!(method.as_str(), "GET" | "HEAD") {
+                response.vary_on_origin();
+            }
+            let out = early(response);
             let mut observed = initial();
             observed.mark_fault(Stage::Other, Fault::named("RequestConversion"));
             let status = request_log::Answered {
@@ -280,7 +285,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
     let mut get = got.into_inner().unwrap_or_else(initial);
-    let (status, out) = fanout::respond(&env, &ctx, resp, &request_id, &mut get).await;
+    let (status, out) =
+        fanout::respond(&env, &ctx, resp, &request_id, &mut get, cors_enabled).await;
     // HTTP conversion can itself turn a response into a 500: the line has
     // the status the client got and, for a 5xx, what the handler observed
     // of it (stage, error variant, provider code; names and numbers only).

@@ -32,14 +32,18 @@ const DOC: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 </CORSConfiguration>"#;
 
 async fn put_doc(rig: &Rig, signer: &Signer) -> Resp {
-    let md5 = STANDARD.encode(md5::compute(DOC).0);
+    put_config(rig, signer, DOC).await
+}
+
+async fn put_config(rig: &Rig, signer: &Signer, doc: &[u8]) -> Resp {
+    let md5 = STANDARD.encode(md5::compute(doc).0);
     rig.call(
         signer,
         Method::Put,
         BUCKET,
         &[("cors", "")],
         &[("content-md5", &md5)],
-        DOC,
+        doc,
     )
     .await
 }
@@ -172,6 +176,7 @@ async fn bucket_cors_roundtrips_and_applies_to_preflight_and_actual_responses() 
             Some("X-Amz-Date, Content-Type")
         );
         assert_eq!(ok.header("access-control-max-age"), Some("600"));
+        assert_eq!(ok.header("access-control-expose-headers"), Some("ETag"));
         assert_eq!(
             ok.header("vary"),
             Some("Origin, Access-Control-Request-Headers, Access-Control-Request-Method")
@@ -293,7 +298,7 @@ async fn no_origin_makes_zero_cors_reads_and_preserves_options_refusal() {
     assert_eq!(put_doc(&rig, &signer).await.status, 200);
     let plain = rig.call(&signer, Method::Get, OBJECT, &[], &[], b"").await;
     assert_eq!(plain.status, 404);
-    assert!(plain.header("vary").is_none());
+    assert_eq!(plain.header("vary"), Some("Origin"));
     let mut options = preflight(OBJECT, ORIGIN, "PUT", "");
     options.headers.retain(|(h, _)| h != "origin");
     assert_eq!(rig.send(options).await.status, 501);
@@ -318,6 +323,85 @@ async fn no_origin_makes_zero_cors_reads_and_preserves_options_refusal() {
         rig.bridge.catalog.sql.cors_queries.get(),
         1,
         "cache is shared with actual requests"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cors_get_and_head_vary_even_without_a_matching_origin() {
+    const PRESENT: &str = "/cors-test/cacheable";
+    const READS: &[u8] = b"<CORSConfiguration><CORSRule><AllowedOrigin>https://app.example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod></CORSRule></CORSConfiguration>";
+    let rig = cors_rig();
+    let (_, signer) = rig.standard(&BUCKET[1..]).await;
+    assert_eq!(put_config(&rig, &signer, READS).await.status, 200);
+    let written = rig
+        .call(
+            &signer,
+            Method::Put,
+            PRESENT,
+            &[],
+            &[("cache-control", "public, max-age=600")],
+            b"cacheable",
+        )
+        .await;
+    assert_eq!(written.status, 200, "{}", written.text());
+    let etag = written.header("etag").unwrap();
+    for method in [Method::Get, Method::Head] {
+        for (path, extra, status) in [
+            (PRESENT, &[][..], 200),
+            (PRESENT, &[("if-none-match", etag)][..], 304),
+            (OBJECT, &[][..], 404),
+        ] {
+            let resp = rig
+                .call(&signer, method.clone(), path, &[], extra, b"")
+                .await;
+            assert_eq!(resp.status, status, "{method:?}: {}", resp.text());
+            assert_eq!(resp.header("vary"), Some("Origin"), "{method:?} {status}");
+            assert!(resp.header("access-control-allow-origin").is_none());
+        }
+    }
+    let refused = Req {
+        method: Method::Get,
+        target: PRESENT.into(),
+        headers: vec![("host".into(), HOST.into())],
+        body: vec![],
+    };
+    let (refused, entered) = through_front(&rig, refused.into_request(), true).await;
+    assert!(!entered);
+    assert_eq!(refused.status, 403);
+    assert_eq!(refused.header("vary"), Some("Origin"));
+    assert_eq!(rig.bridge.catalog.sql.cors_queries.get(), 0);
+
+    let unmatched = rig
+        .call(
+            &signer,
+            Method::Get,
+            PRESENT,
+            &[],
+            &[("origin", "https://unmatched.test")],
+            b"",
+        )
+        .await;
+    assert_eq!(unmatched.status, 200);
+    assert_eq!(unmatched.header("vary"), Some("Origin"));
+    assert!(unmatched.header("access-control-allow-origin").is_none());
+    let matched = rig
+        .call(
+            &signer,
+            Method::Get,
+            PRESENT,
+            &[],
+            &[("origin", ORIGIN)],
+            b"",
+        )
+        .await;
+    assert_eq!(matched.header("access-control-allow-origin"), Some(ORIGIN));
+    assert_eq!(
+        matched
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .count(),
+        1
     );
 }
 
@@ -736,5 +820,44 @@ async fn bucket_cors_is_off_by_default() {
         rig.send(preflight(OBJECT, ORIGIN, "PUT", "")).await.status,
         501
     );
+    let get = rig
+        .call(
+            &signer,
+            Method::Get,
+            OBJECT,
+            &[],
+            &[("origin", ORIGIN)],
+            b"",
+        )
+        .await;
+    assert!(get.header("vary").is_none());
+    let mut unsigned = signer.sign(
+        rig.now(),
+        Method::Put,
+        OBJECT,
+        &[],
+        &[("origin", ORIGIN)],
+        vec![],
+    );
+    unsigned.headers.retain(|(name, _)| name != "authorization");
+    let mut oversized = signer.sign(
+        rig.now(),
+        Method::Put,
+        OBJECT,
+        &[],
+        &[("origin", ORIGIN)],
+        vec![],
+    );
+    oversized.set_header(
+        "content-length",
+        &(rig.bridge.cfg.max_put_bytes + 1).to_string(),
+    );
+    for (req, status) in [(unsigned, 403), (oversized, 400)] {
+        let (refused, entered) = through_front(&rig, req.into_request(), true).await;
+        assert!(!entered);
+        assert_eq!(refused.status, status);
+        assert!(refused.header("access-control-allow-origin").is_none());
+        assert!(refused.header("vary").is_none());
+    }
     assert_eq!(rig.bridge.catalog.sql.cors_queries.get(), 0);
 }

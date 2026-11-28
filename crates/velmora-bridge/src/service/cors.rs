@@ -39,6 +39,14 @@ fn allow_origin(response: &mut S3Response, origin: &str) {
     }
 }
 
+fn expose_headers(response: &mut S3Response, headers: &[String]) {
+    if !headers.is_empty() {
+        response
+            .headers
+            .push(("access-control-expose-headers".into(), headers.join(", ")));
+    }
+}
+
 fn values<'a>(req: &'a S3Request, header: &'static str) -> impl Iterator<Item = &'a str> {
     req.headers.iter().filter_map(move |(name, value)| {
         name.eq_ignore_ascii_case(header)
@@ -117,6 +125,7 @@ pub(super) async fn preflight<
         let found = config.first_match(origin, method, &headers)?;
         let mut response = empty(200);
         allow_origin(&mut response, found.allow_origin);
+        expose_headers(&mut response, found.expose_headers);
         response.headers.push((
             "access-control-allow-methods".into(),
             found.methods.join(", "),
@@ -191,20 +200,8 @@ impl ActualRequest {
             return;
         };
         allow_origin(response, found.allow_origin);
-        if !found.expose_headers.is_empty() {
-            response.headers.push((
-                "access-control-expose-headers".into(),
-                found.expose_headers.join(", "),
-            ));
-        }
-        if !response.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("vary")
-                && value
-                    .split(',')
-                    .any(|v| v.trim() == "*" || v.trim().eq_ignore_ascii_case("Origin"))
-        }) {
-            response.headers.push(("vary".into(), "Origin".into()));
-        }
+        expose_headers(response, found.expose_headers);
+        response.vary_on_origin();
     }
 }
 

@@ -301,13 +301,18 @@ where
             }
         }
         let target = req.raw_target.clone();
+        let cors_enabled = self.catalog.bucket_cors_enabled();
+        let vary_read = cors_enabled && matches!(req.method, Method::Get | Method::Head);
         // A sub-range of a large GET, asked for by another invocation of
         // this Worker. It is told apart by its target alone and admitted
         // by its token alone, before any S3 routing.
         if crate::fanout::is_internal_target(&target) {
-            return get::fanout_piece(&self, req, observed, hit_flush).await;
+            let mut response = get::fanout_piece(&self, req, observed, hit_flush).await;
+            if vary_read {
+                response.vary_on_origin();
+            }
+            return response;
         }
-        let cors_enabled = self.catalog.bucket_cors_enabled();
         let actual_cors = if cors_enabled {
             if let Some(bucket) = preflight_bucket(&self.cfg, &req) {
                 return cors::preflight(&self, &req, &bucket).await;
@@ -379,6 +384,9 @@ where
         };
         if let Some(actual) = actual_cors {
             actual.apply(&self, &mut response).await;
+        }
+        if vary_read {
+            response.vary_on_origin();
         }
         response
     }

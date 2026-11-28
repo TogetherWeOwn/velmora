@@ -44,7 +44,7 @@ use crate::config::BridgeConfig;
 use crate::crypto::{ExtentSealer, SealedStream};
 use crate::ports::{BlobStore, Bridge, Catalog, Clock, JobSink, Kek, NntpConnector};
 use crate::service::{classify, preflight_bucket, ActualRequest, Route};
-use crate::types::{Body, BridgeError, ByteStream, S3Request, S3Response};
+use crate::types::{Body, BridgeError, ByteStream, Method, S3Request, S3Response};
 
 /// How long a request may wait for budget before `503 SlowDown`.
 pub const CHARGE_WAIT_MS: u32 = 20_000;
@@ -597,7 +597,8 @@ where
     Fut: core::future::Future<Output = S3Response>,
 {
     let enabled = bridge.catalog.bucket_cors_enabled();
-    front_inner(
+    let vary_read = enabled && matches!(req.method, Method::Get | Method::Head);
+    let mut response = front_inner(
         req,
         &bridge.cfg,
         https,
@@ -617,7 +618,11 @@ where
             response
         },
     )
-    .await
+    .await;
+    if vary_read {
+        response.vary_on_origin();
+    }
+    response
 }
 
 async fn front_inner<F, Fut, R, Refused>(
