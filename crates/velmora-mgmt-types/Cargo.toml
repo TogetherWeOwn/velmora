@@ -1,0 +1,22 @@
+[package]
+name = "velmora-mgmt-types"
+# The wire contract of the management plane. A change that breaks a
+# caller bumps the major version (while below 1.0, the minor one, as
+# Cargo reads it); a caller pins a velmora commit.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Wire contract of the velmora management plane: paths, request and answer types, codes, positions, header names and the request fingerprint"
+license = "MIT"
+repository = "https://github.com/TogetherWeOwn/velmora"
+publish = false
+
+[lib]
+name = "velmora_mgmt_types"
+path = "src/lib.rs"
+
+# Kept small on purpose: callers take this crate as a git dependency.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
