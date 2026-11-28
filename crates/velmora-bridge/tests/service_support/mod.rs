@@ -259,6 +259,10 @@ pub struct Blobs {
     pub fail_deletes: Cell<u32>,
     /// Called once, with the key, at the start of the next delete.
     pub before_delete: Hook,
+    /// Called once, with the key, right after the next `head_identity`
+    /// has its answer: what another request commits between that check
+    /// and what the caller does next.
+    pub after_identity: Hook,
     /// Called once, with the key, at the start of the next put.
     pub before_put: Hook,
     /// One-shot hooks for interleavings that must await real catalogue I/O.
@@ -553,9 +557,12 @@ impl BlobStore for Blobs {
         self.trip.guard(blob_down, self.inner.head(key)).await
     }
     async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
-        self.trip
+        let answer = self
+            .trip
             .guard(blob_down, self.inner.head_identity(key))
-            .await
+            .await;
+        fire(&self.after_identity, key);
+        answer
     }
     async fn delete(&self, key: &str) -> Result<()> {
         self.allow_write()?;

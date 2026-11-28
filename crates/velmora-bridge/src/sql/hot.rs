@@ -208,18 +208,6 @@ pub const EVICT_WINDOW_SCRUB_AFTER_PG: &str = evict_window!(
 const WATCH_SOON: &str = "UPDATE extents SET scrub_next_at = ?2 \
     WHERE id = ?1 AND scrub_next_at IS NULL AND safety_state = 'released'";
 
-// The scrub deleted a released extent's safety object (its bytes were
-// not the extent's): it is no longer counted, so it adds no phantom bytes
-// to the tier's total. The sequence moves, so an eviction listed before
-// cannot claim the bytes either.
-const SAFETY_GONE: &str = "UPDATE extents SET hot_safety_bytes = 0, evict_seq = evict_seq + 1 \
-    WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes > 0";
-
-// Right before the scrub deletes a safety object whose bytes are not the
-// extent's: the sequence moves first, so an eviction that claimed the row
-// before finds it moved at its check and deletes nothing.
-const SAFETY_FENCE: &str = "UPDATE extents SET evict_seq = evict_seq + 1 WHERE id = ?1";
-
 // The extent's ciphertext as recorded: what a blob must be to be its copy.
 const EXTENT_CIPHER: &str =
     "SELECT bucket_id, cipher_size, cipher_sha256, safety_state FROM extents WHERE id = ?1";
@@ -535,13 +523,6 @@ pub(super) async fn evict_promoted<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate
     Ok(changed == 1)
 }
 
-/// The sequence moves before the scrub deletes a safety object
-/// ([`SAFETY_FENCE`]).
-pub(super) async fn scrub_safety_fence<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<()> {
-    c.sql.exec(SAFETY_FENCE, &[text(extent.as_str())]).await?;
-    Ok(())
-}
-
 /// Gives each of `extents` (released, kept by eviction for want of a
 /// release) a scrub deadline of `at` unless it has one ([`WATCH_SOON`]).
 pub(super) async fn scrub_watch_soon<S: Sql>(
@@ -554,13 +535,6 @@ pub(super) async fn scrub_watch_soon<S: Sql>(
             .exec(WATCH_SOON, &[text(extent.as_str()), ms(at)])
             .await?;
     }
-    Ok(())
-}
-
-/// A released extent's safety object is gone: no longer counted
-/// ([`SAFETY_GONE`]).
-pub(super) async fn scrub_safety_gone<S: Sql>(c: &SqlCatalog<S>, extent: &ExtentId) -> Result<()> {
-    c.sql.exec(SAFETY_GONE, &[text(extent.as_str())]).await?;
     Ok(())
 }
 
@@ -962,8 +936,6 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (EVICT_WINDOW_SCRUB_PG.to_owned(), vec![I, T]),
         (EVICT_WINDOW_SCRUB_AFTER_PG.to_owned(), vec![I, I, T, T]),
         (WATCH_SOON.to_owned(), vec![T, I]),
-        (SAFETY_GONE.to_owned(), vec![T]),
-        (SAFETY_FENCE.to_owned(), vec![T]),
         (EXTENT_CIPHER.to_owned(), vec![T]),
         (EVICT_PROMOTED.to_owned(), vec![T, I]),
         (EVICT_POINT.to_owned(), vec![T]),

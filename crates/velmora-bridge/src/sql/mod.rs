@@ -1121,12 +1121,6 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn scrub_watch_soon(&self, extents: &[ExtentId], at: UnixMs) -> Result<()> {
         hot::scrub_watch_soon(self, extents, at).await
     }
-    async fn scrub_safety_gone(&self, extent: &ExtentId) -> Result<()> {
-        hot::scrub_safety_gone(self, extent).await
-    }
-    async fn scrub_safety_fence(&self, extent: &ExtentId) -> Result<()> {
-        hot::scrub_safety_fence(self, extent).await
-    }
     async fn extent_cipher(&self, extent: &ExtentId) -> Result<Option<crate::types::ExtentCipher>> {
         hot::extent_cipher(self, extent).await
     }
@@ -1309,7 +1303,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 395, "background inventory entry count");
+        assert_eq!(statements.len(), 393, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

@@ -1608,11 +1608,11 @@ where
                 // Pinned without its copy: verify cannot post from it. The
                 // watch looks again after the confirm interval, not at the
                 // bound. An object left under the key that is not the
-                // extent's (never read on a Usenet repair) is no longer
-                // counted as the copy.
+                // extent's (never read on a Usenet repair) goes, or a
+                // catalogue replay would take it for a pinned copy.
                 if let Ok(Some(bytes)) = self.safety.get(&key, None).await {
                     if !digest_ok(extent, &bytes) {
-                        self.uncount_wrong_safety(extent).await;
+                        self.drop_wrong_safety(extent).await;
                     }
                 }
                 crate::trace::alert(|| {
@@ -1653,9 +1653,9 @@ where
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => {
                 return Ok((RepairSource::Safety, Some(bytes)));
             }
-            // Other bytes under the key: no copy, and no longer counted
-            // as one before any re-pin.
-            Ok(Some(_)) => self.uncount_wrong_safety(extent).await,
+            // Other bytes under the key: no copy, and gone before any
+            // re-pin.
+            Ok(Some(_)) => self.drop_wrong_safety(extent).await,
             Ok(None) => true,
             Err(_) => false,
         };
@@ -1673,9 +1673,9 @@ where
     /// that does not answer, or no memory to spare, leaves it to the next
     /// sighting.
     async fn protect_cache_fill(&self, extent: &ExtentRow) {
-        // A blob under the key that is not the extent's (uncounted, left
-        // in place) is overwritten; the extent's own copy, or a store that
-        // does not answer, leaves it to the next sighting.
+        // A blob under the key that is not the extent's is overwritten; the
+        // extent's own copy, or a store that does not answer, leaves it to
+        // the next sighting.
         match self.safety.head_identity(&extent.id.safety_key()).await {
             Ok(Some(blob)) if blob.is(extent.cipher_size, &extent.cipher_sha256) => return,
             Ok(_) => {}
@@ -1703,24 +1703,30 @@ where
         }
     }
 
-    /// A safety object whose bytes are not the extent's, unless the store
-    /// checked them as the extent's when they were stored, is no longer
-    /// counted, and is left where it is: the scrub never deletes a safety
-    /// object of an extent that is still referenced. A read skips it (it
-    /// fails authentication) and fills from Usenet, verified; the next
-    /// verified write of the extent's bytes (a repair, a cold fill, a
-    /// protect) overwrites it, and GC deletes it with the extent once
-    /// nothing references it. So no delete here can meet a verified copy
-    /// written meanwhile. Eviction takes only a blob the store checked as
-    /// the extent's for a pinned extent's copy, so it never takes this
-    /// one; the sequence moves before the count does, as well. `false`:
-    /// the count did not change.
-    async fn uncount_wrong_safety(&self, extent: &ExtentRow) -> bool {
+    /// Deletes a safety object whose bytes are not the extent's, unless the
+    /// store checked them as the extent's when they were stored. Such an
+    /// object holds nothing recoverable. Eviction takes only a checked
+    /// blob for a pinned extent's copy, so the two never meet on one blob.
+    ///
+    /// The catalogue goes first, as one compare-and-set on the sequence
+    /// read before the check: the object is no longer counted and the
+    /// sequence moves, so an eviction that claimed the row before finds it
+    /// moved and deletes nothing. If anything changed the row since the
+    /// check (a cold fill that counted the copy it wrote, an eviction),
+    /// nothing is uncounted and nothing is deleted. Only then is the object
+    /// deleted. A fill whose write lands after the check but is counted
+    /// after the compare-and-set loses its copy to the delete. Its bytes
+    /// came from Usenet, which still has them, so the next read fills
+    /// again. `false`: nothing was deleted.
+    async fn drop_wrong_safety(&self, extent: &ExtentRow) -> bool {
         let key = extent.id.safety_key();
+        let Ok(seq) = self.catalog.hot_seq(&extent.id).await else {
+            return false;
+        };
         // A blob whose digest the store checked against the extent's when
-        // it was stored is the extent's copy: still counted, as eviction
-        // takes it for the copy (a read that came back other is a fault of
-        // the read). Not known: nothing changes.
+        // it was stored is the extent's copy: never deleted here, as
+        // eviction takes it for the copy (a read that came back other is
+        // a fault of the read). Not known: nothing is deleted.
         match self.safety.head_identity(&key).await {
             Ok(Some(blob)) if blob.is(extent.cipher_size, &extent.cipher_sha256) => {
                 crate::trace::alert(|| {
@@ -1734,23 +1740,21 @@ where
             Ok(_) => {}
             Err(_) => return false,
         }
-        // The sequence moves first: an eviction that claimed the row
-        // before finds it moved at its check, and deletes nothing.
-        if self.catalog.scrub_safety_fence(&extent.id).await.is_err() {
-            return false;
-        }
-        let uncounted = self.catalog.scrub_safety_gone(&extent.id).await.is_ok();
+        let outcome = match self.catalog.hot_forget(&extent.id, seq, true, false).await {
+            Ok(true) => match self.safety.delete(&key).await {
+                Ok(()) => "uncounted and deleted",
+                Err(_) => "uncounted; the delete failed, the next look deletes it",
+            },
+            Ok(false) => "changed since the check; kept, still counted",
+            Err(_) => "the count failed; kept",
+        };
         crate::trace::alert(|| {
             format!(
-                "scrub-bad-safety-copy {} its bytes are not the extent's; {}",
-                extent.id.as_str(),
-                match uncounted {
-                    true => "left for the next verified write",
-                    false => "the count failed",
-                }
+                "scrub-bad-safety-copy {} its bytes are not the extent's; {outcome}",
+                extent.id.as_str()
             )
         });
-        uncounted
+        outcome == "uncounted and deleted"
     }
 
     /// The PUT intents whose PUT can no longer land (the invocation that
@@ -1861,9 +1865,9 @@ where
         // `unrecoverable` on it (`unknown`).
         let (kept, mut unknown) = match self.safety.get(&extent.id.safety_key(), None).await {
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => (true, false),
-            // Other bytes under the key: no copy, and no longer counted
-            // as one. Still counted: as a store that did not answer.
-            Ok(Some(_)) => (false, !self.uncount_wrong_safety(extent).await),
+            // Other bytes under the key: no copy, and gone. Not gone: as a
+            // store that did not answer.
+            Ok(Some(_)) => (false, !self.drop_wrong_safety(extent).await),
             Ok(None) => (false, false),
             Err(_) => (false, true),
         };

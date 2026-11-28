@@ -1794,18 +1794,6 @@ pub trait Catalog {
     async fn scrub_watch_soon(&self, _extents: &[ExtentId], _at: UnixMs) -> Result<()> {
         Ok(())
     }
-    /// The scrub deleted the safety object of `extent` (its bytes were not
-    /// the extent's): a released extent's safety copy is no longer
-    /// counted in the hot tier.
-    async fn scrub_safety_gone(&self, _extent: &ExtentId) -> Result<()> {
-        Ok(())
-    }
-    /// Moves the extent's eviction sequence before the scrub deletes its
-    /// safety object, so that an eviction that claimed it before finds it
-    /// moved.
-    async fn scrub_safety_fence(&self, _extent: &ExtentId) -> Result<()> {
-        Ok(())
-    }
     /// The extent's ciphertext as recorded. `None` when the catalogue
     /// cannot tell (the default) or the extent is not there: then no blob
     /// is taken for its copy.
