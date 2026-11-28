@@ -1,9 +1,9 @@
 # PostgreSQL catalogue schema
 
-The Postgres catalogue is opt-in. These files do not change the running D1
-catalogue or select a Worker backend. Apply them from a host with Python 3
-(with SQLite support) and `psql`, connecting directly rather than through a
-transaction pooler.
+The Worker uses the configured catalogue backend. These files apply only to
+PostgreSQL and do not select a Worker backend or change D1. Run the migration
+tool from a host with Python 3 (with SQLite support) and `psql`, connecting
+directly rather than through a transaction pooler.
 
 ## Roles and connection file
 
@@ -105,22 +105,37 @@ timeout). The tool refuses
 to record the file or skip the invalid index on retry. Inspect and repair the
 index before rerunning.
 
-`ops/pg-migrate.sh --check-migrations` is offline. The baseline marker covers
-exact historical D1 versions (not gaps). Its fingerprint is the SHA-256 of
-lines `<filename> <sha256 of raw file>\n` sorted by migration filename. A
-later Postgres translation declares each corresponding D1 file using a comment
-`-- velmora: d1-twin <D1 filename> <sha256 of raw D1 file>`. Missing coverage,
-renamed files and byte changes fail the gate. `--verify` also compares the live
-Postgres manifest against a replay of all shipped D1 migrations in memory;
-update the comparison explicitly for any future intentional engine difference
-(`STATEMENT_TRIGGERS` in `ops/pg-migrate.sh` is one).
+`ops/pg-migrate.sh --check-migrations` is offline. The D1 migration set is
+frozen at the PostgreSQL cutover baseline (`0003`); do not add D1 migrations
+for new PostgreSQL changes. The historical baseline marker fingerprints the
+exact D1 files as `<filename> <sha256 of raw file>\n`, sorted by filename.
+Missing coverage, renamed files and byte changes fail the gate.
 
-The only baseline structural differences from D1 are PostgreSQL's mapped
-column types and non-null PKs, the three identities, the `yenc_name` regex,
-`tx_guard_ok`, documented index keys/null ordering, the translated
-trigger functions, and the statement-level usage triggers (0003). Source PKs that were nullable in SQLite require a copy
-census. The verifier ignores only the migration ledger and import-marker
-tables as host-tool metadata.
+For each new PostgreSQL migration, put a SQLite test twin with the same
+four-digit version in `migrations-local/`. The runner replays these twins in
+memory and checks that they add the same tables, indexes and explicit column
+additions; they are not Wrangler migrations. A pre-merge change must be safe
+with the old code still running. The lint allows named tables and indexes,
+additive columns, and seeds/backfills on post-cutover tables. It refuses
+`DROP`, `RENAME`, type changes, `SET NOT NULL`, `ADD COLUMN NOT NULL` without
+a default, and unsupported forms. Lint is not a substitute for reviewing
+backward compatibility, defaults, indexes and constraints.
+
+`ops/pg-migrate.sh "$CONNECTION_FILE" --pending` reads the SHA-256-checked
+ledger without taking either writer lock or changing the database. It prints
+one pending migration filename per line in version order and exits 3 if the
+list is nonempty, or 0 with no output if everything is applied. Missing or
+inconsistent ledger history is an error. Before deploying code that needs
+new objects, apply the reviewed migration and run `--verify`. Verification
+checks every ledger entry, checks for the declared PostgreSQL-only objects,
+and compares the historical schema to the frozen D1 replay. It still checks
+schema ownership and grants.
+
+The historical structural differences from D1 are PostgreSQL's mapped column
+types and non-null PKs, the three identities, the `yenc_name` regex,
+`tx_guard_ok`, documented index keys/null ordering, the translated trigger
+functions, and the statement-level usage triggers (`0003`). Source PKs that
+were nullable in SQLite require a copy census.
 
 ## Usage counters
 

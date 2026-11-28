@@ -18,6 +18,11 @@ import time
 
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
+LOCAL = PG.parent / 'migrations-local'
+# -I excludes the current directory; import only from the runner's own directory.
+sys.path.insert(0, str(PG.parent / 'ops'))
+from pg_catalog import CUTOVER_BASELINE, Failure, lint_additive, replay_sqlite_twins, verify_post_cutover
+
 W1 = 7413000001
 MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
@@ -98,7 +103,7 @@ def sql_files(root):
     return result
 
 
-def coverage(files, d1):
+def coverage(files, d1, *, quiet=False):
     covered = set()
     for name, body in files.values():
         for selection, expected in re.findall(
@@ -133,7 +138,8 @@ def coverage(files, d1):
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
     if not covered:
         die('no D1 migration coverage found')
-    print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
+    if not quiet:
+        print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
 
 
 def lock_key(raw, setting):
@@ -267,7 +273,7 @@ def sql_tokens(sql):
         yield token
 
 
-def lint_migration(sql, no_tx, name):
+def lint_migration(sql, no_tx, name, *, additive_objects=None):
     statements, source_statements, pending = [], [], []
     segment_start = 0
     try:
@@ -284,6 +290,8 @@ def lint_migration(sql, no_tx, name):
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
+    if additive_objects is not None:
+        lint_additive(sql, source_statements, sql_tokens_with_spans, name, additive_objects)
     for statement in statements:
         # Comments are already gone; literals, bodies and (quoted) names remain.
         # Token boundaries stay spaces, so "velmora.migration_ apply" is not a match.
@@ -532,11 +540,12 @@ def test_triggers(run, begin, history, complete, d1):
 
 
 def main():
-    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --verify | --test] '
+    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --pending | --verify | --test] '
                                      '[--import-mode | --activate], or %(prog)s --check-migrations')
     p.add_argument('env_file', nargs='?')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--to')
+    mode.add_argument('--pending', action='store_true')
     mode.add_argument('--verify', action='store_true')
     mode.add_argument('--test', action='store_true')
     mode.add_argument('--check-migrations', action='store_true')
@@ -546,26 +555,37 @@ def main():
     args = p.parse_args(sys.argv[2:])
     files = sql_files(PG)
     d1 = sql_files(D1)
-    migrations = {}
+    migrations, declarations = {}, {}
+    post_cutover = {kind: set() for kind in ('tables', 'columns', 'indexes')}
     for version, (name, body) in files.items():
         sql = body.decode()
         no_tx = sql.splitlines()[:1] == ['-- velmora: no-transaction']
         if no_tx and version in {'0001', '0002'}:
             die('baseline stages must be transactional')
-        migrations[version] = sql, no_tx, lint_migration(sql, no_tx, name)
+        if version > CUTOVER_BASELINE:
+            before = {kind: entries.copy() for kind, entries in post_cutover.items()}
+            parsed = lint_migration(sql, no_tx, name, additive_objects=post_cutover)
+            declarations[version] = name, {kind: entries - before[kind] for kind, entries in post_cutover.items()}
+        else:
+            parsed = lint_migration(sql, no_tx, name)
+        migrations[version] = sql, no_tx, parsed
+    baseline = {v: files[v] for v in files if v <= CUTOVER_BASELINE}
+    coverage(baseline, d1, quiet=args.pending)
+    twins = sql_files(LOCAL)
+    if declarations or twins:
+        replay_sqlite_twins(d1, twins, declarations)
     if args.check_migrations:
         if args.env_file or args.activate or args.import_mode:
             p.error('--check-migrations does not take a connection file or other flags')
-        coverage(files, d1)
         return
-    if not args.env_file or ((args.verify or args.test) and (args.activate or args.import_mode)):
-        p.error('provide a connection file; --verify and --test do not change migration or activation state')
+    if not args.env_file or ((args.pending or args.verify or args.test) and (args.activate or args.import_mode)):
+        p.error('provide a connection file; --pending, --verify and --test do not change migration or activation state')
     target = max(files) if args.to is None else args.to
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
-    coverage(files, d1)
     env, schema, lock, migration_lock = connection(args.env_file)
-    print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
+    if not args.pending:
+        print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
     prefix = f'''SET search_path TO "{schema}", pg_temp;
 SET standard_conforming_strings = on;
 SET client_min_messages = error;
@@ -643,14 +663,30 @@ SET LOCAL client_min_messages = error;
         SELECT FROM (VALUES {fingerprints}) shipped(version, sha256)
         WHERE shipped.version = m.version AND shipped.sha256 = m.sha256))''', 'VL011')
     complete = check(f'(SELECT count(*) FROM schema_migrations) <> {len(files)}', 'VL017')
-    verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
-                  + transactional_prefix + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
-                  + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
-    # Verification has no execution budget, so it keeps the stdin transport:
-    # psql 14 still works, and the session prefix sets standard_conforming_strings
-    # before the server parses check_schema.sql.
+    read_history = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n' + transactional_prefix
+                    + check(f'NOT ({ledger_exists})', 'VL017') + history)
+    if args.pending:
+        applied = set(run(read_history + "SELECT version FROM schema_migrations;\nCOMMIT;\n",
+                          report='pending migrations').splitlines())
+        pending = [name for version, (name, _) in files.items() if version not in applied]
+        if pending:
+            print('\n'.join(pending))
+            return 3
+        return
+
+    verify_sql = read_history + complete + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n'
+
+    def verify(report):
+        manifest = json.loads(run(verify_sql, report=report))
+        if declarations:
+            verify_post_cutover(manifest, post_cutover)
+        compare(manifest, d1, {v: migrations[v] for v in baseline})
+        if declarations:
+            print('Post-cutover objects verified')
+
+    # Verify uses the stdin transport (also works with psql 14).
     if args.verify:
-        compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
+        verify('schema verification')
         return
     if args.test:
         test_triggers(run, begin, history, complete, d1)
@@ -745,7 +781,7 @@ $$;
             die(f'{name}: no migration status returned')
         print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
-        compare(json.loads(run(verify_sql, report='pre-activation verification')), d1, migrations)
+        verify('pre-activation verification')
         run(online_migrator_session + begin + transactional_prefix + online_limits_sql + history + complete
             + check(f'{MARKER} IS NOT NULL', 'VL016')
             + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True,
@@ -754,7 +790,9 @@ $$;
 
 
 try:
-    main()
+    sys.exit(main())
+except Failure as exc:
+    die(str(exc))
 except (OSError, UnicodeError, json.JSONDecodeError, sqlite3.Error) as exc:
     die(f'cannot read migration files or schema metadata ({type(exc).__name__})')
 PY

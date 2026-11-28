@@ -50,6 +50,159 @@ ATTEMPT_ID = re.compile(r"[0-9a-f]{32}\Z")
 D1_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
 F7_PREFIX = "cutover_f7:"
 R1B_PREFIX = "cutover_r1b:"
+# Last PG migration shipped at the D1 freeze (2026-11-28, c7b955e9).
+CUTOVER_BASELINE = "0003"
+
+
+def lint_additive(sql, source_statements, tokens_with_spans, name, objects):
+    """Record the effects of supported expand-only SQL; unknown forms require review."""
+    cursor = 0
+    tables, columns, indexes = (objects[kind] for kind in ("tables", "columns", "indexes"))
+    for raw in source_statements:
+        start = sql.index(raw, cursor)
+        cursor = start + len(raw)
+        spans = [(token, pos) for token, pos, _ in tokens_with_spans(raw) if token != ";"]
+        words = [token.upper() for token, _ in spans]
+
+        def refuse(message, i=0):
+            line = sql.count("\n", 0, start + spans[i][1]) + 1
+            raise Failure(f"{name}:{line}: {message}")
+
+        def identifier(i):
+            token = spans[i][0] if i < len(spans) else ""
+            # Portable identifiers let the same name identify the object in the SQLite twin.
+            value = token[1:-1] if token.startswith('"') else token.lower()
+            if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value) or value in {"schema_migrations", MARKER}:
+                refuse("expected an unqualified catalogue identifier")
+            return value
+
+        def optional(i, clause):
+            return i + len(clause) if words[i:i + len(clause)] == clause else i
+
+        if words[0] == "DROP":
+            refuse("DROP is not additive")
+        if words[:2] == ["CREATE", "TABLE"]:
+            i = optional(2, ["IF", "NOT", "EXISTS"])
+            table = identifier(i)
+            if words[i + 1:i + 2] != ["("]:
+                refuse("expected CREATE TABLE with a column definition")
+            tables.add(table)
+        elif words[:2] == ["CREATE", "INDEX"] or words[:3] == ["CREATE", "UNIQUE", "INDEX"]:
+            i = optional(optional(words.index("INDEX") + 1, ["CONCURRENTLY"]), ["IF", "NOT", "EXISTS"])
+            index = identifier(i)
+            if words[i + 1:i + 2] != ["ON"] or len(words) <= i + 3 or words[i + 3] == ".":
+                refuse("expected a named index on an unqualified catalogue table")
+            indexes.add((identifier(i + 2), index))
+        elif words[:2] == ["ALTER", "TABLE"]:
+            i = optional(2, ["IF", "EXISTS"])
+            table = identifier(i)
+            # Split the ALTER list on top-level commas, not type/DEFAULT arguments.
+            actions, depth, action = [], 0, i + 1
+            for j in range(action, len(words)):
+                if words[j] == "," and depth == 0:
+                    actions.append((action, j))
+                    action = j + 1
+                depth += (words[j] == "(") - (words[j] == ")")
+            actions.append((action, len(words)))
+            for lo, hi in actions:
+                clause = words[lo:hi]
+                if not clause:
+                    refuse("expected an ALTER TABLE action")
+                if clause[0] in {"DROP", "RENAME"}:
+                    refuse(f"{clause[0]} is not additive", lo)
+                if clause[0] == "ALTER":
+                    k = optional(lo + 1, ["COLUMN"]) + 1
+                    if words[k:k + 1] == ["TYPE"] or words[k:k + 3] == ["SET", "DATA", "TYPE"]:
+                        refuse("ALTER COLUMN TYPE is not additive", lo)
+                    if words[k:k + 3] == ["SET", "NOT", "NULL"]:
+                        refuse("SET NOT NULL is not additive", lo)
+                if clause[0] != "ADD":
+                    refuse("only ADD COLUMN alterations can run before a merge", lo)
+                k = optional(optional(lo + 1, ["COLUMN"]), ["IF", "NOT", "EXISTS"])
+                if k + 1 >= hi or words[k] in {"CONSTRAINT", "CHECK", "UNIQUE", "PRIMARY", "FOREIGN", "EXCLUDE"}:
+                    refuse("expected ADD COLUMN, not a table constraint", lo)
+                column = identifier(k)
+                attrs, depth, default_at = [], 0, hi
+                for j in range(k + 1, hi):
+                    word = words[j]
+                    if depth == 0:
+                        attrs.append(word)
+                        if word == "DEFAULT":
+                            default_at = j + 1
+                    depth += (word == "(") - (word == ")")
+                not_null = any(a == "NOT" and b == "NULL" for a, b in zip(attrs, attrs[1:]))
+                default_value = next((token for token in words[default_at:hi] if token != "("), None)
+                if not_null and default_value in {None, "NULL"}:
+                    refuse("NOT NULL without DEFAULT providing a value cannot run before a merge", lo)
+                if set(attrs) & {"CHECK", "CONSTRAINT", "UNIQUE", "PRIMARY", "REFERENCES", "GENERATED"}:
+                    refuse("ADD COLUMN with constraints beyond NOT NULL requires review", lo)
+                columns.add((table, column))
+        elif words[:2] == ["INSERT", "INTO"] or words[0] == "UPDATE":
+            i = 2 if words[0] == "INSERT" else 1
+            if identifier(i) not in tables or words[i + 1:i + 2] in (["."], ["*"]):
+                refuse("only seed/backfill statements on post-cutover tables can run before a merge")
+        elif words[0] == "ALTER" and "RENAME" in words:
+            refuse("RENAME is not additive", words.index("RENAME"))
+        else:
+            refuse("unsupported statement in an additive migration")
+
+
+def replay_sqlite_twins(d1, twins, declarations):
+    """Replay test-only twins in memory and require the same new object names."""
+    def inventory(db):
+        schema = db.execute("SELECT type, name, tbl_name FROM sqlite_master WHERE sql IS NOT NULL").fetchall()
+        tables = {name for kind, name, _ in schema if kind == "table" and not name.startswith("sqlite_")}
+        return {"tables": tables,
+                "columns": {(table, row[0]) for table in tables
+                            for row in db.execute("SELECT name FROM pragma_table_xinfo(?)", (table,))},
+                "indexes": {(table, name) for kind, name, table in schema if kind == "index"}}
+
+    # The SQLite text is never executed against the deployed D1 database.
+    # Whitelist the operations needed for twins; notably no ATTACH, PRAGMA, temp DDL,
+    # file access, or DROP, even if a replay would otherwise leave a matching schema.
+    safe = {sqlite3.SQLITE_ALTER_TABLE, sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX,
+            sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_READ, sqlite3.SQLITE_SELECT,
+            sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_REINDEX, sqlite3.SQLITE_TRANSACTION}
+    with closing(sqlite3.connect(":memory:")) as db:
+        for _, body in d1.values():
+            db.executescript(body.decode())
+        before = inventory(db)
+        for version, (name, expected) in declarations.items():
+            require(version in twins, f"{name}: missing SQLite twin in migrations-local")
+            twin, body = twins[version]
+            db.set_authorizer(lambda action, *_: sqlite3.SQLITE_OK if action in safe else sqlite3.SQLITE_DENY)
+            try:
+                db.executescript(body.decode())
+            except sqlite3.Error as error:
+                raise Failure(f"migrations-local/{twin}: SQLite replay failed ({error.sqlite_errorname})") from None
+            finally:
+                db.set_authorizer(None)
+            after = inventory(db)
+            for kind, original in before.items():
+                added, wanted = after[kind] - original, expected[kind]
+                if kind == "columns":  # CREATE TABLE is checked by name; ALTER additions are explicit.
+                    added = {col for col in added if col[0] not in expected["tables"]}
+                    wanted = {col for col in wanted if col[0] not in expected["tables"]}
+                require(original <= after[kind] and added == wanted,
+                        f"{name}: SQLite twin {twin} does not add the same {kind}")
+            before = after
+    require(set(twins) <= set(declarations), "migrations-local contains a version with no post-cutover PG migration")
+
+
+def verify_post_cutover(actual, objects):
+    """Verify the declared expansion and hand the historical manifest to the D1 comparator."""
+    tables, columns, indexes = (objects[kind] for kind in ("tables", "columns", "indexes"))
+    observed = (set(actual["tables"] or ()), {tuple(row[:2]) for row in actual["columns"] or ()},
+                {tuple(row[:2]) for row in actual["indexes"] or () if row[4]})
+    missing = [kind + " " + (entry if isinstance(entry, str) else ".".join(entry))
+               for kind, expected, found in zip(("table", "column", "index"), (tables, columns, indexes), observed)
+               for entry in sorted(expected - found)]
+    if missing:
+        raise Failure("post-cutover objects missing or invalid: " + ", ".join(missing))
+    actual["tables"] = observed[0] - tables
+    for kind in ("columns", "indexes", "foreign_keys", "checks", "triggers"):
+        declared = objects.get(kind, ())
+        actual[kind] = [row for row in actual[kind] or () if row[0] not in tables and tuple(row[:2]) not in declared]
 
 
 class Failure(Exception):

@@ -65,6 +65,15 @@ def clone_bridge(tmp, appended=None):
     return clone / "ops" / "pg-migrate.sh"
 
 
+def add_migration(script, name, pg, sqlite=None):
+    bridge = script.parents[1]
+    (bridge / "pg" / name).write_text(pg)
+    if sqlite is not None:
+        twins = bridge / "migrations-local"
+        twins.mkdir(exist_ok=True)
+        (twins / name).write_text(sqlite)
+
+
 @contextlib.contextmanager
 def delayed_pg():
     """Add 100 ms to every proxied request and response packet."""
@@ -148,6 +157,72 @@ class MigrationParser(unittest.TestCase):
                     'SET "standard_conforming_strings" TO off;'):
             with self.subTest(scs), self.assertRaisesRegex(AssertionError, "standard_conforming_strings belongs"):
                 namespace['lint_migration'](scs, False, 'parser_scs.sql')
+
+    def test_post_cutover_lint_refuses_non_additive_statements(self):
+        cases = {
+            'DROP TABLE extents': 'DROP',
+            'DROP INDEX extents_evictable': 'DROP',
+            'ALTER TABLE extents DROP COLUMN plan': 'DROP',
+            'ALTER TABLE extents DROP CONSTRAINT example': 'DROP',
+            'ALTER TABLE extents RENAME TO moved': 'RENAME',
+            'ALTER INDEX extents_evictable RENAME TO moved': 'RENAME',
+            'ALTER TABLE extents ALTER COLUMN id TYPE bigint': 'ALTER COLUMN TYPE',
+            'ALTER TABLE extents ALTER COLUMN id SET DATA TYPE bigint': 'ALTER COLUMN TYPE',
+            'ALTER TABLE extents ALTER COLUMN plan SET NOT NULL': 'SET NOT NULL',
+            'ALTER TABLE extents ADD COLUMN bad INTEGER NOT NULL': 'NOT NULL without DEFAULT',
+            'ALTER TABLE extents ADD COLUMN bad INTEGER NOT NULL DEFAULT (NULL)': 'NOT NULL without DEFAULT',
+            "ALTER TABLE extents ADD COLUMN bad TEXT NOT NULL CHECK (bad <> 'DEFAULT')": 'NOT NULL without DEFAULT',
+        }
+        for sql, diagnostic in cases.items():
+            with self.subTest(sql=sql), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_bad.sql', f'-- example\n\n{sql};\n', 'SELECT 1;')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'0004_bad.sql:3: {diagnostic}', result.stderr)
+
+    def test_post_cutover_lint_accepts_additive_migration_with_local_twin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_kofra_example.sql'
+            add_migration(script, name,
+                          "CREATE TABLE kofra_example (id bigint PRIMARY KEY, note text DEFAULT 'DROP RENAME');\n"
+                          'ALTER TABLE extents\n ADD COLUMN test_flag bigint NOT NULL DEFAULT 0,\n'
+                          ' ADD COLUMN test_note text;\n',
+                          'CREATE TABLE kofra_example (id INTEGER PRIMARY KEY, note TEXT);\n'
+                          'ALTER TABLE extents ADD COLUMN test_flag INTEGER NOT NULL DEFAULT 0;\n'
+                          'ALTER TABLE extents ADD COLUMN test_note TEXT;\n')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            (script.parents[1] / 'migrations-local' / name).unlink()
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f'{name}: missing SQLite twin in migrations-local', result.stderr)
+
+    def test_post_cutover_lint_checks_multiaction_lines_even_for_concurrent_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_bad.sql',
+                          '-- velmora: no-transaction\nALTER TABLE extents ADD COLUMN new_col text,\n'
+                          ' DROP COLUMN plan;\n', 'SELECT 1;')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('0004_bad.sql:3: DROP is not additive', result.stderr)
+
+    def test_post_cutover_sqlite_twin_rejects_a_different_object_or_attach(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_kofra_example.sql'
+            other_db = Path(tmp) / 'unexpected.db'
+            for twin, message in (
+                    ('CREATE TABLE other (id INTEGER);', 'does not add the same tables'),
+                    (f"ATTACH DATABASE '{other_db}' AS other;", 'SQLite replay failed (SQLITE_AUTH)')):
+                with self.subTest(twin=twin):
+                    add_migration(script, name, 'CREATE TABLE kofra_example (id bigint);', twin)
+                    result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(other_db.exists())
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
@@ -301,6 +376,46 @@ class PgMigrate(unittest.TestCase):
         self.assertEqual(self.owner_sql("SELECT applied_at FROM schema_migrations ORDER BY version").stdout, before)
         self.assertEqual(self.owner_sql(triggers).stdout, count)
         self.assertEqual(self.owner_sql("SELECT count(*) FROM usage_global").stdout.strip(), "2")
+
+    def test_pending_uses_read_only_ledger_in_version_order(self):
+        self.migrate("--to", "0002")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_kofra_example.sql'
+            sql = 'CREATE TABLE kofra_example (id INTEGER PRIMARY KEY);'
+            add_migration(script, name, sql, sql)
+            pending = self.migrate('--pending', ok=False, script=script)
+            self.assertEqual(pending.returncode, 3, pending.stderr)
+            self.assertEqual(pending.stdout.splitlines(), ['0003_usage_statement_triggers.sql', name])
+            self.assertEqual(self.ledger(), ['0001', '0002'])
+            self.migrate(script=script)
+            self.assertEqual(self.migrate('--pending', script=script).stdout, '')
+            self.owner_sql("UPDATE schema_migrations SET sha256 = 'wrong' WHERE version = '0004'")
+            bad_history = self.migrate('--pending', ok=False, script=script)
+            self.assertNotIn(bad_history.returncode, (0, 3))
+            self.assertEqual(bad_history.stdout, '')
+            self.assertIn('applied migration history does not match', bad_history.stderr)
+
+    def test_verify_checks_pg_only_objects_without_masking_baseline_drift(self):
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_kofra_example.sql'
+            sql = ('CREATE TABLE kofra_example (id bigint PRIMARY KEY, note text);\n'
+                   'CREATE INDEX kofra_example_note ON kofra_example(note);\n'
+                   'ALTER TABLE extents ADD COLUMN test_flag bigint NOT NULL DEFAULT 0;\n'
+                   'CREATE INDEX test_extents_flag ON extents(test_flag);\n')
+            add_migration(script, name, sql, sql)
+            self.migrate(script=script)
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+            self.owner_sql('ALTER TABLE extents ADD COLUMN untracked_col bigint;')
+            drift = self.migrate('--verify', ok=False, script=script)
+            self.assertIn('columns unexpected/changed: extents.untracked_col', drift.stderr)
+            self.owner_sql('ALTER TABLE extents DROP COLUMN untracked_col; DROP TABLE kofra_example;')
+            missing = self.migrate('--verify', ok=False, script=script)
+            self.assertIn('table kofra_example', missing.stderr)
+            self.assertIn('index kofra_example.kofra_example_note', missing.stderr)
 
     def test_verify_runs_on_psql_older_than_15(self):
         self.migrate()
