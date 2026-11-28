@@ -221,6 +221,39 @@ class MigrationParser(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(error, result.stderr)
 
+    def test_allowlist_refuses_literal_insert_into_historical_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_bad.sql',
+                          "INSERT INTO meta(k, v) VALUES ('fixture_key', 'fixture_value');\n",
+                          'SELECT 1;')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn('0004_bad.sql:1: INSERT may only seed a post-cutover table', result.stderr)
+
+    def test_allowlist_refuses_trailing_clauses(self):
+        cases = (
+            ('ON CONFLICT', 'INSERT INTO sample(id) VALUES (1) ON CONFLICT DO NOTHING', 'SELECT 1'),
+            ('RETURNING', 'INSERT INTO sample(id) VALUES (1) RETURNING id', 'SELECT 1'),
+            ('index WITH', 'CREATE INDEX sample_probe ON sample(id) WITH (fillfactor = 70)',
+             'CREATE INDEX sample_probe ON sample(id)'),
+            ('table WITH', 'CREATE TABLE child (id bigint) WITH (fillfactor = 70)',
+             'CREATE TABLE child (id INTEGER)'),
+            ('PARTITION BY', 'CREATE TABLE child (id bigint) PARTITION BY RANGE (id)',
+             'CREATE TABLE child (id INTEGER)'),
+            ('ADD COLUMN constraint', 'ALTER TABLE sample ADD COLUMN tag text UNIQUE',
+             'ALTER TABLE sample ADD COLUMN tag TEXT'),
+        )
+        for clause, pg, twin in cases:
+            with self.subTest(clause=clause), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_sample.sql', 'CREATE TABLE sample (id bigint);',
+                              'CREATE TABLE sample (id INTEGER);')
+                add_migration(script, '0005_bad.sql', pg + ';', twin + ';')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn('0005_bad.sql:1: unsupported trailing clause in an additive migration', result.stderr)
+
     def test_allowlist_accepts_pure_expressions_and_literal_seed(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = clone_bridge(tmp)
