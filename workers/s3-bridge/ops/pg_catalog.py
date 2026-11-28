@@ -107,6 +107,10 @@ class AdditiveStatement:
         value = token[1:-1] if token.startswith('"') else token.lower()
         if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value) or value in {"schema_migrations", MARKER}:
             self.refuse("expected an unqualified catalogue identifier")
+        # Unquoted, these are SQL value functions (CURRENT_TIMESTAMP is not
+        # immutable), not column names.
+        if not token.startswith('"') and token.upper() in SQL_VALUES:
+            self.refuse("expected an unqualified catalogue identifier")
         self.i += 1
         return value
 

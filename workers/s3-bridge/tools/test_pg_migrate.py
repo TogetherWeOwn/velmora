@@ -229,6 +229,10 @@ class MigrationParser(unittest.TestCase):
             ("id) WHERE cipher_size + 1 > 3", 'historical index predicate'),
             ("id) WHERE safety_state = 'released'::text", 'historical index predicate'),
             ("cipher_size + 1)", 'historical index keys must be plain columns'),
+            # SQL value functions are not columns, unquoted, in a predicate or key.
+            ("id) WHERE current_timestamp IS NOT NULL", 'expected an unqualified catalogue identifier'),
+            ("id) WHERE CURRENT_USER = 'x'", 'expected an unqualified catalogue identifier'),
+            ("localtime)", 'expected an unqualified catalogue identifier'),
         )
         for body, error in cases:
             with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
@@ -510,6 +514,8 @@ class MigrationParser(unittest.TestCase):
 #   inject: SQL in the runner's own session right after the index fence;
 #   between: SQL (as between_user) in another session before a concurrent
 #            migration's ledger transaction, which then runs in a new session;
+#   hold_w1: hold the W1 advisory key in another session during the first
+#            concurrent ledger transaction, which runs in a new session;
 #   replace: [old, new] pairs applied to the runner's SQL, each recorded when seen.
 # Each hook fires once, and only for the configured version.
 HOOK_PSQL = r'''#!/usr/bin/env python3
@@ -518,6 +524,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 here = Path(sys.argv[0]).resolve().parent
 config = json.loads((here / 'hook.json').read_text())
@@ -545,6 +552,13 @@ def side_session(sql, user):
     if result.returncode:
         note('hook failed: ' + result.stderr)
         sys.exit(97)
+
+
+def held(key):
+    env = dict(os.environ, PGAPPNAME='velmora-test-hook')
+    probe = subprocess.run([real, '-X', '-qAt', '-c', f"SELECT pg_try_advisory_xact_lock('{key}'::bigint)"],
+                           env=env, capture_output=True, text=True)
+    return probe.stdout.strip() == 'f'
 
 
 def psql(argv, stdin=None):
@@ -592,6 +606,27 @@ if len(messages) > 1 and record in messages[-1]:
         setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
                  'SET client_min_messages = error;')
         finish(head, psql(options + ['-c', setup, '-c', messages[-1]]))
+    if once('hold_w1'):
+        head = psql(options + [x for m in messages[:-1] for x in ('-c', m)])
+        if head.returncode:
+            finish(head)
+        holder = subprocess.Popen([real, '-X', '-qAt'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                  text=True, env=dict(os.environ, PGAPPNAME='velmora-test-hook'))
+        holder.stdin.write(f"SELECT pg_advisory_lock('{config['hold_w1']}'::bigint);\n")
+        holder.stdin.flush()
+        for _ in range(200):
+            if held(config['hold_w1']):
+                break
+            time.sleep(0.05)
+        else:
+            note('hook failed: W1 was not held')
+            sys.exit(97)
+        setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
+                 'SET client_min_messages = error;')
+        tail = psql(options + ['-c', setup, '-c', messages[-1]])
+        holder.stdin.close()
+        holder.wait()
+        finish(head, tail)
     finish(psql(options + [x for m in messages for x in ('-c', m)]))
 if messages:
     finish(psql(options + [x for m in messages for x in ('-c', after_fence(m))]))
@@ -634,7 +669,7 @@ class PgMigrate(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.baseline_script = clone_bridge(tmp.name)
         self.env = Path(tmp.name) / "pg.env"
-        lock = 7_413_100_000 + secrets.randbelow(1_000_000)
+        lock = self.lock = 7_413_100_000 + secrets.randbelow(1_000_000)
         lines = [f"PGHOST={host}", f"PGDATABASE={os.environ['PGDATABASE']}", "PGUSER=kofra_migrate",
                  f"PGSCHEMA={self.schema}", f"PGLOCKKEY={lock}"]
         if os.environ.get("PGPORT"):
@@ -947,6 +982,19 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
         with tempfile.TemporaryDirectory() as tmp:
             self.concurrent_reuse_race(tmp, 'DROP INDEX CONCURRENTLY kofra_a;')
             self.assertEqual(self.index_oid('kofra_a'), '0')
+
+    def test_concurrent_ledger_lock_timeout_retries_with_a_fresh_plan(self):
+        # W1 is busy past the 3 s lock_timeout after kofra_b was built. The
+        # retry must reuse kofra_b, not refuse it against the stale snapshot.
+        with tempfile.TemporaryDirectory() as tmp:
+            script, _ = self.reuse_setup(tmp, REUSE_BOTH, mode='concurrent')
+            env, log = self.hooked(tmp, hold_w1=str(self.lock))
+            result = self.migrate(script=script, env=env)
+            self.assertIn('fired hold_w1', log.read_text())
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE 55P03, retry 1/5', result.stderr)
+            self.assertIn('0005_kofra_indexes.sql: applied', result.stdout)
+            self.assertEqual(self.ledger(), [*STAGES, '0004', '0005'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
 
     def test_reused_index_made_invalid_maps_to_the_concurrent_mismatch(self):
         # The reuse check runs before the catalogue-wide invalid-index check.

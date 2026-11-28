@@ -733,7 +733,7 @@ SET {scope}client_min_messages = error;
 
     one_message_checked = False
 
-    def run(sql, *, retry=False, report=None, one_message=False, concurrent=False):
+    def run(sql, *, retry=False, report=None, one_message=False, concurrent=False, busy=False):
         nonlocal one_message_checked
         messages = (sql,) if one_message else sql if concurrent else ()
         if concurrent:
@@ -770,6 +770,8 @@ SET {scope}client_min_messages = error;
             state = states[-1] if states else None
             if concurrent and state == 'VL020':
                 return 'already applied'  # Caller independently confirms the ledger row.
+            if state == '55P03' and busy:
+                return None  # The caller re-plans before it retries.
             if state == '55P03' and retry and attempt < 5:
                 print(f'{report}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                 time.sleep(0.25 * (2 ** attempt))
@@ -946,20 +948,30 @@ $$;
             # Each statement gets a SQL-only -c in one psql session. W1 is
             # released during CIC; the session migrator lock stays held.
             applied = f"EXISTS (SELECT FROM {ledger} WHERE version = '{version}')"
-            prepare = (prefix + online_migrator_session + concurrent_tx
-                       + check(f'NOT ({ledger_exists})', 'VL017') + history)
-            if args.import_mode:
-                prepare += check(f'{marker} IS NULL OR {usage} OR NOT ({seeds})', 'VL013')
-            else:
-                prepare += check(f'{marker} IS NOT NULL', 'VL016' if args.activate else 'VL014')
-            # ON_ERROR_STOP ends the session without running any queued -c if
-            # this version is already applied. Confirm that outcome separately.
-            prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
-            prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
-            # Check reused indexes first: a reused index made invalid is VL021, not VL015.
-            finish = (concurrent_tx + reuse_guard(reused, 'VL021') + check(bad_index, 'VL015') + path_check + record
-                      + "\nCOMMIT;\nSELECT 'applied';\n")
-            output = run([prepare, *source_statements, finish], retry=True, report=name, concurrent=True).splitlines()
+            for attempt in range(6):
+                if attempt:
+                    # An index the failed attempt built is now reused, not
+                    # rebuilt: retrying the old plan would only fail its fence.
+                    index_condition, source_statements, reused = index_plan(version, name, statements, parsed[1])
+                prepare = (prefix + online_migrator_session + concurrent_tx
+                           + check(f'NOT ({ledger_exists})', 'VL017') + history)
+                if args.import_mode:
+                    prepare += check(f'{marker} IS NULL OR {usage} OR NOT ({seeds})', 'VL013')
+                else:
+                    prepare += check(f'{marker} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+                # ON_ERROR_STOP ends the session without running any queued -c if
+                # this version is already applied. Confirm that outcome separately.
+                prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
+                prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
+                # Check reused indexes first: a reused index made invalid is VL021, not VL015.
+                finish = (concurrent_tx + reuse_guard(reused, 'VL021') + check(bad_index, 'VL015') + path_check
+                          + record + "\nCOMMIT;\nSELECT 'applied';\n")
+                output = run([prepare, *source_statements, finish], busy=attempt < 5, report=name, concurrent=True)
+                if output is not None:
+                    break
+                print(f'{name}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
+                time.sleep(0.25 * (2 ** attempt))
+            output = output.splitlines()
             if output == ['already applied']:
                 confirmed = run(read_history + f'SELECT {applied};\nCOMMIT;\n', report=name)
                 if confirmed != 't':
