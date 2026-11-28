@@ -9,6 +9,8 @@ mod admin;
 mod bucket;
 mod common;
 mod copy;
+mod cors;
+pub(crate) use cors::{preflight_bucket, ActualRequest};
 mod delete;
 mod get;
 pub use get::{INTERRUPTED_RETRIES, PIECE_WAIT_MS, READ_STAMP_MS};
@@ -45,6 +47,9 @@ pub enum Route<'a> {
         bucket: &'a str,
     },
     GetBucketLocation {
+        bucket: &'a str,
+    },
+    BucketCors {
         bucket: &'a str,
     },
     ListObjects {
@@ -210,6 +215,7 @@ pub fn classify<'a>(method: &Method, raw_target: &'a str) -> Route<'a> {
             (Method::Put, []) => Route::CreateBucket { bucket },
             (Method::Head, []) => Route::HeadBucket { bucket },
             (Method::Get, ["location"]) => Route::GetBucketLocation { bucket },
+            (Method::Get | Method::Put | Method::Delete, ["cors"]) => Route::BucketCors { bucket },
             (Method::Delete, []) => Route::DeleteBucket { bucket },
             (Method::Post, ["delete"]) => Route::DeleteObjects { bucket },
             (Method::Get, ["uploads"]) => Route::ListMultipartUploads { bucket },
@@ -301,7 +307,16 @@ where
         if crate::fanout::is_internal_target(&target) {
             return get::fanout_piece(&self, req, observed, hit_flush).await;
         }
-        match classify(&req.method, &target) {
+        let cors_enabled = self.catalog.bucket_cors_enabled();
+        let actual_cors = if cors_enabled {
+            if let Some(bucket) = preflight_bucket(&self.cfg, &req) {
+                return cors::preflight(&self, &req, &bucket).await;
+            }
+            cors::ActualRequest::from_request(&self.cfg, &req)
+        } else {
+            None
+        };
+        let mut response = match classify(&req.method, &target) {
             Route::Admin { rest } => admin::handle(&self, req, rest).await,
             Route::ListBuckets => list::list_buckets(&self, req).await,
             Route::CreateBucket { bucket } => {
@@ -327,6 +342,7 @@ where
             }
             Route::HeadBucket { .. } => bucket::head_bucket(&self, req, observed).await,
             Route::GetBucketLocation { .. } => bucket::get_bucket_location(&self, req).await,
+            Route::BucketCors { .. } if cors_enabled => cors::configuration(&self, req).await,
             Route::ListObjects { bucket } => list::list_objects(&self, req, bucket).await,
             Route::PutObject { .. } => put::put_object(&self, req, observed).await,
             Route::GetObject { .. } => get::get_object(&self, req, observed, hit_flush).await,
@@ -348,7 +364,7 @@ where
             // A host that is not this endpoint is the likelier cause
             // (virtual-hosted style shifts the bucket out of the path), so
             // it is named first, as on the routes that parse a target.
-            Route::NotImplemented => req
+            Route::NotImplemented | Route::BucketCors { .. } => req
                 .headers
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("host"))
@@ -360,7 +376,11 @@ where
                     );
                     S3Response::not_implemented()
                 }),
+        };
+        if let Some(actual) = actual_cors {
+            actual.apply(&self, &mut response).await;
         }
+        response
     }
 }
 

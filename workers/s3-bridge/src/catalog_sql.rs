@@ -153,6 +153,10 @@ impl CatalogSql {
 }
 
 impl Sql for CatalogSql {
+    fn supports_bucket_cors(&self) -> bool {
+        matches!(self, Self::Pg(_) | Self::PgFrozen(_))
+    }
+
     fn is_frozen(&self) -> bool {
         matches!(self, Self::D1Frozen(_) | Self::PgFrozen(_))
     }

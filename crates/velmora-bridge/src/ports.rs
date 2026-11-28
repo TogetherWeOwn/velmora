@@ -103,6 +103,10 @@ pub trait Sql {
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
     }
+    /// False for the legacy D1 backend, whose schema is frozen.
+    fn supports_bucket_cors(&self) -> bool {
+        true
+    }
     /// This backend refuses mutations for the duration of a cutover freeze.
     fn is_frozen(&self) -> bool {
         false
@@ -752,6 +756,29 @@ pub trait Catalog {
         perm: Perm,
     ) -> Result<GrantPut>;
     async fn bucket_by_name(&self, name: &str) -> Result<Option<Bucket>>;
+    /// Bucket CORS is disabled unless the deployment opts in on a supported backend.
+    fn bucket_cors_enabled(&self) -> bool {
+        false
+    }
+    async fn bucket_cors(&self, _id: &BucketId) -> Result<Option<String>> {
+        Ok(None)
+    }
+    async fn cached_bucket_cors(
+        &self,
+        _name: &str,
+        _now: UnixMs,
+    ) -> Result<Option<std::rc::Rc<velmora_s3_proto::mutation::CorsConfiguration>>> {
+        Ok(None)
+    }
+    /// Atomically replace or remove a validated document while the bucket exists.
+    async fn set_bucket_cors(
+        &self,
+        _bucket: &Bucket,
+        _doc_and_rules: Option<(&str, usize)>,
+        _now: UnixMs,
+    ) -> Result<Guard<()>> {
+        Err(BridgeError::Sql("bucket CORS unavailable".into()))
+    }
     /// `true` while anything of the bucket is on record: a generation
     /// (live or not; none is ever removed), a key floor, an upload in any
     /// state, an extent. Such a bucket is never deleted.

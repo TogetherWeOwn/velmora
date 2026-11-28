@@ -1486,6 +1486,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         [
             "access_keys",
             "articles",
+            "bucket_cors",
             "buckets",
             "extents",
             "gc",
@@ -1555,6 +1556,8 @@ async fn ddl_applies_cleanly_with_fixed_times() {
         ("INSERT INTO meta(k,v) VALUES (?1,?2)", vec![text("last_dispatch_at"), t.clone()]),
         ("INSERT INTO write_intents(extent_id,write_id,generation_id,state,created_at) VALUES (?1,?2,?3,?4,?5)",
          vec![text("x_3"), text("w_1"), SqlValue::Null, text("open"), t.clone()]),
+        ("INSERT INTO bucket_cors(bucket_id,doc,doc_sha256,rules,updated_at_ms) VALUES (?1,?2,?3,?4,?5)",
+         vec![text("b_1"), text("<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"), text(&"0".repeat(64)), i(1), t.clone()]),
     ];
     let changed = db.batch(rows).await.unwrap();
     // The committed extent (statement 5) also gets its reference row
@@ -1576,9 +1579,10 @@ async fn ddl_applies_cleanly_with_fixed_times() {
 
     let back = db
         .query(
-            "SELECT g.created_at, e.created_at, o.next_at, gc.due_at \
+            "SELECT g.created_at, e.created_at, o.next_at, gc.due_at, cors.updated_at_ms \
              FROM generations g JOIN extents e ON e.generation_id = g.id \
-             JOIN outbox o ON o.extent_id = e.id, gc",
+             JOIN outbox o ON o.extent_id = e.id \
+             JOIN bucket_cors cors ON cors.bucket_id = g.bucket_id, gc",
             &[],
         )
         .await
@@ -1590,6 +1594,7 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             SqlValue::Int(T0.0),
             SqlValue::Int(T0.0),
             SqlValue::Int(T0.plus_secs(86_400).0),
+            SqlValue::Int(T0.0),
         ]]
     );
 

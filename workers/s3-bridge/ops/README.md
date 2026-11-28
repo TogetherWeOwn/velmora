@@ -838,6 +838,10 @@ successfully, then detach the Custom Domain.
 
 ## Client settings
 
+For browser uploads on a CORS-enabled endpoint, see [S3 bucket CORS](../../../docs/s3-compatibility.md).
+On PostgreSQL, apply the bucket CORS migration before turning on `BUCKET_CORS`.
+The switch defaults to `off`. The legacy D1 backend does not serve bucket CORS.
+
 Write with parts of 16 MiB, start multipart at 16 MiB, keep about 16
 requests in flight, and give rclone one connection per request:
 

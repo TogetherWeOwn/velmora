@@ -267,15 +267,16 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     );
     let got = std::cell::Cell::new(None);
     let ctx = Rc::new(ctx);
-    let resp = ingress::front(incoming.req, &bridge.cfg, incoming.https, |req| async {
-        let (resp, get) = handle_detached(Rc::clone(&ctx), Rc::clone(&bridge), req).await;
-        got.set(Some(get));
-        // A deferred document: buffered when it is done soon, else
-        // streamed with keepalive whitespace.
-        keepalive::settle_response(resp, env::sleeper()).await
-    })
-    .await
-    .with_request_id(&request_id);
+    let resp =
+        ingress::front_with_bucket_cors(incoming.req, &bridge, incoming.https, |req| async {
+            let (resp, get) = handle_detached(Rc::clone(&ctx), Rc::clone(&bridge), req).await;
+            got.set(Some(get));
+            // A deferred document: buffered when it is done soon, else
+            // streamed with keepalive whitespace.
+            keepalive::settle_response(resp, env::sleeper()).await
+        })
+        .await
+        .with_request_id(&request_id);
     // A body in sub-ranges: the first one is opened before the status is
     // known to the client.
     let mut get = got.into_inner().unwrap_or_else(initial);
