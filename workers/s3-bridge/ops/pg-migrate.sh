@@ -1015,14 +1015,17 @@ $$;
                 # session's 3 s lock_timeout the build would fail and leave an
                 # INVALID index (VL015 on every retry). It takes only SHARE
                 # UPDATE EXCLUSIVE, which blocks no reads or writes, so it waits
-                # up to 90 s per lock wait. A build waits up to three times, so
-                # 270 s of waits fit inside the 600 s a caller gives one apply
-                # (the merge gate's budget), with room for prechecks, builds,
-                # retries and the ledger. A blocker held longer than 90 s (an
-                # operator or read-only session) ends in this runner's own
-                # refusal (55P03, then VL015), before the caller's kill. The
-                # ledger transaction sets its own timeouts (SET LOCAL), and the
-                # session is back at 3 s before it.
+                # up to 90 s per lock wait. A build can wait more than once (its
+                # table lock, then each older transaction, in each phase). App
+                # transactions end within 30 s of their start, so app writers
+                # alone end a phase's waits within 30 s, well inside the 600 s
+                # a caller gives one apply (the merge gate's budget). A session
+                # without that timeout (an operator, a read-only session) held
+                # longer than 90 s ends in this runner's own refusal (55P03;
+                # VL015 on the retry if the build had created its index); each
+                # such session can add up to 90 s. The ledger transaction sets
+                # its own timeouts (SET LOCAL), and the session is back at 3 s
+                # before it.
                 messages = [prepare, "SET lock_timeout = '90s'"]
                 after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
                 for n, statement in enumerate(source_statements):

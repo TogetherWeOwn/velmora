@@ -108,12 +108,21 @@ Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
 session lock without waiting in PostgreSQL with a snapshot. The index statements run under a
 90 s `lock_timeout` instead of 3 s: a concurrent build waits out older
-transactions (app transactions run up to 30 s) and takes only `SHARE UPDATE
-EXCLUSIVE`, which blocks no reads or writes. The effective limit is 90 s per
-lock wait; a build waits up to three times, so 270 s fit inside the 600 s a
-caller gives one apply (the merge gate's budget). A blocker held longer than
-90 s (an operator or read-only session) ends in the runner's own refusal
-(`55P03`, then the invalid-index refusal `VL015`), before the caller's kill.
+transactions and takes only `SHARE UPDATE EXCLUSIVE`, which by itself blocks no
+reads or writes. An `ACCESS EXCLUSIVE` request queued behind it (other DDL on
+the table) would make later reads and writes wait; the migrator lock keeps
+other migrations out, so run no manual DDL on the table while a migration runs.
+The limit is 90 s per lock wait, and a build can wait more than once: for its
+table lock, then for each older transaction, in each of its phases. App
+transactions end within 30 s of their start (`transaction_timeout`), so app
+writers alone end a phase's waits within 30 s, well inside the 600 s a caller
+gives one apply (the merge gate's budget). Each session without that timeout
+(an operator, a read-only session) can add up to 90 s per wait; with several,
+the caller's budget can run out first. A blocker held longer than 90 s ends in
+the runner's own `55P03`. If the build had already created its index, that
+index is invalid and the retry refuses with `VL015`; if it timed out taking
+the table lock, nothing was created and the retry builds again or ends with
+`55P03`.
 A failed concurrent index build can leave an invalid index (including after
 that lock timeout). The tool refuses
 to record the file or skip the invalid index on retry. Before reusing an

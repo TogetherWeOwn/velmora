@@ -899,16 +899,18 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertEqual(self.ledger(), [*STAGES, '0004'])
             self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script, env=env).stdout)
 
-    def hold_extents_for(self, seconds):
-        """A writer transaction that holds ROW EXCLUSIVE on extents for
-        `seconds`, begun now: older than anything the migrator starts."""
+    def hold_extents(self):
+        """An app writer transaction holding ROW EXCLUSIVE on extents, begun
+        now: older than anything the migrator starts. It commits when
+        `migrate_while_held` says so."""
         holder = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=libpq_env())
         holder.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
-                           f"BEGIN; LOCK TABLE extents IN ROW EXCLUSIVE MODE; SELECT pg_sleep({seconds}); COMMIT;\n")
-        holder.stdin.close()
+                           "BEGIN; LOCK TABLE extents IN ROW EXCLUSIVE MODE;\n")
+        holder.stdin.flush()
         self.addCleanup(holder.stderr.close)
         self.addCleanup(holder.wait)
+        self.addCleanup(lambda: holder.stdin.closed or holder.stdin.close())
         for _ in range(100):
             held = psql(f"SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
                         f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{self.schema}' "
@@ -917,6 +919,33 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
                 return holder
             time.sleep(0.05)
         self.fail("the writer never took its lock")
+
+    def migrate_while_held(self, holder, script, hold):
+        """Runs the migrator with `holder` open. Once a concurrent build is
+        seen waiting on a lock, the writer stays open `hold` more seconds
+        (or until the migrator exits), then commits. Returns the migrator's
+        result and whether a build was seen waiting."""
+        runner = subprocess.Popen(["bash", str(script), str(self.env)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        waited = False
+        deadline = time.monotonic() + 120
+        while runner.poll() is None and time.monotonic() < deadline:
+            waiting = psql("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                           "AND pid <> pg_backend_pid() AND query ILIKE '%CREATE INDEX CONCURRENTLY%' "
+                           "AND wait_event_type = 'Lock'").stdout
+            if waiting.strip() != "0":
+                waited = True
+                break
+            time.sleep(0.05)
+        if waited:
+            until = time.monotonic() + hold
+            while runner.poll() is None and time.monotonic() < until:
+                time.sleep(0.05)
+        holder.stdin.write("COMMIT;\n")
+        holder.stdin.close()
+        out, err = runner.communicate(timeout=600)
+        self.assertEqual(holder.wait(), 0, holder.stderr.read())
+        return subprocess.CompletedProcess(runner.args, runner.returncode, out, err), waited
 
     def test_a_concurrent_index_stage_waits_out_a_long_writer(self):
         # An app writer transaction older than the build and longer than the
@@ -930,10 +959,12 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
             add_migration(script, name, '-- velmora: no-transaction\n' +
                           sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
-            holder = self.hold_extents_for(6)
-            applied = self.migrate(script=script).stdout
-            self.assertEqual(holder.wait(), 0, holder.stderr.read())
-            self.assertIn(f'{name}: applied', applied)
+            # Held 5 s past the moment the build is seen waiting: longer than
+            # the old 3 s timeout, however long the runner took to get there.
+            result, waited = self.migrate_while_held(self.hold_extents(), script, 5)
+            self.assertTrue(waited, 'the build waited for the writer')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f'{name}: applied', result.stdout)
             self.assertEqual(self.ledger(), [*STAGES, '0004'])
             self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
 
@@ -953,9 +984,9 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
             add_migration(script, name, '-- velmora: no-transaction\n' +
                           sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
-            holder = self.hold_extents_for(5)
-            refused = self.migrate(script=script, ok=False)
-            self.assertEqual(holder.wait(), 0, holder.stderr.read())
+            refused, waited = self.migrate_while_held(self.hold_extents(), script, 5)
+            self.assertTrue(waited, 'the build waited for the writer')
+            self.assertNotEqual(refused.returncode, 0, refused.stdout)
             self.assertIn(f'{name}: catalogue contains an invalid index; repair it before retrying',
                           refused.stderr)
             self.assertEqual(self.ledger(), STAGES, 'no ledger row')
