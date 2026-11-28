@@ -26,8 +26,7 @@ SELECT json_build_object(
         LEFT JOIN pg_collation co ON co.oid = a.attcollation),
     'indexes', (SELECT json_agg(json_build_array(t.relname, idx.relname, i.indisprimary,
         i.indisunique, i.indisvalid AND i.indisready, m.amname,
-        (SELECT json_agg(json_build_array(coalesce(a.attname, pg_get_indexdef(idx.oid, k.ord::int, true)),
-                    (i.indoption[k.ord - 1] & 1) <> 0,
+        (SELECT json_agg(json_build_array(a.attname, (i.indoption[k.ord - 1] & 1) <> 0,
                     (i.indoption[k.ord - 1] & 2) <> 0) ORDER BY k.ord)
          FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
          LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum),
