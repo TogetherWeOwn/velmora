@@ -21,6 +21,36 @@ const MAX_BODY = 16 * 1024;
 // Control characters (CR, LF ...) never reach a subject line.
 const oneLine = (s) => String(s).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
 const SOURCES = new Set(["host", "ci"]);
+// Keep the set finite: an alert can page once per code per hour. Never
+// persist caller-provided text, mail addresses, or message metadata.
+const MAIL_TITLES = new Map(Object.entries({
+  delivery_dlq: "Mail delivery dead-lettered",
+  delivery_failed: "Mail delivery exhausted its retries",
+  delivery_stuck: "Mail delivery is still retrying",
+  restore_skipped: "Mailbox restore skipped deliveries with missing mail",
+  backup_stale: "Mailbox backup is stale",
+  restore_blocked: "Mailbox restore is blocked",
+  backup_conflict: "Mailbox state diverged from its backup",
+  holder_confirm_stale: "A published mailbox holder is still unconfirmed",
+  holder_source_lost: "A mailbox source object is missing",
+  send_invariant: "A send is held after a release invariant failed",
+  handoff_stuck: "An internal delivery handoff keeps failing",
+  link_reported: "A file link was reported for abuse",
+  send_dlq: "Outbound mail queue message dead-lettered",
+  send_outage: "The outbound mail provider is unavailable",
+  send_unknown_error: "The outbound mail provider returned an unknown error",
+  send_ambiguous_cap: "An outbound send reached the ambiguous-result cap",
+  send_deadline: "An outbound send reached the provider retry deadline",
+  send_held: "An outbound send is held after repeated unfinished attempts",
+  send_result_unapplied: "A stored provider acceptance cannot be recorded",
+  send_result_stuck: "A stored provider result keeps failing to record",
+  send_quota_release: "The send quota object could not release a charge",
+  send_quota_failed: "The send quota object could not reserve or confirm a charge",
+  send_quota_gate_hit: "A mail account quota gate was reached",
+  send_stale_release_failed: "A stale send charge could not be released",
+  send_request_invalid: "An outbound request could not be built",
+  send_stalled: "An outbound send has stalled",
+}).map(([code, title]) => [`mail:${code}`, title]));
 
 function dailyCap(env) {
   const n = Number(env.DAILY_EMAIL_CAP);
@@ -120,6 +150,7 @@ export async function tick(env, now) {
   await store.resolveCron(db, conds.map((c) => c.key), now, (k) => failed.has(readingOf(k)));
   await store.expireEvents(db, now);
   await store.prune(db, now);
+  if (env.MAIL_ALERTS_ENABLED === "on") await store.pruneMailIdem(db, now);
   return {
     conditions: conds.map((c) => c.key),
     sent: results.filter((r) => r === "sent").length,
@@ -159,6 +190,17 @@ export async function ingest(request, env, now) {
   if (!env.INGEST_TOKEN || !timingSafeEqual(auth, `Bearer ${env.INGEST_TOKEN}`)) {
     return json(401, { error: "unauthorized" });
   }
+  return ingestEvent(request, env, now);
+}
+
+/** Called only by the named service-binding entrypoint, never by default fetch. */
+export async function ingestMail(request, env, now, ctx) {
+  if (env.MAIL_ALERTS_ENABLED !== "on") return json(503, { error: "mail alerts disabled" });
+  if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) return json(413, { error: "body too large" });
+  return ingestEvent(request, env, now, ctx);
+}
+
+async function ingestEvent(request, env, now, mailCtx) {
   let b;
   try {
     const raw = await request.text();
@@ -167,25 +209,36 @@ export async function ingest(request, env, now) {
   } catch {
     return json(400, { error: "body must be JSON" });
   }
-  const source = String(b?.source ?? "");
+  const source = mailCtx ? b?.source : String(b?.source ?? "");
   const key = String(b?.key ?? "").toLowerCase();
   const severity = b?.severity === "info" ? "info" : "page";
-  if (!SOURCES.has(source) && source !== "test") return json(400, { error: "source must be host or ci" });
+  let title;
+  if (mailCtx) {
+    title = MAIL_TITLES.get(source);
+    if (!title) return json(400, { error: "source must be mail:<event>" });
+  } else if (!SOURCES.has(source) && source !== "test") {
+    return json(400, { error: "source must be host or ci" });
+  }
   if (!KEY_RE.test(key)) return json(400, { error: "key: 1-100 of a-z 0-9 . _ : -" });
-  if (typeof b?.title !== "string" || b.title.length === 0) return json(400, { error: "title required" });
+  if (!mailCtx) {
+    if (typeof b?.title !== "string" || b.title.length === 0) return json(400, { error: "title required" });
+    title = oneLine(b.title).slice(0, 200);
+  }
+  const idempotencyKey = mailCtx ? request.headers.get("idempotency-key") : null;
+  if (idempotencyKey !== null && idempotencyKey !== b.key) return json(400, { error: "idempotency key must match key" });
+  const namespacedKey = mailCtx ? source : `${source}:${key}`;
   const row = await store.observe(
     env.STATE,
-    {
-      key: `${source}:${key}`,
-      source,
-      severity,
-      title: oneLine(b.title).slice(0, 200),
-      detail: String(b.detail ?? "").slice(0, 4000),
-    },
+    { key: namespacedKey, source, severity, title, detail: mailCtx ? "" : String(b.detail ?? "").slice(0, 4000) },
     now,
+    { mailOccurrence: idempotencyKey === null ? undefined : `${source}:${key}` },
   );
-  const sent = severity === "page" ? (await maybeSend(env, row, now, 0)) === "sent" : false;
-  return json(200, { key: row.key, emailed: sent });
+  if (!row || severity !== "page") return json(200, { key: namespacedKey, emailed: false });
+  const sending = maybeSend(env, row, now, 0);
+  // Finish the email claim even if the calling Worker times out. A replay
+  // must not be needed to recover a claim that was already taken.
+  mailCtx?.waitUntil(sending);
+  return json(200, { key: namespacedKey, emailed: (await sending) === "sent" });
 }
 
 export default {
