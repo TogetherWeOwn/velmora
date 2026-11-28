@@ -197,6 +197,17 @@ class SqliteTwins(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("SQLite twin fingerprint changed or is missing", result.stderr)
 
+    def test_a_later_stage_without_a_twin_fails(self):
+        def drop(bridge):
+            twin = sorted((bridge / "migrations-local").glob("*.sql"))[-1]
+            stage = bridge / "pg" / twin.name
+            stage.write_text("".join(l for l in stage.read_text().splitlines(True)
+                                     if not l.startswith("-- velmora: sqlite-twin ")))
+            twin.unlink()
+        result = self.check(drop)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PostgreSQL stages after the cutover without a SQLite twin", result.stderr)
+
     def test_a_twin_has_the_version_of_its_stage(self):
         def renumber(bridge):
             twin = sorted((bridge / "migrations-local").glob("*.sql"))[0]

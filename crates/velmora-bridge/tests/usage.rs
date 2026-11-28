@@ -1327,6 +1327,7 @@ async fn an_old_worker_is_not_disturbed_until_the_counters_are_on() {
     old.apply(MIGRATION_0021).unwrap();
     old.apply(MIGRATION_0022).unwrap();
     old.apply(MIGRATION_SCRUB).unwrap();
+    old.apply(MIGRATION_SCRUB_INDEXES).unwrap();
     add_buckets_sqlite(&old);
     old.meter_writes().unwrap();
     let expected = old_worker_changes(&old).await;

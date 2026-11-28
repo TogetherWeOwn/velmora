@@ -307,9 +307,12 @@ pub const MIGRATION_0025: &str =
 pub const MIGRATION_0026: &str =
     include_str!("../../../workers/s3-bridge/migrations/0026_verification_claim.sql");
 /// The scrub's schema in the local SQLite catalogue: the twin of
-/// PostgreSQL stages 0005 and 0006, which the frozen D1 never takes.
+/// PostgreSQL stage 0005, which the frozen D1 never takes.
 pub const MIGRATION_SCRUB: &str =
     include_str!("../../../workers/s3-bridge/migrations-local/0005_scrub.sql");
+/// The scrub's extents indexes: the twin of PostgreSQL stage 0006.
+pub const MIGRATION_SCRUB_INDEXES: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0006_scrub_indexes.sql");
 
 /// Switches the usage counters on over an empty catalogue: zero is the
 /// right count of nothing, so no recount is needed first.
@@ -539,6 +542,7 @@ impl RusqliteSql {
         db.apply(MIGRATION_0025)?;
         db.apply(MIGRATION_0026)?;
         db.apply(MIGRATION_SCRUB)?;
+        db.apply(MIGRATION_SCRUB_INDEXES)?;
         Ok(db)
     }
 

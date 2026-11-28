@@ -21,6 +21,8 @@ D1 = PG.parent / 'migrations'
 # Schema changes after the cutover: PostgreSQL stages with a SQLite twin of the
 # same version, for local development and tests. The frozen D1 never takes them.
 LOCAL = PG.parent / 'migrations-local'
+# The last stage of the cutover; every later stage has a SQLite twin.
+CUTOVER_BASELINE = '0003'
 W1 = 7413000001
 MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
@@ -146,6 +148,9 @@ def coverage(files, d1, local):
     missing = d1.keys() - covered
     if missing:
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
+    untwinned = [files[v][0] for v in sorted(files) if v > CUTOVER_BASELINE and v not in local_covered]
+    if untwinned:
+        die('PostgreSQL stages after the cutover without a SQLite twin: ' + ', '.join(untwinned))
     missing = local.keys() - local_covered
     if missing:
         die('SQLite twins without a PostgreSQL stage: ' + ', '.join(local[v][0] for v in sorted(missing)))

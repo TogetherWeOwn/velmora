@@ -1,4 +1,5 @@
 -- velmora: no-transaction
+-- velmora: sqlite-twin 0006_scrub_indexes.sql 4ea951be6f746339e5910c5c06cf611ef8bed87d04e11cf68649caee3b4f8760
 -- These indexes scan the existing extents table. Build without holding W1.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS extents_scrub_pending ON extents(id)
     WHERE safety_state = 'released' AND scrub_enrolled = 0;
