@@ -39,13 +39,14 @@ class DeployD1GuardTest(unittest.TestCase):
         for name in ("deploy_d1_guard.py", MANIFEST):
             shutil.copyfile(TOOLS / name, self.worker / "tools" / name)
 
-    def policy(self, backend=None, migrations_dir=None, *, extra=""):
+    def policy(self, backend=None, migrations_dir=None, *, extra="", extra_bindings=""):
         config = self.worker / "wrangler.deploy.toml"
         config.write_text(
             f"{extra}[vars]\n"
             + (f"CATALOG_BACKEND = {backend}\n" if backend is not None else "")
             + '[[d1_databases]]\nbinding = "CATALOG"\ndatabase_name = "velmora-catalog"\n'
             + (f'migrations_dir = "{migrations_dir}"\n' if migrations_dir is not None else "")
+            + extra_bindings
             + '[env.dev.vars]\nCATALOG_BACKEND = "d1"\n'
             + '[[env.dev.d1_databases]]\nbinding = "CATALOG"\nmigrations_dir = "dev-migrations"\n',
             encoding="utf-8",
@@ -114,6 +115,17 @@ class DeployD1GuardTest(unittest.TestCase):
         for value in ('""', '"D1"', '"other"', "true"):
             with self.subTest(value=value):
                 self.refused(self.policy(value), "invalid CATALOG_BACKEND")
+
+    def test_ambiguous_catalog_binding_fails_closed(self):
+        second = '[[d1_databases]]\nbinding = "OTHER"\ndatabase_name = "CATALOG"\n'
+        self.refused(self.policy('"d1"', extra_bindings=second), 'expected one unambiguous CATALOG D1 binding')
+
+    def test_frozen_migrations_do_not_follow_symlinks(self):
+        migration = self.migrations / '0001_init.sql'
+        target = self.worker / 'same-bytes.sql'
+        migration.rename(target)
+        migration.symlink_to(target)
+        self.refused(self.policy('"pg"'), 'changed: "0001_init.sql"')
 
     def test_cannot_keep_an_out_of_band_backend(self):
         self.refused(self.policy(extra="keep_vars = true\n"), "keep_vars must be disabled")

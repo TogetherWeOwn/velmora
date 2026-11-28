@@ -60,135 +60,384 @@ HISTORICAL_PG_RELATIONS = {
      "gc_id_seq", "usage_recounts_id_seq", "outbox_seq_seq"}
 
 
+# Deliberately not a general SQL parser: each supported expansion consumes its
+# entire statement. Unknown types, operators and clauses require operator review.
+NUMBER = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?\Z")
+TYPES = {"BIGINT", "INT8", "INTEGER", "INT", "INT4", "SMALLINT", "INT2", "TEXT", "VARCHAR", "CHAR",
+         "CHARACTER", "BOOLEAN", "BOOL", "BYTEA", "JSON", "JSONB", "UUID", "NUMERIC", "DECIMAL",
+         "REAL", "FLOAT4", "FLOAT8", "DOUBLE", "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIME"}
+PURE_CALLS = {"NOW": 0, "LOWER": 1, "LENGTH": 1, "COALESCE": None}
+POST_TABLE_CALLS = {"LEAST": None, "GREATEST": None}
+BINARY = {"+", "-", "*", "/", "%", "=", "!=", "<>", "<", ">", "<=", ">=", "AND", "OR"}
+SQL_VALUES = {"CURRENT_CATALOG", "CURRENT_DATE", "CURRENT_ROLE", "CURRENT_SCHEMA", "CURRENT_TIME",
+              "CURRENT_TIMESTAMP", "CURRENT_USER", "LOCALTIME", "LOCALTIMESTAMP", "SESSION_USER",
+              "SYSTEM_USER", "USER", "DEFAULT"}
+
+
+class AdditiveStatement:
+    def __init__(self, source, start, spans, name, objects):
+        self.source, self.start, self.spans, self.name = source, start, spans, name
+        self.words = [token.upper() for token, _, _ in spans]
+        self.i = 0
+        self.tables, self.columns, self.indexes = (objects[key] for key in ("tables", "columns", "indexes"))
+
+    def peek(self, offset=0):
+        i = self.i + offset
+        return self.words[i] if i < len(self.words) else ""
+
+    def refuse(self, message, i=None):
+        i = min(self.i if i is None else i, len(self.spans) - 1)
+        line = self.source.count("\n", 0, self.start + self.spans[i][1]) + 1
+        raise Failure(f"{self.name}:{line}: {message}")
+
+    def take(self, *words):
+        if self.words[self.i:self.i + len(words)] != list(words):
+            return False
+        self.i += len(words)
+        return True
+
+    def need(self, *words):
+        if not self.take(*words):
+            self.refuse("expected " + " ".join(words))
+
+    def identifier(self):
+        token = self.spans[self.i][0] if self.peek() else ""
+        value = token[1:-1] if token.startswith('"') else token.lower()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value) or value in {"schema_migrations", MARKER}:
+            self.refuse("expected an unqualified catalogue identifier")
+        self.i += 1
+        return value
+
+    def new_relation(self):
+        pos = self.i
+        relation = self.identifier()
+        if relation in TABLES or relation in HISTORICAL_PG_RELATIONS:
+            self.refuse(f"{relation} is a historical PostgreSQL name", pos)
+        if relation in self.tables or any(name == relation for _, name in self.indexes):
+            self.refuse(f"{relation} is already declared by a post-cutover migration", pos)
+        return relation
+
+    def existing_table(self):
+        pos = self.i
+        table = self.identifier()
+        if table not in TABLES and table not in self.tables:
+            self.refuse("expected an existing catalogue table", pos)
+        return table
+
+    def comma_list(self, item, end):
+        item()
+        while self.take(","):
+            item()
+        self.need(end)
+
+    def type_name(self):
+        typ = self.peek()
+        if typ not in TYPES:
+            self.refuse("column and cast types must be allowlisted built-in types")
+        self.i += 1
+        if typ == "DOUBLE":
+            self.need("PRECISION")
+        if typ in {"CHARACTER", "CHAR"}:
+            self.take("VARYING")
+        if self.take("("):
+            def modifier():
+                if not self.peek().isdigit():
+                    self.refuse("expected a numeric type modifier")
+                self.i += 1
+            self.comma_list(modifier, ")")
+        if typ in {"TIME", "TIMESTAMP"} and (self.take("WITH") or self.take("WITHOUT")):
+            self.need("TIME", "ZONE")
+        while self.take("["):
+            self.need("]")
+
+    def collation(self):
+        if self.peek() != '"C"':
+            self.refuse('only COLLATE "C" is allowed')
+        self.i += 1
+
+    def atom(self):
+        token = self.peek()
+        if token in {"TRUE", "FALSE", "NULL"} or token.startswith("'") or NUMBER.fullmatch(token):
+            self.i += 1
+            return True, token != "NULL"
+        return False, False
+
+    def literal(self):
+        if self.take("("):
+            nonnull = self.literal()
+            self.need(")")
+        elif self.take("ARRAY", "["):
+            if not self.take("]"):
+                self.comma_list(self.literal, "]")
+            nonnull = True
+        elif self.take("+") or self.take("-"):
+            if not NUMBER.fullmatch(self.peek()):
+                self.refuse("expected a signed numeric literal")
+            self.i += 1
+            nonnull = True
+        else:
+            found, nonnull = self.atom()
+            if not found:
+                self.refuse("expected a literal value")
+        if self.take("COLLATE"):
+            self.collation()
+        return nonnull
+
+    def expression(self, *, names, calls):
+        # Precedence is the server's responsibility. We recognize only terms,
+        # simple operators, safe built-in casts and explicitly approved calls.
+        def expr():
+            return self.expression(names=names, calls=calls)
+
+        while self.peek() in {"+", "-", "NOT"}:
+            self.i += 1
+        if self.take("("):
+            expr()
+            self.need(")")
+        elif self.take("CAST", "("):
+            expr()
+            self.need("AS")
+            self.type_name()
+            self.need(")")
+        elif self.peek() == "ARRAY":
+            self.literal()
+        elif not self.atom()[0]:
+            pos, token = self.i, self.peek()
+            self.identifier()
+            if self.take("("):
+                if token not in calls:
+                    self.refuse("function must be allowlisted", pos)
+                count = 0
+                if not self.take(")"):
+                    count = 1
+                    expr()
+                    while self.take(","):
+                        count += 1
+                        expr()
+                    self.need(")")
+                arity = calls[token]
+                if (arity is None and count == 0) or (arity is not None and count != arity):
+                    self.refuse("invalid argument count for allowlisted function", pos)
+            elif not names or token in SQL_VALUES:
+                self.refuse("expected a literal or an allowlisted function", pos)
+        while self.take("::"):
+            self.type_name()
+        if self.take("COLLATE"):
+            self.collation()
+        if self.take("IS"):
+            self.take("NOT")
+            if self.peek() not in {"NULL", "TRUE", "FALSE"}:
+                self.refuse("only IS NULL, TRUE or FALSE is allowed")
+            self.i += 1
+        if self.peek() in BINARY:
+            self.i += 1
+            expr()
+
+    def references(self, table):
+        pos = self.i - 1
+        target = self.identifier()
+        if target != table and target not in self.tables:
+            self.refuse("REFERENCES targets a historical or undeclared table and requires review", pos)
+        if self.take("("):
+            self.comma_list(self.identifier, ")")
+        while self.take("ON"):
+            if not (self.take("DELETE") or self.take("UPDATE")):
+                self.refuse("expected DELETE or UPDATE in foreign-key action")
+            if not (self.take("NO", "ACTION") or self.take("RESTRICT") or self.take("CASCADE") or
+                    self.take("SET", "NULL")):
+                self.refuse("unsupported foreign-key action")
+
+    def create_table(self):
+        self.take("IF", "NOT", "EXISTS")
+        table = self.new_relation()
+        if self.take("PARTITION", "OF"):
+            self.refuse("PARTITION OF changes the parent table and requires review", self.i - 2)
+        if not self.take("("):
+            self.refuse("expected CREATE TABLE with a column definition")
+
+        def constraint(*, column):
+            named = self.take("CONSTRAINT")
+            if named:
+                self.identifier()
+            if self.take("PRIMARY", "KEY") or self.take("UNIQUE"):
+                if not column:
+                    self.need("(")
+                    self.comma_list(self.identifier, ")")
+            elif self.take("CHECK", "("):
+                self.expression(names=True, calls=PURE_CALLS | POST_TABLE_CALLS)
+                self.need(")")
+            elif column and self.take("REFERENCES"):
+                self.references(table)
+            elif not column and self.take("FOREIGN", "KEY", "("):
+                self.comma_list(self.identifier, ")")
+                self.need("REFERENCES")
+                self.references(table)
+            elif named or not column:
+                self.refuse("expected an allowlisted table or column constraint")
+            else:
+                return False
+            return True
+
+        def element():
+            if self.peek() in {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}:
+                constraint(column=False)
+                return
+            if self.peek() == "LIKE":
+                self.refuse("LIKE targets a historical table or uses an unsupported table form")
+            column = self.identifier()
+            self.type_name()
+            self.add_column(table, column)
+            while self.peek() not in {",", ")", ""}:
+                if self.take("COLLATE"):
+                    self.collation()
+                elif self.take("NOT", "NULL") or self.take("NULL"):
+                    continue
+                elif self.take("DEFAULT"):
+                    self.expression(names=False, calls=PURE_CALLS)
+                elif not constraint(column=True):
+                    self.refuse("unsupported column definition")
+        self.comma_list(element, ")")
+        if self.peek() == "INHERITS":
+            self.refuse("INHERITS changes which rows existing catalogue queries read")
+        if not any(owner == table for owner, _ in self.columns):
+            self.refuse("expected CREATE TABLE with a column definition")
+        self.tables.add(table)
+
+    def create_index(self, unique):
+        self.take("CONCURRENTLY")
+        self.take("IF", "NOT", "EXISTS")
+        index = self.new_relation()
+        self.need("ON")
+        table = self.existing_table()
+        if unique and table not in self.tables:
+            self.refuse("UNIQUE index on a historical or undeclared table requires review", 1)
+        calls = PURE_CALLS | (POST_TABLE_CALLS if table in self.tables else {})
+        if self.take("USING"):
+            method = self.peek()
+            if method not in {"BTREE", "HASH", "GIN", "GIST", "SPGIST", "BRIN"}:
+                self.refuse("index access method must be allowlisted")
+            self.i += 1
+        self.need("(")
+
+        def key():
+            self.expression(names=True, calls=calls)
+            self.take("ASC") or self.take("DESC")
+            if self.take("NULLS") and not (self.take("FIRST") or self.take("LAST")):
+                self.refuse("expected NULLS FIRST or NULLS LAST")
+        self.comma_list(key, ")")
+        if self.take("INCLUDE", "("):
+            self.comma_list(self.identifier, ")")
+        if self.take("WHERE"):
+            # LEAST/GREATEST are restricted to index keys and CHECKs.
+            self.expression(names=True, calls=PURE_CALLS)
+        self.indexes.add((table, index))
+
+    def add_column(self, table, column):
+        if (table, column) == ("outbox", "seq"):
+            self.refuse("outbox.seq is a historical PostgreSQL column")
+        if (table, column) in self.columns:
+            self.refuse("column is already declared by a post-cutover migration")
+        self.columns.add((table, column))
+
+    def alter_table(self):
+        table = self.existing_table()
+
+        def action():
+            pos = self.i
+            if self.peek() in {"DROP", "RENAME"}:
+                self.refuse(f"{self.peek()} is not additive")
+            if self.take("ALTER"):
+                self.take("COLUMN")
+                self.identifier()
+                if self.take("TYPE") or self.take("SET", "DATA", "TYPE"):
+                    self.refuse("ALTER COLUMN TYPE is not additive", pos)
+                if self.take("SET", "NOT", "NULL"):
+                    self.refuse("SET NOT NULL is not additive", pos)
+            if not self.take("ADD"):
+                self.refuse("only ADD COLUMN alterations can run before a merge", pos)
+            self.take("COLUMN")
+            guarded = self.take("IF", "NOT", "EXISTS")
+            if self.peek() in {"NOT", "CONSTRAINT", "CHECK", "UNIQUE", "PRIMARY", "FOREIGN", "EXCLUDE"}:
+                self.refuse("expected ADD COLUMN, not a table constraint", pos)
+            column = self.identifier()
+            self.add_column(table, column)
+            if guarded:
+                self.refuse("ADD COLUMN IF NOT EXISTS requires review", pos)
+            self.type_name()
+            if self.take("COLLATE"):
+                self.collation()
+            not_null = self.take("NOT", "NULL")
+            if not not_null:
+                self.take("NULL")
+            nonnull = False
+            if self.take("DEFAULT"):
+                try:
+                    nonnull = self.literal()
+                    if self.peek() not in {"", ",", "NOT", "NULL"}:
+                        self.refuse("expected a literal DEFAULT")
+                except Failure:
+                    if not_null:
+                        self.refuse("NOT NULL without DEFAULT supplying a non-NULL literal cannot run before a merge", pos)
+                    raise
+                if not not_null:
+                    not_null = self.take("NOT", "NULL")
+                    if not not_null:
+                        self.take("NULL")
+            if not_null and not nonnull:
+                self.refuse("NOT NULL without DEFAULT supplying a non-NULL literal cannot run before a merge", pos)
+        action()
+        while self.take(","):
+            action()
+
+    def insert(self):
+        table = self.identifier()
+        if table not in self.tables:
+            self.refuse("INSERT may only seed a post-cutover table")
+        if self.take("("):
+            self.comma_list(self.identifier, ")")
+        self.need("VALUES")
+        while True:
+            self.need("(")
+            self.comma_list(self.literal, ")")
+            if not self.take(","):
+                break
+
+    def parse(self):
+        for i, (token, _, end) in enumerate(self.spans):
+            if token.upper() == "UESCAPE" or (token.upper() == "U" and self.source[self.start + end:self.start + end + 1] == "&"):
+                self.refuse("Unicode escapes are not allowed", i)
+            if token.upper().startswith("E'"):
+                self.refuse("escape strings are not allowed", i)
+        if self.take("CREATE", "TABLE"):
+            self.create_table()
+        elif self.take("CREATE", "UNIQUE", "INDEX"):
+            self.create_index(unique=True)
+        elif self.take("CREATE", "INDEX"):
+            self.create_index(unique=False)
+        elif self.take("ALTER", "TABLE"):
+            self.alter_table()
+        elif self.take("INSERT", "INTO"):
+            self.insert()
+        elif self.peek() == "DROP":
+            self.refuse("DROP is not additive")
+        elif self.peek() == "ALTER" and "RENAME" in self.words:
+            self.refuse("RENAME is not additive", self.words.index("RENAME"))
+        else:
+            self.refuse("unsupported statement in an additive migration")
+        if self.peek():
+            self.refuse("unsupported trailing clause in an additive migration")
+
+
 def lint_additive(sql, source_statements, tokens_with_spans, name, objects):
-    """Record the effects of supported expand-only SQL; unknown forms require review."""
     cursor = 0
-    tables, columns, indexes = (objects[kind] for kind in ("tables", "columns", "indexes"))
     for raw in source_statements:
         start = sql.index(raw, cursor)
         cursor = start + len(raw)
-        spans = [(token, pos) for token, pos, _ in tokens_with_spans(raw) if token != ";"]
-        words = [token.upper() for token, _ in spans]
-
-        def refuse(message, i=0):
-            line = sql.count("\n", 0, start + spans[i][1]) + 1
-            raise Failure(f"{name}:{line}: {message}")
-
-        def identifier(i):
-            token = spans[i][0] if i < len(spans) else ""
-            # Portable identifiers let the same name identify the object in the SQLite twin.
-            value = token[1:-1] if token.startswith('"') else token.lower()
-            if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", value) or value in {"schema_migrations", MARKER}:
-                refuse("expected an unqualified catalogue identifier")
-            return value
-
-        def optional(i, clause):
-            return i + len(clause) if words[i:i + len(clause)] == clause else i
-
-        def new_relation(i):
-            value = identifier(i)
-            if value in HISTORICAL_PG_RELATIONS:
-                refuse(f"{value} is a historical PostgreSQL name", i)
-            return value
-
-        if words[0] == "DROP":
-            refuse("DROP is not additive")
-        if words[:2] == ["CREATE", "TABLE"]:
-            i = optional(2, ["IF", "NOT", "EXISTS"])
-            table = new_relation(i)
-            if words[i + 1:i + 3] == ["PARTITION", "OF"]:
-                refuse("PARTITION OF changes the parent table and requires review", i + 1)
-            if words[i + 1:i + 2] != ["("]:
-                refuse("expected CREATE TABLE with a column definition")
-            depth = 1
-            for j in range(i + 2, len(words)):
-                word = words[j]
-                if depth == 0:
-                    if word == "INHERITS":
-                        refuse("INHERITS changes which rows existing catalogue queries read", j)
-                    refuse("unsupported clause after CREATE TABLE column definitions", j)
-                # LIKE is a table element here, not a predicate inside CHECK.
-                if word == "REFERENCES" or (word == "LIKE" and depth == 1 and words[j - 1] in {"(", ","}):
-                    target = identifier(j + 1)
-                    if words[j + 2:j + 3] == ["."]:
-                        refuse(f"{word} requires an unqualified post-cutover table", j)
-                    if target not in tables and not (word == "REFERENCES" and target == table):
-                        refuse(f"{word} targets a historical or undeclared table and requires review", j)
-                depth += (word == "(") - (word == ")")
-            tables.add(table)
-        elif words[:2] == ["CREATE", "INDEX"] or words[:3] == ["CREATE", "UNIQUE", "INDEX"]:
-            unique = words[1] == "UNIQUE"
-            i = optional(optional(words.index("INDEX") + 1, ["CONCURRENTLY"]), ["IF", "NOT", "EXISTS"])
-            index = new_relation(i)
-            if words[i + 1:i + 2] != ["ON"] or len(words) <= i + 3 or words[i + 3] == ".":
-                refuse("expected a named index on an unqualified catalogue table")
-            table = identifier(i + 2)
-            if unique and table not in tables:
-                refuse("UNIQUE index on a historical or undeclared table requires review", 1)
-            indexes.add((table, index))
-        elif words[:2] == ["ALTER", "TABLE"]:
-            i = optional(2, ["IF", "EXISTS"])
-            table = identifier(i)
-            # Split the ALTER list on top-level commas, not type/DEFAULT arguments.
-            actions, depth, action = [], 0, i + 1
-            for j in range(action, len(words)):
-                if words[j] == "," and depth == 0:
-                    actions.append((action, j))
-                    action = j + 1
-                depth += (words[j] == "(") - (words[j] == ")")
-            actions.append((action, len(words)))
-            for lo, hi in actions:
-                clause = words[lo:hi]
-                if not clause:
-                    refuse("expected an ALTER TABLE action")
-                if clause[0] in {"DROP", "RENAME"}:
-                    refuse(f"{clause[0]} is not additive", lo)
-                if clause[0] == "ALTER":
-                    k = optional(lo + 1, ["COLUMN"]) + 1
-                    if words[k:k + 1] == ["TYPE"] or words[k:k + 3] == ["SET", "DATA", "TYPE"]:
-                        refuse("ALTER COLUMN TYPE is not additive", lo)
-                    if words[k:k + 3] == ["SET", "NOT", "NULL"]:
-                        refuse("SET NOT NULL is not additive", lo)
-                if clause[0] != "ADD":
-                    refuse("only ADD COLUMN alterations can run before a merge", lo)
-                k = optional(optional(lo + 1, ["COLUMN"]), ["IF", "NOT", "EXISTS"])
-                if k + 1 >= hi or words[k] in {"CONSTRAINT", "CHECK", "UNIQUE", "PRIMARY", "FOREIGN", "EXCLUDE"}:
-                    refuse("expected ADD COLUMN, not a table constraint", lo)
-                column = identifier(k)
-                if (table, column) == ("outbox", "seq"):
-                    refuse("outbox.seq is a historical PostgreSQL column", k)
-                attrs, not_null, depth, default_at = [], [], 0, hi
-                for j in range(k + 1, hi):
-                    word = words[j]
-                    if depth == 0:
-                        attrs.append(word)
-                        if words[j:j + 2] == ["NOT", "NULL"]:
-                            not_null.append(j)
-                        if word == "DEFAULT":
-                            default_at = j + 1
-                    depth += (word == "(") - (word == ")")
-                if not_null:
-                    # The running Worker omits new columns. Require a literal
-                    # non-NULL default, not a cast or expression we cannot prove.
-                    end = next((j for j in not_null if j >= default_at), hi)
-                    literal = words[default_at:end]
-                    while literal[:1] == ["("] and literal[-1:] == [")"]:
-                        literal = literal[1:-1]
-                    if not (len(literal) == 1 and (literal[0] in {"TRUE", "FALSE"} or
-                                                  literal[0].startswith(("'", "E'"))) or
-                            re.fullmatch(r"[+-]?\s*[0-9]+(?:\s*\.\s*[0-9]+)?", " ".join(literal))):
-                        refuse("NOT NULL without DEFAULT supplying a non-NULL literal cannot run before a merge", lo)
-                if set(attrs) & {"CHECK", "CONSTRAINT", "UNIQUE", "PRIMARY", "REFERENCES", "GENERATED"}:
-                    refuse("ADD COLUMN with constraints beyond NOT NULL requires review", lo)
-                columns.add((table, column))
-        elif words[:2] == ["INSERT", "INTO"] or words[0] == "UPDATE":
-            i = 2 if words[0] == "INSERT" else 1
-            if identifier(i) not in tables or words[i + 1:i + 2] in (["."], ["*"]):
-                refuse("only seed/backfill statements on post-cutover tables can run before a merge")
-        elif words[0] == "ALTER" and "RENAME" in words:
-            refuse("RENAME is not additive", words.index("RENAME"))
-        else:
-            refuse("unsupported statement in an additive migration")
+        spans = [span for span in tokens_with_spans(raw) if span[0] != ";"]
+        try:
+            AdditiveStatement(sql, start, spans, name, objects).parse()
+        except RecursionError:
+            raise Failure(f"{name}: expression nesting exceeds the additive parser limit") from None
 
 
 def replay_sqlite_twins(d1, twins, declarations):
@@ -222,14 +471,11 @@ def replay_sqlite_twins(d1, twins, declarations):
             finally:
                 db.set_authorizer(None)
             after = inventory(db)
-            require(expected["columns"] <= after["columns"] - before["columns"],
-                    f"{name}: SQLite twin {twin} does not add the declared columns")
             for kind, original in before.items():
-                added, wanted = after[kind] - original, expected[kind]
-                if kind == "columns":  # CREATE TABLE is checked by name; ALTER additions are explicit.
-                    added = {col for col in added if col[0] not in expected["tables"]}
-                    wanted = {col for col in wanted if col[0] not in expected["tables"]}
-                require(original <= after[kind] and added == wanted,
+                added = after[kind] - original
+                if kind == "columns":
+                    require(expected[kind] <= added, f"{name}: SQLite twin {twin} does not add the declared columns")
+                require(original <= after[kind] and added == expected[kind],
                         f"{name}: SQLite twin {twin} does not add the same {kind}")
             before = after
     require(set(twins) <= set(declarations), "migrations-local contains a version with no post-cutover PG migration")

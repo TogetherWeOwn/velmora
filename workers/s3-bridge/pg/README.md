@@ -2,8 +2,8 @@
 
 The Worker uses the configured catalogue backend. These files apply only to
 PostgreSQL and do not select a Worker backend or change D1. Run the migration
-tool from a host with Python 3 (with SQLite support) and `psql`, connecting
-directly rather than through a transaction pooler.
+tool from a host with Python 3.11 or newer (with SQLite support) and `psql`.
+Connect directly rather than through a transaction pooler.
 
 ## Roles and connection file
 
@@ -100,7 +100,9 @@ count against the budget; this needs psql 15 or newer and a batch under
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
 Each statement travels through a separate SQL `psql -c` argument in the same
-session, not through the psql command interpreter on stdin.
+session, not through the psql command interpreter on stdin. Each argument must
+be under 128 KiB; `--check-migrations` rejects an oversized concurrent
+statement without opening a database connection.
 Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
 session lock without waiting in PostgreSQL with a snapshot. A failed
@@ -118,14 +120,24 @@ Missing coverage, renamed files and byte changes fail the gate.
 For each new PostgreSQL migration, put a SQLite test twin with the same
 four-digit version in `migrations-local/`. The runner replays these twins in
 memory and checks that they add the same tables, indexes and explicit column
-additions; they are not Wrangler migrations. A pre-merge change must be safe
-with the old code still running. The lint allows named tables and indexes,
-additive columns, and seeds/backfills on post-cutover tables. It refuses
-`DROP`, `RENAME`, type changes, `SET NOT NULL`, `ADD COLUMN NOT NULL` without
-a non-null literal default, and unsupported forms. New objects cannot inherit,
-partition, or add foreign keys, `LIKE` copies or unique indexes that depend
-on a historical table. Lint is not a substitute for reviewing backward
-compatibility, defaults, indexes and constraints.
+additions; they are not Wrangler migrations. If a feature needs the new SQL in
+Rust contract tests, update the relevant `testkit.rs` and `testkit_pg.rs`
+fixture lists in the same feature PR. A pre-merge change must be safe with
+old code still running. The post-cutover SQL allowlist is:
+
+- Create a new named table or index. Table constraints must refer only to
+  new tables; unique indexes cannot target a historical table. Declared table
+  columns and names are checked against the SQLite replay and live manifest.
+- Add a new nullable column, or a new `NOT NULL` column with a non-null
+  literal default. No other `ALTER` is allowed.
+- Seed a post-cutover table with `INSERT ... VALUES` containing only literals.
+  `INSERT ... SELECT`, `UPDATE`, and `DELETE` are refused.
+
+Defaults and check/index expressions accept only the supported literal,
+operator, and built-in cast syntax and the functions `now`, `lower`, `length`,
+and `coalesce`. `least` and `greatest` are also allowed in index keys and
+checks on post-cutover tables. Escape strings and Unicode escape syntax are
+not allowed. Any other form needs review before it can be used.
 
 `ops/pg-migrate.sh "$CONNECTION_FILE" --pending` reads the SHA-256-checked
 ledger without taking either writer lock or changing the database. It prints

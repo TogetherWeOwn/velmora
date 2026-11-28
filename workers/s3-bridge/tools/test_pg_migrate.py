@@ -129,7 +129,7 @@ class MigrationParser(unittest.TestCase):
         names = {'SQL_TOKEN', 'sql_tokens_with_spans', 'sql_tokens', 'lint_migration'}
         for node in tree.body:
             if isinstance(node, ast.Assign) and any(
-                    isinstance(target, ast.Name) and target.id == 'SQL_TOKEN' for target in node.targets):
+                    isinstance(target, ast.Name) and target.id in {'SQL_TOKEN', 'PSQL_ARGUMENT_LIMIT'} for target in node.targets):
                 wanted.append(node)
             elif isinstance(node, ast.FunctionDef) and node.name in names:
                 wanted.append(node)
@@ -195,6 +195,73 @@ class MigrationParser(unittest.TestCase):
                 result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f'0004_bad.sql:3: {diagnostic}', result.stderr)
+
+    def test_allowlist_refuses_unapproved_syntax_before_connecting(self):
+        cases = {
+            "INSERT INTO sample(id) VALUES (setval('fixture_sequence', 1))": 'literal',
+            "INSERT INTO sample(id) SELECT 1": 'expected VALUES',
+            'UPDATE sample SET id = 2': 'unsupported statement',
+            'DELETE FROM sample': 'unsupported statement',
+            "ALTER TABLE sample ADD COLUMN example text DEFAULT set_config('fixture.key', 'value', false)": 'literal',
+            "CREATE TABLE extra (id bigint CHECK (setval('fixture_sequence', 1) > 0))": 'function must be allowlisted',
+            'ALTER TABLE outbox ADD NOT NULL lease_owner NOT VALID': 'expected ADD COLUMN',
+            'CREATE TABLE U&"test_name" (id bigint)': 'Unicode escapes',
+            "CREATE TABLE extra (name text DEFAULT E'plain')": 'escape strings',
+            'CREATE TABLE IF NOT EXISTS sample (id bigint, new_col text)': 'already declared',
+            'CREATE INDEX repeat_name ON sample(id); CREATE INDEX IF NOT EXISTS repeat_name ON sample(id)': 'already declared',
+            'CREATE INDEX bad ON extents(least(id, id))': 'function must be allowlisted',
+            "CREATE TABLE extra (label text CHECK ((label || label) <> ''))": 'expected )',
+        }
+        for sql, error in cases.items():
+            with self.subTest(sql=sql), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_sample.sql', 'CREATE TABLE sample (id bigint);', 'CREATE TABLE sample (id INTEGER);')
+                add_migration(script, '0005_bad.sql', sql + ';', 'SELECT 1;')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(error, result.stderr)
+
+    def test_allowlist_accepts_pure_expressions_and_literal_seed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            pg = ('CREATE TABLE sample (id bigint PRIMARY KEY, label TEXT DEFAULT lower(\'X\'), '
+                  'CHECK (least(id, 99) > 0 AND length(coalesce(label, \'\')) >= 0));\n'
+                  'CREATE TABLE child (id bigint REFERENCES sample(id));\n'
+                  'CREATE INDEX sample_floor ON sample(greatest(id, 1));\n'
+                  "INSERT INTO sample(id, label) VALUES (1, 'literal'), (2, NULL);\n")
+            twin = ('CREATE TABLE sample (id INTEGER PRIMARY KEY, label TEXT);\n'
+                    'CREATE TABLE child (id INTEGER REFERENCES sample(id));\n'
+                    'CREATE INDEX sample_floor ON sample(id);\n')
+            add_migration(script, '0004_sample.sql', pg, twin)
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_guard_rejects_stray_twin_and_nonconcurrent_no_transaction_sql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_plain_index.sql', '-- velmora: no-transaction\n'
+                          'CREATE INDEX ordinary_idx ON extents(id);', 'CREATE INDEX ordinary_idx ON extents(id);')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertIn('only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed', result.stderr)
+            (script.parents[1] / 'pg' / '0004_plain_index.sql').unlink()
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('migrations-local contains a version with no post-cutover PG migration', result.stderr)
+
+    def test_transaction_control_is_refused_in_legacy_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp, {'0003_usage_statement_triggers.sql': '\nCOMMIT;\n'})
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('transaction control belongs to the migration runner', result.stderr)
+
+    def test_number_and_parameter_do_not_consume_following_dollar_quote(self):
+        for prefix in ('1', '$11'):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp, {'0003_usage_statement_triggers.sql':
+                    f"\nSELECT {prefix}$a$fixture$a$ :lint_only;\n"})
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertIn('psql variable substitution is not allowed', result.stderr)
 
     def test_post_cutover_lint_accepts_additive_migration_with_local_twin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,6 +373,31 @@ class MigrationParser(unittest.TestCase):
             script = clone_bridge(tmp, {stage: "\n-- :lint_only\nSELECT 1::bigint, ':lint_only';\n"})
             result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_post_cutover_lint_accepts_array_and_static_literal_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_defaults.sql',
+                          'ALTER TABLE extents\n'
+                          ' ADD COLUMN fixture_array bigint[] DEFAULT ARRAY[1, 2],\n'
+                          ' ADD COLUMN fixture_ratio numeric NOT NULL DEFAULT 1e-3,\n'
+                          ' ADD COLUMN fixture_label text NOT NULL DEFAULT \'\' COLLATE "C";\n',
+                          "ALTER TABLE extents ADD COLUMN fixture_array TEXT DEFAULT '[1, 2]';\n"
+                          'ALTER TABLE extents ADD COLUMN fixture_ratio REAL NOT NULL DEFAULT 1e-3;\n'
+                          "ALTER TABLE extents ADD COLUMN fixture_label TEXT NOT NULL DEFAULT '';\n")
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_oversized_concurrent_statement_is_refused_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_concurrent.sql', '-- velmora: no-transaction\n'
+                          'CREATE INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id) '
+                          "WHERE id <> '" + 'x' * (128 * 1024) + "';\n",
+                          'CREATE INDEX fixture_idx ON extents(id);')
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('0004_concurrent.sql: concurrent statement exceeds the psql -c argument limit', result.stderr)
 
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
@@ -487,6 +579,26 @@ class PgMigrate(unittest.TestCase):
         self.assertNotEqual(pending.returncode, 3)
         self.assertEqual(pending.stdout, '')
         self.assertIn('applied migration history is not an ordered prefix', pending.stderr)
+
+    def test_online_apply_refuses_search_path_drift_before_ledger_insert(self):
+        result = self.migrate_online_with('\nSET LOCAL search_path TO pg_catalog;\n', ok=False)
+        self.assertIn('migration changed schema or search_path', result.stderr)
+        self.assertEqual(self.ledger(), ['0001', '0002'])
+
+    def test_verify_requires_every_shipped_version_applied(self):
+        self.migrate('--to', '0002')
+        result = self.migrate('--verify', ok=False)
+        self.assertIn('not all requested migrations have been applied', result.stderr)
+
+    def test_verify_requires_columns_created_in_post_cutover_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_sample.sql', 'CREATE TABLE sample (id bigint, required text);',
+                          'CREATE TABLE sample (id INTEGER, required TEXT);')
+            self.migrate(script=script)
+            self.owner_sql('ALTER TABLE sample DROP COLUMN required')
+            result = self.migrate('--verify', script=script, ok=False)
+            self.assertIn('column sample.required', result.stderr)
 
     def test_verify_rejects_inheritance_from_historical_catalogue(self):
         self.migrate()
