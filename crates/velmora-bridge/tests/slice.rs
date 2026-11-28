@@ -3689,7 +3689,7 @@ async fn rows_written_per_extent() {
     // 48, not 46, while `extents_safety` and the two indexes it replaces
     // exist side by side: its entry at the upload and at the start of
     // the release. The drops give both back and three more.
-    // 49 with the scrub's pending index (migration 0029): a released extent
+    // 49 with the scrub's pending index (migration 0005): a released extent
     // has an entry there, written once by the release.
     assert!(
         uncounted.0 <= 49,

@@ -58,8 +58,9 @@ def psql(sql, *, user=None, schema=None, check=True):
 def clone_bridge(tmp, appended=None):
     """Copy what pg-migrate.sh reads, appending SQL to named PG migrations."""
     clone = Path(tmp) / "s3-bridge"
-    for part in ("ops", "pg", "migrations"):
-        shutil.copytree(BRIDGE / part, clone / part)
+    for part in ("ops", "pg", "migrations", "migrations-local"):
+        if (BRIDGE / part).is_dir():
+            shutil.copytree(BRIDGE / part, clone / part)
     for name, sql in (appended or {}).items():
         migration = clone / "pg" / name
         migration.write_text(migration.read_text() + sql)
@@ -163,6 +164,54 @@ class MigrationParser(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("0001_baseline_pre.sql: one-message batch is", result.stderr)
         self.assertIn("128 KiB", result.stderr)
+
+
+class SqliteTwins(unittest.TestCase):
+    """Post-cutover stages and their SQLite twins (offline)."""
+
+    def check(self, change):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            change(script.parents[1])
+            return subprocess.run(["bash", str(script), "--check-migrations"],
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_the_shipped_twins_are_each_declared_once(self):
+        result = self.check(lambda bridge: None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        twins = len(list((BRIDGE / "migrations-local").glob("[0-9][0-9][0-9][0-9]_*.sql")))
+        self.assertIn(f"SQLite twin coverage: {twins} files accounted for", result.stdout)
+
+    def test_a_twin_no_stage_declares_fails(self):
+        def add(bridge):
+            (bridge / "migrations-local" / "0099_orphan.sql").write_text("CREATE TABLE orphan (id INTEGER);\n")
+        result = self.check(add)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SQLite twins without a PostgreSQL stage: 0099_orphan.sql", result.stderr)
+
+    def test_a_changed_twin_fails(self):
+        def change(bridge):
+            twin = sorted((bridge / "migrations-local").glob("*.sql"))[0]
+            twin.write_text(twin.read_text() + "-- changed\n")
+        result = self.check(change)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SQLite twin fingerprint changed or is missing", result.stderr)
+
+    def test_a_twin_has_the_version_of_its_stage(self):
+        def renumber(bridge):
+            twin = sorted((bridge / "migrations-local").glob("*.sql"))[0]
+            stage = bridge / "pg" / twin.name
+            moved = bridge / "pg" / f"0099{stage.name[4:]}"
+            stage.rename(moved)
+        result = self.check(renumber)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("a SQLite twin has the version of its PostgreSQL stage", result.stderr)
+
+    def test_no_new_d1_migration_after_the_cutover(self):
+        # The frozen D1 takes no schema change: the last D1 file is the one
+        # the cutover baseline covers.
+        self.assertEqual(max(f.name[:4] for f in (BRIDGE / "migrations").glob("[0-9][0-9][0-9][0-9]_*.sql")),
+                         "0027")
 
 
 @unittest.skipUnless(os.environ.get("VELMORA_TEST_PG_MIGRATE") == "1",

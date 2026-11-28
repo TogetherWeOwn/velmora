@@ -115,6 +115,15 @@ Postgres manifest against a replay of all shipped D1 migrations in memory;
 update the comparison explicitly for any future intentional engine difference
 (`STATEMENT_TRIGGERS` in `ops/pg-migrate.sh` is one).
 
+After the cutover the D1 catalogue is frozen: a schema change ships as a
+PostgreSQL stage numbered after the baseline (`0003`) and a SQLite twin of the
+same version in `../migrations-local/`, which local development and the tests
+apply and the frozen D1 never takes. The stage declares it with
+`-- velmora: sqlite-twin <twin filename> <sha256 of raw twin file>`; every twin
+must be declared exactly once, by the stage of its version. `--verify` replays
+the D1 migrations and then the twins. Such changes are additive only: no
+`DROP`, `RENAME`, column type change, or `NOT NULL` without a `DEFAULT`.
+
 The only baseline structural differences from D1 are PostgreSQL's mapped
 column types and non-null PKs, the three identities, the `yenc_name` regex,
 `tx_guard_ok`, documented index keys/null ordering, the translated

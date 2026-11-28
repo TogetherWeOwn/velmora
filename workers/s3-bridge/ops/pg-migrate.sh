@@ -18,6 +18,9 @@ import time
 
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
+# Schema changes after the cutover: PostgreSQL stages with a SQLite twin of the
+# same version, for local development and tests. The frozen D1 never takes them.
+LOCAL = PG.parent / 'migrations-local'
 W1 = 7413000001
 MIGRATOR = 7413000002
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
@@ -98,8 +101,9 @@ def sql_files(root):
     return result
 
 
-def coverage(files, d1):
+def coverage(files, d1, local):
     covered = set()
+    local_covered = set()
     for name, body in files.values():
         for selection, expected in re.findall(
             rb'^-- velmora: d1-baseline ([0-9,-]+) ([0-9a-f]{64})$', body, re.M
@@ -128,12 +132,27 @@ def coverage(files, d1):
             if version in covered:
                 die(f'duplicate D1 coverage: {version}')
             covered.add(version)
+        for source, expected in re.findall(
+            rb'^-- velmora: sqlite-twin ([0-9]{4}_[a-z0-9_]+\.sql) ([0-9a-f]{64})$', body, re.M
+        ):
+            version = source[:4].decode()
+            if version != name[:4]:
+                die(f'a SQLite twin has the version of its PostgreSQL stage ({name})')
+            if version not in local or (local[version][0], digest(local[version][1])) != (source.decode(), expected.decode()):
+                die(f'SQLite twin fingerprint changed or is missing ({name})')
+            if version in local_covered:
+                die(f'duplicate SQLite twin coverage: {version}')
+            local_covered.add(version)
     missing = d1.keys() - covered
     if missing:
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
+    missing = local.keys() - local_covered
+    if missing:
+        die('SQLite twins without a PostgreSQL stage: ' + ', '.join(local[v][0] for v in sorted(missing)))
     if not covered:
         die('no D1 migration coverage found')
     print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
+    print(f'SQLite twin coverage: {len(local_covered)} files accounted for', flush=True)
 
 
 def lock_key(raw, setting):
@@ -561,6 +580,9 @@ def main():
     args = p.parse_args(sys.argv[2:])
     files = sql_files(PG)
     d1 = sql_files(D1)
+    local = sql_files(LOCAL) if LOCAL.is_dir() else {}
+    # The schema PostgreSQL must match: every D1 migration, then every twin.
+    sqlite_schema = {**{f'd1/{v}': f for v, f in d1.items()}, **{f'local/{v}': f for v, f in local.items()}}
     migrations = {}
     for version, (name, body) in files.items():
         sql = body.decode()
@@ -571,14 +593,14 @@ def main():
     if args.check_migrations:
         if args.env_file or args.activate or args.import_mode:
             p.error('--check-migrations does not take a connection file or other flags')
-        coverage(files, d1)
+        coverage(files, d1, local)
         return
     if not args.env_file or ((args.verify or args.test) and (args.activate or args.import_mode)):
         p.error('provide a connection file; --verify and --test do not change migration or activation state')
     target = max(files) if args.to is None else args.to
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
-    coverage(files, d1)
+    coverage(files, d1, local)
     env, schema, lock, migration_lock = connection(args.env_file)
     print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
     prefix = f'''SET search_path TO "{schema}", pg_temp;
@@ -667,7 +689,7 @@ SET LOCAL client_min_messages = error;
     # psql 14 still works, and the session prefix sets standard_conforming_strings
     # before the server parses check_schema.sql.
     if args.verify:
-        compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
+        compare(json.loads(run(verify_sql, report='schema verification')), sqlite_schema, migrations)
         return
     if args.test:
         test_triggers(run, begin, history, complete, d1)
@@ -766,7 +788,7 @@ $$;
             die(f'{name}: no migration status returned')
         print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
-        compare(json.loads(run(verify_sql, report='pre-activation verification')), d1, migrations)
+        compare(json.loads(run(verify_sql, report='pre-activation verification')), sqlite_schema, migrations)
         run(online_migrator_session + begin + transactional_prefix + online_limits_sql + history + complete
             + check(f'{MARKER} IS NOT NULL', 'VL016')
             + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True,
