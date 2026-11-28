@@ -1057,21 +1057,28 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             blocker.stdin.close()
             blocker.wait(timeout=30)
 
-    def reuse_lock_timeout(self, mode, message):
+    def reuse_lock_timeout(self, mode, message, *, replace=()):
         with tempfile.TemporaryDirectory() as tmp:
             script, args = self.reuse_setup(tmp, REUSE_ONLY, mode=mode)
-            # The 30 s production wait, shortened to 1 s for the test.
-            env, log = self.hooked(tmp, replace=[["SET LOCAL lock_timeout = '30s'", "SET LOCAL lock_timeout = '1s'"]])
+            env, log = self.hooked(tmp, replace=list(replace))
             result = self.held_reused_table(script, args, env)
-            self.assertIn("seen SET LOCAL lock_timeout = '30s'", log.read_text())
+            for old, _ in replace:
+                self.assertIn(f'seen {old}', log.read_text())
             self.assert_refused_without_ledger_row(result, script, message)
             self.assertIn('0005_kofra_indexes.sql: applied', self.migrate(*args, script=script).stdout)
 
+    # With app access, the real timeouts: the lock wait ends inside the 3 s
+    # statement and transaction budgets, so the refusal is the mismatch.
     def test_concurrent_reuse_lock_timeout_writes_no_ledger_row(self):
         self.reuse_lock_timeout('concurrent', CONCURRENT_MISMATCH)
 
     def test_online_reuse_lock_timeout_writes_no_ledger_row(self):
         self.reuse_lock_timeout('online', ORDINARY_MISMATCH)
+
+    def test_import_reuse_lock_timeout_writes_no_ledger_row(self):
+        # Without app access the wait is 30 s, shortened to 1 s for the test.
+        self.reuse_lock_timeout('import', ORDINARY_MISMATCH,
+                                replace=[["SET LOCAL lock_timeout = '30s'", "SET LOCAL lock_timeout = '1s'"]])
 
     def test_same_name_index_created_after_snapshot_is_refused_at_the_fence(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -875,7 +875,10 @@ SET {scope}client_min_messages = error;
         if not reused:
             return ''
         tables = ', '.join(f'"{schema}"."{table}"' for table in sorted({table for table, *_ in reused}))
-        lock = f'LOCK TABLE ONLY {tables} IN SHARE UPDATE EXCLUSIVE MODE;'
+        # With app access the 3 s online statement budget applies: wait less,
+        # so a held table is reported as the mismatch, not as a budget overrun.
+        lock = (f"IF {usage} THEN SET LOCAL lock_timeout = '2s'; END IF; "
+                f'LOCK TABLE ONLY {tables} IN SHARE UPDATE EXCLUSIVE MODE;')
         if online:
             lock = f'IF {APPLY} THEN {lock} END IF;'
         # A digest keeps the deparse text out of the size-capped arguments.
