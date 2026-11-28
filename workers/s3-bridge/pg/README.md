@@ -1,9 +1,9 @@
 # PostgreSQL catalogue schema
 
-The Postgres catalogue is opt-in. These files do not change the running D1
-catalogue or select a Worker backend. Apply them from a host with Python 3
-(with SQLite support) and `psql`, connecting directly rather than through a
-transaction pooler.
+The Worker uses the configured catalogue backend. These files apply only to
+PostgreSQL and do not select a Worker backend or change D1. Run the migration
+tool from a host with Python 3.11 or newer (with SQLite support) and `psql`.
+Connect directly rather than through a transaction pooler.
 
 ## Roles and connection file
 
@@ -80,7 +80,9 @@ DDL; it is not the import activation procedure.
 
 Each numbered PostgreSQL file is applied once and recorded with its SHA-256.
 Do not edit an applied migration. Ordinary files are atomic; leave transaction
-control and psql metacommands to the runner. Use dollar-quoted routine bodies
+control and psql metacommands to the runner. Numbered PostgreSQL migrations
+allow only printable ASCII, tabs, and LF line endings, with no backslashes
+or unquoted psql variable references. Use dollar-quoted routine bodies
 and unqualified catalogue object names so the same DDL works in each target
 schema. A `55P03` lock timeout retries up to five times after the initial
 attempt, with backoff. A statement or transaction budget expiry is not retried.
@@ -97,30 +99,67 @@ count against the budget; this needs psql 15 or newer and a batch under
 
 A file whose first line is `-- velmora: no-transaction` may contain only
 idempotent `CREATE [UNIQUE] INDEX CONCURRENTLY IF NOT EXISTS` statements.
+Each statement travels through a separate SQL `psql -c` argument in the same
+session, not through the psql command interpreter on stdin. Concurrent SQL
+requires the exact first-line directive. Each argument must be under 128 KiB;
+concurrent commands also have a 256 KiB aggregate SQL argument limit.
+`--check-migrations` rejects oversized concurrent SQL without connecting.
 Only the migrator session lock is held through the index statements; short
 precheck and ledger transactions use W1. A competing migrator retries the
 session lock without waiting in PostgreSQL with a snapshot. A failed
 concurrent index build can leave an invalid index (including after a lock
 timeout). The tool refuses
-to record the file or skip the invalid index on retry. Inspect and repair the
-index before rerunning.
+to record the file or skip the invalid index on retry. Before reusing an
+existing index in a pending migration, the runner compares its PostgreSQL
+definition to the reviewed SQL, not just its name and validity. If the
+normalization cannot establish a match, inspect and reconcile the index
+before retrying.
 
-`ops/pg-migrate.sh --check-migrations` is offline. The baseline marker covers
-exact historical D1 versions (not gaps). Its fingerprint is the SHA-256 of
-lines `<filename> <sha256 of raw file>\n` sorted by migration filename. A
-later Postgres translation declares each corresponding D1 file using a comment
-`-- velmora: d1-twin <D1 filename> <sha256 of raw D1 file>`. Missing coverage,
-renamed files and byte changes fail the gate. `--verify` also compares the live
-Postgres manifest against a replay of all shipped D1 migrations in memory;
-update the comparison explicitly for any future intentional engine difference
-(`STATEMENT_TRIGGERS` in `ops/pg-migrate.sh` is one).
+`ops/pg-migrate.sh --check-migrations` is offline. The D1 migration set is
+frozen at the PostgreSQL cutover baseline (`0003`); do not add D1 migrations
+for new PostgreSQL changes. The historical baseline marker fingerprints the
+exact D1 files as `<filename> <sha256 of raw file>\n`, sorted by filename.
+Missing coverage, renamed files and byte changes fail the gate.
 
-The only baseline structural differences from D1 are PostgreSQL's mapped
-column types and non-null PKs, the three identities, the `yenc_name` regex,
-`tx_guard_ok`, documented index keys/null ordering, the translated
-trigger functions, and the statement-level usage triggers (0003). Source PKs that were nullable in SQLite require a copy
-census. The verifier ignores only the migration ledger and import-marker
-tables as host-tool metadata.
+For each new PostgreSQL migration, put a SQLite test twin with the same
+four-digit version in `migrations-local/`. The runner replays these twins in
+memory and checks that they add the same tables, indexes and explicit column
+additions; they are not Wrangler migrations. If a feature needs the new SQL in
+Rust contract tests, update the relevant `testkit.rs` and `testkit_pg.rs`
+fixture lists in the same feature PR. A pre-merge change must be safe with
+old code still running. The post-cutover SQL allowlist is:
+
+- Create a new named table or index. Table constraints must refer only to
+  new tables. A historical table permits only non-unique indexes with plain
+  column keys; a partial predicate may combine column-to-literal comparisons
+  and `IS [NOT] NULL` with `AND` or `OR`. Declared table columns and names are
+  checked against the SQLite replay and live manifest.
+- Add a new nullable column, or a new `NOT NULL` column with a non-null
+  literal default. No other `ALTER` is allowed.
+- Seed a post-cutover table with `INSERT ... VALUES` containing only literals.
+  `INSERT ... SELECT`, `UPDATE`, and `DELETE` are refused.
+
+Defaults and check/index expressions accept only the supported literal,
+operator, and built-in cast syntax and the functions `now`, `lower`, `length`,
+and `coalesce`. `now` is not allowed in indexes. `least` and `greatest` are
+also allowed in index keys and checks on post-cutover tables. Escape strings and Unicode escape syntax are
+not allowed. Any other form needs review before it can be used.
+
+`ops/pg-migrate.sh "$CONNECTION_FILE" --pending` reads the SHA-256-checked
+ledger without taking either writer lock or changing the database. It prints
+one pending migration filename per line in version order and exits 3 if the
+list is nonempty, or 0 with no output if everything is applied. Missing or
+inconsistent ledger history is an error. Before deploying code that needs
+new objects, apply the reviewed migration and run `--verify`. Verification
+checks every ledger entry, checks for the declared PostgreSQL-only objects,
+and compares the historical schema to the frozen D1 replay. It still checks
+schema ownership and grants.
+
+The historical structural differences from D1 are PostgreSQL's mapped column
+types and non-null PKs, the three identities, the `yenc_name` regex,
+`tx_guard_ok`, documented index keys/null ordering, the translated trigger
+functions, and the statement-level usage triggers (`0003`). Source PKs that
+were nullable in SQLite require a copy census.
 
 ## Usage counters
 

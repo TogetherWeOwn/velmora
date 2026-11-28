@@ -521,6 +521,9 @@ jobs:
       - name: Test the production config generator
         working-directory: workers/s3-bridge
         run: python3 -I tools/test_deploy_config.py
+      - name: Test the production D1 migration guard
+        working-directory: workers/s3-bridge
+        run: python3 -I tools/test_deploy_d1_guard.py
       - name: Install pinned wrangler (npm ci)
         working-directory: workers/s3-bridge
         run: npm ci --ignore-scripts --no-audit --no-fund
@@ -780,9 +783,10 @@ jobs:
   # and account id reach only the wrangler steps that call the API, through
   # env, never argv. Worker secrets are never read, written or listed.
   #
-  # D1 migrations must be additive-only (expand, then contract in a later
-  # release): they run before the new version goes live, and a rollback
+  # Only writable D1 deployments apply remote D1 migrations. Those must be
+  # additive-only: they run before the new version goes live, and a rollback
   # restores the previous Worker version but never reverts a migration.
+  # PostgreSQL and both frozen modes require the fixed cutover D1 tree.
   deploy-build:
     name: deploy build (s3-bridge bundle)
     needs: [changes]
@@ -1197,6 +1201,21 @@ jobs:
           class_list = f" ({','.join(classes)})" if classes else ""
           print(f"extra S3 hosts in the generated config: {len(classes)}{class_list}")
           PY
+      # Check the same top-level config that all Wrangler calls below use.
+      # Never set a Worker secret named CATALOG_BACKEND. Production requires
+      # an explicit backend; a missing binding must not select writable D1.
+      - id: d1-migrations
+        name: Check the D1 migration policy
+        if: steps.fresh.outputs.fresh == 'true'
+        working-directory: workers/s3-bridge
+        env:
+          # These pins change only if the owner explicitly unfreezes D1.
+          D1_FROZEN_AT: "c7b955e9f25e2f43d3d17649af09358c56ba942e"
+          D1_FROZEN_MANIFEST_SHA256: "bdc4d8a34cb2ba04d931139259d07cc1bad32438018e866e11af0bb46c7b762b"
+        run: |
+          set -euo pipefail
+          apply=$(python3 -I tools/deploy_d1_guard.py wrangler.deploy.toml "$D1_FROZEN_AT" "$D1_FROZEN_MANIFEST_SHA256")
+          echo "apply=${apply}" >> "$GITHUB_OUTPUT"
       # The version serving 100% of traffic now, the rollback target. A
       # Worker that does not exist yet (first deploy) has none; any other
       # failure, or a split (gradual) deployment, stops the deploy.
@@ -1211,7 +1230,7 @@ jobs:
           set -euo pipefail
           out="${RUNNER_TEMP}/deployments-before.json"
           err="${RUNNER_TEMP}/deployments-before.err"
-          if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out" 2> "$err"; then
+          if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml --env="" > "$out" 2> "$err"; then
             version=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
             if ! [[ "$version" =~ ^[0-9a-f-]{36}$ ]]; then
               echo "active deployment is not a single version at 100%; refusing to deploy"
@@ -1226,12 +1245,12 @@ jobs:
             exit 1
           fi
       - name: Apply D1 migrations (remote)
-        if: steps.fresh.outputs.fresh == 'true'
+        if: steps.fresh.outputs.fresh == 'true' && steps.d1-migrations.outputs.apply == 'true'
         working-directory: workers/s3-bridge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: ./node_modules/.bin/wrangler d1 migrations apply velmora-catalog --remote -c wrangler.deploy.toml
+        run: ./node_modules/.bin/wrangler d1 migrations apply CATALOG --remote -c wrangler.deploy.toml --env=""
       - id: deploy
         name: Deploy the Worker
         if: steps.fresh.outputs.fresh == 'true'
@@ -1243,7 +1262,7 @@ jobs:
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
         # The version message identifies this run's version even when
         # wrangler fails before writing its deploy output entry.
-        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml --message "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}"
+        run: ./node_modules/.bin/wrangler deploy -c wrangler.deploy.toml --env="" --message "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}"
       # An unsigned GET must be refused with 403 and an S3 AccessDenied
       # body. Retries cover the propagation window right after deploy.
       - id: smoke
@@ -1307,7 +1326,7 @@ jobs:
           out="${RUNNER_TEMP}/deployments-after.json"
           active=""
           for _ in 1 2 3; do
-            if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml > "$out"; then
+            if ./node_modules/.bin/wrangler deployments status --json -c wrangler.deploy.toml --env="" > "$out"; then
               active=$(jq -r 'if (.versions | length) == 1 and .versions[0].percentage == 100 then .versions[0].version_id else empty end' "$out")
               break
             fi
@@ -1323,7 +1342,7 @@ jobs:
           # version only if its message is exactly this run's.
           if [ -z "$deployed" ] && [ -n "$active" ]; then
             message=""
-            if ./node_modules/.bin/wrangler versions view "$active" --json -c wrangler.deploy.toml > "${RUNNER_TEMP}/active-version.json"; then
+            if ./node_modules/.bin/wrangler versions view "$active" --json -c wrangler.deploy.toml --env="" > "${RUNNER_TEMP}/active-version.json"; then
               message=$(jq -r '.annotations["workers/message"] // empty' "${RUNNER_TEMP}/active-version.json")
             fi
             if [ "$message" = "ci ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA}" ]; then
@@ -1341,7 +1360,7 @@ jobs:
           fi
           # active is this run's version, or could not be read after a
           # deploy this run made: restore the recorded version.
-          ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml \
+          ./node_modules/.bin/wrangler rollback "$PREV_VERSION" -c wrangler.deploy.toml --env="" \
             --message "automatic rollback: deploy job failed or was cancelled" -y
           echo "Deploy failed or was cancelled; rolled back from \`${deployed}\` to Worker version \`${PREV_VERSION}\`." >> "$GITHUB_STEP_SUMMARY"
       - name: Record the Worker version id

@@ -18,8 +18,15 @@ import time
 
 PG = Path(sys.argv[1]).resolve().parent.parent / 'pg'
 D1 = PG.parent / 'migrations'
+LOCAL = PG.parent / 'migrations-local'
+# -I excludes the current directory; import only from the runner's own directory.
+sys.path.insert(0, str(PG.parent / 'ops'))
+from pg_catalog import CUTOVER_BASELINE, Failure, lint_additive, replay_sqlite_twins, verify_post_cutover
+
 W1 = 7413000001
 MIGRATOR = 7413000002
+PSQL_ARGUMENT_LIMIT = 128 * 1024  # Linux MAX_ARG_STRLEN includes the terminating NUL.
+PSQL_CONCURRENT_ARGUMENTS_LIMIT = 256 * 1024
 DATA_ENV = {'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD',
             'PGSSLMODE', 'PGSSLROOTCERT', 'PGCONNECT_TIMEOUT'}
 ERRORS = {
@@ -32,6 +39,10 @@ ERRORS = {
     'VL016': 'activation refused while the import marker exists',
     'VL017': 'not all requested migrations have been applied',
     'VL018': 'a migration statement changed the runner apply decision; the migration was rolled back',
+    'VL021': 'existing concurrent index definition does not match the migration',
+    'VL022': 'existing index definition does not match the migration',
+    'VL023': 'index table busy; retry later',
+    'VLM01': 'migration changed schema or search_path',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
     '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
 }
@@ -53,27 +64,22 @@ STATEMENT_TRIGGERS = {
     'usage_outbox_failure': (KEEP_COLUMNS, None, None),
     'usage_outbox_stage': ((), 'old_rows', 'new_rows'),
 }
-MARKER = "to_regclass(format('%I._velmora_import_incomplete', current_schema()))"
-USAGE = "has_schema_privilege('kofra_app', current_schema(), 'USAGE')"
-SEEDS = '(SELECT count(*) FROM usage_global WHERE id IN (1, 2)) = 2'
-BAD_INDEX = '''EXISTS (SELECT FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-    WHERE c.relnamespace = to_regnamespace(current_schema()) AND NOT (i.indisvalid AND i.indisready))'''
-LEDGER = '''CREATE TABLE schema_migrations (
-    version TEXT COLLATE "C" PRIMARY KEY,
-    sha256 TEXT COLLATE "C" NOT NULL,
+LEDGER = '''CREATE TABLE {ledger} (
+    version TEXT COLLATE pg_catalog."C" PRIMARY KEY,
+    sha256 TEXT COLLATE pg_catalog."C" NOT NULL,
     applied_at BIGINT NOT NULL
 );
-REVOKE ALL ON TABLE schema_migrations FROM kofra_app;'''
+REVOKE ALL ON TABLE {ledger} FROM kofra_app;'''
 RESTART_IDENTITIES = '''
 DO $$
 DECLARE next_id bigint;
 BEGIN
-    SELECT greatest(coalesce(max(id), 0) + 1, 1) INTO next_id FROM gc;
-    EXECUTE format('ALTER TABLE gc ALTER COLUMN id RESTART WITH %s', next_id);
-    SELECT greatest(coalesce(max(id), 0) + 1, 1) INTO next_id FROM usage_recounts;
-    EXECUTE format('ALTER TABLE usage_recounts ALTER COLUMN id RESTART WITH %s', next_id);
-    SELECT greatest(coalesce(max(seq), 0) + 1, 1) INTO next_id FROM outbox;
-    EXECUTE format('ALTER TABLE outbox ALTER COLUMN seq RESTART WITH %s', next_id);
+    SELECT greatest(coalesce(pg_catalog.max(id), 0) + 1, 1) INTO next_id FROM "{schema}".gc;
+    EXECUTE pg_catalog.format('ALTER TABLE "{schema}".gc ALTER COLUMN id RESTART WITH %s', next_id);
+    SELECT greatest(coalesce(pg_catalog.max(id), 0) + 1, 1) INTO next_id FROM "{schema}".usage_recounts;
+    EXECUTE pg_catalog.format('ALTER TABLE "{schema}".usage_recounts ALTER COLUMN id RESTART WITH %s', next_id);
+    SELECT greatest(coalesce(pg_catalog.max(seq), 0) + 1, 1) INTO next_id FROM "{schema}".outbox;
+    EXECUTE pg_catalog.format('ALTER TABLE "{schema}".outbox ALTER COLUMN seq RESTART WITH %s', next_id);
 END;
 $$;
 '''
@@ -81,6 +87,15 @@ $$;
 
 def die(message):
     raise SystemExit(f'pg-migrate: {message}')
+
+
+# Lock timeouts. VL023 is the index-table lock in the ledger transaction,
+# kept apart so its final message is not a generic lock timeout.
+BUSY = {'55P03', 'VL023'}
+
+
+class Busy(Exception):
+    pass
 
 
 def digest(data):
@@ -98,7 +113,7 @@ def sql_files(root):
     return result
 
 
-def coverage(files, d1):
+def coverage(files, d1, *, quiet=False):
     covered = set()
     for name, body in files.values():
         for selection, expected in re.findall(
@@ -133,7 +148,8 @@ def coverage(files, d1):
         die('D1 migrations without a PostgreSQL translation: ' + ', '.join(d1[v][0] for v in sorted(missing)))
     if not covered:
         die('no D1 migration coverage found')
-    print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
+    if not quiet:
+        print(f'D1 migration coverage: {len(covered)} files accounted for', flush=True)
 
 
 def lock_key(raw, setting):
@@ -203,8 +219,8 @@ def pg_literal(text):
 
 # Set exactly once per online batch, under the locks, before any guarded
 # statement; current_setting without missing_ok fails closed if it is absent.
-APPLY = "current_setting('velmora.migration_apply') = 'on'"
-SKIP = "current_setting('velmora.migration_apply') = 'off'"
+APPLY = "pg_catalog.current_setting('velmora.migration_apply') OPERATOR(pg_catalog.=) 'on'"
+SKIP = "pg_catalog.current_setting('velmora.migration_apply') OPERATOR(pg_catalog.=) 'off'"
 
 
 def guarded(body):
@@ -225,13 +241,18 @@ def execute_migration(source_statements):
     return ''.join(guarded(f'EXECUTE {pg_literal(statement)};') for statement in source_statements)
 
 
+# Only identifiers consume `$` as a continuation character. After a number
+# or a positional parameter, lex `$tag$` as a dollar-quote opener instead.
 SQL_TOKEN = re.compile(r'''\s+|--[^\n]*|/\*|\$(?:[A-Za-z_]\w*)?\$|
     [eE]'(?:\\.|''|[^'\\])*'|'(?:''|[^'])*'|"(?:""|[^"])*"|
-    [\w$]+|::|<>|!=|>=|<=|!~|.''', re.X | re.S)
+    \$[0-9]+|(?:[0-9]+(?:\.(?!\.)[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|
+    [A-Za-z_][\w$]*|::|<>|!=|>=|<=|!~|.''', re.X | re.S | re.ASCII)
 
 
-def sql_tokens_with_spans(sql):
+def sql_tokens_with_spans(sql, *, ascii_only=True):
     """Keep literals and dollar bodies intact; omit comments with source spans."""
+    if ascii_only and not sql.isascii():
+        raise ValueError('non-ASCII SQL cannot be tokenized')
     i = 0
     while i < len(sql):
         start = i
@@ -263,15 +284,38 @@ def sql_tokens_with_spans(sql):
 
 
 def sql_tokens(sql):
-    for token, _, _ in sql_tokens_with_spans(sql):
+    # Read-only schema comparison also consumes historical SQLite metadata.
+    # It can contain non-ASCII comments and is never sent to psql.
+    for token, _, _ in sql_tokens_with_spans(sql, ascii_only=False):
         yield token
 
 
-def lint_migration(sql, no_tx, name):
+def concurrent_index_head(tokens):
+    head = [t.upper() for t in tokens[:4]]
+    if head[:3] == ['CREATE', 'INDEX', 'CONCURRENTLY']:
+        return 3
+    if head == ['CREATE', 'UNIQUE', 'INDEX', 'CONCURRENTLY']:
+        return 4
+    return None
+
+
+def check_concurrent_arguments(commands, name):
+    # Each SQL string and its -c flag contribute their terminating NUL.
+    if sum(len(command.encode('utf-8')) + 4 for command in commands) > PSQL_CONCURRENT_ARGUMENTS_LIMIT:
+        die(f'{name}: concurrent psql -c arguments exceed the 256 KiB aggregate limit')
+
+
+def lint_migration(sql, no_tx, name, *, additive_objects=None):
     statements, source_statements, pending = [], [], []
     segment_start = 0
     try:
-        for token, _, end in sql_tokens_with_spans(sql):
+        for token, start, end in sql_tokens_with_spans(sql):
+            # Import mode has runner-owned psql commands on stdin. Candidate
+            # SQL may not expand client variables. The :: cast is one token;
+            # comments, strings and dollar bodies never yield a colon token.
+            if token == ':' and re.match(r'''[A-Za-z0-9_'"]|\{\?''', sql[end:end + 2]):
+                line = sql.count('\n', 0, start) + 1
+                die(f'{name}:{line}: psql variable substitution is not allowed')
             if token == ';':
                 if pending:
                     statements.append(pending)
@@ -284,6 +328,14 @@ def lint_migration(sql, no_tx, name):
         die(f'{name}: {e}')
     if pending or not statements:
         die(f'{name}: migration must contain terminated SQL statements')
+    if no_tx:
+        if any(len(command) >= PSQL_ARGUMENT_LIMIT for command in source_statements):
+            die(f'{name}: concurrent statement exceeds the psql -c argument limit (must be under 128 KiB)')
+        check_concurrent_arguments(source_statements, name)
+    if additive_objects is not None:
+        if not no_tx and any(concurrent_index_head(statement) is not None for statement in statements):
+            die(f'{name}: CREATE INDEX CONCURRENTLY requires the exact first-line -- velmora: no-transaction header')
+        lint_additive(sql, source_statements, sql_tokens_with_spans, name, additive_objects)
     for statement in statements:
         # Comments are already gone; literals, bodies and (quoted) names remain.
         # Token boundaries stay spaces, so "velmora.migration_ apply" is not a match.
@@ -303,6 +355,74 @@ def lint_migration(sql, no_tx, name):
             if head[:6] != ['CREATE', 'INDEX', 'CONCURRENTLY', 'IF', 'NOT', 'EXISTS']:
                 die(f'{name}: only CREATE INDEX CONCURRENTLY IF NOT EXISTS is allowed')
     return statements, source_statements
+
+
+def index_identifier(token):
+    if re.fullmatch(r'"[a-z_][a-z0-9_]{0,62}"', token):
+        return token[1:-1]
+    if re.fullmatch(r'[a-z_][a-z0-9_]{0,62}', token):
+        return token
+    raise ValueError('expected an unqualified index or table identifier')
+
+
+def index_definition(tokens, schema, *, source=False):
+    """Compare deparse syntax, not just keys or names. Do not erase casts,
+    literal syntax, collation, operator classes, ordering, or inner grouping."""
+    tokens = [t.lower() if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9$]*', t) else t for t in tokens]
+    unique = tokens[:2] == ['create', 'unique']
+    head = ['create', 'unique', 'index'] if unique else ['create', 'index']
+    if source:
+        if tokens[len(head):len(head) + 1] == ['concurrently']:
+            head += ['concurrently']
+        head += ['if', 'not', 'exists']
+    if tokens[:len(head)] != head:
+        raise ValueError('unexpected index command')
+    name, on, *target = tokens[len(head):]
+    if on != 'on':
+        raise ValueError('expected an index target')
+    if not source:
+        qualifier, dot, *target = target
+        if dot != '.' or index_identifier(qualifier) != schema:
+            raise ValueError('unexpected index target schema')
+    table, *tail = target
+    if source and tail[:1] == ['(']:
+        tail[:0] = ['using', 'btree']
+    if tail[:1] != ['using']:
+        raise ValueError('expected an index access method and keys')
+    # pg_get_indexdef can wrap the entire WHERE expression in one pair of
+    # parentheses. Remove one outer pair only, never inner grouping.
+    depth = 0
+    for i, token in enumerate(tail):
+        if token == 'where' and depth == 0 and tail[i + 1:i + 2] == ['(']:
+            depth = 0
+            for j in range(i + 1, len(tail)):
+                depth += (tail[j] == '(') - (tail[j] == ')')
+                if depth == 0:
+                    if j == len(tail) - 1:
+                        tail = tail[:i + 1] + tail[i + 2:j]
+                    break
+            break
+        depth += (token == '(') - (token == ')')
+    return index_identifier(name), unique, index_identifier(table), tuple(tail)
+
+
+def index_guard_position(tokens):
+    words = [token.upper() for token in tokens[:7]]
+    pos = concurrent_index_head(words)
+    if pos is None and words[:3] == ['CREATE', 'UNIQUE', 'INDEX']:
+        pos = 3
+    if pos is None and words[:2] == ['CREATE', 'INDEX']:
+        pos = 2
+    if pos is not None and words[pos:pos + 3] == ['IF', 'NOT', 'EXISTS']:
+        return pos
+    return None
+
+
+def require_new_index(source, pos):
+    # For observed absence, never let a relation that appears after prepare
+    # turn CREATE INDEX into a silent no-op. Remove only IF NOT EXISTS.
+    spans = list(sql_tokens_with_spans(source))
+    return source[:spans[pos][1]] + source[spans[pos + 2][2]:]
 
 
 def predicate(text):
@@ -532,11 +652,16 @@ def test_triggers(run, begin, history, complete, d1):
 
 
 def main():
-    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --verify | --test] '
-                                     '[--import-mode | --activate], or %(prog)s --check-migrations')
+    p = argparse.ArgumentParser(prog='pg-migrate.sh', usage='%(prog)s ENV-FILE [--to NNNN | --pending | --verify | --test] '
+                                     '[--import-mode | --activate], or %(prog)s --check-migrations',
+        epilog='If a pending concurrent index is refused, inspect its pg_catalog.pg_get_indexdef output. '
+               'A PostgreSQL rewrite of an otherwise matching definition may be refused. '
+               'After review, use DROP INDEX CONCURRENTLY on the pending index only, in a controlled rebuild, '
+               'then rerun the migration. Never drop an index created by an applied migration or edit the migration ledger by hand.')
     p.add_argument('env_file', nargs='?')
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--to')
+    mode.add_argument('--pending', action='store_true')
     mode.add_argument('--verify', action='store_true')
     mode.add_argument('--test', action='store_true')
     mode.add_argument('--check-migrations', action='store_true')
@@ -546,44 +671,89 @@ def main():
     args = p.parse_args(sys.argv[2:])
     files = sql_files(PG)
     d1 = sql_files(D1)
-    migrations = {}
+    migrations, declarations = {}, {}
+    post_cutover = {kind: set() for kind in ('tables', 'columns', 'indexes')}
     for version, (name, body) in files.items():
-        sql = body.decode()
+        # Limit all numbered PostgreSQL files before parsing or reading any
+        # connection file. SQLite-only inputs never reach psql.
+        # Only TAB, LF, and printable ASCII other than backslash. In
+        # particular, CR can end a PostgreSQL line comment before LF.
+        bad = re.search(rb'[\x00-\x08\x0b-\x1f\x7f-\xff\\]', body)
+        if bad:
+            kind = {b'\x00': 'NUL byte', b'\\': 'backslash'}.get(
+                bad[0], 'ASCII control byte' if bad[0].isascii() else 'non-ASCII byte')
+            line = body.count(b'\n', 0, bad.start()) + 1
+            die(f'{name}:{line}: {kind} in migration SQL')
+        sql = body.decode('ascii')
         no_tx = sql.splitlines()[:1] == ['-- velmora: no-transaction']
         if no_tx and version in {'0001', '0002'}:
             die('baseline stages must be transactional')
-        migrations[version] = sql, no_tx, lint_migration(sql, no_tx, name)
+        if version > CUTOVER_BASELINE:
+            before = {kind: entries.copy() for kind, entries in post_cutover.items()}
+            parsed = lint_migration(sql, no_tx, name, additive_objects=post_cutover)
+            declarations[version] = name, {kind: entries - before[kind] for kind, entries in post_cutover.items()}
+        else:
+            parsed = lint_migration(sql, no_tx, name)
+        migrations[version] = sql, no_tx, parsed
+    baseline = {v: files[v] for v in files if v <= CUTOVER_BASELINE}
+    coverage(baseline, d1, quiet=args.pending)
+    twins = sql_files(LOCAL)
+    if declarations or twins:
+        replay_sqlite_twins(d1, twins, declarations)
     if args.check_migrations:
         if args.env_file or args.activate or args.import_mode:
             p.error('--check-migrations does not take a connection file or other flags')
-        coverage(files, d1)
         return
-    if not args.env_file or ((args.verify or args.test) and (args.activate or args.import_mode)):
-        p.error('provide a connection file; --verify and --test do not change migration or activation state')
+    if not args.env_file or ((args.pending or args.verify or args.test) and (args.activate or args.import_mode)):
+        p.error('provide a connection file; --pending, --verify and --test do not change migration or activation state')
     target = max(files) if args.to is None else args.to
     if target not in files or (args.activate and target != max(files)):
         p.error('--to must name a shipped version; activation requires the full schema')
-    coverage(files, d1)
     env, schema, lock, migration_lock = connection(args.env_file)
-    print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
-    prefix = f'''SET search_path TO "{schema}", pg_temp;
-SET standard_conforming_strings = on;
-SET client_min_messages = error;
-''' + check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
+    if not args.pending:
+        print(f'Catalogue schema: {schema}; W1 key: {lock}; migrator key: {migration_lock}', flush=True)
+    ledger = f'"{schema}".schema_migrations'
+    usage_global = f'"{schema}".usage_global'
+    namespace = f'''pg_catalog.to_regnamespace('"{schema}"')'''
+    marker = f'''pg_catalog.to_regclass('"{schema}"._velmora_import_incomplete')'''
+    usage = f"pg_catalog.has_schema_privilege('kofra_app', '{schema}', 'USAGE')"
+    seeds = f'(SELECT pg_catalog.count(*) FROM {usage_global} WHERE id IN (1, 2)) = 2'
+    bad_index = f'''EXISTS (SELECT FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+        WHERE c.relnamespace = {namespace} AND NOT (i.indisvalid AND i.indisready))'''
+    setup_check = check(f'''current_user <> 'kofra_migrate' OR session_user <> current_user
+        OR pg_catalog.current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (
+            SELECT FROM pg_catalog.pg_namespace n WHERE n.nspname = '{schema}'
+                AND n.nspowner = current_user::pg_catalog.regrole AND NOT EXISTS (
+                    SELECT FROM pg_catalog.aclexplode(coalesce(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+                    WHERE a.grantee = 0))''', 'VL010')
+    # SET drops redundant identifier quotes. Use the same canonical spelling,
+    # and don't resolve the guard's functions or operators through the new path.
+    path_check = check(f'''(pg_catalog.current_schema() OPERATOR(pg_catalog.=) '{schema}'::pg_catalog.name
+        AND pg_catalog.current_setting('search_path') COLLATE pg_catalog."C" OPERATOR(pg_catalog.=)
+            (pg_catalog.quote_ident('{schema}') OPERATOR(pg_catalog.||) ', pg_temp')) IS NOT TRUE''', 'VLM01')
 
-    transactional_prefix = f'''SET LOCAL search_path TO "{schema}", pg_temp;
-SET LOCAL standard_conforming_strings = on;
-SET LOCAL client_min_messages = error;
-''' + check(f"current_user <> 'kofra_migrate' OR session_user <> current_user OR current_schema() IS DISTINCT FROM '{schema}' OR NOT EXISTS (SELECT FROM pg_namespace n WHERE n.nspname = '{schema}' AND n.nspowner = current_user::regrole AND NOT EXISTS (SELECT FROM aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE a.grantee = 0))", 'VL010')
+    def setup(scope=''):
+        return f'''SET {scope}search_path TO "{schema}", pg_temp;
+SET {scope}standard_conforming_strings = on;
+SET {scope}client_min_messages = error;
+''' + setup_check
+
+    prefix = setup()
+    transactional_prefix = setup('LOCAL ')
 
     one_message_checked = False
 
-    def run(sql, *, retry=False, report=None, one_message=False):
+    def run(sql, *, retry=False, report=None, one_message=False, concurrent=False, busy=False):
         nonlocal one_message_checked
+        messages = (sql,) if one_message else sql if concurrent else ()
+        if concurrent:
+            check_concurrent_arguments(messages, report)
         # Linux rejects one argv string of 128 KiB or more (MAX_ARG_STRLEN, with its NUL).
-        if one_message and len(sql.encode()) >= 128 * 1024:
-            die(f'{report}: one-message batch is {len(sql.encode())} bytes; psql -c takes under 128 KiB, '
-                'so split the migration into smaller files')
+        for message in messages:
+            size = len(message.encode())
+            if size >= PSQL_ARGUMENT_LIMIT:
+                die(f'{report}: one-message batch is {size} bytes; psql -c takes under 128 KiB, '
+                    'so split the migration into smaller files')
         if one_message and not one_message_checked:
             version = subprocess.run(['psql', '--version'], stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, check=False)
@@ -595,8 +765,10 @@ SET LOCAL client_min_messages = error;
             command = ['psql', '-X', '-qAtw', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate']
             kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True,
                       'encoding': 'utf-8', 'errors': 'replace', 'env': env, 'check': False}
-            if one_message:
-                command += ['-c', sql]
+            if messages:
+                for message in messages:
+                    command.extend(('-c', message))
+                kwargs['stdin'] = subprocess.DEVNULL
             else:
                 kwargs['input'] = prefix + sql
             result = subprocess.run(command, **kwargs)
@@ -606,63 +778,198 @@ SET LOCAL client_min_messages = error;
             # The severity word comes from the server's locale even in SQLSTATE mode.
             states = re.findall(r':[^\S\n]+([0-9A-Z]{5})[^\S\n]*$', result.stderr, re.M)
             state = states[-1] if states else None
-            if state == '55P03' and retry and attempt < 5:
-                print(f'{report}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
+            if concurrent and state == 'VL020':
+                return 'already applied'  # Caller independently confirms the ledger row.
+            if state in BUSY and busy:
+                raise Busy(state)  # The caller re-plans before it retries.
+            if state in BUSY and retry and attempt < 5:
+                print(f'{report}: SQLSTATE {state}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                 time.sleep(0.25 * (2 ** attempt))
                 continue
             reason = ERRORS.get(state) or (f'SQLSTATE {state}' if state else 'psql connection or client failure')
             die(f'{report or "database operation"}: {reason}')
 
     # Cast the complete signed literal, including the sign of BIGINT_MIN.
-    begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_advisory_xact_lock('{lock}'::bigint);\n"
+    begin = f"BEGIN;\nSET LOCAL lock_timeout = '3s';\nSELECT pg_catalog.pg_advisory_xact_lock('{lock}'::bigint);\n"
     # Never wait for the migration key with an open snapshot: an in-progress
     # concurrent index build could be waiting for that very snapshot to end.
     migrator_session = ("SET lock_timeout = '3s';\n"
-                        f"SELECT pg_try_advisory_lock('{migration_lock}'::bigint) AS migrator_locked \\gset\n"
+                        f"SELECT pg_catalog.pg_try_advisory_lock('{migration_lock}'::bigint) AS migrator_locked \\gset\n"
                         '\\if :migrator_locked\n\\else\n' + check('true', '55P03') + '\\endif\n')
-    online_limits = f'''SELECT {USAGE} AS online, current_setting('server_version_num')::int >= 170000 AS pg17 \\gset
-\\if :online
-    SET LOCAL statement_timeout = '3s';
-    \\if :pg17
-        SET LOCAL transaction_timeout = '3s';
-    \\endif
-\\endif
-'''
-    ledger_create, ledger_revoke = LEDGER.rstrip().split(';\n', 1)
-    online_migrator_session = ("SET lock_timeout = '3s';\nDO $velmora_migrator$ BEGIN IF NOT pg_try_advisory_lock('" +
+    ledger_sql = LEDGER.format(ledger=ledger)
+    ledger_create, ledger_revoke = ledger_sql.rstrip().split(';\n', 1)
+    online_migrator_session = ("SET lock_timeout = '3s';\nDO $velmora_migrator$ BEGIN IF NOT pg_catalog.pg_try_advisory_lock('" +
                                f"{migration_lock}'::bigint) THEN RAISE EXCEPTION USING ERRCODE = '55P03'; END IF; END $velmora_migrator$;\n")
-    online_limits_sql = ("DO $velmora_limits$ BEGIN IF " + USAGE + " THEN "
+    online_limits_sql = ("DO $velmora_limits$ BEGIN IF " + usage + " THEN "
                          "EXECUTE 'SET LOCAL statement_timeout = ''3s'''; "
-                         "IF current_setting('server_version_num')::int >= 170000 THEN "
+                         "IF pg_catalog.current_setting('server_version_num')::int >= 170000 THEN "
                          "EXECUTE 'SET LOCAL transaction_timeout = ''3s'''; END IF; "
                          "END IF; END $velmora_limits$;\n")
-    migration_tx = begin + ('' if args.import_mode else online_limits)
-    ledger_exists = "to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL"
+    concurrent_tx = begin + ('' if args.import_mode else online_limits_sql)
+    ledger_exists = f"pg_catalog.to_regclass('{ledger}') IS NOT NULL"
     fingerprints = ', '.join(f"('{v}', '{digest(body)}')" for v, (_, body) in files.items())
-    history = check(f'''EXISTS (SELECT FROM schema_migrations m WHERE NOT EXISTS (
+    history = check(f'''EXISTS (SELECT FROM {ledger} m WHERE NOT EXISTS (
         SELECT FROM (VALUES {fingerprints}) shipped(version, sha256)
         WHERE shipped.version = m.version AND shipped.sha256 = m.sha256))''', 'VL011')
-    complete = check(f'(SELECT count(*) FROM schema_migrations) <> {len(files)}', 'VL017')
-    verify_sql = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n'
-                  + transactional_prefix + check(f'NOT ({ledger_exists})', 'VL017') + history + complete
-                  + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n')
-    # Verification has no execution budget, so it keeps the stdin transport:
-    # psql 14 still works, and the session prefix sets standard_conforming_strings
-    # before the server parses check_schema.sql.
+    complete = check(f'(SELECT pg_catalog.count(*) FROM {ledger}) <> {len(files)}', 'VL017')
+    read_history = ('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n' + transactional_prefix
+                    + check(f'NOT ({ledger_exists})', 'VL017') + history)
+    # Force pg_get_indexdef to qualify the target table with its schema and
+    # avoid hiding a non-catalog function/operator behind the migration path.
+    index_deparse_path = 'SET LOCAL search_path TO pg_catalog, pg_temp;\n'
+
+    def pending_index_snapshot(indexes):
+        candidates = ', '.join(f'({i}, {pg_literal(index)}::pg_catalog.name)' for i, index in enumerate(indexes))
+        # Null = no relation by this name. An array with a null definition is
+        # still a relation (e.g. a table) and must not be treated as absence.
+        return f'''(SELECT pg_catalog.jsonb_agg((SELECT pg_catalog.jsonb_build_array(c.oid,
+                    CASE WHEN i.indisvalid AND i.indisready THEN pg_catalog.pg_get_indexdef(c.oid) END)
+                  FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+                  WHERE c.relnamespace = {namespace} AND c.relname = x.name)
+                 ORDER BY x.position) FROM (VALUES {candidates}) x(position, name))'''
+
+    def index_plan(version, report, statements, source_statements):
+        candidates = [(i, pos) for i, parts in enumerate(statements)
+                      if (pos := index_guard_position(parts)) is not None]
+        if not candidates:
+            return None, source_statements, (), ()
+        try:
+            expected = [index_definition(statements[i], schema, source=True) for i, _ in candidates]
+            snapshot = pending_index_snapshot([definition[0] for definition in expected])
+            applied = f"EXISTS (SELECT FROM {ledger} WHERE version = '{version}')"
+            raw_snapshot = run(read_history + index_deparse_path
+                + f"SELECT CASE WHEN {applied} THEN 'null'::pg_catalog.jsonb ELSE {snapshot} END;\nCOMMIT;\n",
+                report=report)
+            observed = json.loads(raw_snapshot)
+            if not isinstance(observed, list) or len(observed) != len(expected):
+                # The already-applied read-only fast path also lands here.
+                # The locked apply decision must confirm applied, not run DDL.
+                return 'true', [], (), ()
+            commands = list(source_statements)
+            reused, built = [], {}
+            for (i, pos), definition, actual in zip(candidates, expected, observed):
+                if actual is None:
+                    commands[i] = require_new_index(commands[i], pos)
+                    built[i] = definition[2], definition[0]
+                elif (isinstance(actual, list) and len(actual) == 2 and isinstance(actual[0], str)
+                      and re.fullmatch(r'[0-9]{1,10}', actual[0])
+                      and isinstance(actual[1], str)
+                      and index_definition([token for token, _, _ in sql_tokens_with_spans(actual[1])], schema)
+                      == definition):
+                    commands[i] = None
+                    # Table, index OID, name and the digest of the raw deparse.
+                    reused.append((definition[2], actual[0], definition[0], digest(actual[1].encode('utf-8'))))
+                else:
+                    return 'true', [], (), ()
+        except ValueError:
+            return 'true', [], (), ()
+        # Revalidate the same OIDs, raw deparse text, and absences after
+        # acquiring the migrator lock. Hex keeps catalog text out of the SQL
+        # grammar and the wrapper's dollar quote.
+        raw = raw_snapshot.encode('utf-8').hex()
+        expected_snapshot = f"pg_catalog.convert_from(pg_catalog.decode('{raw}', 'hex'), 'UTF8')"
+        changed = f'{snapshot}::pg_catalog.text COLLATE pg_catalog."C" IS DISTINCT FROM {expected_snapshot}'
+        kept = [i for i, statement in enumerate(commands) if statement is not None]
+        # Built: (position among the returned statements, table, index name).
+        return (changed, [commands[i] for i in kept], tuple(reused),
+                tuple((n, *built[i]) for n, i in enumerate(kept) if i in built))
+
+    def index_fence(condition, code, *, online=False):
+        if condition is None:
+            return ''
+        if online:
+            condition = f'{APPLY} AND ({condition})'
+        return index_deparse_path + check(condition, code) + f'SET LOCAL search_path TO "{schema}", pg_temp;\n'
+
+    def built_identity(table, name):
+        """OID and raw-deparse digest of the valid, ready index on its table.
+        Evaluate under index_deparse_path, as the fence does."""
+        return f'''(SELECT c.oid::pg_catalog.text OPERATOR(pg_catalog.||) ' ' OPERATOR(pg_catalog.||)
+                pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.pg_get_indexdef(c.oid), 'UTF8')), 'hex')
+            FROM pg_catalog.pg_class c JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+            WHERE c.relnamespace = {namespace} AND c.relname = '{name}'
+                AND i.indrelid = pg_catalog.to_regclass('"{schema}"."{table}"') AND i.indisvalid AND i.indisready)'''
+
+    def record_built(k, table, name):
+        """Right after a no-transaction build, record in the session what was
+        built, for the ledger transaction to require. IF NOT EXISTS is gone,
+        so an index under this name is this run's build."""
+        return ("DO $velmora_built$ BEGIN PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true); "
+                f"PERFORM pg_catalog.set_config('velmora.built_{k}', "
+                f"coalesce({built_identity(table, name)}, 'missing'), false); END $velmora_built$;")
+
+    def reuse_guard(reused, code, *, online=False, built=()):
+        """In the ledger transaction, hold every reused or self-built index's
+        table against DROP INDEX [CONCURRENTLY]. Then require the OID,
+        validity and raw deparse recorded at the fence (reused) or right
+        after the build (built). Without this, an index dropped after the
+        fence or its build would still be recorded as applied."""
+        if not reused and not built:
+            return ''
+        tables = ', '.join(f'"{schema}"."{table}"'
+                           for table in sorted({entry[0] for entry in reused} | {entry[1] for entry in built}))
+        # With app access the 3 s online statement budget applies: wait less,
+        # so a held table is reported as busy, not as a budget overrun.
+        lock = (f"IF {usage} THEN SET LOCAL lock_timeout = '2s'; END IF; "
+                f'LOCK TABLE ONLY {tables} IN SHARE UPDATE EXCLUSIVE MODE;')
+        if online:
+            lock = f'IF {APPLY} THEN {lock} END IF;'
+        # A digest keeps the deparse text out of the size-capped arguments.
+        changed = [f'''NOT EXISTS (SELECT FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+            WHERE c.oid = '{oid}'::pg_catalog.oid AND c.relnamespace = {namespace} AND c.relname = '{name}'
+                AND i.indisvalid AND i.indisready AND pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+                    pg_catalog.pg_get_indexdef(c.oid), 'UTF8')), 'hex') = '{definition}')'''
+            for _, oid, name, definition in reused]
+        changed += [f"""(pg_catalog.current_setting('velmora.built_{k}') = 'missing'
+            OR {built_identity(table, name)} IS DISTINCT FROM pg_catalog.current_setting('velmora.built_{k}'))"""
+            for k, table, name in built]
+        # A busy table is VL023 (retried, then "busy"), never a mismatch.
+        return ("SET LOCAL lock_timeout = '30s';\n"
+                f'DO $velmora_reuse$ BEGIN {lock} EXCEPTION '
+                "WHEN lock_not_available THEN RAISE EXCEPTION USING ERRCODE = 'VL023'; "
+                f"WHEN undefined_table THEN RAISE EXCEPTION USING ERRCODE = '{code}'; END $velmora_reuse$;\n"
+                "SET LOCAL lock_timeout = '3s';\n" + index_fence(' OR '.join(changed), code, online=online))
+
+    if args.pending:
+        applied = set(run(read_history + f"SELECT version FROM {ledger};\nCOMMIT;\n",
+                          report='pending migrations').splitlines())
+        if applied != set(list(files)[:len(applied)]):
+            die('pending migrations: applied migration history is not an ordered prefix')
+        pending = [name for version, (name, _) in files.items() if version not in applied]
+        if pending:
+            print('\n'.join(pending))
+            return 3
+        return
+
+    verify_sql = read_history + complete + (PG / 'check_schema.sql').read_text() + '\nCOMMIT;\n'
+
+    def verify(report):
+        manifest = json.loads(run(verify_sql, report=report))
+        inherited = set(manifest['inherited_tables'] or ()) - post_cutover['tables']
+        if inherited:
+            die('historical catalogue tables cannot have inherited children: ' + ', '.join(sorted(inherited)))
+        if declarations:
+            verify_post_cutover(manifest, post_cutover)
+        compare(manifest, d1, {v: migrations[v] for v in baseline})
+        if declarations:
+            print('Post-cutover objects verified')
+
+    # Verify uses the stdin transport (also works with psql 14).
     if args.verify:
-        compare(json.loads(run(verify_sql, report='schema verification')), d1, migrations)
+        verify('schema verification')
         return
     if args.test:
         test_triggers(run, begin, history, complete, d1)
         return
 
-    import_pre = check(f"{USAGE} OR {MARKER} IS NOT NULL OR EXISTS (SELECT FROM schema_migrations WHERE version <> '0001')", 'VL012') + '''
+    import_pre = check(f"{usage} OR {marker} IS NOT NULL OR EXISTS (SELECT FROM {ledger} WHERE version <> '0001')", 'VL012') + f'''
 DO $$
 DECLARE t record; populated boolean;
 BEGIN
-    FOR t IN SELECT relname FROM pg_class WHERE relnamespace = to_regnamespace(current_schema())
+    FOR t IN SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = {namespace}
              AND relkind IN ('r', 'p') AND relname <> 'schema_migrations' LOOP
-        EXECUTE format('SELECT EXISTS (SELECT FROM %I.%I)', current_schema(), t.relname) INTO populated;
+        EXECUTE pg_catalog.format('SELECT EXISTS (SELECT FROM %I.%I)', '{schema}', t.relname) INTO populated;
         IF populated THEN RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;
     END LOOP;
 END;
@@ -673,7 +980,57 @@ $$;
             break
         sql, no_tx, parsed = migrations[version]
         statements, source_statements = parsed
-        if not args.import_mode and not no_tx:
+        index_condition, reused, built = None, (), ()
+        if no_tx or version > CUTOVER_BASELINE:
+            index_condition, source_statements, reused, built = index_plan(
+                version, name, statements, source_statements)
+        record = (f"INSERT INTO {ledger} VALUES ('{version}', '{digest(body)}', "
+                  "(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::bigint);")
+        if no_tx:
+            # Each statement gets a SQL-only -c in one psql session. W1 is
+            # released during CIC; the session migrator lock stays held.
+            applied = f"EXISTS (SELECT FROM {ledger} WHERE version = '{version}')"
+            for attempt in range(6):
+                if attempt:
+                    # An index the failed attempt built is now reused, not
+                    # rebuilt: retrying the old plan would only fail its fence.
+                    index_condition, source_statements, reused, built = index_plan(
+                        version, name, statements, parsed[1])
+                prepare = (prefix + online_migrator_session + concurrent_tx
+                           + check(f'NOT ({ledger_exists})', 'VL017') + history)
+                if args.import_mode:
+                    prepare += check(f'{marker} IS NULL OR {usage} OR NOT ({seeds})', 'VL013')
+                else:
+                    prepare += check(f'{marker} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+                # ON_ERROR_STOP ends the session without running any queued -c if
+                # this version is already applied. Confirm that outcome separately.
+                prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
+                prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
+                # Check reused indexes first: a reused index made invalid is VL021, not VL015.
+                finish = (concurrent_tx + reuse_guard(reused, 'VL021', built=built) + check(bad_index, 'VL015')
+                          + path_check + record + "\nCOMMIT;\nSELECT 'applied';\n")
+                messages = [prepare]
+                after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
+                for n, statement in enumerate(source_statements):
+                    messages.append(statement)
+                    if n in after:
+                        messages.append(record_built(*after[n]))
+                try:
+                    output = run([*messages, finish], busy=attempt < 5, report=name, concurrent=True)
+                    break
+                except Busy as busy:
+                    print(f'{name}: SQLSTATE {busy}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
+                    time.sleep(0.25 * (2 ** attempt))
+            output = output.splitlines()
+            if output == ['already applied']:
+                confirmed = run(read_history + f'SELECT {applied};\nCOMMIT;\n', report=name)
+                if confirmed != 't':
+                    die(f'{name}: ledger does not confirm the concurrent migration was already applied')
+            elif not output or output[-1] != 'applied':
+                die(f'{name}: no migration status returned')
+            print(f'{name}: {output[-1]}', flush=True)
+            continue
+        if not args.import_mode:
             # psql metacommands cannot be part of a -c simple-query message.
             # Keep the branch and status inside SQL so the wrapper and every
             # migration statement reach the server in one network message.
@@ -684,77 +1041,69 @@ $$;
             else:
                 batch += check(f'NOT ({ledger_exists})', 'VL017')
             batch += history
-            batch += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+            batch += check(f'{marker} IS NOT NULL', 'VL016' if args.activate else 'VL014')
             # Decide apply or skip once, then guard every statement and the ledger on it.
-            batch += (f"DO $velmora_decide$ BEGIN IF EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') THEN "
-                      "PERFORM set_config('velmora.migration_apply', 'off', true); ELSE\n")
+            batch += (f"DO $velmora_decide$ BEGIN IF EXISTS (SELECT FROM {ledger} WHERE version = '{version}') THEN "
+                      "PERFORM pg_catalog.set_config('velmora.migration_apply', 'off', true); ELSE\n")
             if version == '0002':
-                batch += (f"    IF ({MARKER} IS NOT NULL OR NOT ({SEEDS})) THEN "
+                batch += (f"    IF ({marker} IS NOT NULL OR NOT ({seeds})) THEN "
                           "RAISE EXCEPTION USING ERRCODE = 'VL014'; END IF;\n")
             if version == '0001':
-                batch += (f"    IF ({USAGE} OR {MARKER} IS NOT NULL) THEN "
+                batch += (f"    IF ({usage} OR {marker} IS NOT NULL) THEN "
                           "RAISE EXCEPTION USING ERRCODE = 'VL012'; END IF;\n")
-            batch += "    PERFORM set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
+            batch += "    PERFORM pg_catalog.set_config('velmora.migration_apply', 'on', true); END IF; END $velmora_decide$;\n"
+            batch += index_fence(index_condition, 'VL022', online=True)
             batch += execute_migration(source_statements)
-            batch += guarded(('INSERT INTO usage_global(id) VALUES (1), (2); ' if version == '0001' else '')
-                             + f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
-                             "(extract(epoch FROM clock_timestamp()) * 1000)::bigint);")
+            if version == '0001':
+                batch += guarded(f'INSERT INTO {usage_global}(id) VALUES (1), (2);')
+            batch += reuse_guard(reused, 'VL022', online=True) + path_check + guarded(record)
             # The lint cannot see a computed setting name, so commit only with the ledger row present.
-            batch += check(f"NOT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}')", 'VL018')
+            batch += check(f"NOT EXISTS (SELECT FROM {ledger} WHERE version = '{version}')", 'VL018')
             batch += (f"SELECT CASE WHEN {APPLY} THEN 'applied' ELSE 'already applied' END;\nCOMMIT;\n")
             output = run(batch, retry=True, report=name, one_message=True).splitlines()
             if not output or output[-1] not in {'applied', 'already applied'}:
                 die(f'{name}: no migration status returned')
             print(f'{name}: {output[-1]}', flush=True)
             continue
-        batch = migrator_session + migration_tx
+        # Transactional offline/import stages keep the existing stdin runner.
+        # Only the runner's own text can contain psql metacommands.
+        batch = migrator_session + begin
         batch += f'SELECT {ledger_exists} AS ledger_exists \\gset\n\\if :ledger_exists\n\\else\n'
-        batch += LEDGER + '\n\\endif\n' if version == '0001' else check('true', 'VL017') + '\\endif\n'
+        batch += ledger_sql + '\n\\endif\n' if version == '0001' else check('true', 'VL017') + '\\endif\n'
         batch += history
-        batch += f"SELECT EXISTS (SELECT FROM schema_migrations WHERE version = '{version}') AS applied \\gset\n"
-        if version >= '0002' and args.import_mode:
-            batch += check(f'{MARKER} IS NULL OR {USAGE} OR NOT ({SEEDS})', 'VL013')
-        if not args.import_mode:
-            batch += check(f'{MARKER} IS NOT NULL', 'VL016' if args.activate else 'VL014')
+        batch += f"SELECT EXISTS (SELECT FROM {ledger} WHERE version = '{version}') AS applied \\gset\n"
+        if version >= '0002':
+            batch += check(f'{marker} IS NULL OR {usage} OR NOT ({seeds})', 'VL013')
         batch += '\\if :applied\n'
-        if args.import_mode and target == '0001':
+        if target == '0001':
             batch += import_pre
         batch += '\\echo already applied\n\\else\n'
         if version == '0001':
-            batch += check(f'{USAGE} OR {MARKER} IS NOT NULL', 'VL012')
-        if version == '0002' and not args.import_mode:
-            batch += check(f'{MARKER} IS NOT NULL OR NOT ({SEEDS})', 'VL014')
-        if no_tx:
-            # Release W1 before CIC may wait for old snapshots; keep only the
-            # session migrator lock until the ledger transaction commits.
-            batch += check(BAD_INDEX, 'VL015') + 'COMMIT;\n'
-        batch += sql + '\n'
-        if no_tx:
-            batch += migration_tx + check(BAD_INDEX, 'VL015')
-        if version == '0002' and args.import_mode:
-            batch += RESTART_IDENTITIES
+            batch += check(f'{usage} OR {marker} IS NOT NULL', 'VL012')
+        batch += index_fence(index_condition, 'VL022')
+        batch += (sql if index_condition is None else '\n'.join(source_statements)) + '\n'
+        if version == '0002':
+            batch += RESTART_IDENTITIES.format(schema=schema)
         if version == '0001':
-            batch += import_pre if args.import_mode else ''
-            if not args.import_mode:
-                batch += 'INSERT INTO usage_global(id) VALUES (1), (2);\n'
-        batch += (f"INSERT INTO schema_migrations VALUES ('{version}', '{digest(body)}', "
-                  f"(extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
-                  '\\echo applied\n\\endif\nCOMMIT;\n')
+            batch += import_pre
+        batch += reuse_guard(reused, 'VL022') + path_check + record + '\n\\echo applied\n\\endif\nCOMMIT;\n'
         output = run(batch, retry=True, report=name).splitlines()
         if not output or output[-1] not in {'applied', 'already applied'}:
             die(f'{name}: no migration status returned')
         print(f'{name}: {output[-1]}', flush=True)
     if args.activate:
-        compare(json.loads(run(verify_sql, report='pre-activation verification')), d1, migrations)
+        verify('pre-activation verification')
         run(online_migrator_session + begin + transactional_prefix + online_limits_sql + history + complete
-            + check(f'{MARKER} IS NOT NULL', 'VL016')
+            + check(f'{marker} IS NOT NULL', 'VL016')
             + f'GRANT USAGE ON SCHEMA "{schema}" TO kofra_app;\nCOMMIT;\n', retry=True,
             report='activation', one_message=True)
         print('App schema USAGE granted')
 
 
 try:
-    main()
+    sys.exit(main())
+except Failure as exc:
+    die(str(exc))
 except (OSError, UnicodeError, json.JSONDecodeError, sqlite3.Error) as exc:
     die(f'cannot read migration files or schema metadata ({type(exc).__name__})')
 PY

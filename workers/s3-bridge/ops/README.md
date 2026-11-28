@@ -322,6 +322,13 @@ exists: restore it to a timestamp, then replay from that timestamp.
 
 ## Restore
 
+This procedure is for a writable D1 deployment or a separate restore target.
+Do not run it against a frozen D1 backup: applying migrations, restoring a
+point in time, and arming a replay all write to the database. Production CI
+requires an explicit `CATALOG_BACKEND` and only applies D1 migrations for
+writable `d1`. For a PostgreSQL catalogue, see the [PostgreSQL migration
+runbook](../pg/README.md).
+
 Deploy a Worker revision with the incomplete-import replay guard before
 using the batched importer. The arming SQL also checks the marker, but an
 older Worker cannot enforce it on a direct replay call.
