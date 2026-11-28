@@ -937,6 +937,29 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertEqual(self.ledger(), [*STAGES, '0004'])
             self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
 
+    def test_a_blocker_held_past_the_build_timeout_ends_in_the_runners_refusal(self):
+        # A transaction older than the build and held longer than the build's
+        # lock_timeout: the runner's own diagnosed refusal (the invalid index
+        # it left), and no ledger row. The clone's timeout is cut to 1 s, so
+        # the test does not wait 90 s; production has no such knob.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            runner = script.read_text()
+            self.assertEqual(runner.count("SET lock_timeout = '90s'"), 1)
+            script.write_text(runner.replace("SET lock_timeout = '90s'", "SET lock_timeout = '1s'"))
+            name = '0004_concurrent.sql'
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            holder = self.hold_extents_for(5)
+            refused = self.migrate(script=script, ok=False)
+            self.assertEqual(holder.wait(), 0, holder.stderr.read())
+            self.assertIn(f'{name}: catalogue contains an invalid index; repair it before retrying',
+                          refused.stderr)
+            self.assertEqual(self.ledger(), STAGES, 'no ledger row')
+
     def test_a_live_cutover_schema_takes_later_stages_online_over_a_delayed_network(self):
         # The production upgrade: a schema at the cutover baseline with app
         # access granted takes a later transactional stage and a later

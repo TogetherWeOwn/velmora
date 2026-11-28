@@ -1010,13 +1010,20 @@ $$;
                 finish = (concurrent_tx + reuse_guard(reused, 'VL021', built=built) + check(bad_index, 'VL015')
                           + path_check + record + "\nCOMMIT;\nSELECT 'applied';\n")
                 # CREATE INDEX CONCURRENTLY waits out older transactions
-                # through lock waits, and app transactions may run 30 s: under
-                # the session's 3 s lock_timeout the build would fail and leave
-                # an INVALID index (VL015 on every retry). It takes only SHARE
-                # UPDATE EXCLUSIVE, which blocks no reads or writes, so it may
-                # wait longer. The ledger transaction sets its own timeouts
-                # (SET LOCAL), and the session is back at 3 s before it.
-                messages = [prepare, "SET lock_timeout = '10min'"]
+                # through lock waits, and app transactions run up to 30 s (the
+                # app role's transaction_timeout on PostgreSQL 17+): under the
+                # session's 3 s lock_timeout the build would fail and leave an
+                # INVALID index (VL015 on every retry). It takes only SHARE
+                # UPDATE EXCLUSIVE, which blocks no reads or writes, so it waits
+                # up to 90 s per lock wait. A build waits up to three times, so
+                # 270 s of waits fit inside the 600 s a caller gives one apply
+                # (the merge gate's budget), with room for prechecks, builds,
+                # retries and the ledger. A blocker held longer than 90 s (an
+                # operator or read-only session) ends in this runner's own
+                # refusal (55P03, then VL015), before the caller's kill. The
+                # ledger transaction sets its own timeouts (SET LOCAL), and the
+                # session is back at 3 s before it.
+                messages = [prepare, "SET lock_timeout = '90s'"]
                 after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
                 for n, statement in enumerate(source_statements):
                     messages.append(statement)
