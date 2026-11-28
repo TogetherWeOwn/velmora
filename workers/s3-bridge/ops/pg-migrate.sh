@@ -1009,12 +1009,19 @@ $$;
                 # Check reused indexes first: a reused index made invalid is VL021, not VL015.
                 finish = (concurrent_tx + reuse_guard(reused, 'VL021', built=built) + check(bad_index, 'VL015')
                           + path_check + record + "\nCOMMIT;\nSELECT 'applied';\n")
-                messages = [prepare]
+                # CREATE INDEX CONCURRENTLY waits out older transactions
+                # through lock waits, and app transactions may run 30 s: under
+                # the session's 3 s lock_timeout the build would fail and leave
+                # an INVALID index (VL015 on every retry). It takes only SHARE
+                # UPDATE EXCLUSIVE, which blocks no reads or writes, so it may
+                # wait longer; the ledger transaction is back under 3 s.
+                messages = [prepare, "SET lock_timeout = '10min'"]
                 after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
                 for n, statement in enumerate(source_statements):
                     messages.append(statement)
                     if n in after:
                         messages.append(record_built(*after[n]))
+                messages.append("SET lock_timeout = '3s'")
                 try:
                     output = run([*messages, finish], busy=attempt < 5, report=name, concurrent=True)
                     break

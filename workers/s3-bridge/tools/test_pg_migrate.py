@@ -1206,6 +1206,62 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertIn('0005_kofra_indexes.sql: applied', self.migrate(script=script).stdout)
             self.assertEqual(self.index_oid('kofra_p'), before)
 
+    def test_a_live_cutover_schema_takes_the_shipped_later_stages_online(self):
+        # The production upgrade: a schema at the cutover baseline with app
+        # access granted takes every shipped later stage as an online
+        # migration over a network with round-trip latency.
+        later = sorted(f.name for f in (BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql")
+                       if f.name[:4] > STAGES[-1])
+        self.assertTrue(later, "a stage ships after the cutover baseline")
+        self.migrate("--to", STAGES[-1], script=MIGRATE)
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        original = self.env.read_text()
+        with delayed_pg() as proxy_port:
+            lines = [f"PGHOST=127.0.0.1" if line.startswith("PGHOST=") else line
+                     for line in original.splitlines() if not line.startswith("PGPORT=")]
+            lines.append(f"PGPORT={proxy_port}")
+            self.env.write_text("\n".join(lines) + "\n")
+            try:
+                applied = self.migrate(script=MIGRATE).stdout
+            finally:
+                self.env.write_text(original)
+        for name in later:
+            self.assertIn(f"{name}: applied", applied)
+        self.assertEqual(self.migrate('--pending', script=MIGRATE).stdout, '')
+        self.assertIn('Schema matches D1', self.migrate('--verify', script=MIGRATE).stdout)
+
+    def test_a_concurrent_index_stage_waits_out_a_long_writer(self):
+        # A writer transaction older than the build, longer than the
+        # migrator's 3 s lock timeout: CREATE INDEX CONCURRENTLY waits for
+        # it, and must not fail and leave an INVALID index.
+        no_tx = [f.name[:4] for f in sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+                 if f.read_text().startswith("-- velmora: no-transaction\n")]
+        self.assertTrue(no_tx, "a shipped stage builds its indexes concurrently")
+        before = sorted(f.name[:4] for f in (BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql") if f.name[:4] < no_tx[0])[-1]
+        self.migrate("--to", "0001", script=MIGRATE)
+        self.migrate("--to", before, script=MIGRATE)
+        holder = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=libpq_env())
+        holder.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
+                           "BEGIN; LOCK TABLE extents IN ROW EXCLUSIVE MODE; SELECT pg_sleep(6); COMMIT;\n")
+        holder.stdin.close()
+        self.addCleanup(holder.wait)
+        for _ in range(100):
+            held = psql(f"SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                        f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{self.schema}' "
+                        f"AND c.relname = 'extents' AND l.mode = 'RowExclusiveLock' AND l.granted").stdout
+            if held.strip() == "1":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the writer never took its lock")
+        applied = self.migrate(script=MIGRATE)
+        self.assertEqual(holder.wait(), 0, holder.stderr.read())
+        self.assertIn(f"{no_tx[0]}_", applied.stdout)
+        self.assertEqual(self.migrate("--pending", script=MIGRATE).stdout, "")
+        self.assertIn("Schema matches D1", self.migrate("--verify", script=MIGRATE).stdout)
+
+
     def test_full_shipped_chain_verifies(self):
         self.migrate(script=MIGRATE)
         self.assertEqual(self.migrate('--pending', script=MIGRATE).stdout, '')
