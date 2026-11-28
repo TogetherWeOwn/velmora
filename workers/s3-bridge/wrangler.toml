@@ -139,7 +139,7 @@ INFLIGHT_BUDGET_BYTES = "50331648"   # 48 MiB per isolate: what requests may cha
 JOB_BUDGET_BYTES = "94371840"        # 90 MiB per isolate
 GC_MODE = "off"                      # off | disposable
 HOT_CAP_BYTES = "107374182400"       # 100 GiB of evictable R2 bytes; pinned (unverified) bytes are never counted or evicted
-MAINTENANCE = "restore"                  # off | restore
+MAINTENANCE = "off"                  # off | restore
 # Sockets per post job, spread over the posting tier. A post job charges
 # its extent (16 MiB) plus 1.5 MiB per socket to the isolate's byte budget
 # (and 4.13 MiB more for its parity with PARITY on), and the invocations
