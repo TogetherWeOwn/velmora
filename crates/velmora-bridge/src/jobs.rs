@@ -1066,7 +1066,7 @@ where
     /// begun.
     /// With the scrub on, the backbones whose losses fence eviction: the
     /// ones the scrub checks (`verify::release_labels`).
-    pub(crate) fn scrub_counting(&self) -> Option<Vec<String>> {
+    fn scrub_counting(&self) -> Option<Vec<String>> {
         self.cfg
             .scrub
             .on

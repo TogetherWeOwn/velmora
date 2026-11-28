@@ -2810,46 +2810,21 @@ where
     /// write-ahead intent, with the collection guard after it, and
     /// counted. A blob the store checked as the extent's is kept;
     /// anything else under the key (other bytes, or a streamed put whose
-    /// digest the store never checked) is replaced, unless the scrub has
-    /// a loss of the extent on record. It never fails the read: when the
-    /// write cannot be made, nothing is written anywhere, and the next
-    /// read of the extent fills it again. `true` = the copy is there.
-    ///
-    /// The scrub deletes a blob that is not the extent's only in a
-    /// repair, and repairs only a loss on record for at least
-    /// [`crate::scrub::REPIN_MIN_LOSS_AGE_MS`], twice the longest an
-    /// invocation runs. With such a loss on record the blob is the
-    /// repair's: a write here could land between its check and its
-    /// delete. With none on record when this looks, no repair can delete
-    /// before this write has landed.
+    /// digest the store never checked) is replaced: the scrub never
+    /// deletes a safety object of a referenced extent, so nothing can
+    /// delete this write. It never fails the read: when the write cannot
+    /// be made, nothing is written anywhere, and the next read of the
+    /// extent fills it again. `true` = the copy is there.
     async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {
         let key = extent.id.safety_key();
         let written = async {
-            match self.safety.head_identity(&key).await? {
-                Some(blob) if blob.is(extent.cipher_size, &extent.cipher_sha256) => {
-                    return Ok::<_, crate::types::BridgeError>(true);
-                }
-                Some(_) => {
-                    if let Some(counting) = self.scrub_counting() {
-                        if !self
-                            .catalog
-                            .scrub_has_loss(&extent.id, &counting)
-                            .await?
-                            .is_empty()
-                        {
-                            crate::trace::alert(|| {
-                                format!(
-                                    "fill-protect-left-to-scrub {} not releasable; a blob that \
-                                     is not its copy is under its safety key and a loss is on \
-                                     record",
-                                    extent.id.as_str()
-                                )
-                            });
-                            return Ok(false);
-                        }
-                    }
-                }
-                None => {}
+            if self
+                .safety
+                .head_identity(&key)
+                .await?
+                .is_some_and(|blob| blob.is(extent.cipher_size, &extent.cipher_sha256))
+            {
+                return Ok::<_, crate::types::BridgeError>(());
             }
             let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
             self.catalog.scrub_put_intent(&extent.id, until).await?;
@@ -2869,11 +2844,10 @@ where
                     extent.id.as_str()
                 )
             });
-            Ok(true)
+            Ok(())
         };
-        let written = written.await;
-        let done = matches!(written, Ok(true));
-        if written.is_err() {
+        let done = written.await.is_ok();
+        if !done {
             crate::trace::alert(|| {
                 format!(
                     "fill-protect-failed {} not releasable and the safety write failed; \

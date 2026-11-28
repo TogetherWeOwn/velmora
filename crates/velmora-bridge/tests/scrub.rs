@@ -4649,9 +4649,9 @@ async fn a_kept_cache_fill_does_not_end_the_drain() {
     assert!(!w.has_safety(&b), "the drain went on past the kept fill");
 }
 
-/// A Usenet repair whose safety PUTs fail leaves no object with other
-/// bytes under the safety key: eviction would take it for the copy and
-/// delete a later intact cache fill.
+/// A Usenet repair whose safety PUTs fail leaves the object with other
+/// bytes under the safety key uncounted and in place, and eviction never
+/// takes it for the copy: a later intact cache fill stays.
 #[tokio::test(flavor = "current_thread")]
 async fn a_wrong_safety_object_is_not_taken_for_the_copy() {
     let w = world_with(|cfg| cfg.hot_cap_bytes = 1).await;
@@ -4667,10 +4667,20 @@ async fn a_wrong_safety_object_is_not_taken_for_the_copy() {
     assert_eq!(w.scrub().await.repaired, 1);
     *w.bridge().safety.fail_put_prefix.borrow_mut() = None;
     assert_eq!(w.safety_state(&o).await, "held");
-    assert!(!w.has_safety(&o), "the object with other bytes is gone");
+    assert!(
+        w.has_safety(&o),
+        "the object with other bytes is left in place"
+    );
+    assert_ne!(
+        w.bridge().safety.stored(&key).map(|b| b.bytes),
+        Some(cipher.clone()),
+        "it is not the extent's"
+    );
     assert!(alerts()
         .iter()
-        .any(|a| a.starts_with("scrub-bad-safety-copy ") && a.contains(o.extent.as_str())));
+        .any(|a| a.starts_with("scrub-bad-safety-copy ")
+            && a.contains(o.extent.as_str())
+            && a.ends_with("its bytes are not the extent's; left for the next verified write")));
     cache_fill(&w, &o, "a", cipher).await;
     w.bridge().evict_batch(0).await.unwrap();
     assert!(
@@ -4714,19 +4724,28 @@ async fn a_moved_sequence_at_the_pre_delete_check_ends_the_drain() {
     assert!(w.has_safety(&b), "the drain ended at the moved extent");
 }
 
-/// The scrub deletes a released extent's safety object whose bytes are
-/// not the extent's, and only then says so; the deleted object is no
-/// longer counted. A delete that fails is said as such, and nothing
-/// changes.
+/// The scrub never deletes a referenced extent's safety object: one whose
+/// bytes are not the extent's is no longer counted, left in place, and
+/// only then said so. An uncount that fails is said as such, and nothing
+/// changes. Nothing is deleted either way.
 #[tokio::test(flavor = "current_thread")]
-async fn a_deleted_wrong_safety_object_is_uncounted_and_a_failed_delete_is_said() {
+async fn a_wrong_safety_object_is_uncounted_in_place_and_a_failed_uncount_is_said() {
     for fails in [true, false] {
         let w = world().await;
         let o = w.released("a", 46).await;
         let key = o.extent.safety_key();
         assert!(w.bridge().safety.corrupt(&key, |b| b[10] ^= 1));
+        let deleted = std::rc::Rc::new(RefCell::new(None::<String>));
+        let seen = std::rc::Rc::clone(&deleted);
+        *w.bridge().safety.before_delete.borrow_mut() = Some(Box::new(move |k: &str| {
+            *seen.borrow_mut() = Some(k.to_owned())
+        }));
         if fails {
-            *w.bridge().safety.fail_delete.borrow_mut() = Some(key.clone());
+            *w.bridge().catalog.sql.fail_matching.borrow_mut() = Some((
+                "SET hot_safety_bytes = 0, evict_seq = evict_seq + 1 WHERE id = ?1 \
+                 AND safety_state = 'released' AND hot_safety_bytes > 0",
+                0,
+            ));
         }
         w.advance_secs(31 * DAY_SECS);
         w.hide(0, &o, 1).await;
@@ -4746,17 +4765,22 @@ async fn a_deleted_wrong_safety_object_is_uncounted_and_a_failed_delete_is_said(
             .collect();
         assert!(!lines.is_empty(), "fails={fails}: {lines:?}");
         assert_eq!(w.safety_state(&o).await, "released", "fails={fails}");
+        // No delete of the safety store was even tried.
+        assert!(w.bridge().safety.contains(&key), "fails={fails}: left");
+        assert_eq!(*deleted.borrow(), None, "fails={fails}: never deleted");
         if fails {
             assert!(
-                lines.iter().all(|l| l.ends_with("the delete failed")),
+                lines.iter().all(|l| l.ends_with("; the count failed")),
                 "{lines:?}"
             );
-            assert!(w.bridge().safety.contains(&key));
-            assert_ne!(counted, "0", "still there: still counted");
+            assert_ne!(counted, "0", "the uncount failed: still counted");
         } else {
-            assert!(lines.iter().all(|l| l.ends_with("; deleted")), "{lines:?}");
-            assert!(!w.bridge().safety.contains(&key));
-            assert_eq!(counted, "0", "gone: no longer counted");
+            assert!(
+                lines.iter().all(|l| l
+                    .ends_with("its bytes are not the extent's; left for the next verified write")),
+                "{lines:?}"
+            );
+            assert_eq!(counted, "0", "no longer counted");
             assert_eq!(w.result(&o).await, "unrecoverable");
         }
     }
@@ -4797,7 +4821,7 @@ async fn a_pinned_fill_stays_while_the_safety_blob_is_not_the_extents() {
     );
 }
 
-/// The scrub moves the sequence before it deletes a safety object: an
+/// The scrub moves the sequence before it stops counting a safety object: an
 /// eviction that claimed the pinned row and found the copy in place, but
 /// whose claim moved before the delete, deletes nothing.
 #[tokio::test(flavor = "current_thread")]
@@ -6045,46 +6069,6 @@ async fn a_cold_fill_replaces_a_safety_blob_that_is_not_the_extents() {
     );
 }
 
-/// With a loss on record, a blob under the safety key that is not the
-/// extent's is the scrub repair's to delete: the cold fill leaves it, so
-/// its write cannot land between the repair's check and its delete.
-#[tokio::test(flavor = "current_thread")]
-async fn a_cold_fill_leaves_a_wrong_safety_blob_to_a_repair_on_record() {
-    let mut w = world().await;
-    let o = w.released("a", 168).await;
-    let key = o.extent.safety_key();
-    let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
-    assert!(w.bridge().safety.corrupt(&key, |b| {
-        let mid = b.len() / 2;
-        b[mid] ^= 1
-    }));
-    w.bridge()
-        .catalog
-        .sql
-        .inner
-        .fixture_exec(
-            "UPDATE scrub_copies SET full_loss_at = ?2 WHERE extent_id = ?1 AND backbone = 'alpha'",
-            &[
-                SqlValue::Text(o.extent.as_str().to_owned()),
-                SqlValue::Int(w.bridge().clock.now().0),
-            ],
-        )
-        .await
-        .unwrap();
-    cfg_mut(&mut w).providers[1].release = false;
-    let puts = w.bridge().safety.puts.borrow().len();
-    read_cold(&w, &o, "a").await;
-    assert_eq!(w.bridge().safety.puts.borrow().len(), puts, "no write");
-    assert_ne!(
-        w.bridge().safety.stored(&key).map(|b| b.bytes),
-        Some(cipher),
-        "left to the repair"
-    );
-    assert!(alerts()
-        .iter()
-        .any(|a| a.starts_with("fill-protect-left-to-scrub ")));
-}
-
 /// A releasable extent's cold fill writes nothing to the safety store: no
 /// cost for the common case.
 #[tokio::test(flavor = "current_thread")]
@@ -6243,4 +6227,95 @@ async fn with_the_scrub_off_nothing_needs_the_scrub_schema() {
         w.advance_secs(3600);
     }
     assert_eq!(w.safety_state(&o).await, "deleted", "collected");
+}
+
+/// Makes `o`'s safety object one whose bytes are not the extent's, and
+/// lets the scrub find it: no longer counted, left in place, the extent
+/// unrecoverable while Usenet lacks it. Usenet then has it again.
+async fn uncounted_bad_copy(w: &World, o: &Obj) {
+    let key = o.extent.safety_key();
+    // In the middle: a span read of it fails authentication.
+    assert!(w.bridge().safety.corrupt(&key, |b| {
+        let mid = b.len() / 2;
+        b[mid] ^= 1
+    }));
+    w.advance_secs(31 * DAY_SECS);
+    w.hide(0, o, 1).await;
+    w.hide(1, o, 1).await;
+    w.scrub().await;
+    w.advance_secs(3600);
+    w.scrub().await;
+    assert_eq!(w.result(o).await, "unrecoverable");
+    assert!(w.bridge().safety.contains(&key), "left in place");
+    assert_eq!(
+        w.scalar(
+            "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+            &o.extent
+        )
+        .await,
+        "0",
+        "uncounted"
+    );
+    let plan = w.plan(o).await;
+    for server in &w.servers {
+        server.unhide(&plan[1].message_id).await;
+    }
+}
+
+/// A read of an extent whose bad safety copy the scrub uncounted serves
+/// only verified bytes: the bad copy fails authentication and the read
+/// fills from Usenet. An extent not releasable now has its verified fill
+/// written over the bad copy, counted; a releasable one has it cached,
+/// and the bad copy stays uncounted until a verified write or GC.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_past_an_uncounted_bad_copy_serves_verified_bytes_and_rewrites_it() {
+    for releasable in [false, true] {
+        let mut w = world().await;
+        let o = w.released("a", 170).await;
+        let key = o.extent.safety_key();
+        let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
+        uncounted_bad_copy(&w, &o).await;
+        cfg_mut(&mut w).providers[1].release = releasable;
+        read_cold(&w, &o, "a").await;
+        let stored = w.bridge().safety.stored(&key).map(|b| b.bytes);
+        let counted = w
+            .scalar(
+                "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
+                &o.extent,
+            )
+            .await;
+        if releasable {
+            assert!(w.bridge().cache.contains(&o.extent.cache_key()), "cached");
+            assert_ne!(stored, Some(cipher), "the bad copy is left");
+            assert_eq!(counted, "0");
+        } else {
+            assert_eq!(stored, Some(cipher), "rewritten from the verified fill");
+            assert_ne!(counted, "0", "and counted");
+        }
+    }
+}
+
+/// GC still removes an uncounted bad safety copy once nothing references
+/// its extent.
+#[tokio::test(flavor = "current_thread")]
+async fn gc_removes_an_uncounted_bad_copy_once_the_extent_is_unreferenced() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 171).await;
+    uncounted_bad_copy(&w, &o).await;
+    w.rig
+        .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+        .await
+        .expect(204);
+    for _ in 0..4 {
+        if !w.has_safety(&o) {
+            break;
+        }
+        assert_eq!(
+            w.bridge().run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        w.advance_secs(3600);
+    }
+    assert!(!w.has_safety(&o), "collected with the extent");
+    assert_eq!(w.safety_state(&o).await, "deleted");
 }
