@@ -899,6 +899,75 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertEqual(self.ledger(), [*STAGES, '0004'])
             self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script, env=env).stdout)
 
+    def hold_extents_for(self, seconds):
+        """A writer transaction that holds ROW EXCLUSIVE on extents for
+        `seconds`, begun now: older than anything the migrator starts."""
+        holder = subprocess.Popen(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=libpq_env())
+        holder.stdin.write(f'SET search_path TO "{self.schema}", pg_temp;\n'
+                           f"BEGIN; LOCK TABLE extents IN ROW EXCLUSIVE MODE; SELECT pg_sleep({seconds}); COMMIT;\n")
+        holder.stdin.close()
+        self.addCleanup(holder.stderr.close)
+        self.addCleanup(holder.wait)
+        for _ in range(100):
+            held = psql(f"SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                        f"JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{self.schema}' "
+                        f"AND c.relname = 'extents' AND l.mode = 'RowExclusiveLock' AND l.granted").stdout
+            if held.strip() == "1":
+                return holder
+            time.sleep(0.05)
+        self.fail("the writer never took its lock")
+
+    def test_a_concurrent_index_stage_waits_out_a_long_writer(self):
+        # An app writer transaction older than the build and longer than the
+        # migrator's 3 s lock timeout: CREATE INDEX CONCURRENTLY waits for it,
+        # and must not fail and leave an INVALID index.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            name = '0004_concurrent.sql'
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, name, '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            holder = self.hold_extents_for(6)
+            applied = self.migrate(script=script).stdout
+            self.assertEqual(holder.wait(), 0, holder.stderr.read())
+            self.assertIn(f'{name}: applied', applied)
+            self.assertEqual(self.ledger(), [*STAGES, '0004'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+
+    def test_a_live_cutover_schema_takes_later_stages_online_over_a_delayed_network(self):
+        # The production upgrade: a schema at the cutover baseline with app
+        # access granted takes a later transactional stage and a later
+        # concurrent-index stage online, over a network with round-trip
+        # latency, ledger and verification included.
+        self.migrate()
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp)
+            add_migration(script, '0004_fixture_table.sql',
+                          'CREATE TABLE fixture_later (id BIGINT PRIMARY KEY, note TEXT COLLATE "C");\n',
+                          'CREATE TABLE fixture_later (id INTEGER PRIMARY KEY, note TEXT);\n')
+            sql = 'CREATE INDEX IF NOT EXISTS fixture_extent_bucket ON extents(bucket_id);\n'
+            add_migration(script, '0005_fixture_index.sql', '-- velmora: no-transaction\n' +
+                          sql.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY'), sql)
+            original = self.env.read_text()
+            with delayed_pg() as proxy_port:
+                lines = [f"PGHOST=127.0.0.1" if line.startswith("PGHOST=") else line
+                         for line in original.splitlines() if not line.startswith("PGPORT=")]
+                lines.append(f"PGPORT={proxy_port}")
+                self.env.write_text("\n".join(lines) + "\n")
+                try:
+                    applied = self.migrate(script=script).stdout
+                finally:
+                    self.env.write_text(original)
+            self.assertIn('0004_fixture_table.sql: applied', applied)
+            self.assertIn('0005_fixture_index.sql: applied', applied)
+            self.assertEqual(self.migrate('--pending', script=script).stdout, '')
+            self.assertEqual(self.ledger(), [*STAGES, '0004', '0005'])
+            self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+
     def test_failed_concurrent_statement_leaves_migration_pending(self):
         self.migrate()
         self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
