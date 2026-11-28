@@ -207,6 +207,22 @@ class SqliteTwins(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("a SQLite twin has the version of its PostgreSQL stage", result.stderr)
 
+    def test_later_stages_neither_reference_nor_uniquely_index_a_historical_table(self):
+        stages = sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        historical = set()
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                historical.update(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?([a-z_0-9]+)", stage.read_text(), re.I))
+        self.assertIn("extents", historical)
+        for stage in stages:
+            if stage.name[:4] <= "0003":
+                continue
+            text = re.sub(r"--[^\n]*", "", stage.read_text())
+            for table in re.findall(r"\bREFERENCES\s+([a-z_0-9]+)", text, re.I):
+                self.assertNotIn(table.lower(), historical, f"{stage.name} references {table}")
+            for table in re.findall(r"CREATE\s+UNIQUE\s+INDEX\b[^;]*?\bON\s+([a-z_0-9]+)", text, re.I):
+                self.assertNotIn(table.lower(), historical, f"{stage.name} uniquely indexes {table}")
+
     def test_no_new_d1_migration_after_the_cutover(self):
         # The frozen D1 takes no schema change: the last D1 file is the one
         # the cutover baseline covers.

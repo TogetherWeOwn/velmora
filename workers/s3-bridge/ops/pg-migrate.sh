@@ -464,18 +464,13 @@ def compare(actual, d1, migrations):
             for key, seq, target, src, dst, update, delete, match in db.execute(
                 'SELECT * FROM pragma_foreign_key_list(?)', (table,)
             ):
-                if (table, target, src, dst, update, delete, match) == (
-                        'scrub_copies', 'extents', 'extent_id', 'id', 'NO ACTION', 'CASCADE', 'NONE'):
-                    on_delete = 'c'
-                elif (update, delete, match) == ('NO ACTION', 'NO ACTION', 'NONE'):
-                    on_delete = 'a'
-                else:
+                if (update, delete, match) != ('NO ACTION', 'NO ACTION', 'NONE'):
                     die(f'new D1 foreign-key actions on {table} require an explicit translation')
-                fks[key].append((seq, target, src, dst, on_delete))
+                fks[key].append((seq, target, src, dst))
             for rows in fks.values():
                 rows.sort()
                 expected['foreign_keys'].add((table, rows[0][1], tuple(r[2] for r in rows),
-                                              tuple(r[3] for r in rows), 'a', rows[0][4], 's', True))
+                                              tuple(r[3] for r in rows), 'a', 'a', 's', True))
         elif typ == 'trigger':
             timing, event, updates = re.search(
                 r'\b(BEFORE|AFTER)\s+(INSERT|UPDATE|DELETE)(?:\s+OF\s+([a-z_0-9,\s]+?))?\s+ON\b', sql, re.I

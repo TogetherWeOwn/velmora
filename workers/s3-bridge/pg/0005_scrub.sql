@@ -1,4 +1,4 @@
--- velmora: sqlite-twin 0005_scrub.sql f21390558eec06dbe551e2841f2f8a1df0bb117b2f3588d56f2e2c12081d2290
+-- velmora: sqlite-twin 0005_scrub.sql 837269065d0fd65fbb424cf497d59c56aa1091cc630e386380acdbd90e693e68
 -- Additive only. The extents indexes follow in 0006, built concurrently.
 -- No extent rewrite: all new summary columns are nullable.
 ALTER TABLE extents
@@ -30,8 +30,11 @@ INSERT INTO scrub_state(id) VALUES (1);
 -- The constant default does not rewrite extents in PostgreSQL.
 ALTER TABLE extents ADD COLUMN scrub_enrolled BIGINT NOT NULL DEFAULT 0;
 
+-- No foreign key to extents: a new table never references a historical one.
+-- No extent row is ever deleted (GC marks it 'deleted'), and the scrub
+-- removes a deleted extent's rows when it retires it.
 CREATE TABLE scrub_copies (
-    extent_id TEXT COLLATE "C" NOT NULL REFERENCES extents(id) ON DELETE CASCADE,
+    extent_id TEXT COLLATE "C" NOT NULL,
     backbone TEXT COLLATE "C" NOT NULL,
     stat_at BIGINT NOT NULL,
     full_at BIGINT NOT NULL,

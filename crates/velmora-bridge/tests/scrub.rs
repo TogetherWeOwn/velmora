@@ -6058,3 +6058,99 @@ async fn a_releasable_extents_cold_fill_writes_no_safety_copy() {
     assert!(!w.has_safety(&o));
     assert_eq!(w.bridge().safety.puts.borrow().len(), safety_puts);
 }
+
+/// Scrub rows of extents that are no longer in the catalogue (there is no
+/// foreign key to remove them).
+async fn orphan_scrub_rows(w: &World) -> String {
+    let rows = w
+        .bridge()
+        .catalog
+        .sql
+        .inner
+        .fixture_query_now(
+            "SELECT COUNT(*) FROM scrub_copies c \
+             WHERE NOT EXISTS (SELECT 1 FROM extents e WHERE e.id = c.extent_id)",
+            &[],
+        )
+        .unwrap();
+    match &rows[0][0] {
+        SqlValue::Int(n) => n.to_string(),
+        other => panic!("a count: {other:?}"),
+    }
+}
+
+/// Deleting an object's data: GC marks its extent `deleted` (no extent
+/// row is ever deleted), and the scrub's next look at it removes its scrub
+/// rows in the batch that retires it. No scrub row is left behind, on
+/// either engine.
+#[tokio::test(flavor = "current_thread")]
+async fn a_collected_extent_leaves_no_scrub_rows() {
+    let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
+    let o = w.released("a", 166).await;
+    let rows = "SELECT COUNT(*) FROM scrub_copies WHERE extent_id = ?1";
+    assert_ne!(w.scalar(rows, &o.extent).await, "0", "enrolled");
+    w.rig
+        .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
+        .await
+        .expect(204);
+    for _ in 0..4 {
+        if w.safety_state(&o).await == "deleted" {
+            break;
+        }
+        assert_eq!(
+            w.bridge().run_job(&Job::Gc { v: JOB_VERSION }).await,
+            JobOutcome::Ack
+        );
+        w.advance_secs(3600);
+    }
+    assert_eq!(w.safety_state(&o).await, "deleted", "collected");
+    w.advance_secs(31 * DAY_SECS);
+    assert_eq!(w.scrub().await.checked, 0);
+    assert_eq!(w.scalar(rows, &o.extent).await, "0", "its rows are gone");
+    assert_eq!(
+        w.scalar(
+            "SELECT scrub_enrolled FROM extents WHERE id = ?1",
+            &o.extent
+        )
+        .await,
+        "0"
+    );
+    assert_eq!(orphan_scrub_rows(&w).await, "0");
+}
+
+/// No catalogue statement, in either dialect, deletes an `extents` row: the
+/// scrub's rows reference extents without a foreign key, so a statement
+/// that did would have to delete them in the same batch.
+#[test]
+fn no_catalogue_statement_deletes_an_extent_row() {
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    sources(&root.join("../../workers/s3-bridge/src"), &mut files);
+    assert!(files.len() > 20, "the sources were found");
+    let mut found = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap().to_ascii_lowercase();
+        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "delete from extents",
+            "delete from \"extents\"",
+            "truncate extents",
+        ] {
+            if flat.contains(needle) {
+                found.push(format!("{}: {needle}", file.display()));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{found:?}");
+}

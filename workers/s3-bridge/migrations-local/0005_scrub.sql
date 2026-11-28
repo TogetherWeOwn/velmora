@@ -55,7 +55,7 @@ CREATE INDEX extents_scrub_enrolled ON extents(id)
 CREATE INDEX extents_scrub_watch ON extents(scrub_next_at, id) WHERE scrub_next_at IS NOT NULL;
 
 CREATE TABLE scrub_copies (
-  extent_id TEXT NOT NULL REFERENCES extents(id) ON DELETE CASCADE,
+  extent_id TEXT NOT NULL,  -- no foreign key: a historical table is never referenced
   backbone TEXT NOT NULL,
   stat_at INTEGER NOT NULL,
   full_at INTEGER NOT NULL,

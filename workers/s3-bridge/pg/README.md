@@ -122,7 +122,10 @@ apply and the frozen D1 never takes. The stage declares it with
 `-- velmora: sqlite-twin <twin filename> <sha256 of raw twin file>`; every twin
 must be declared exactly once, by the stage of its version. `--verify` replays
 the D1 migrations and then the twins. Such changes are additive only: no
-`DROP`, `RENAME`, column type change, or `NOT NULL` without a `DEFAULT`.
+`DROP`, `RENAME`, column type change, or `NOT NULL` without a `DEFAULT`; no
+foreign key from a new table to a table of `0001`–`0003` (a path that removes
+such a row removes its child rows in the same batch instead), and no `UNIQUE`
+index on one.
 
 The only baseline structural differences from D1 are PostgreSQL's mapped
 column types and non-null PKs, the three identities, the `yenc_name` regex,
