@@ -511,9 +511,11 @@ class MigrationParser(unittest.TestCase):
 
 # A psql shim for deterministic races. hook.json beside it names the hooks:
 #   after_snapshot: admin SQL in another session after the read-only index snapshot;
-#   inject: SQL in the runner's own session right after the index fence;
+#   inject: SQL in the runner's own session right after the index fence (or,
+#           for a concurrent file, after the first message containing inject_after);
 #   between: SQL (as between_user) in another session before a concurrent
-#            migration's ledger transaction, which then runs in a new session;
+#            migration's ledger transaction, which then runs in a new session
+#            after replaying the runner's per-build records;
 #   hold_w1: hold the W1 advisory key in another session during the first
 #            concurrent ledger transaction, which runs in a new session;
 #   replace: [old, new] pairs applied to the runner's SQL, each recorded when seen.
@@ -597,7 +599,9 @@ def after_fence(text):
 
 if len(messages) > 1 and record in messages[-1]:
     if once('inject'):
-        messages.insert(1, config['inject'])
+        marker = config.get('inject_after')
+        at = 1 if marker is None else next(i for i, m in enumerate(messages) if marker in m) + 1
+        messages.insert(at, config['inject'])
     if once('between'):
         head = psql(options + [x for m in messages[:-1] for x in ('-c', m)])
         if head.returncode:
@@ -605,7 +609,8 @@ if len(messages) > 1 and record in messages[-1]:
         side_session(config['between'], config.get('between_user', 'kofra_migrate'))
         setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
                  'SET client_min_messages = error;')
-        finish(head, psql(options + ['-c', setup, '-c', messages[-1]]))
+        setup = [x for m in [setup, *(m for m in messages if m.startswith('DO $velmora_built$'))] for x in ('-c', m)]
+        finish(head, psql(options + setup + ['-c', messages[-1]]))
     if once('hold_w1'):
         head = psql(options + [x for m in messages[:-1] for x in ('-c', m)])
         if head.returncode:
@@ -623,7 +628,8 @@ if len(messages) > 1 and record in messages[-1]:
             sys.exit(97)
         setup = ('SET search_path TO "' + schema + '", pg_temp; SET standard_conforming_strings = on; '
                  'SET client_min_messages = error;')
-        tail = psql(options + ['-c', setup, '-c', messages[-1]])
+        setup = [x for m in [setup, *(m for m in messages if m.startswith('DO $velmora_built$'))] for x in ('-c', m)]
+        tail = psql(options + setup + ['-c', messages[-1]])
         holder.stdin.close()
         holder.wait()
         finish(head, tail)
@@ -646,6 +652,7 @@ REUSE_BOTH = ('CREATE INDEX IF NOT EXISTS kofra_a ON kofra_t (id);\n'
 REUSE_ONLY = 'CREATE INDEX IF NOT EXISTS kofra_a ON kofra_t (id);\n'
 CONCURRENT_MISMATCH = 'existing concurrent index definition does not match the migration'
 ORDINARY_MISMATCH = 'existing index definition does not match the migration'
+TABLE_BUSY = 'index table busy; retry later'
 
 
 @unittest.skipUnless(os.environ.get("VELMORA_TEST_PG_MIGRATE") == "1",
@@ -931,9 +938,9 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
         (hook / 'psql').chmod(0o755)
         return dict(os.environ, PATH=f"{hook}{os.pathsep}{os.environ['PATH']}"), hook / 'hook.log'
 
-    def reuse_setup(self, tmp, indexes, *, mode):
+    def reuse_setup(self, tmp, indexes, *, mode, existing=True):
         """Apply 0001-0004 in mode (online, import or concurrent), create the
-        matching kofra_a, and add 0005 with the given index statements."""
+        matching kofra_a if existing, and add 0005 with the given index statements."""
         script = clone_bridge(tmp)
         args = ('--import-mode',) if mode == 'import' else ()
         if mode == 'import':
@@ -944,7 +951,8 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
         self.migrate(*args, script=script)
         if mode != 'import':
             self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
-        self.owner_sql('CREATE INDEX kofra_a ON kofra_t (id);')
+        if existing:
+            self.owner_sql('CREATE INDEX kofra_a ON kofra_t (id);')
         pg = indexes
         if mode == 'concurrent':
             pg = '-- velmora: no-transaction\n' + indexes.replace('CREATE INDEX', 'CREATE INDEX CONCURRENTLY')
@@ -954,9 +962,12 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
     def index_oid(self, name):
         return self.owner_sql(f"SELECT coalesce(to_regclass('{name}')::oid, 0)").stdout.strip()
 
-    def assert_refused_without_ledger_row(self, result, script, message):
+    def assert_refused_without_ledger_row(self, result, script, message, *, retried=False):
         self.assertIn(f'0005_kofra_indexes.sql: {message}', result.stderr)
-        self.assertNotIn('retry', result.stderr)
+        if retried:
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE VL023, retry 5/5', result.stderr)
+        else:
+            self.assertNotIn('retry', result.stderr)
         self.assertNotIn('0005', self.ledger())
         pending = self.migrate('--pending', script=script, ok=False)
         self.assertEqual((pending.returncode, pending.stdout), (3, '0005_kofra_indexes.sql\n'), pending.stderr)
@@ -1035,9 +1046,9 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assert_refused_without_ledger_row(result, script, ORDINARY_MISMATCH)
             self.assertNotEqual(self.index_oid('kofra_a'), '0')
 
-    def held_reused_table(self, script, args, env):
+    def held_reused_table(self, script, args, env, *, release_on_retry=False):
         """Run the migration while another session holds kofra_t in the mode
-        DROP INDEX CONCURRENTLY takes."""
+        DROP INDEX CONCURRENTLY takes; optionally release it at the first retry."""
         blocker = subprocess.Popen(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1'], stdin=subprocess.PIPE,
                                    stdout=subprocess.DEVNULL, text=True, env=libpq_env())
         try:
@@ -1051,34 +1062,85 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
                 time.sleep(0.05)
             else:
                 self.fail('blocker did not take its lock')
-            return self.migrate(*args, script=script, env=env, ok=False)
-        finally:
+            if not release_on_retry:
+                return self.migrate(*args, script=script, env=env, ok=False)
+            run = subprocess.Popen(['bash', str(script), str(self.env), *args], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, env=env)
+            first = run.stderr.readline()
+            self.assertIn('retry 1/5', first)
             blocker.stdin.write('ROLLBACK;\n')
+            blocker.stdin.close()
+            out, err = run.communicate(timeout=120)
+            self.assertEqual(run.returncode, 0, err)
+            return subprocess.CompletedProcess(run.args, run.returncode, out, first + err)
+        finally:
+            if not blocker.stdin.closed:
+                blocker.stdin.write('ROLLBACK;\n')
             blocker.stdin.close()
             blocker.wait(timeout=30)
 
-    def reuse_lock_timeout(self, mode, message, *, replace=()):
+    def reuse_lock_timeout(self, mode, *, replace=()):
         with tempfile.TemporaryDirectory() as tmp:
             script, args = self.reuse_setup(tmp, REUSE_ONLY, mode=mode)
             env, log = self.hooked(tmp, replace=list(replace))
             result = self.held_reused_table(script, args, env)
             for old, _ in replace:
                 self.assertIn(f'seen {old}', log.read_text())
-            self.assert_refused_without_ledger_row(result, script, message)
+            # Busy, not a mismatch: the matching index must not look droppable.
+            self.assert_refused_without_ledger_row(result, script, TABLE_BUSY, retried=True)
+            self.assertNotIn('does not match', result.stderr)
+            self.assertNotEqual(self.index_oid('kofra_a'), '0')
             self.assertIn('0005_kofra_indexes.sql: applied', self.migrate(*args, script=script).stdout)
 
     # With app access, the real timeouts: the lock wait ends inside the 3 s
-    # statement and transaction budgets, so the refusal is the mismatch.
+    # statement and transaction budgets, so the refusal is the busy table.
     def test_concurrent_reuse_lock_timeout_writes_no_ledger_row(self):
-        self.reuse_lock_timeout('concurrent', CONCURRENT_MISMATCH)
+        self.reuse_lock_timeout('concurrent')
 
     def test_online_reuse_lock_timeout_writes_no_ledger_row(self):
-        self.reuse_lock_timeout('online', ORDINARY_MISMATCH)
+        self.reuse_lock_timeout('online')
 
     def test_import_reuse_lock_timeout_writes_no_ledger_row(self):
         # Without app access the wait is 30 s, shortened to 1 s for the test.
-        self.reuse_lock_timeout('import', ORDINARY_MISMATCH,
-                                replace=[["SET LOCAL lock_timeout = '30s'", "SET LOCAL lock_timeout = '1s'"]])
+        self.reuse_lock_timeout('import', replace=[["SET LOCAL lock_timeout = '30s'", "SET LOCAL lock_timeout = '1s'"]])
+
+    def busy_until_retry(self, mode):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, args = self.reuse_setup(tmp, REUSE_ONLY, mode=mode)
+            env, _ = self.hooked(tmp)
+            result = self.held_reused_table(script, args, env, release_on_retry=True)
+            self.assertIn('0005_kofra_indexes.sql: SQLSTATE VL023, retry 1/5', result.stderr)
+            self.assertIn('0005_kofra_indexes.sql: applied', result.stdout)
+            self.assertEqual(self.ledger()[-1], '0005')
+
+    def test_busy_index_table_is_retried_until_free_concurrent(self):
+        self.busy_until_retry('concurrent')
+
+    def test_busy_index_table_is_retried_until_free_online(self):
+        self.busy_until_retry('online')
+
+    def built_race(self, inject, *, recovers):
+        """Build kofra_a, then kofra_b; inject runs after kofra_a's build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script, _ = self.reuse_setup(tmp, REUSE_BOTH, mode='concurrent', existing=False)
+            env, log = self.hooked(tmp, inject=inject, inject_after="velmora.built_0'")
+            result = self.migrate(script=script, env=env, ok=False)
+            self.assertIn('fired inject', log.read_text())
+            self.assert_refused_without_ledger_row(result, script, CONCURRENT_MISMATCH)
+            self.assertNotEqual(self.index_oid('kofra_b'), '0')
+            if recovers:
+                # The next run builds what is missing and records the migration.
+                self.assertIn('0005_kofra_indexes.sql: applied', self.migrate(script=script).stdout)
+                self.assertIn('Post-cutover objects verified', self.migrate('--verify', script=script).stdout)
+            else:
+                # A different index under the name stays refused until repaired.
+                self.assertIn(CONCURRENT_MISMATCH, self.migrate(script=script, ok=False).stderr)
+
+    def test_index_built_by_this_run_dropped_before_ledger_write_is_refused(self):
+        self.built_race('DROP INDEX kofra_a;', recovers=True)
+
+    def test_index_built_by_this_run_replaced_before_ledger_write_is_refused(self):
+        self.built_race('DROP INDEX kofra_a; CREATE INDEX kofra_a ON kofra_t (a);', recovers=False)
 
     def test_same_name_index_created_after_snapshot_is_refused_at_the_fence(self):
         with tempfile.TemporaryDirectory() as tmp:

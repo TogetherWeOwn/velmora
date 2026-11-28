@@ -41,6 +41,7 @@ ERRORS = {
     'VL018': 'a migration statement changed the runner apply decision; the migration was rolled back',
     'VL021': 'existing concurrent index definition does not match the migration',
     'VL022': 'existing index definition does not match the migration',
+    'VL023': 'index table busy; retry later',
     'VLM01': 'migration changed schema or search_path',
     '25P04': 'SQLSTATE 25P04: online migration exceeded the 3 s transaction budget',
     '57014': 'SQLSTATE 57014: an online migration statement exceeded the 3 s statement budget or was canceled',
@@ -86,6 +87,15 @@ $$;
 
 def die(message):
     raise SystemExit(f'pg-migrate: {message}')
+
+
+# Lock timeouts. VL023 is the index-table lock in the ledger transaction,
+# kept apart so its final message is not a generic lock timeout.
+BUSY = {'55P03', 'VL023'}
+
+
+class Busy(Exception):
+    pass
 
 
 def digest(data):
@@ -770,10 +780,10 @@ SET {scope}client_min_messages = error;
             state = states[-1] if states else None
             if concurrent and state == 'VL020':
                 return 'already applied'  # Caller independently confirms the ledger row.
-            if state == '55P03' and busy:
-                return None  # The caller re-plans before it retries.
-            if state == '55P03' and retry and attempt < 5:
-                print(f'{report}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
+            if state in BUSY and busy:
+                raise Busy(state)  # The caller re-plans before it retries.
+            if state in BUSY and retry and attempt < 5:
+                print(f'{report}: SQLSTATE {state}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
                 time.sleep(0.25 * (2 ** attempt))
                 continue
             reason = ERRORS.get(state) or (f'SQLSTATE {state}' if state else 'psql connection or client failure')
@@ -822,7 +832,7 @@ SET {scope}client_min_messages = error;
         candidates = [(i, pos) for i, parts in enumerate(statements)
                       if (pos := index_guard_position(parts)) is not None]
         if not candidates:
-            return None, source_statements, ()
+            return None, source_statements, (), ()
         try:
             expected = [index_definition(statements[i], schema, source=True) for i, _ in candidates]
             snapshot = pending_index_snapshot([definition[0] for definition in expected])
@@ -834,12 +844,13 @@ SET {scope}client_min_messages = error;
             if not isinstance(observed, list) or len(observed) != len(expected):
                 # The already-applied read-only fast path also lands here.
                 # The locked apply decision must confirm applied, not run DDL.
-                return 'true', [], ()
+                return 'true', [], (), ()
             commands = list(source_statements)
-            reused = []
+            reused, built = [], {}
             for (i, pos), definition, actual in zip(candidates, expected, observed):
                 if actual is None:
                     commands[i] = require_new_index(commands[i], pos)
+                    built[i] = definition[2], definition[0]
                 elif (isinstance(actual, list) and len(actual) == 2 and isinstance(actual[0], str)
                       and re.fullmatch(r'[0-9]{1,10}', actual[0])
                       and isinstance(actual[1], str)
@@ -849,16 +860,19 @@ SET {scope}client_min_messages = error;
                     # Table, index OID, name and the digest of the raw deparse.
                     reused.append((definition[2], actual[0], definition[0], digest(actual[1].encode('utf-8'))))
                 else:
-                    return 'true', [], ()
+                    return 'true', [], (), ()
         except ValueError:
-            return 'true', [], ()
+            return 'true', [], (), ()
         # Revalidate the same OIDs, raw deparse text, and absences after
         # acquiring the migrator lock. Hex keeps catalog text out of the SQL
         # grammar and the wrapper's dollar quote.
         raw = raw_snapshot.encode('utf-8').hex()
         expected_snapshot = f"pg_catalog.convert_from(pg_catalog.decode('{raw}', 'hex'), 'UTF8')"
         changed = f'{snapshot}::pg_catalog.text COLLATE pg_catalog."C" IS DISTINCT FROM {expected_snapshot}'
-        return changed, [statement for statement in commands if statement is not None], tuple(reused)
+        kept = [i for i, statement in enumerate(commands) if statement is not None]
+        # Built: (position among the returned statements, table, index name).
+        return (changed, [commands[i] for i in kept], tuple(reused),
+                tuple((n, *built[i]) for n, i in enumerate(kept) if i in built))
 
     def index_fence(condition, code, *, online=False):
         if condition is None:
@@ -867,31 +881,55 @@ SET {scope}client_min_messages = error;
             condition = f'{APPLY} AND ({condition})'
         return index_deparse_path + check(condition, code) + f'SET LOCAL search_path TO "{schema}", pg_temp;\n'
 
-    def reuse_guard(reused, code, *, online=False):
-        """In the ledger transaction, hold every reused index's table against
-        DROP INDEX [CONCURRENTLY], then require the OID, validity and raw
-        deparse recorded at the fence. Without this, an index dropped after
-        the fence would still be recorded as applied."""
-        if not reused:
+    def built_identity(table, name):
+        """OID and raw-deparse digest of the valid, ready index on its table.
+        Evaluate under index_deparse_path, as the fence does."""
+        return f'''(SELECT c.oid::pg_catalog.text OPERATOR(pg_catalog.||) ' ' OPERATOR(pg_catalog.||)
+                pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.pg_get_indexdef(c.oid), 'UTF8')), 'hex')
+            FROM pg_catalog.pg_class c JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
+            WHERE c.relnamespace = {namespace} AND c.relname = '{name}'
+                AND i.indrelid = pg_catalog.to_regclass('"{schema}"."{table}"') AND i.indisvalid AND i.indisready)'''
+
+    def record_built(k, table, name):
+        """Right after a no-transaction build, record in the session what was
+        built, for the ledger transaction to require. IF NOT EXISTS is gone,
+        so an index under this name is this run's build."""
+        return ("DO $velmora_built$ BEGIN PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true); "
+                f"PERFORM pg_catalog.set_config('velmora.built_{k}', "
+                f"coalesce({built_identity(table, name)}, 'missing'), false); END $velmora_built$;")
+
+    def reuse_guard(reused, code, *, online=False, built=()):
+        """In the ledger transaction, hold every reused or self-built index's
+        table against DROP INDEX [CONCURRENTLY]. Then require the OID,
+        validity and raw deparse recorded at the fence (reused) or right
+        after the build (built). Without this, an index dropped after the
+        fence or its build would still be recorded as applied."""
+        if not reused and not built:
             return ''
-        tables = ', '.join(f'"{schema}"."{table}"' for table in sorted({table for table, *_ in reused}))
+        tables = ', '.join(f'"{schema}"."{table}"'
+                           for table in sorted({entry[0] for entry in reused} | {entry[1] for entry in built}))
         # With app access the 3 s online statement budget applies: wait less,
-        # so a held table is reported as the mismatch, not as a budget overrun.
+        # so a held table is reported as busy, not as a budget overrun.
         lock = (f"IF {usage} THEN SET LOCAL lock_timeout = '2s'; END IF; "
                 f'LOCK TABLE ONLY {tables} IN SHARE UPDATE EXCLUSIVE MODE;')
         if online:
             lock = f'IF {APPLY} THEN {lock} END IF;'
         # A digest keeps the deparse text out of the size-capped arguments.
-        changed = ' OR '.join(f'''NOT EXISTS (SELECT FROM pg_catalog.pg_class c
+        changed = [f'''NOT EXISTS (SELECT FROM pg_catalog.pg_class c
             JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
             WHERE c.oid = '{oid}'::pg_catalog.oid AND c.relnamespace = {namespace} AND c.relname = '{name}'
                 AND i.indisvalid AND i.indisready AND pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
                     pg_catalog.pg_get_indexdef(c.oid), 'UTF8')), 'hex') = '{definition}')'''
-            for _, oid, name, definition in reused)
+            for _, oid, name, definition in reused]
+        changed += [f"""(pg_catalog.current_setting('velmora.built_{k}') = 'missing'
+            OR {built_identity(table, name)} IS DISTINCT FROM pg_catalog.current_setting('velmora.built_{k}'))"""
+            for k, table, name in built]
+        # A busy table is VL023 (retried, then "busy"), never a mismatch.
         return ("SET LOCAL lock_timeout = '30s';\n"
-                f'DO $velmora_reuse$ BEGIN {lock} EXCEPTION WHEN lock_not_available OR undefined_table THEN '
-                f"RAISE EXCEPTION USING ERRCODE = '{code}'; END $velmora_reuse$;\n"
-                "SET LOCAL lock_timeout = '3s';\n" + index_fence(changed, code, online=online))
+                f'DO $velmora_reuse$ BEGIN {lock} EXCEPTION '
+                "WHEN lock_not_available THEN RAISE EXCEPTION USING ERRCODE = 'VL023'; "
+                f"WHEN undefined_table THEN RAISE EXCEPTION USING ERRCODE = '{code}'; END $velmora_reuse$;\n"
+                "SET LOCAL lock_timeout = '3s';\n" + index_fence(' OR '.join(changed), code, online=online))
 
     if args.pending:
         applied = set(run(read_history + f"SELECT version FROM {ledger};\nCOMMIT;\n",
@@ -942,9 +980,10 @@ $$;
             break
         sql, no_tx, parsed = migrations[version]
         statements, source_statements = parsed
-        index_condition, reused = None, ()
+        index_condition, reused, built = None, (), ()
         if no_tx or version > CUTOVER_BASELINE:
-            index_condition, source_statements, reused = index_plan(version, name, statements, source_statements)
+            index_condition, source_statements, reused, built = index_plan(
+                version, name, statements, source_statements)
         record = (f"INSERT INTO {ledger} VALUES ('{version}', '{digest(body)}', "
                   "(extract(epoch FROM pg_catalog.clock_timestamp()) * 1000)::bigint);")
         if no_tx:
@@ -955,7 +994,8 @@ $$;
                 if attempt:
                     # An index the failed attempt built is now reused, not
                     # rebuilt: retrying the old plan would only fail its fence.
-                    index_condition, source_statements, reused = index_plan(version, name, statements, parsed[1])
+                    index_condition, source_statements, reused, built = index_plan(
+                        version, name, statements, parsed[1])
                 prepare = (prefix + online_migrator_session + concurrent_tx
                            + check(f'NOT ({ledger_exists})', 'VL017') + history)
                 if args.import_mode:
@@ -967,13 +1007,20 @@ $$;
                 prepare += check(applied, 'VL020') + check(bad_index, 'VL015') + path_check
                 prepare += index_fence(index_condition, 'VL021') + 'COMMIT;\n'
                 # Check reused indexes first: a reused index made invalid is VL021, not VL015.
-                finish = (concurrent_tx + reuse_guard(reused, 'VL021') + check(bad_index, 'VL015') + path_check
-                          + record + "\nCOMMIT;\nSELECT 'applied';\n")
-                output = run([prepare, *source_statements, finish], busy=attempt < 5, report=name, concurrent=True)
-                if output is not None:
+                finish = (concurrent_tx + reuse_guard(reused, 'VL021', built=built) + check(bad_index, 'VL015')
+                          + path_check + record + "\nCOMMIT;\nSELECT 'applied';\n")
+                messages = [prepare]
+                after = {n: (k, table, index) for k, (n, table, index) in enumerate(built)}
+                for n, statement in enumerate(source_statements):
+                    messages.append(statement)
+                    if n in after:
+                        messages.append(record_built(*after[n]))
+                try:
+                    output = run([*messages, finish], busy=attempt < 5, report=name, concurrent=True)
                     break
-                print(f'{name}: SQLSTATE 55P03, retry {attempt + 1}/5', file=sys.stderr, flush=True)
-                time.sleep(0.25 * (2 ** attempt))
+                except Busy as busy:
+                    print(f'{name}: SQLSTATE {busy}, retry {attempt + 1}/5', file=sys.stderr, flush=True)
+                    time.sleep(0.25 * (2 ** attempt))
             output = output.splitlines()
             if output == ['already applied']:
                 confirmed = run(read_history + f'SELECT {applied};\nCOMMIT;\n', report=name)
