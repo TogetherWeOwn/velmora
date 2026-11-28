@@ -1485,11 +1485,14 @@ pub trait Catalog {
 
     // provider pool
     /// Held slots, slots ever handed out and health, per provider that
-    /// has a permit or a health row.
+    /// has a health row or an entry in the active source of permit load
+    /// (gate hint or catalogue slots). With an active gate, slot rows
+    /// alone do not contribute, but gate entries without health rows do.
+    /// Treat an absent provider as having zero load and being healthy.
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>>;
-    /// [`Self::provider_load`] for the operator's status: what is held
-    /// at this moment, where `provider_load` may go by what its caller
-    /// last heard.
+    /// [`Self::provider_load`] for the operator's status, using live gate
+    /// load rather than a hint. Gate-only providers are included; an
+    /// absent provider has zero load and is healthy.
     async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
         self.provider_load(now).await
     }

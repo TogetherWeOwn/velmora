@@ -41,19 +41,32 @@ fn pooled(id: &str, max_conns: u32, pool: &str, pool_max_conns: u32) -> Provider
 
 /// One database for the catalogue callers and the gates.
 #[derive(Clone)]
-struct Db(Rc<TestSql>);
+struct Db(Rc<TestSql>, Rc<RefCell<Option<Vec<String>>>>);
+
+impl Db {
+    fn record(&self, sql: &str) {
+        if let Some(trace) = self.1.borrow_mut().as_mut() {
+            trace.push(sql.to_owned());
+        }
+    }
+}
 
 impl Sql for Db {
     fn dialect(&self) -> Dialect {
         self.0.dialect()
     }
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.record(sql);
         self.0.query(sql, params).await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.record(sql);
         self.0.exec(sql, params).await
     }
     async fn batch(&self, stmts: Vec<(&'static str, Vec<SqlValue>)>) -> Result<Vec<u64>> {
+        for (sql, _) in &stmts {
+            self.record(sql);
+        }
         self.0.batch(stmts).await
     }
 }
@@ -107,6 +120,8 @@ struct World {
     /// Requests without a session: each is one billed request.
     posts: Cell<u32>,
     ops: Cell<u32>,
+    /// Gates contacted with a live status request.
+    status_requests: RefCell<Vec<String>>,
     /// No gate can be reached.
     down: Cell<bool>,
     /// Requests to a gate do not arrive while this is set.
@@ -119,7 +134,7 @@ struct World {
 impl World {
     fn new() -> Rc<Self> {
         Rc::new(World {
-            db: Db(Rc::new(TestSql::with_schema().unwrap())),
+            db: Db(Rc::new(TestSql::with_schema().unwrap()), Rc::default()),
             now: Cell::new(T0),
             stores: RefCell::default(),
             gates: RefCell::default(),
@@ -130,6 +145,7 @@ impl World {
             msgs: Cell::new(0),
             posts: Cell::new(0),
             ops: Cell::new(0),
+            status_requests: RefCell::default(),
             down: Cell::new(false),
             late: Cell::new(false),
             stall: Cell::new(false),
@@ -307,6 +323,12 @@ impl Wire {
         }
         self.0.calls.set(self.0.calls.get() + 1);
         self.0.ops.set(self.0.ops.get() + request.ops.len() as u32);
+        if request.ops.iter().any(|op| matches!(op, GateOp::Load)) {
+            self.0
+                .status_requests
+                .borrow_mut()
+                .push(request.gate.clone());
+        }
         // As on the wire: the request and the reply are JSON.
         Ok(serde_json::from_str(&serde_json::to_string(request).unwrap()).unwrap())
     }
@@ -557,11 +579,138 @@ async fn load_is_what_the_gate_handed_out() {
     let p = load.iter().find(|l| l.provider_id == "p").unwrap();
     assert_eq!((p.held, p.holders, p.background_holders), (3, 2, 1));
     assert_eq!(p.uses, 3);
-    let q = load.iter().find(|l| l.provider_id == "q").unwrap();
-    assert_eq!((q.held, q.holders, q.background_holders), (0, 0, 0));
+    // No hint or health row for q; the pool counts it as zero load.
+    assert!(!load.iter().any(|l| l.provider_id == "q"));
     c.release_permit(&a).await.unwrap();
     let load = c.provider_load(w.now()).await.unwrap();
     assert_eq!(load.iter().find(|l| l.provider_id == "p").unwrap().held, 2);
+}
+
+#[tokio::test]
+async fn active_load_and_status_match_slot_overlay_where_it_has_rows() {
+    let w = World::new();
+    let providers = [
+        provider("slots-with-hint", 2),
+        provider("hint-only", 2),
+        provider("both", 2),
+        provider("slots-without-hint", 2),
+    ];
+    let old = w.old_catalog();
+    old.seed_permits(&providers).await.unwrap();
+    w.db.0
+        .fixture_script(
+            "INSERT INTO provider_health \
+        (provider_id, failures, cooldowns, cooldown_until, last_failure_reason) VALUES \
+        ('both', 2, 1, 1762992060123, 'connect_refused'), \
+        ('health-only', 1, 0, 0, 'session_failed'), \
+        ('stale-reason', 0, 0, 0, 'connect_refused');",
+        )
+        .unwrap();
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    for p in &providers[..3] {
+        take(&c, &w, p, JOB, "job").await.unwrap();
+        take(&c, &w, p, READ, "reader").await.unwrap();
+    }
+
+    // Reference: the old full read, with the four load fields replaced by
+    // the gate's values. A slot-only provider the gate has not heard of
+    // has all zeroes after the overlay, the same as an absent row in Pool.
+    let mut expected = old.provider_load(w.now()).await.unwrap();
+    let inactive = w.catalog(PermitMode::Catalog, GateSharding::One, &providers);
+    assert_eq!(inactive.provider_load(w.now()).await.unwrap(), expected);
+    assert_eq!(inactive.provider_status(w.now()).await.unwrap(), expected);
+    expected.retain(|l| l.provider_id != "slots-without-hint");
+    for l in &mut expected {
+        if providers[..3].iter().any(|p| p.id == l.provider_id) {
+            (l.held, l.holders, l.background_holders, l.uses) = (2, 2, 1, 2);
+        }
+    }
+    assert_eq!(
+        expected
+            .iter()
+            .map(|l| l.provider_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "both",
+            "health-only",
+            "hint-only",
+            "slots-with-hint",
+            "stale-reason"
+        ]
+    );
+    assert_eq!(expected[0].fault, Some(ProviderFault::ConnectRefused));
+    assert_eq!(expected[4].fault, None);
+
+    // Drop one provider's slots after warming the gate: its hint now has
+    // no catalogue row at all but must still contribute to provider load.
+    w.db.0
+        .fixture_script("DELETE FROM provider_permits WHERE provider_id = 'hint-only';")
+        .unwrap();
+    assert_eq!(c.provider_load(w.now()).await.unwrap(), expected);
+    assert_eq!(c.provider_status(w.now()).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn active_load_and_status_do_not_query_permit_slots() {
+    let w = World::new();
+    let providers = [provider("p", 4), provider("q", 3)];
+    let c = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    c.seed_permits(&providers).await.unwrap();
+    // Acquire through the live gate before tracing: this warms the gate
+    // and gives the caller a hint with distinct load counters.
+    for (p, class, holder) in [
+        (&providers[0], JOB, "job"),
+        (&providers[0], JOB, "job"),
+        (&providers[0], READ, "reader"),
+        (&providers[1], READ, "reader"),
+    ] {
+        take(&c, &w, p, class, holder).await.unwrap();
+    }
+
+    // A different caller updates the gate without updating c's hint.
+    let peer = w.catalog(PermitMode::Gate, GateSharding::One, &providers);
+    take(&peer, &w, &providers[1], JOB, "peer-job")
+        .await
+        .unwrap();
+
+    let calls = w.calls.get();
+    *w.db.1.borrow_mut() = Some(Vec::new());
+    let load = c.provider_load(w.now()).await.unwrap();
+    let load_sql = w.db.1.replace(Some(Vec::new())).unwrap();
+    assert_eq!(w.calls.get(), calls, "provider_load should use its hint");
+    let status = c.provider_status(w.now()).await.unwrap();
+    let status_sql = w.db.1.borrow_mut().take().unwrap();
+    assert_eq!(&*w.status_requests.borrow(), &["permits:all:0"]);
+    assert!(
+        load_sql
+            .iter()
+            .chain(&status_sql)
+            .all(|sql| !sql.to_ascii_lowercase().contains("provider_permits")),
+        "active load/status read slot rows: load={load_sql:?}, status={status_sql:?}"
+    );
+    for (method, sql, rows, expected_q) in [
+        ("provider_load", load_sql, load, ("q", 1, 1, 0, 1)),
+        ("provider_status", status_sql, status, ("q", 2, 2, 1, 2)),
+    ] {
+        assert_eq!(sql.len(), 1, "{method} should read health once: {sql:?}");
+        assert!(
+            sql[0].to_ascii_lowercase().contains("from provider_health"),
+            "{method} should read provider health: {sql:?}"
+        );
+        let counters: Vec<_> = rows
+            .iter()
+            .map(|l| {
+                (
+                    l.provider_id.as_str(),
+                    l.held,
+                    l.holders,
+                    l.background_holders,
+                    l.uses,
+                )
+            })
+            .collect();
+        assert_eq!(counters, [("p", 3, 2, 1, 3), expected_q], "{method}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2390,9 +2539,9 @@ async fn the_load_a_gate_told_is_used_by_a_call_whose_clock_is_behind() {
         assert_eq!(load[0].held, 1, "{behind} ms behind");
     }
     let load = c.provider_load(UnixMs(w.now().0 - HINT_MS)).await.unwrap();
-    assert_eq!(load[0].held, 0, "too far ahead to go by");
+    assert!(load.is_empty(), "too far ahead to go by");
     let load = c.provider_load(UnixMs(w.now().0 + HINT_MS)).await.unwrap();
-    assert_eq!(load[0].held, 0, "too old to go by");
+    assert!(load.is_empty(), "too old to go by");
 }
 
 /// Names that are not ASCII are counted at their stored size, and
