@@ -1,4 +1,3 @@
--- velmora: sqlite-twin 0005_scrub.sql 011665e7e9bb256cef211f3b43ecb128c42d9be89bd0aefb5dc0d4962074d493
 -- Additive only. The extents indexes follow in 0006, built concurrently.
 -- No extent rewrite: all new summary columns are nullable.
 ALTER TABLE extents
