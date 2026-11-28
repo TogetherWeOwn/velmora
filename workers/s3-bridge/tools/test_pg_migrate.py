@@ -223,6 +223,15 @@ class SqliteTwins(unittest.TestCase):
             for table in re.findall(r"CREATE\s+UNIQUE\s+INDEX\b[^;]*?\bON\s+([a-z_0-9]+)", text, re.I):
                 self.assertNotIn(table.lower(), historical, f"{stage.name} uniquely indexes {table}")
 
+    def test_stages_and_twins_are_plain_ascii(self):
+        # Printable ASCII, tab and newline only: no backslash, no NUL,
+        # comments included.
+        files = sorted((BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        files += sorted((BRIDGE / "migrations-local").glob("[0-9][0-9][0-9][0-9]_*.sql"))
+        for f in files:
+            bad = sorted({b for b in f.read_bytes() if not (32 <= b < 127 or b in (9, 10)) or b == 92})
+            self.assertEqual(bad, [], f.name)
+
     def test_no_new_d1_migration_after_the_cutover(self):
         # The frozen D1 takes no schema change: the last D1 file is the one
         # the cutover baseline covers.
