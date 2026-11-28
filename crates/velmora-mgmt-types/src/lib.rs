@@ -31,8 +31,8 @@
 //! bucket_name}` (`null` for a bucket that is gone) and events
 //! (`data.bucket_id`, `data.bucket`).
 //!
-//! **Who acts.** [`headers::ACTING_OWNER_REF`] names the member; the root
-//! unit resolves it to a principal. The plane takes grants, never a role:
+//! **Who acts.** [`headers::ACTING_OWNER_REF`] names the member; the plane
+//! resolves it to a principal. The plane takes grants, never a role:
 //! the caller maps a role to a grant list. A grant asked for with the
 //! header must be held by the acting principal (`403 grant_not_held`).
 //!

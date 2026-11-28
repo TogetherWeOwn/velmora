@@ -9,7 +9,7 @@
 //!
 //! | Code | Status | Retry-After | When | `kofra-api` |
 //! |---|---|---|---|---|
-//! | `bad_request`, `grant_limits_not_served` | 400 | — | malformed or not served | `Upstream` |
+//! | `bad_request`, `grant_limits_not_served` | 400 | — | malformed request or unsupported grant limits | `Upstream` |
 //! | `jurisdiction_not_served` | 400 | — | a tenant create names a jurisdiction other than `none` (the initial release serves `none` only) | `Upstream` |
 //! | `limits_not_served`, `rate_class_not_served` | 400 | — | a tenant create carries `limits` or `rate_class` (the initial release serves neither) | `Upstream` |
 //! | `idempotency_key_required` | 400 | — | missing required idempotency key | `Upstream` |
@@ -17,7 +17,8 @@
 //! | `unauthenticated` | 401 | — | token | `Upstream` |
 //! | `insufficient_scope`, `internal_key_refused`, `acting_principal_unknown`, `acting_principal_inactive` | 403 | — | wrong token class; the tenant's internal key; the acting header | `Upstream` |
 //! | `grant_not_held` | 403 | — | the subset rule: a grant wider than the acting principal's, or an object call with no grant | `GrantNotHeld` |
-//! | `not_found`, `method_not_allowed` | 404, 405 | — | no such call | `Upstream` |
+//! | `not_found` | 404 | — | unknown path or an initial-release deferred route | `Upstream` |
+//! | `method_not_allowed` | 405 | — | method not allowed on a served route | `Upstream` |
 //! | `tenant_not_found`, `principal_not_found` | 404 | — | an id the tenant does not have | `Upstream` |
 //! | `bucket_not_found`, `key_not_found` | 404 | — | | same-named variant |
 //! | `bucket_already_exists`, `bucket_not_empty`, `key_limit_reached`, `bucket_limit_reached`, `upload_limit_reached`, `grant_limit_reached`, `feed_reset`, `deletion_already_requested`, `deletion_not_requested`, `deletion_final` | 409 | — | | same-named variant |
@@ -33,7 +34,7 @@
 //! | `idempotency_key_in_use` | 409 | yes | the same request is still being applied | `IdempotencyKeyInUse { retry_after }` |
 //! | `idempotency_key_reused` | 422 | — | the key with another request | `IdempotencyKeyReused` |
 //! | `cap_reached` | 429 | yes | a per-tenant or per-token rate cap; never an absolute limit | `Busy` |
-//! | `service_unavailable` | 503 | yes | the `m/rst/` bound, the directory gate, a unit that cannot be reached | `Unavailable` |
+//! | `service_unavailable` | 503 | yes | the plane cannot complete the call right now | `Unavailable` |
 //! | `internal_error` | 500 | — | | `Upstream` |
 //!
 //! **Absolute limits answer `409`**, never `429`: the tenant's buckets

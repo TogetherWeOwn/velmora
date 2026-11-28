@@ -4,8 +4,9 @@
 //! path (a `../` or a `?` in a key id could otherwise name another
 //! tenant's path). Tenant 0 is not a tenant of this plane.
 //!
-//! Routes marked `not_served` are not available in the initial release.
-//! Their paths and types remain in the contract for client compatibility.
+//! The initial release answers `404 not_found` for routes in [`NOT_SERVED`],
+//! just as for an unknown path. Their paths and types remain in the contract
+//! for client compatibility.
 //!
 //! | `kofra-api` call | Method and path | Scope, token |
 //! |---|---|---|
@@ -13,7 +14,7 @@
 //! | `Tenancy::create_principal` | `POST /v1/tenants/{t}/principals` (`not_served`) | `principals:write`, confirmed |
 //! | `tenant` | `GET /v1/tenants/{t}` | `tenants:read` |
 //! | `tenant_reach` | `GET /v1/tenants/{t}/reach` (`not_served`) | `tenants:read` |
-//! | `delete_tenant` | `DELETE /v1/tenants/{t}?hold_days=<n>` | `tenants:delete`, confirmed, with a confirmation record |
+//! | `delete_tenant` | `DELETE /v1/tenants/{t}?hold_days=<n>` (`not_served`) | `tenants:delete`, confirmed, with a confirmation record |
 //! | `restore_tenant` | `POST /v1/tenants/{t}/restore` (`not_served`) | `tenants:delete`, confirmed, with a confirmation record |
 //! | `buckets` | `GET /v1/tenants/{t}/buckets?after=&limit=` | `tenants:read` |
 //! | (name lookup) | `GET /v1/tenants/{t}/buckets?name=<n>[&name=…]` | `tenants:read` |
@@ -41,6 +42,17 @@ use crate::ids::{valid_bucket_id, valid_key_id, valid_tenant_id};
 
 /// The prefix of every path of the plane.
 pub const PREFIX: &str = "/v1";
+
+/// Method and path templates that answer `404 not_found` in the initial
+/// release. Query parameters do not change whether a route is served.
+pub const NOT_SERVED: &[(&str, &str)] = &[
+    ("POST", "/v1/tenants/{t}/principals"),
+    ("GET", "/v1/tenants/{t}/reach"),
+    ("DELETE", "/v1/tenants/{t}"),
+    ("POST", "/v1/tenants/{t}/restore"),
+    ("GET", "/v1/tenants/{t}/usage/days"),
+    ("GET", "/v1/tenants/{t}/events"),
+];
 
 pub fn tenants() -> String {
     format!("{PREFIX}/tenants")

@@ -796,6 +796,43 @@ fn the_kofra_api_mapping() {
 }
 
 #[test]
+fn initial_release_deferred_routes_are_not_found() {
+    assert_eq!(
+        paths::NOT_SERVED,
+        &[
+            ("POST", "/v1/tenants/{t}/principals"),
+            ("GET", "/v1/tenants/{t}/reach"),
+            ("DELETE", "/v1/tenants/{t}"),
+            ("POST", "/v1/tenants/{t}/restore"),
+            ("GET", "/v1/tenants/{t}/usage/days"),
+            ("GET", "/v1/tenants/{t}/events"),
+        ],
+    );
+    assert_eq!(Code::NotFound.as_str(), "not_found");
+    assert_eq!(Code::NotFound.status(), 404);
+}
+
+#[test]
+fn tenant_and_bucket_ids_refuse_wrong_shape() {
+    for bad in [
+        "t_0123456789abcdef0",
+        "b_0123456789abcdef",
+        "0123456789abcdef",
+        "t_0123456789abcdeg",
+    ] {
+        assert!(!ids::valid_tenant_id(bad), "accepted {bad}");
+    }
+    for bad in [
+        "b_0123456789abcdef0",
+        "t_0123456789abcdef",
+        "0123456789abcdef",
+        "b_0123456789abcdeg",
+    ] {
+        assert!(!ids::valid_bucket_id(bad), "accepted {bad}");
+    }
+}
+
+#[test]
 fn id_and_header_forms() {
     assert!(ids::valid_tenant_id(TENANT));
     assert!(

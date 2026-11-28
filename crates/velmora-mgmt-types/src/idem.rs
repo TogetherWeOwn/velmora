@@ -15,7 +15,7 @@
 //! What keeps the key, per call class:
 //!
 //! 1. **Capped opening calls** (create a bucket, a key or a principal; a
-//!    widening grant change): the root unit's reservation row holds the
+//!    widening grant change): the reservation holds the
 //!    scope, the fingerprint, the state (`reserved` or `applied`) and,
 //!    once applied, the answer (status and body, at most
 //!    [`MAX_STORED_ANSWER_BYTES`], **never a secret**). It is kept 24 h
@@ -36,11 +36,11 @@
 //!      with no reservation and no record.
 //!
 //!    A refused call (`4xx`) leaves no row.
-//! 2. **Tenant create:** `m/tref/` (create or adopt by `external_ref`).
+//! 2. **Tenant create:** create or adopt by `external_ref`.
 //! 3. **Closing calls** (revoke, disable, narrowing, bucket delete, the
-//!    tenant delete request): the chain. A tenant delete whose key hash
-//!    equals the set deletion's answers `200` with the tenant and runs
-//!    the stores again (steps 3 and 4). Otherwise a
+//!    tenant delete request): use the existing result when applicable.
+//!    A tenant delete whose key hash equals the set deletion's answers
+//!    `200` with the tenant and retries unfinished changes. Otherwise a
 //!    reused key on another closing request is not refused: that request
 //!    is evaluated on its own. A repeated key revoke answers `204`; a
 //!    repeated bucket delete answers `404 bucket_not_found`.

@@ -25,7 +25,7 @@ use crate::position::{Day, ObjectPosition};
 /// The most bytes in a request body.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
-/// The most bytes in an answer that the root unit keeps for a replay
+/// The most bytes in an answer the plane keeps for a replay
 /// (`Idempotency-Key`, capped opening calls). A `Key` with 64 grants fits.
 pub const MAX_STORED_ANSWER_BYTES: usize = 16 * 1024;
 
@@ -279,8 +279,8 @@ pub enum DeletionActor {
     Operator,
 }
 
-/// A deletion that is set. `seq` is the tenant-chain seq of the record
-/// that set it: the `deletion_seq` that [`TenantRestore`] names.
+/// A requested deletion. `seq` identifies the deletion request and is
+/// the `deletion_seq` that [`TenantRestore`] names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deletion {
     pub seq: u64,
@@ -386,7 +386,7 @@ impl Validate for BucketCreate {
     }
 }
 
-/// A bucket. The counters are the unit's.
+/// A bucket and its current storage counters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
     pub id: String,
@@ -441,7 +441,7 @@ pub enum KeyStatus {
     Revoked,
 }
 
-/// A key, never with its secret. `seq` is the key's newest key-chain seq,
+/// A key, never with its secret. `seq` is the current key revision,
 /// which a grant change names as `if_seq`. `last_used_at_ms` is `null`
 /// until the plane records use.
 ///
@@ -508,7 +508,7 @@ impl fmt::Debug for KeyCreated {
 /// **whole new list**, never a delta; `if_seq` is the `seq` the caller
 /// read.
 ///
-/// The unit checks in this order: (1) the same scope and the same
+/// The plane checks in this order: (1) the same scope and the same
 /// fingerprint: the answer of [`crate::idem`], case 1 (the stored answer
 /// once applied; `409 idempotency_key_in_use` or a re-admission while
 /// reserved); (2) the key already has
