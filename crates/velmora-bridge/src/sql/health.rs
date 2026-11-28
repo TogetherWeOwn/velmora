@@ -16,6 +16,7 @@
 
 use super::uploads::{ms, text, Cols};
 use super::SqlCatalog;
+use crate::gate::GateLoad;
 use crate::ports::{Sql, SqlValue};
 use crate::types::{ProviderFault, ProviderLoad, Result, UnixMs};
 
@@ -66,7 +67,7 @@ pub(super) async fn provider_load<S: Sql>(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut r = Cols::new(row);
-        let mut load = ProviderLoad {
+        let load = ProviderLoad {
             provider_id: r.text()?,
             held: r.num()?,
             uses: r.num()?,
@@ -75,17 +76,81 @@ pub(super) async fn provider_load<S: Sql>(
             cooldown_until: UnixMs(r.num()?),
             holders: r.num()?,
             background_holders: r.num()?,
-            // A code this version does not know reads as no reason.
-            fault: r.opt_text()?.as_deref().and_then(ProviderFault::parse),
+            fault: None,
         };
-        // No strike on record, no reason: a version from before the
-        // column clears the strikes and leaves the reason behind.
-        if load.healthy() {
-            load.fault = None;
-        }
-        out.push(load);
+        out.push(with_fault(load, &mut r)?);
     }
     Ok(out)
+}
+
+/// Only health comes from SQL when the permit gate supplies the load.
+pub(super) async fn provider_health<S: Sql>(c: &SqlCatalog<S>) -> Result<Vec<ProviderLoad>> {
+    c.sql
+        .query(
+            c.sql.dialect().pick(PROVIDER_HEALTH, PROVIDER_HEALTH_PG),
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| {
+            let mut r = Cols::new(row);
+            let provider_id = r.text()?;
+            let load = ProviderLoad {
+                failures: r.num()?,
+                cooldowns: r.num()?,
+                cooldown_until: UnixMs(r.num()?),
+                ..empty_load(provider_id)
+            };
+            with_fault(load, &mut r)
+        })
+        .collect()
+}
+
+fn with_fault(mut load: ProviderLoad, r: &mut Cols) -> Result<ProviderLoad> {
+    let reason = r.opt_text()?;
+    // A version from before the column can clear the strikes but leave
+    // the reason behind. Unknown reason codes also read as no reason.
+    if !load.healthy() {
+        load.fault = reason.as_deref().and_then(ProviderFault::parse);
+    }
+    Ok(load)
+}
+
+fn empty_load(provider_id: String) -> ProviderLoad {
+    ProviderLoad {
+        provider_id,
+        failures: 0,
+        cooldowns: 0,
+        cooldown_until: UnixMs::ZERO,
+        fault: None,
+        held: 0,
+        holders: 0,
+        background_holders: 0,
+        uses: 0,
+    }
+}
+
+/// Keep health-only and gate-only providers. Both SQL schemas order IDs
+/// bytewise (SQLite BINARY / PostgreSQL C), as Rust does here.
+pub(super) fn merge_gate_load(
+    mut load: Vec<ProviderLoad>,
+    held: Vec<GateLoad>,
+) -> Vec<ProviderLoad> {
+    for g in held {
+        let index = match load.binary_search_by(|l| l.provider_id.cmp(&g.provider)) {
+            Ok(i) => i,
+            Err(i) => {
+                load.insert(i, empty_load(g.provider));
+                i
+            }
+        };
+        let l = &mut load[index];
+        l.held = g.held;
+        l.holders = g.holders;
+        l.background_holders = g.background_holders;
+        l.uses = g.uses;
+    }
+    load
 }
 
 pub(super) async fn provider_failed<S: Sql>(
@@ -196,6 +261,11 @@ const PROVIDER_LOAD_PG: &str =
                  FROM provider_health) AS loads \
              GROUP BY provider_id ORDER BY provider_id";
 
+const PROVIDER_HEALTH: &str =
+    "SELECT provider_id, failures, cooldowns, cooldown_until, last_failure_reason \
+       FROM provider_health ORDER BY provider_id";
+const PROVIDER_HEALTH_PG: &str = PROVIDER_HEALTH;
+
 const SEED_HEALTH: &str = "INSERT OR IGNORE INTO provider_health(provider_id) VALUES (?1)";
 
 const SEED_HEALTH_PG: &str =
@@ -266,6 +336,7 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
     const T: SqlValue = SqlValue::Text(String::new());
     vec![
         (PROVIDER_LOAD_PG.to_owned(), vec![I]),
+        (PROVIDER_HEALTH_PG.to_owned(), vec![]),
         (SEED_HEALTH_PG.to_owned(), vec![T]),
         (RECOVER_PROVIDER.to_owned(), vec![T, I]),
         (PROVIDERS_TO_PROBE_PG.to_owned(), vec![I, I, I, T]),

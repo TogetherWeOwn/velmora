@@ -135,17 +135,6 @@ const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 /// deletes it.
 pub(crate) struct GuardRefused(());
 
-/// Puts what the gates hold in place of what the slot rows say.
-fn overlay(load: &mut [ProviderLoad], held: &[crate::gate::GateLoad]) {
-    for l in load {
-        let g = held.iter().find(|g| g.provider == l.provider_id);
-        l.held = g.map_or(0, |g| g.held);
-        l.holders = g.map_or(0, |g| g.holders);
-        l.background_holders = g.map_or(0, |g| g.background_holders);
-        l.uses = g.map_or(0, |g| g.uses);
-    }
-}
-
 /// The scrub's due query, word for word as it runs (for a test of its
 /// query plan).
 #[doc(hidden)]
@@ -914,22 +903,20 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
 
     // provider pool
     async fn provider_load(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
-        let mut load = health::provider_load(self, now).await?;
-        if let Some(gate) = self.active_gate() {
-            // The slot rows are the gate's as a whole; what is in use
-            // is what the gates have handed out, as they last told
-            // this caller: the order of providers is a preference, and
-            // not worth a request to every gate.
-            overlay(&mut load, &gate.hint(now));
-        }
-        Ok(load)
+        let Some(gate) = self.active_gate() else {
+            return health::provider_load(self, now).await;
+        };
+        // The order of providers is a preference, not worth a request
+        // to every gate. An absent provider counts as zero load in Pool.
+        let load = health::provider_health(self).await?;
+        Ok(health::merge_gate_load(load, gate.hint(now)))
     }
     async fn provider_status(&self, now: UnixMs) -> Result<Vec<ProviderLoad>> {
-        let mut load = health::provider_load(self, now).await?;
-        if let Some(gate) = self.active_gate() {
-            overlay(&mut load, &gate.load().await?);
-        }
-        Ok(load)
+        let Some(gate) = self.active_gate() else {
+            return health::provider_load(self, now).await;
+        };
+        let load = health::provider_health(self).await?;
+        Ok(health::merge_gate_load(load, gate.load().await?))
     }
     async fn provider_failed(
         &self,
@@ -1322,7 +1309,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 394, "background inventory entry count");
+        assert_eq!(statements.len(), 395, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }

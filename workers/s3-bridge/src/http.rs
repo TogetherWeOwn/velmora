@@ -38,15 +38,20 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
         }
     }
     ingress::restore_accept_encoding(&mut headers, client_accept_encoding(&req).as_deref());
-    let declared_len = ingress::declared_length(&headers).unwrap_or(None);
-    let body = if req.inner().body().is_some() {
-        let stream = req
-            .stream()
-            .map_err(|_| IngressError::Internal)?
-            .map(|chunk| chunk.map_err(|_| BridgeError::Invalid("request body stream")));
+    let body = if let Some(raw) = req.inner().body() {
+        let (declared_len, read_len) = body_lengths(&method, &headers);
+        let stream: velmora_bridge::ByteStream = match ByobReads::new(&raw, read_len) {
+            Some(reads) => Box::pin(pieces(reads)),
+            // Not a byte stream: the runtime's default reader.
+            None => Box::pin(
+                req.stream()
+                    .map_err(|_| IngressError::Internal)?
+                    .map(|chunk| chunk.map_err(|_| BridgeError::Invalid("request body stream"))),
+            ),
+        };
         Body::Stream {
             declared_len,
-            stream: Box::pin(stream),
+            stream,
         }
     } else {
         Body::Empty
@@ -60,6 +65,254 @@ pub fn to_s3_request(mut req: Request) -> Result<Incoming, IngressError> {
         },
         https,
     })
+}
+
+/// The most one body fill gathers, and so the maximum size of its reused
+/// runtime buffer. The default reader hands a deployed request body out
+/// in 4 KiB items, each a new array crossing into wasm on its
+/// own task; a BYOB read fills up to this much at once. It is one plain
+/// chunk, inside the item allowance of a streamed upload's charge
+/// (`ingress::STREAM_ITEM_ALLOWANCE`).
+const BODY_READ: u32 = velmora::media::PLAIN_CHUNK_SIZE as u32;
+const BODY_PROBE: u32 = 4096;
+
+/// Wire length for the consumer and length to size the BYOB reader.
+/// A reader length of `None` is a single-read body-presence probe.
+fn body_lengths(method: &Method, headers: &[(String, String)]) -> (Option<u64>, Option<u64>) {
+    let wire_len = || ingress::declared_length(headers).unwrap_or(None);
+    // The two object PUT handlers dispatch to CopyObject or UploadPartCopy
+    // on presence of this header. Those operations only probe for a body
+    // and take no body charge; upload framing must not select their reader.
+    if matches!(method, Method::Put)
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-copy-source"))
+    {
+        return (wire_len(), None);
+    }
+    match ingress::upload_lengths(headers, u64::MAX) {
+        // The admission budget uses the decoded length for aws-chunked,
+        // including when the wire length was omitted.
+        Ok(ingress::UploadLengths { encoded, decoded }) => {
+            (encoded, Some(decoded.min(encoded.unwrap_or(decoded))))
+        }
+        // Invalid headers are still rejected by existing consumer checks.
+        Err(_) => {
+            let wire = wire_len();
+            (wire, wire)
+        }
+    }
+}
+
+fn body_read_cap(declared_len: Option<u64>) -> u32 {
+    match declared_len {
+        // Even an empty body needs a non-empty view to read its end.
+        Some(n) => n.clamp(1, u64::from(BODY_READ)) as u32,
+        // An undeclared body can be an uncharged CopyObject body probe.
+        None => BODY_PROBE,
+    }
+}
+
+/// Reads of a body: `Ok(None)` is its end. After an error or the end
+/// nothing more is asked.
+trait PieceReads {
+    async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError>;
+}
+
+/// The body as a stream of pieces, in order. It ends at the end of the
+/// body or after the first failed read.
+fn pieces<R: PieceReads + 'static>(
+    reads: R,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, BridgeError>> {
+    futures_util::stream::unfold(Some(reads), |state| async move {
+        let mut reads = state?;
+        match reads.next_piece().await {
+            Ok(Some(piece)) => Some((Ok(piece), Some(reads))),
+            Ok(None) => None,
+            Err(e) => Some((Err(e), None)),
+        }
+    })
+}
+
+#[worker::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = worker::wasm_bindgen)]
+extern "C" {
+    /// A `ReadableStream` of bytes.
+    type ByteBody;
+    /// A `ReadableStreamBYOBReader`.
+    type ByobReader;
+    #[wasm_bindgen(method, catch, js_name = getReader)]
+    fn byob_reader(
+        this: &ByteBody,
+        options: &worker::js_sys::Object,
+    ) -> Result<ByobReader, worker::wasm_bindgen::JsValue>;
+}
+
+#[worker::wasm_bindgen::prelude::wasm_bindgen(
+    wasm_bindgen = worker::wasm_bindgen,
+    inline_js = "export async function fillBody(reader, buf, singleRead) {
+  const cap = buf.byteLength;
+  const target = singleRead ? 1 : cap;
+  let off = 0;
+  for (;;) {
+    const r = await reader.read(new Uint8Array(buf, off, cap - off));
+    if (r.value === undefined) throw new Error('body canceled');
+    buf = r.value.buffer;
+    off += r.value.byteLength;
+    if (r.done) return { buf, n: off, done: true };
+    if (r.value.byteLength === 0) throw new Error('empty read');
+    if (off >= target) return { buf, n: off, done: false };
+  }
+}
+export function cancelBody(reader) {
+  reader.cancel().catch(() => {});
+}"
+)]
+extern "C" {
+    /// Cancels the body; a stream that already failed is not an error.
+    #[wasm_bindgen(js_name = cancelBody)]
+    fn cancel_body(reader: &ByobReader);
+    /// Reads the body in JS until `buf` is full or the body ends; an
+    /// undeclared body probe returns as soon as any bytes arrive. A
+    /// deployed body gives at most 8 KiB per read (measured), and every
+    /// read that came back into wasm cost a task and a wake. Rejects if
+    /// the body failed or was canceled (a done read without a view).
+    #[wasm_bindgen(catch, js_name = fillBody)]
+    fn fill_body(
+        reader: &ByobReader,
+        buf: worker::js_sys::ArrayBuffer,
+        single_read: bool,
+    ) -> Result<worker::js_sys::Promise, worker::wasm_bindgen::JsValue>;
+    /// What `fill_body` resolves to.
+    type Filled;
+    #[wasm_bindgen(method, getter)]
+    fn buf(this: &Filled) -> worker::js_sys::ArrayBuffer;
+    #[wasm_bindgen(method, getter)]
+    fn n(this: &Filled) -> u32;
+    #[wasm_bindgen(method, getter)]
+    fn done(this: &Filled) -> bool;
+}
+
+/// What one fill gave, from the bytes it filled and whether the body
+/// ended.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum FillGave {
+    /// The end of the body, nothing more.
+    End,
+    /// A piece, and more may follow.
+    Piece,
+    /// The last piece of the body.
+    LastPiece,
+    /// A fill that neither ended nor filled anything.
+    Failed,
+}
+
+/// At the end a read says done and hands the (empty) view back (workerd
+/// from compatibility date 2024-05-13, `internal_stream_byob_return_view`;
+/// ours is later); a fill that is not the end provides at least one byte.
+fn fill_gave(filled: u32, done: bool) -> FillGave {
+    match (filled, done) {
+        (0, true) => FillGave::End,
+        (0, false) => FillGave::Failed,
+        (_, true) => FillGave::LastPiece,
+        (_, false) => FillGave::Piece,
+    }
+}
+
+/// A request body read with a BYOB reader into one runtime buffer; each
+/// fill is copied once into a piece.
+struct ByobReads {
+    reader: ByobReader,
+    cap: u32,
+    /// A probe must not wait for more bytes once it knows the body exists.
+    single_read: bool,
+    /// The runtime buffer, allocated on the first poll. A fill transfers
+    /// it and hands it back.
+    buffer: Option<worker::js_sys::ArrayBuffer>,
+    /// The body ended: there is nothing left to cancel.
+    settled: bool,
+    /// A fill failed or was interrupted: further reads return the error.
+    failed: bool,
+}
+
+impl ByobReads {
+    /// `None` when the body has no BYOB reader (it is not a byte stream).
+    fn new(stream: &worker::web_sys::ReadableStream, declared_len: Option<u64>) -> Option<Self> {
+        use worker::wasm_bindgen::JsCast;
+        let options = worker::js_sys::Object::new();
+        worker::js_sys::Reflect::set(&options, &"mode".into(), &"byob".into()).ok()?;
+        Some(ByobReads {
+            reader: stream
+                .unchecked_ref::<ByteBody>()
+                .byob_reader(&options)
+                .ok()?,
+            cap: body_read_cap(declared_len),
+            single_read: declared_len.is_none(),
+            buffer: None,
+            settled: false,
+            failed: false,
+        })
+    }
+}
+
+/// A body left unread (a refused upload) is canceled, as the default
+/// reader's stream did when it was dropped.
+impl Drop for ByobReads {
+    fn drop(&mut self) {
+        if !self.settled {
+            cancel_body(&self.reader);
+        }
+    }
+}
+
+impl PieceReads for ByobReads {
+    async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+        use worker::wasm_bindgen::JsCast;
+        let failed = || BridgeError::Invalid("request body stream");
+        if self.failed {
+            return Err(failed());
+        }
+        if self.settled {
+            return Ok(None);
+        }
+        // The upload holds its stream charge before polling. Opening the
+        // reader earlier must not allocate a buffer outside that charge.
+        let buffer = self
+            .buffer
+            .take()
+            .unwrap_or_else(|| worker::js_sys::ArrayBuffer::new(self.cap));
+        // Do not retry a rejected or interrupted fill. Drop still cancels
+        // it; an already errored reader rejects cancel and JS handles that.
+        self.failed = true;
+        let promise = fill_body(&self.reader, buffer, self.single_read).map_err(|_| failed())?;
+        let filled: Filled = worker::wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|_| failed())?
+            .unchecked_into();
+        let n = filled.n();
+        let back = filled.buf();
+        let done = filled.done();
+        let gave = fill_gave(n, done);
+        if matches!(gave, FillGave::Failed) || n > back.byte_length() {
+            return Err(failed());
+        }
+        self.failed = false;
+        self.settled = done;
+        if matches!(gave, FillGave::End) {
+            return Ok(None);
+        }
+        let piece =
+            worker::js_sys::Uint8Array::new_with_byte_offset_and_length(&back, 0, n).to_vec();
+        if matches!(gave, FillGave::Piece) {
+            // The runtime hands the whole buffer back; one that came back
+            // smaller would cap every later fill, so it is replaced.
+            self.buffer = Some(if back.byte_length() < self.cap {
+                worker::js_sys::ArrayBuffer::new(self.cap)
+            } else {
+                back
+            });
+        }
+        Ok(Some(piece))
+    }
 }
 
 /// `request.cf.clientAcceptEncoding`, the client's own `Accept-Encoding`
@@ -140,4 +393,126 @@ pub fn internal_error() -> Response {
     try_response(IngressError::Internal.response())
         .or_else(|_| Response::error("Internal Error", 500))
         .unwrap_or_else(|_| Response::empty().expect("empty response").with_status(500))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pieces from a script: `Some(Ok(n))` is a piece of `n` bytes,
+    /// `Some(Err(()))` a failed read, `None` the end.
+    struct Scripted {
+        steps: Vec<Option<Result<usize, ()>>>,
+        asked: std::rc::Rc<std::cell::Cell<usize>>,
+        next_byte: u8,
+    }
+
+    impl PieceReads for Scripted {
+        async fn next_piece(&mut self) -> Result<Option<Vec<u8>>, BridgeError> {
+            self.asked.set(self.asked.get() + 1);
+            assert!(!self.steps.is_empty(), "read after the end or a failure");
+            match self.steps.remove(0) {
+                None => Ok(None),
+                Some(Err(())) => Err(BridgeError::Invalid("request body stream")),
+                Some(Ok(n)) => Ok(Some(
+                    (0..n)
+                        .map(|_| {
+                            self.next_byte = self.next_byte.wrapping_add(1);
+                            self.next_byte
+                        })
+                        .collect(),
+                )),
+            }
+        }
+    }
+
+    use std::future::Future;
+
+    fn collect(steps: Vec<Option<Result<usize, ()>>>) -> (Vec<Result<Vec<u8>, ()>>, usize) {
+        use std::task::{Context, Poll, Waker};
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reads = Scripted {
+            steps,
+            asked: asked.clone(),
+            next_byte: 0,
+        };
+        let fut = pieces(reads).map(|p| p.map_err(|_| ())).collect::<Vec<_>>();
+        let out = match std::pin::pin!(fut).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("scripted reads never wait"),
+        };
+        (out, asked.get())
+    }
+
+    #[test]
+    fn pieces_come_in_order_and_end_with_the_body() {
+        let (out, asked) = collect(vec![Some(Ok(3)), Some(Ok(65_536)), Some(Ok(1)), None]);
+        let bytes: Vec<u8> = out.into_iter().flat_map(|p| p.unwrap()).collect();
+        assert_eq!(bytes.len(), 65_540);
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == ((i + 1) % 256) as u8));
+        assert_eq!(asked, 4, "no read after the end");
+    }
+
+    #[test]
+    fn an_empty_body_is_no_piece() {
+        let (out, asked) = collect(vec![None]);
+        assert!(out.is_empty());
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn a_failed_read_is_the_last_item() {
+        let (out, asked) = collect(vec![Some(Ok(10)), Some(Err(())), Some(Ok(10))]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err());
+        assert_eq!(asked, 2, "nothing is read after a failure");
+    }
+
+    #[test]
+    fn a_fill_ends_gives_a_piece_or_fails() {
+        assert_eq!(fill_gave(0, true), FillGave::End);
+        assert_eq!(fill_gave(0, false), FillGave::Failed, "nothing filled");
+        assert_eq!(fill_gave(1, true), FillGave::LastPiece);
+        assert_eq!(fill_gave(BODY_READ, true), FillGave::LastPiece);
+        assert_eq!(fill_gave(BODY_READ, false), FillGave::Piece);
+    }
+
+    #[test]
+    fn one_read_fits_the_item_allowance() {
+        assert!(u64::from(BODY_READ) <= velmora_bridge::ingress::STREAM_ITEM_ALLOWANCE);
+    }
+
+    #[test]
+    fn copy_uses_a_body_presence_probe_regardless_of_upload_framing() {
+        let mut headers = vec![
+            ("content-encoding".into(), "aws-chunked".into()),
+            ("x-amz-decoded-content-length".into(), "65536".into()),
+        ];
+        assert_eq!(body_lengths(&Method::Put, &headers), (None, Some(65_536)));
+        headers.push(("X-Amz-Copy-Source".into(), "/bucket/key".into()));
+        assert_eq!(body_lengths(&Method::Put, &headers), (None, None));
+        headers.push(("Content-Length".into(), "0".into()));
+        assert_eq!(body_lengths(&Method::Put, &headers), (Some(0), None));
+    }
+
+    #[test]
+    fn the_body_buffer_fits_the_declared_length_or_the_probe_cap() {
+        for (declared, cap) in [
+            (0, 1),
+            (1, 1),
+            (32_768, 32_768),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (u64::MAX, 65_536),
+        ] {
+            let actual = body_read_cap(Some(declared));
+            assert!(u64::from(actual) <= declared.max(1));
+            assert_eq!(actual, cap);
+        }
+        assert_eq!(body_read_cap(None), 4096);
+    }
 }
