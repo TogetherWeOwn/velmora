@@ -1020,16 +1020,17 @@ $$;
                 # retry). It takes only SHARE UPDATE EXCLUSIVE, which by itself
                 # blocks no reads or writes, so it waits up to 90 s per lock
                 # wait, and a timeout of the build itself is not retried. The
-                # bound per index build: about 26 s of prepare retries, 90 s for
-                # the table lock, and up to 90 s per wait phase for each
-                # long-lived non-app session, plus build time. With only app
-                # sessions (transaction_timeout 30 s, PostgreSQL 17+) that is
-                # about 3 x 30 s. A file with many concurrent builds multiplies
-                # it: split such migrations to fit the caller's budget (the
-                # merge gate gives one apply 600 s). Several non-app sessions
-                # (an operator, kofra_ro) holding transactions for minutes can
-                # still push one build past it: end them before a migration
-                # merge. The ledger transaction sets its own timeouts (SET
+                # bound is per index build: 90 s for the table lock and up to
+                # 90 s per wait phase for each long-lived non-app session, plus
+                # build time, and about 26 s of prepare retries per file. With
+                # only app sessions (transaction_timeout 30 s, PostgreSQL 17+) a
+                # build waits about 3 x 30 s. A caller's deadline covers every
+                # build applied in one invocation (the merge gate applies all
+                # pending versions of one PR in one 600 s run): land a migration
+                # with many concurrent builds in separate PRs, not just separate
+                # files. Several non-app sessions (an operator, kofra_ro)
+                # holding transactions for minutes can still push one build past
+                # it: end them before a migration merge. The ledger transaction sets its own timeouts (SET
                 # LOCAL), and the session is back at 3 s before it.
                 # The markers tell a lock timeout of the build itself (between
                 # them) from one of the 3 s prepare or finish waits.
