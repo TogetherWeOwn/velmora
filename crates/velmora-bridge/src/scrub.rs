@@ -1877,12 +1877,16 @@ where
         };
         // A store that did not answer is not a missing copy: no
         // `unrecoverable` on it (`unknown`).
+        let mut bad_kept = false;
         let (kept, mut unknown) = match self.safety.get(&extent.id.safety_key(), None).await {
             Ok(Some(bytes)) if digest_ok(extent, &bytes) => (true, false),
             // Other bytes under the key: no copy, and no longer counted as
             // one; kept, as nothing verified is held yet. Still counted: as
             // a store that did not answer.
-            Ok(Some(_)) => (false, !self.drop_wrong_safety(extent, false).await),
+            Ok(Some(_)) => {
+                bad_kept = true;
+                (false, !self.drop_wrong_safety(extent, false).await)
+            }
             Ok(None) => (false, false),
             Err(_) => (false, true),
         };
@@ -1931,10 +1935,15 @@ where
                     walk.run.unrecoverable += 1;
                     crate::trace::alert(|| {
                         format!(
-                            "scrub-unrecoverable {} re-pinned, no intact safety copy (one that \
-                             is not the extent's is kept, uncounted) and no intact copy is on \
+                            "scrub-unrecoverable {} re-pinned, {} and no intact copy is on \
                              Usenet or in the cache",
-                            extent.id.as_str()
+                            extent.id.as_str(),
+                            match bad_kept {
+                                true =>
+                                    "no intact safety copy (one that is not the extent's \
+                                         is kept, uncounted)",
+                                false => "its safety copy is gone",
+                            }
                         )
                     });
                     let next = Some(after(u64::from(cfg.confirm_secs)));
