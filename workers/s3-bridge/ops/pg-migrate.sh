@@ -281,7 +281,13 @@ def lint_migration(sql, no_tx, name, *, additive_objects=None):
     statements, source_statements, pending = [], [], []
     segment_start = 0
     try:
-        for token, _, end in sql_tokens_with_spans(sql):
+        for token, start, end in sql_tokens_with_spans(sql):
+            # Import mode has runner-owned psql commands on stdin. Candidate
+            # SQL may not expand client variables. The :: cast is one token;
+            # comments, strings and dollar bodies never yield a colon token.
+            if token == ':' and re.match(r'''[A-Za-z0-9_'"]|\{\?''', sql[end:end + 2]):
+                line = sql.count('\n', 0, start) + 1
+                die(f'{name}:{line}: psql variable substitution is not allowed')
             if token == ';':
                 if pending:
                     statements.append(pending)
@@ -564,9 +570,12 @@ def main():
     for version, (name, body) in files.items():
         # Limit all numbered PostgreSQL files before parsing or reading any
         # connection file. SQLite-only inputs never reach psql.
-        bad = re.search(rb'[\x00\\\x80-\xff]', body)
+        # Only TAB, LF, and printable ASCII other than backslash. In
+        # particular, CR can end a PostgreSQL line comment before LF.
+        bad = re.search(rb'[\x00-\x08\x0b-\x1f\x7f-\xff\\]', body)
         if bad:
-            kind = {b'\x00': 'NUL byte', b'\\': 'backslash'}.get(bad[0], 'non-ASCII byte')
+            kind = {b'\x00': 'NUL byte', b'\\': 'backslash'}.get(
+                bad[0], 'ASCII control byte' if bad[0].isascii() else 'non-ASCII byte')
             line = body.count(b'\n', 0, bad.start()) + 1
             die(f'{name}:{line}: {kind} in migration SQL')
         sql = body.decode('ascii')

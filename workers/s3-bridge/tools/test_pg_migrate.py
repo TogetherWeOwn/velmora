@@ -281,6 +281,32 @@ class MigrationParser(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f'0004_bad.sql:2: {diagnostic} in migration SQL', result.stderr)
 
+    def test_pg_file_refuses_control_bytes_inside_line_comments(self):
+        # Offline byte-check fixtures only. The DROP token has no operand.
+        for control in ('\rDROP', '\v', '\f', '\x1b', '\x7f'):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp)
+                add_migration(script, '0004_bad.sql', '-- velmora: no-transaction\n'
+                              f'-- fixture control {control}\n'
+                              'CREATE INDEX CONCURRENTLY IF NOT EXISTS fixture_idx ON extents(id);',
+                              'CREATE INDEX fixture_idx ON extents(id);')
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('0004_bad.sql:2: ASCII control byte in migration SQL', result.stderr)
+
+    def test_lint_refuses_psql_variables_but_not_casts_or_quoted_text(self):
+        stage = '0003_usage_statement_triggers.sql'
+        for token in (':lint_only', ":'lint_only'", ':"lint_only"', ':{?lint_only}'):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as tmp:
+                script = clone_bridge(tmp, {stage: f'\nSELECT {token};\n'})
+                result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, rf'{re.escape(stage)}:[1-9][0-9]*: psql variable substitution is not allowed')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = clone_bridge(tmp, {stage: "\n-- :lint_only\nSELECT 1::bigint, ':lint_only';\n"})
+            result = subprocess.run(['bash', str(script), '--check-migrations'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_oversized_online_batch_names_the_argument_limit(self):
         # Linux refuses a single argv string of 128 KiB or more (MAX_ARG_STRLEN).
         # This fails before any connection, so the port need not be listening.

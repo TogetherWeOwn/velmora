@@ -81,7 +81,8 @@ DDL; it is not the import activation procedure.
 Each numbered PostgreSQL file is applied once and recorded with its SHA-256.
 Do not edit an applied migration. Ordinary files are atomic; leave transaction
 control and psql metacommands to the runner. Numbered PostgreSQL migrations
-must be ASCII and cannot contain backslashes or NUL bytes. Use dollar-quoted routine bodies
+allow only printable ASCII, tabs, and LF line endings, with no backslashes
+or unquoted psql variable references. Use dollar-quoted routine bodies
 and unqualified catalogue object names so the same DDL works in each target
 schema. A `55P03` lock timeout retries up to five times after the initial
 attempt, with backoff. A statement or transaction budget expiry is not retried.
