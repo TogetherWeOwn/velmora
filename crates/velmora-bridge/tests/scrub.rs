@@ -4717,63 +4717,50 @@ async fn a_moved_sequence_at_the_pre_delete_check_ends_the_drain() {
     assert!(w.has_safety(&b), "the drain ended at the moved extent");
 }
 
-/// The scrub deletes a released extent's safety object whose bytes are
-/// not the extent's: uncounted first, then deleted, and only then said
-/// so. A delete that fails is said as such; the object, already
-/// uncounted, goes at the next look.
+/// Where the scrub holds no verified bytes of the extent (Usenet lacks
+/// it too), a safety object whose bytes are not the extent's is uncounted
+/// but kept: its intact chunks are the last readable bytes. A range read
+/// of an intact chunk still serves verified bytes; one that touches the
+/// bad chunk is still refused.
 #[tokio::test(flavor = "current_thread")]
-async fn a_deleted_wrong_safety_object_is_uncounted_and_a_failed_delete_is_said() {
-    for fails in [true, false] {
-        let w = world().await;
-        let o = w.released("a", 46).await;
-        let key = o.extent.safety_key();
-        assert!(w.bridge().safety.corrupt(&key, |b| b[10] ^= 1));
-        if fails {
-            *w.bridge().safety.fail_delete.borrow_mut() = Some(key.clone());
+async fn without_verified_bytes_a_wrong_safety_object_is_uncounted_and_kept() {
+    let w = world().await;
+    let o = w.released("a", 46).await;
+    let deleted = bad_copy_found(&w, &o).await;
+    assert_eq!(*deleted.borrow(), None, "never deleted");
+    assert!(alerts()
+        .iter()
+        .any(|a| a.starts_with("scrub-bad-safety-copy ")
+            && a.contains(o.extent.as_str())
+            && a.ends_with("; uncounted; kept, no verified bytes to replace it")));
+    let get = |range: &'static str| {
+        let w = &w;
+        async move {
+            w.rig
+                .call(
+                    &w.signer,
+                    Method::Get,
+                    &path(BUCKET, "a"),
+                    &[],
+                    &[("range", range)],
+                    b"",
+                )
+                .await
         }
-        w.advance_secs(31 * DAY_SECS);
-        w.hide(0, &o, 1).await;
-        w.hide(1, &o, 1).await;
-        w.scrub().await;
-        w.advance_secs(3600);
-        w.scrub().await;
-        let counted = w
-            .scalar(
-                "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
-                &o.extent,
-            )
-            .await;
-        let lines: Vec<String> = alerts()
-            .into_iter()
-            .filter(|a| a.starts_with("scrub-bad-safety-copy ") && a.contains(o.extent.as_str()))
-            .collect();
-        assert!(!lines.is_empty(), "fails={fails}: {lines:?}");
-        assert_eq!(w.safety_state(&o).await, "released", "fails={fails}");
-        assert_eq!(counted, "0", "fails={fails}: no longer counted");
-        if fails {
-            assert!(
-                lines.iter().all(
-                    |l| l.ends_with("; uncounted; the delete failed, the next look deletes it")
-                ),
-                "{lines:?}"
-            );
-            assert!(w.bridge().safety.contains(&key));
-            *w.bridge().safety.fail_delete.borrow_mut() = None;
-            w.advance_secs(3600);
-            w.scrub().await;
-            assert!(
-                !w.bridge().safety.contains(&key),
-                "the next look deleted it"
-            );
-        } else {
-            assert!(
-                lines.iter().all(|l| l.ends_with("; uncounted and deleted")),
-                "{lines:?}"
-            );
-            assert!(!w.bridge().safety.contains(&key));
-            assert_eq!(w.result(&o).await, "unrecoverable");
-        }
-    }
+    };
+    let intact = get("bytes=0-99").await;
+    intact.expect(206);
+    assert_eq!(
+        intact.body,
+        o.plain[..100],
+        "verified bytes of an intact chunk"
+    );
+    let bad = get("bytes=480000-520000").await;
+    assert!(
+        !(200..300).contains(&bad.status),
+        "a range on the bad chunk is refused: {}",
+        bad.status
+    );
 }
 
 /// The race the compare-and-set closes: a cold fill counts the copy it
@@ -6277,14 +6264,20 @@ async fn with_the_scrub_off_nothing_needs_the_scrub_schema() {
 }
 
 /// Makes `o`'s safety object one whose bytes are not the extent's, and
-/// lets the scrub find it and delete it, the extent unrecoverable while
-/// Usenet lacks it. Usenet then has it again.
-async fn scrubbed_bad_copy(w: &World, o: &Obj) {
+/// lets the scrub find it while Usenet lacks the extent too: no verified
+/// bytes anywhere, so it is uncounted and kept, the extent unrecoverable.
+/// What the safety store was asked to delete since is returned.
+async fn bad_copy_found(w: &World, o: &Obj) -> std::rc::Rc<RefCell<Option<String>>> {
     let key = o.extent.safety_key();
     // In the middle: a span read of it fails authentication.
     assert!(w.bridge().safety.corrupt(&key, |b| {
         let mid = b.len() / 2;
         b[mid] ^= 1
+    }));
+    let deleted = std::rc::Rc::new(RefCell::new(None::<String>));
+    let seen = std::rc::Rc::clone(&deleted);
+    *w.bridge().safety.before_delete.borrow_mut() = Some(Box::new(move |k: &str| {
+        *seen.borrow_mut() = Some(k.to_owned())
     }));
     w.advance_secs(31 * DAY_SECS);
     w.hide(0, o, 1).await;
@@ -6293,7 +6286,7 @@ async fn scrubbed_bad_copy(w: &World, o: &Obj) {
     w.advance_secs(3600);
     w.scrub().await;
     assert_eq!(w.result(o).await, "unrecoverable");
-    assert!(!w.bridge().safety.contains(&key), "deleted");
+    assert!(w.bridge().safety.contains(&key), "kept");
     assert_eq!(
         w.scalar(
             "SELECT hot_safety_bytes FROM extents WHERE id = ?1",
@@ -6303,16 +6296,22 @@ async fn scrubbed_bad_copy(w: &World, o: &Obj) {
         "0",
         "uncounted"
     );
+    deleted
+}
+
+/// Usenet has `o`'s hidden article again.
+async fn usenet_again(w: &World, o: &Obj) {
     let plan = w.plan(o).await;
     for server in &w.servers {
         server.unhide(&plan[1].message_id).await;
     }
 }
 
-/// A read of an extent whose bad safety copy the scrub deleted serves only
-/// verified bytes, from Usenet. An extent not releasable now has its
-/// verified fill written as its safety copy, counted; a releasable one has
-/// it cached.
+/// A read of an extent whose bad safety copy the scrub uncounted serves
+/// only verified bytes: the whole object is read from Usenet once it has
+/// it again. An extent not releasable now has its verified fill written
+/// over the bad copy, counted; a releasable one has it cached, the bad
+/// copy left uncounted.
 #[tokio::test(flavor = "current_thread")]
 async fn a_read_after_a_bad_copy_serves_verified_bytes_and_rewrites_it() {
     for releasable in [false, true] {
@@ -6320,7 +6319,8 @@ async fn a_read_after_a_bad_copy_serves_verified_bytes_and_rewrites_it() {
         let o = w.released("a", 170).await;
         let key = o.extent.safety_key();
         let cipher = w.bridge().safety.stored(&key).unwrap().bytes;
-        scrubbed_bad_copy(&w, &o).await;
+        bad_copy_found(&w, &o).await;
+        usenet_again(&w, &o).await;
         cfg_mut(&mut w).providers[1].release = releasable;
         read_cold(&w, &o, "a").await;
         let stored = w.bridge().safety.stored(&key).map(|b| b.bytes);
@@ -6332,7 +6332,7 @@ async fn a_read_after_a_bad_copy_serves_verified_bytes_and_rewrites_it() {
             .await;
         if releasable {
             assert!(w.bridge().cache.contains(&o.extent.cache_key()), "cached");
-            assert_eq!(stored, None);
+            assert_ne!(stored, Some(cipher), "the bad copy is left");
             assert_eq!(counted, "0");
         } else {
             assert_eq!(stored, Some(cipher), "written from the verified fill");
@@ -6341,13 +6341,13 @@ async fn a_read_after_a_bad_copy_serves_verified_bytes_and_rewrites_it() {
     }
 }
 
-/// GC collects an extent whose bad safety copy the scrub already deleted:
-/// its delete of the missing object is no error.
+/// GC removes a bad safety copy the scrub kept, with its extent, once
+/// nothing references it.
 #[tokio::test(flavor = "current_thread")]
-async fn gc_collects_an_extent_whose_bad_copy_the_scrub_deleted() {
+async fn gc_removes_a_kept_bad_copy_once_the_extent_is_unreferenced() {
     let w = world_with(|cfg| cfg.gc_mode = velmora_bridge::config::GcMode::Disposable).await;
     let o = w.released("a", 171).await;
-    scrubbed_bad_copy(&w, &o).await;
+    bad_copy_found(&w, &o).await;
     w.rig
         .call(&w.signer, Method::Delete, &path(BUCKET, "a"), &[], &[], b"")
         .await
@@ -6372,14 +6372,14 @@ async fn gc_collects_an_extent_whose_bad_copy_the_scrub_deleted() {
     );
 }
 
-/// A catalogue replay after the scrub deleted a bad safety copy restores
-/// the extent as one read from Usenet (no pinned copy, its articles
-/// posted), not as `held` with a copy to post from.
+/// A catalogue replay after the scrub kept a bad safety copy (no verified
+/// bytes to replace it) restores the extent as `held`: the copy is still
+/// there, its intact chunks readable.
 #[tokio::test(flavor = "current_thread")]
-async fn a_replay_after_the_scrub_deletes_a_bad_copy_restores_a_usenet_read() {
+async fn a_replay_after_the_scrub_keeps_a_bad_copy_restores_it_held() {
     let w = world().await;
     let o = w.released("a", 173).await;
-    scrubbed_bad_copy(&w, &o).await;
+    bad_copy_found(&w, &o).await;
     let db = &w.bridge().catalog.sql.inner;
     db.fixture_script(
         "DELETE FROM scrub_copies; DELETE FROM generation_extents; DELETE FROM outbox; \
@@ -6395,15 +6395,5 @@ async fn a_replay_after_the_scrub_deletes_a_bad_copy_restores_a_usenet_read() {
         steps += 1;
         assert!(steps < 20, "the replay ends");
     }
-    assert_eq!(w.safety_state(&o).await, "deleted", "no pinned copy");
-    assert_eq!(
-        w.scalar(
-            "SELECT COUNT(*) FROM articles WHERE extent_id = ?1 AND state <> 'posted'",
-            &o.extent
-        )
-        .await,
-        "0",
-        "its articles are posted: read from Usenet"
-    );
-    read_cold(&w, &o, "a").await;
+    assert_eq!(w.safety_state(&o).await, "held", "the kept copy is pinned");
 }
