@@ -12,7 +12,7 @@ use tokio::runtime::{Builder, Handle, Id};
 use tokio::task::JoinHandle;
 use tokio_postgres::{config::SslMode, Client, Config, NoTls};
 
-use crate::pg::{PgConfig, PgConnect, PgConnection, PgSql};
+use crate::pg::{PgConfig, PgConnect, PgConnection, PgSql, ProbeOutcome, WriteTx};
 use crate::ports::{Row, Sql, SqlValue};
 use crate::types::{BridgeError, Result};
 
@@ -80,6 +80,19 @@ fn schema_script(last: &str) -> Result<String> {
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
 
 pub const URL_VAR: &str = "VELMORA_TEST_PG_URL";
+
+/// `VELMORA_TEST_PG_WRITE_TX=pipeline` runs the suite on the one-Sync-per-
+/// statement transport; unset or `single-sync` on the default transport.
+pub const WRITE_TX_VAR: &str = "VELMORA_TEST_PG_WRITE_TX";
+
+/// Run the transport comparison on every catalogue write (see
+/// [`TestPostgres::differential`]).
+pub const DIFFERENTIAL_VAR: &str = "VELMORA_TEST_PG_DIFFERENTIAL";
+
+fn write_tx() -> WriteTx {
+    let value = std::env::var(WRITE_TX_VAR).ok();
+    WriteTx::parse(value.as_deref()).unwrap_or_else(|e| panic!("{WRITE_TX_VAR}: {e}"))
+}
 
 fn pg_error(context: &str, error: tokio_postgres::Error) -> BridgeError {
     // Never print a connection URL, server message, or bound parameter.
@@ -251,17 +264,28 @@ pub struct TestPostgres {
 impl TestPostgres {
     pub(super) fn new(armed: bool, _record: bool) -> Result<Self> {
         let last = &STAGES[STAGES.len() - 1].0[..4];
-        Self::through(last, armed, _record)
+        Self::through(last, armed, _record, write_tx())
     }
 
     /// A schema with the stages through `last` only, to compare a
     /// superseded stage's behaviour with the shipped one.
     pub fn through_stage(last: &str, armed: bool) -> Result<Self> {
-        Self::through(last, armed, false)
+        Self::through(last, armed, false, write_tx())
     }
 
-    fn through(last: &str, armed: bool, _record: bool) -> Result<Self> {
+    /// A schema whose catalogue writes use the one-Sync-per-statement
+    /// transport, for tests of the pooled session's driver state (type
+    /// lookups) that the single-Sync transport never creates.
+    pub fn with_typed_writes() -> Result<Self> {
+        let last = &STAGES[STAGES.len() - 1].0[..4];
+        Self::through(last, true, false, WriteTx::Pipeline)
+    }
+
+    fn through(last: &str, armed: bool, _record: bool, catalog_write_tx: WriteTx) -> Result<Self> {
         let script = schema_script(last)?;
+        // Read the switch before the schema exists, so an invalid value
+        // cannot leave a schema without an owner to drop it.
+        let fixture_write_tx = write_tx();
         let url = std::env::var(URL_VAR)
             .map_err(|_| BridgeError::Sql(format!("pg testkit: {URL_VAR} must be UTF-8")))?;
         let base: Config = url
@@ -283,20 +307,24 @@ impl TestPostgres {
             config: scoped,
             pool: None,
         };
-        let sql = |connector: NativePgConnect| {
+        let sql = |connector: NativePgConnect, write_tx| {
             PgSql::new(
                 connector.clone(),
                 connector,
                 PgConfig {
                     lock_key,
+                    write_tx,
                     ..PgConfig::default()
                 },
             )
         };
-        let catalog = sql(NativePgConnect {
-            config: connector.config.clone(),
-            pool: Some(Arc::default()),
-        });
+        let catalog = sql(
+            NativePgConnect {
+                config: connector.config.clone(),
+                pool: Some(Arc::default()),
+            },
+            catalog_write_tx,
+        );
         #[cfg(feature = "pg-test-record")]
         let catalog = if _record {
             catalog.with_statement_recording()
@@ -319,13 +347,76 @@ impl TestPostgres {
             schema,
             lock_key,
             sql: catalog,
-            fixture_sql: sql(connector.clone()),
+            fixture_sql: sql(connector.clone(), fixture_write_tx),
             connector,
         })
     }
 
     pub fn lock_key(&self) -> i64 {
         self.lock_key
+    }
+
+    /// Run one write transaction on each transport against the current
+    /// catalogue state, rolling both back: (pipelined, single Sync). The
+    /// second is `None` when the transaction is over the single-Sync size
+    /// bound and so ran one Sync per statement too: nothing was compared.
+    pub async fn compare_transports(
+        &self,
+        stmts: &[(&str, Vec<SqlValue>)],
+        collect_rows: bool,
+    ) -> (ProbeOutcome, Option<ProbeOutcome>) {
+        let pipelined = self
+            .sql
+            .rolled_back(WriteTx::Pipeline, stmts, collect_rows)
+            .await;
+        let before = crate::pg::oversize_fallbacks();
+        let single_sync = self
+            .sql
+            .rolled_back(WriteTx::SingleSync, stmts, collect_rows)
+            .await;
+        let compared = crate::pg::oversize_fallbacks() == before;
+        (pipelined, compared.then_some(single_sync))
+    }
+
+    /// With `VELMORA_TEST_PG_DIFFERENTIAL=1`, every catalogue write of the
+    /// suite first runs rolled back on both transports, with its own
+    /// values and again with NULL in every position, and the results must
+    /// be equal. Statement text, never values, goes into a failure.
+    pub(super) async fn differential(&self, stmts: &[(&str, Vec<SqlValue>)], collect_rows: bool) {
+        if std::env::var_os(DIFFERENTIAL_VAR).is_none() {
+            return;
+        }
+        let nulls: Vec<(&str, Vec<SqlValue>)> = stmts
+            .iter()
+            .map(|(sql, args)| (*sql, vec![SqlValue::Null; args.len()]))
+            .collect();
+        for (variant, stmts) in [("values", stmts), ("nulls", &nulls[..])] {
+            let (typed, message) = self.compare_transports(stmts, collect_rows).await;
+            // Over the size bound both sides ran one Sync per statement.
+            let Some(message) = message else { continue };
+            let same = match (&typed, &message) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(a), Err(b)) => format!("{a:?}") == format!("{b:?}"),
+                _ => false,
+            };
+            if !same {
+                let texts: Vec<&str> = stmts.iter().map(|(sql, _)| *sql).collect();
+                let class = |o: &ProbeOutcome| match o {
+                    Ok((counts, tags, rows)) => {
+                        format!(
+                            "Ok(counts {counts:?}, tags {tags:?}, {} row sets)",
+                            rows.len()
+                        )
+                    }
+                    Err(e) => format!("Err({e:?})"),
+                };
+                panic!(
+                    "transport difference ({variant}): pipelined {}, single Sync {}: {texts:?}",
+                    class(&typed),
+                    class(&message)
+                );
+            }
+        }
     }
 
     /// Open a session for typed PREPARE and fixture setup. The connection is
@@ -347,6 +438,7 @@ impl TestPostgres {
                 connector,
                 PgConfig {
                     lock_key,
+                    write_tx: write_tx(),
                     ..PgConfig::default()
                 },
             );

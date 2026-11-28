@@ -614,7 +614,7 @@ fn missing_secret_fails_closed() {
     // selector instead of BridgeConfig. Nothing BridgeConfig reads may
     // be added here to bypass its missing-variable checks.
     const WORKER_ONLY_OPTIONAL: [&str; 3] =
-        ["CATALOG_BACKEND", "PG_PIPELINE", "D1_ROLLBACK_RETIRED"];
+        ["CATALOG_BACKEND", "PG_WRITE_TX", "D1_ROLLBACK_RETIRED"];
     let (prod, dev) = wrangler_vars();
     let full = with_secrets(prod, &prod_providers());
     let dev = with_secrets(dev, PROVIDER_PLAIN);

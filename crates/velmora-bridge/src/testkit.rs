@@ -180,7 +180,12 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.query(sql, params).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.query(sql, params).await,
+            Self::Postgres(db) => {
+                if !crate::pg::is_postgres_read_only(sql) {
+                    Box::pin(db.differential(&[(sql, params.to_vec())], true)).await;
+                }
+                db.sql.query(sql, params).await
+            }
         }
     }
 
@@ -188,7 +193,10 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.exec(sql, params).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.exec(sql, params).await,
+            Self::Postgres(db) => {
+                Box::pin(db.differential(&[(sql, params.to_vec())], false)).await;
+                db.sql.exec(sql, params).await
+            }
         }
     }
 
@@ -196,7 +204,16 @@ impl Sql for TestSql {
         match self {
             Self::Sqlite(db) => db.batch(stmts).await,
             #[cfg(feature = "testkit-pg")]
-            Self::Postgres(db) => db.sql.batch(stmts).await,
+            Self::Postgres(db) => {
+                if !stmts.is_empty() {
+                    let probe: Vec<(&str, Vec<SqlValue>)> = stmts
+                        .iter()
+                        .map(|(sql, args)| (*sql, args.clone()))
+                        .collect();
+                    Box::pin(db.differential(&probe, false)).await;
+                }
+                db.sql.batch(stmts).await
+            }
         }
     }
 }

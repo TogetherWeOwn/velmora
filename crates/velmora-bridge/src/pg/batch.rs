@@ -4,10 +4,11 @@ use std::task::Poll;
 
 use futures_util::future::{join, join_all, poll_fn};
 use futures_util::StreamExt;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::{Client, PipelineStatement, Row};
 
-use super::{error, params, value};
-use crate::{Result, SqlValue};
+use super::{error, params, value, WriteTx};
+use crate::{BridgeError, Result, SqlValue};
 
 pub(super) struct Prepared {
     pub(super) statement: params::Statement,
@@ -20,6 +21,11 @@ impl Prepared {
             statement: params::statement(text)?,
             values: value::Params::encode(values)?,
         })
+    }
+
+    #[cfg(feature = "pg-test-record")]
+    fn record(&self) {
+        super::registry::record(&self.statement.text, self.values.oids());
     }
 
     pub(super) async fn run(
@@ -36,7 +42,7 @@ impl Prepared {
                     *c != tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
                 }))
         {
-            super::registry::record(&self.statement.text, self.values.oids());
+            self.record();
         }
         raw.map_err(error::from_driver)
     }
@@ -58,6 +64,7 @@ impl Prepared {
                 .map(|_| Reply {
                     rows: Vec::new(),
                     changed: None,
+                    tag: None,
                 });
         }
         let mut stream = pin!(
@@ -75,7 +82,12 @@ impl Prepared {
         let changed = stream
             .rows_affected()
             .map(|count| if self.statement.select { 0 } else { count });
-        Ok(Reply { rows, changed })
+        // Only the transport comparison reads tags: no copy elsewhere.
+        #[cfg(feature = "testkit-pg")]
+        let tag = stream.command_tag().map(str::to_owned);
+        #[cfg(not(feature = "testkit-pg"))]
+        let tag = None;
+        Ok(Reply { rows, changed, tag })
     }
 }
 
@@ -106,9 +118,17 @@ impl tokio_postgres::types::ToSql for RejectBind {
 pub(super) struct Reply {
     rows: Vec<Row>,
     changed: Option<u64>,
+    /// The command tag, for comparing the two transports in tests.
+    #[cfg_attr(not(feature = "testkit-pg"), allow(dead_code))]
+    tag: Option<String>,
 }
 
 impl Reply {
+    #[cfg(feature = "testkit-pg")]
+    pub(super) fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
     pub(super) fn changed(&self) -> Result<u64> {
         self.changed.ok_or_else(error::shape)
     }
@@ -119,13 +139,30 @@ impl Reply {
     }
 }
 
-fn prelude(lock_key: Option<i64>) -> String {
+/// The prelude statements: BEGIN, four `SET LOCAL`s and, unless the
+/// negative-control test build disabled it, the W1 lock.
+pub(super) fn prelude_statements(lock_key: Option<i64>) -> usize {
+    PRELUDE.len() + usize::from(lock_key.is_some())
+}
+
+/// The prelude of the single-Sync transport, one statement each. The app
+/// role defaults to read-only, so a write without BEGIN READ WRITE fails.
+/// `log_parameter_max_length_on_error = 0` keeps bind values out of the
+/// server's error log whatever the role or session says.
+const PRELUDE: [&str; 5] = [
+    "BEGIN READ WRITE, ISOLATION LEVEL READ COMMITTED",
+    "SET LOCAL lock_timeout = '2s'",
+    "SET LOCAL statement_timeout = '20s'",
+    "SET LOCAL idle_in_transaction_session_timeout = '5s'",
+    "SET LOCAL log_parameter_max_length_on_error = 0",
+];
+
+const LOCK: &str = "SELECT pg_advisory_xact_lock($1::bigint)";
+
+pub(super) fn prelude(lock_key: Option<i64>) -> String {
     // The app role defaults to read-only. If a proxy drops this prelude,
     // later extended requests must not autocommit writes on that role.
-    let mut start =
-        "BEGIN READ WRITE, ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '2s'; \
-        SET LOCAL statement_timeout = '20s'; SET LOCAL idle_in_transaction_session_timeout = '5s'"
-            .to_owned();
+    let mut start = PRELUDE.join("; ");
     if let Some(key) = lock_key {
         // This is the only variable in the prelude and is an i64, not SQL text.
         use std::fmt::Write;
@@ -144,13 +181,277 @@ async fn control(client: &Client, sql: &str) -> Result<()> {
         .map_err(error::without_guard)
 }
 
+/// Where a write transaction's first error happened, for comparing the two
+/// transports in tests. Not used otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorPosition {
+    Prelude,
+    Statement(usize),
+    Commit,
+}
+
+#[cfg(feature = "testkit-pg")]
+std::thread_local! {
+    static ERROR_POSITION: std::cell::Cell<Option<ErrorPosition>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test builds only. Called right before a transaction returns its error,
+/// after its last await, so no other future on the thread can run between
+/// this and the caller reading it.
+#[cfg(feature = "testkit-pg")]
+fn set_error_position(position: ErrorPosition) {
+    ERROR_POSITION.with(|p| p.set(Some(position)));
+}
+
+#[cfg(not(feature = "testkit-pg"))]
+fn set_error_position(_: ErrorPosition) {}
+
+/// The position of the last write transaction error on this thread, taken.
+#[cfg(feature = "testkit-pg")]
+pub(super) fn take_error_position() -> Option<ErrorPosition> {
+    ERROR_POSITION.with(std::cell::Cell::take)
+}
+
+/// The statement that ends a transaction that succeeded. Only the
+/// transport comparison tests end with ROLLBACK.
+pub(super) const COMMIT: &str = "COMMIT";
+
+/// The largest single-Sync request. The driver encodes the whole request
+/// into one buffer before it sends it, and the Worker's socket writes it in
+/// one piece: both must stay well inside the isolate's 128 MB. The largest
+/// catalogue batch is a multipart Complete with a 2 MB placement value
+/// (about 2 MB); 16 MiB leaves room for several values at the 2 MB limit.
+/// A larger transaction uses the one-Sync-per-statement transport, which
+/// has the same statements and binds.
+pub const MAX_SINGLE_SYNC_BYTES: usize = 16 * 1024 * 1024;
+
+/// The encoded size of the single-Sync request: Parse, Bind, Describe and
+/// Execute per statement (unnamed, binary results), then one Sync.
+pub(super) fn single_sync_bytes(lock_key: Option<i64>, prepared: &[Prepared], end: &str) -> usize {
+    fn statement(text: usize, params: usize, bytes: usize) -> usize {
+        let parse = 1 + 4 + 1 + text + 1 + 2 + 4 * params;
+        let bind = 1 + 4 + 1 + 1 + 2 + 2 * params + 2 + 4 * params + bytes + 2 + 2;
+        parse + bind + 7 + 10
+    }
+    let mut total = PRELUDE
+        .iter()
+        .map(|q| statement(q.len(), 0, 0))
+        .sum::<usize>()
+        + statement(end.len(), 0, 0)
+        + 5;
+    if lock_key.is_some() {
+        total += statement(LOCK.len(), 1, 8);
+    }
+    for p in prepared {
+        let (params, bytes) = p.values.wire_size();
+        total = total.saturating_add(statement(p.statement.text.len(), params, bytes));
+    }
+    total
+}
+
+std::thread_local! {
+    static OVERSIZE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Write transactions on this thread that exceeded
+/// [`MAX_SINGLE_SYNC_BYTES`] and used the one-Sync-per-statement transport.
+pub fn oversize_fallbacks() -> u64 {
+    OVERSIZE.with(std::cell::Cell::get)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn transaction(
     client: &Client,
     lock_key: Option<i64>,
-    pipelined: bool,
+    write_tx: WriteTx,
     prepared: &[Prepared],
     collect_rows: bool,
     record: bool,
+    end: &'static str,
+    on_oversize: Option<fn(usize)>,
+) -> Result<Vec<Reply>> {
+    let write_tx = if write_tx == WriteTx::SingleSync
+        && single_sync_bytes(lock_key, prepared, end) > MAX_SINGLE_SYNC_BYTES
+    {
+        OVERSIZE.with(|n| n.set(n.get() + 1));
+        if let Some(hook) = on_oversize {
+            hook(prepared.len());
+        }
+        WriteTx::Pipeline
+    } else {
+        write_tx
+    };
+    match write_tx {
+        WriteTx::Pipeline => pipelined(client, lock_key, prepared, collect_rows, record, end).await,
+        WriteTx::SingleSync => {
+            match single_sync(client, lock_key, prepared, collect_rows, record, end).await {
+                Ok(replies) => Ok(replies),
+                Err((sent, position, err)) => {
+                    if sent {
+                        // W1 is released when the error aborts the transaction;
+                        // this returns the origin connection clean. Its outcome
+                        // changes nothing: the connection is dropped next.
+                        let _ = client.simple_query("ROLLBACK").await;
+                    }
+                    if let Some(position) = position {
+                        set_error_position(position);
+                    }
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+/// Error class of a single-Sync transaction by position: `done` is the
+/// index of the statement the error belongs to (the number of statements
+/// that completed before it), `server` the SQLSTATE and constraint of a
+/// server ErrorResponse, if it was one, and `status` the transaction status
+/// of the final ReadyForQuery. Only a server statement's own SQLSTATE after
+/// BEGIN and before COMMIT, followed by ReadyForQuery E, is a known
+/// rollback. Anything that may hide a committed write is `statement
+/// failed`.
+pub(super) fn message_error(
+    server: Option<(&str, Option<&str>)>,
+    done: usize,
+    prelude: usize,
+    n: usize,
+    status: Option<u8>,
+) -> BridgeError {
+    let Some((code, constraint)) = server else {
+        // EOF, connection loss, or a protocol error: unknown outcome.
+        return error::statement_failed();
+    };
+    if done == 0 {
+        // Before BEGIN completed. Hyperdrive's 58000 is a known refusal
+        // only once it is shown to precede forwarding of a Sync group.
+        return if code == "58000" && error::SINGLE_SYNC_58000_BEFORE_FORWARD {
+            error::overloaded()
+        } else {
+            error::statement_failed()
+        };
+    }
+    if done >= prelude + n || !error::server_statement_code(code) {
+        // The COMMIT position is classed exactly as a COMMIT failure on the
+        // typed transport. A code no statement raises is unknown too.
+        return error::statement_failed();
+    }
+    if status != Some(b'E') {
+        // Only the server's own ReadyForQuery in a failed transaction shows
+        // that it skipped the rest, COMMIT included. Without it (the reply
+        // ended, or a pooler said idle) the write may have committed.
+        return error::statement_failed();
+    }
+    let class = error::classify(code, constraint);
+    if done < prelude {
+        // A prelude statement is never a guard refusal.
+        error::without_guard(class)
+    } else {
+        class
+    }
+}
+
+/// The whole transaction as one request with one Sync. `Err((sent, _, _))`
+/// says whether anything reached the connection (an encode error or a
+/// closed connection sends nothing) and where the first error was.
+async fn single_sync(
+    client: &Client,
+    lock_key: Option<i64>,
+    prepared: &[Prepared],
+    collect_rows: bool,
+    _record: bool,
+    end: &'static str,
+) -> core::result::Result<Vec<Reply>, (bool, Option<ErrorPosition>, BridgeError)> {
+    let key = lock_key.unwrap_or_default();
+    let mut stmts: Vec<PipelineStatement<'_>> = PRELUDE
+        .iter()
+        .map(|query| PipelineStatement {
+            query,
+            params: Vec::new(),
+        })
+        .collect();
+    if lock_key.is_some() {
+        stmts.push(PipelineStatement {
+            query: LOCK,
+            params: vec![(&key as &(dyn ToSql + Sync), Type::INT8)],
+        });
+    }
+    let prelude = stmts.len();
+    debug_assert_eq!(prelude, prelude_statements(lock_key));
+    stmts.extend(prepared.iter().map(|p| PipelineStatement {
+        query: &p.statement.text,
+        params: p.values.typed().collect(),
+    }));
+    stmts.push(PipelineStatement {
+        query: end,
+        params: Vec::new(),
+    });
+    let n = prepared.len();
+    let outcome = client
+        .pipeline_typed(&stmts, collect_rows)
+        .await
+        .map_err(|_| (false, None, error::statement_failed()))?;
+    if let Some((done, err)) = outcome.error {
+        #[cfg(feature = "pg-test-record")]
+        if _record {
+            // As the typed transport records: every statement that ran,
+            // including the one that failed.
+            let ran = (done + 1).saturating_sub(prelude).min(n);
+            prepared[..ran].iter().for_each(Prepared::record);
+        }
+        let server = err
+            .as_db_error()
+            .map(|db| (db.code().code(), db.constraint()));
+        let position = if done < prelude {
+            ErrorPosition::Prelude
+        } else if done < prelude + n {
+            ErrorPosition::Statement(done - prelude)
+        } else {
+            ErrorPosition::Commit
+        };
+        return Err((
+            true,
+            Some(position),
+            message_error(server, done, prelude, n, outcome.status),
+        ));
+    }
+    // Committed only if every statement completed, the last with exactly
+    // the end tag, and the session is out of the transaction.
+    let mut replies = outcome.replies;
+    if replies.len() != prelude + n + 1
+        || replies.last().map(|r| r.tag.as_str()) != Some(end)
+        || outcome.status != Some(b'I')
+    {
+        return Err((true, None, error::shape()));
+    }
+    #[cfg(feature = "pg-test-record")]
+    if _record {
+        prepared.iter().for_each(Prepared::record);
+    }
+    replies.truncate(prelude + n);
+    Ok(replies
+        .drain(prelude..)
+        .zip(prepared)
+        .map(|(reply, p)| Reply {
+            rows: reply.rows,
+            changed: Some(if p.statement.select {
+                0
+            } else {
+                reply.rows_affected
+            }),
+            tag: Some(reply.tag),
+        })
+        .collect())
+}
+
+async fn pipelined(
+    client: &Client,
+    lock_key: Option<i64>,
+    prepared: &[Prepared],
+    collect_rows: bool,
+    record: bool,
+    end: &'static str,
 ) -> Result<Vec<Reply>> {
     let start = prelude(lock_key);
     let begin = async {
@@ -161,27 +462,8 @@ pub(super) async fn transaction(
             .map_err(error::before_catalogue)
     };
     let stmts = prepared.iter().map(|s| s.run(client, collect_rows, record));
-    let finish = |commit| control(client, if commit { "COMMIT" } else { "ROLLBACK" });
-    if pipelined {
-        pipeline(begin, stmts.collect(), finish).await
-    } else {
-        if let Err(err) = begin.await {
-            let _ = finish(false).await;
-            return Err(err);
-        }
-        let mut replies = Vec::with_capacity(prepared.len());
-        for s in stmts {
-            match s.await {
-                Ok(reply) => replies.push(reply),
-                Err(err) => {
-                    let _ = finish(false).await;
-                    return Err(err);
-                }
-            }
-        }
-        finish(true).await.map_err(|_| error::statement_failed())?;
-        Ok(replies)
-    }
+    let finish = |commit| control(client, if commit { end } else { "ROLLBACK" });
+    pipeline(begin, stmts.collect(), finish).await
 }
 
 async fn first_poll<F: Future>(mut step: Pin<&mut F>) -> Poll<F::Output> {
@@ -207,11 +489,12 @@ where
         Poll::Ready(Err(err)) => {
             drop(begin);
             let _ = finish(false).await;
+            set_error_position(ErrorPosition::Prelude);
             return Err(err);
         }
     };
     let mut sent = Vec::with_capacity(stmts.len());
-    for s in stmts {
+    for (i, s) in stmts.into_iter().enumerate() {
         let mut s = Box::pin(s);
         let instant = match first_poll(s.as_mut()).await {
             Poll::Pending => None,
@@ -224,6 +507,7 @@ where
                 drop(sent);
                 drop(begin);
                 let _ = finish(false).await;
+                set_error_position(ErrorPosition::Statement(i));
                 return Err(err);
             }
         };
@@ -242,9 +526,9 @@ where
         }
     };
     let (commit, (start, replies)) = join(finish(true), join(begin, join_all(sent))).await;
-    let mut first_error = start.err();
+    let mut first_error = start.err().map(|err| (ErrorPosition::Prelude, err));
     let mut values = Vec::with_capacity(replies.len());
-    for reply in replies {
+    for (i, reply) in replies.into_iter().enumerate() {
         match reply {
             // After a server error aborts a transaction, another statement
             // can't succeed. A proxy may have omitted the prelude or changed
@@ -252,14 +536,18 @@ where
             Ok(_) if first_error.is_some() => return Err(error::statement_failed()),
             Ok(value) => values.push(value),
             Err(err) => {
-                first_error.get_or_insert(err);
+                first_error.get_or_insert((ErrorPosition::Statement(i), err));
             }
         }
     }
-    if let Some(err) = first_error {
+    if let Some((position, err)) = first_error {
+        set_error_position(position);
         return Err(err);
     }
-    commit.map_err(|_| error::statement_failed())?;
+    if commit.is_err() {
+        set_error_position(ErrorPosition::Commit);
+        return Err(error::statement_failed());
+    }
     Ok(values)
 }
 
