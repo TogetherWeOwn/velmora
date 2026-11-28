@@ -848,6 +848,7 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         replay_read_ahead: false,
         packed_plans: false,
         parity: false,
+        record_plain_crc64: false,
         required_backbones: 1,
         safety_min_age_secs: 0,
         release_at_verify: false,

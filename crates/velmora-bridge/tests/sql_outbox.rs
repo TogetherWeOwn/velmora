@@ -215,6 +215,7 @@ impl Fx {
             wrapped_file_key: Some(vec![n; 73]),
             plain_md5: [n; 16],
             plain_sha256: [n; 32],
+            plain_crc64: None,
             cipher_sha256: [n; 32],
             safety_state: SafetyState::Held,
             article_count: None,

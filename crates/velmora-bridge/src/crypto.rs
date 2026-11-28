@@ -103,6 +103,7 @@ use velmora::media::{
     HEADER_SIZE, PLAIN_CHUNK_SIZE,
 };
 use velmora::rng::FillRandom;
+use velmora_s3_proto::Crc64Nvme;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ports::Kek;
@@ -564,6 +565,7 @@ pub struct SealedExtent {
     pub ciphertext: Vec<u8>,
     pub plain_md5: [u8; 16],
     pub plain_sha256: [u8; 32],
+    pub plain_crc64: Option<[u8; 8]>,
     /// SHA-256 of `ciphertext`.
     pub cipher_sha256: [u8; 32],
     /// The extent's file key, wrapped for this bucket and extent.
@@ -591,19 +593,38 @@ pub fn seal_extent<R: FillRandom>(
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<SealedExtent> {
+    seal_extent_with_crc64(bdk, bucket, extent, plaintext, rng, false)
+}
+
+/// As [`seal_extent`], optionally recording CRC64NVME on each plaintext
+/// chunk as it is sealed. The ciphertext and key binding are unchanged.
+pub fn seal_extent_with_crc64<R: FillRandom>(
+    bdk: &DataKey,
+    bucket: &BucketId,
+    extent: &ExtentId,
+    plaintext: &[u8],
+    rng: &mut R,
+    record_crc64: bool,
+) -> Result<SealedExtent> {
     // Refuse a bad binding before any key exists.
     file_key_aad(bucket, extent)?;
 
     let file_key = FileKey::generate(rng).map_err(|_| ERR_RNG)?;
     let sealer = Sealer::random(&profile(), &file_key, rng).map_err(|_| ERR_RNG)?;
     let media_header = sealer.header().to_bytes();
-    let ciphertext = sealer.seal_to_vec(plaintext).map_err(|_| ERR_SEAL)?;
+    let mut crc = record_crc64.then(Crc64Nvme::default);
+    let ciphertext = match &mut crc {
+        Some(crc) => sealer.seal_to_vec_observing(plaintext, |chunk| crc.update(chunk)),
+        None => sealer.seal_to_vec(plaintext),
+    }
+    .map_err(|_| ERR_SEAL)?;
     let wrapped_file_key = wrap_file_key(bdk, bucket, extent, &file_key, rng)?;
 
     Ok(SealedExtent {
         media_header,
         plain_md5: md5::compute(plaintext).0,
         plain_sha256: Sha256::digest(plaintext).into(),
+        plain_crc64: crc.map(Crc64Nvme::finish),
         cipher_sha256: Sha256::digest(&ciphertext).into(),
         ciphertext,
         wrapped_file_key,
@@ -611,13 +632,14 @@ pub fn seal_extent<R: FillRandom>(
 }
 
 /// What [`ExtentSealer::finish`] returns: everything about the sealed
-/// stream the catalogue records, except the plaintext digests (those are
-/// the caller's, taken where it read the plaintext).
+/// stream the catalogue records. The caller still supplies the plaintext
+/// MD5 and SHA-256 from the upload validator.
 pub struct SealedStream {
     /// The 48-byte stream header (also the first 48 bytes of the stream).
     pub media_header: [u8; HEADER_SIZE as usize],
     /// Length of the whole stream: header and every sealed chunk.
     pub cipher_size: u64,
+    pub plain_crc64: Option<[u8; 8]>,
     /// SHA-256 of the whole stream.
     pub cipher_sha256: [u8; 32],
     /// MD5 of the whole stream: what a blob store reports for an object
@@ -662,6 +684,7 @@ pub struct ExtentSealer {
     cipher_size: u64,
     /// Bytes of the stream given out so far.
     given: u64,
+    plain_crc64: Option<Crc64Nvme>,
     cipher_sha256: Sha256,
     cipher_md5: md5::Context,
 }
@@ -685,6 +708,19 @@ impl ExtentSealer {
         plain_size: u64,
         rng: &mut R,
     ) -> Result<Self> {
+        Self::begin_with_crc64(bdk, bucket, extent, plain_size, rng, false)
+    }
+
+    /// As [`Self::begin`], optionally recording the CRC64NVME of the
+    /// accepted plaintext chunks of this extent.
+    pub fn begin_with_crc64<R: FillRandom>(
+        bdk: &DataKey,
+        bucket: &BucketId,
+        extent: &ExtentId,
+        plain_size: u64,
+        rng: &mut R,
+        record_crc64: bool,
+    ) -> Result<Self> {
         // Refuse a bad binding before any key exists.
         file_key_aad(bucket, extent)?;
         let cipher_size = media::ciphertext_size(plain_size).ok_or(ERR_SEAL)?;
@@ -701,6 +737,7 @@ impl ExtentSealer {
             sealed: 0,
             cipher_size,
             given: 0,
+            plain_crc64: record_crc64.then(Crc64Nvme::default),
             cipher_sha256: Sha256::new(),
             cipher_md5: md5::Context::new(),
         })
@@ -751,6 +788,9 @@ impl ExtentSealer {
             .sealer
             .seal_chunk(plaintext, last)
             .map_err(|_| ERR_SEAL)?;
+        if let Some(crc) = &mut self.plain_crc64 {
+            crc.update(plaintext);
+        }
         let piece = if self.given == 0 {
             let mut piece = Vec::with_capacity(self.media_header.len() + chunk.len());
             piece.extend_from_slice(&self.media_header);
@@ -775,6 +815,7 @@ impl ExtentSealer {
         Ok(SealedStream {
             media_header: self.media_header,
             cipher_size: self.cipher_size,
+            plain_crc64: self.plain_crc64.map(Crc64Nvme::finish),
             cipher_sha256: self.cipher_sha256.finalize().into(),
             cipher_md5: self.cipher_md5.finalize().0,
             wrapped_file_key: self.wrapped_file_key,

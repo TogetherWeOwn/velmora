@@ -1108,14 +1108,16 @@ pub(super) async fn store_streamed<B: BlobStore>(
     bdk: &DataKey,
     blob: StreamMeta<'_>,
     charge: &Charge,
+    record_crc64: bool,
     observed: &mut RequestObservation,
 ) -> Result<SealedUpload, UploadReadError> {
-    let sealer = ExtentSealer::begin(
+    let sealer = ExtentSealer::begin_with_crc64(
         bdk,
         blob.bucket,
         blob.extent,
         lengths.decoded,
         &mut SystemRng,
+        record_crc64,
     )
     .map_err(|_| IngressError::Internal)?;
     let cipher_size = sealer.cipher_size();

@@ -95,6 +95,9 @@ const articles = wasm.setup(mib * 1048576);
 const CHUNKS = [4096, 65536];
 const stages = [
   ["ingest", "seal + MD5 + 2x SHA-256 (seal_extent)", () => wasm.ingest()],
+  ...(wasm.ingest_crc64
+    ? [["ingest.crc64", "same seal with CRC64NVME recording on", () => wasm.ingest_crc64()]]
+    : []),
   ["post", "whole post stage", () => wasm.post(65536)],
   ["post.load_check", "SHA-256 of the loaded ciphertext", () => wasm.post_load_check()],
   ["post.payload_check", "SHA-256 of each article payload", () => wasm.post_payload_check()],

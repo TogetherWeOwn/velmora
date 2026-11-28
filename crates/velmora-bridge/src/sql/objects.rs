@@ -182,6 +182,7 @@ pub(super) fn extent_row(row: Row) -> Result<ExtentRow> {
         wrapped_file_key: c.opt_blob()?,
         plain_md5: c.array()?,
         plain_sha256: c.array()?,
+        plain_crc64: None,
         cipher_sha256: c.array()?,
         safety_state: c.parsed(SafetyState::parse)?,
         article_count: c.opt_num()?,

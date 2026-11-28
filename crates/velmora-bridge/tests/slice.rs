@@ -2474,6 +2474,103 @@ async fn rebuild_from_usenet(packed_plans: &str) {
     expect_eq(s, "dead outbox rows", 0, rig.outbox_dead());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn new_streamed_extents_record_crc64_only_when_enabled() {
+    for (vars, expected) in [
+        (&[][..], [None, None]),
+        (
+            &[("RECORD_PLAIN_CRC64", "on")][..],
+            [
+                Some(vec![0; 8]),
+                Some(0xae8b14860a799888_u64.to_be_bytes().to_vec()),
+            ],
+        ),
+    ] {
+        let rig = Rig::with_vars(vars).await;
+        let step = "CRC64 at seal";
+        rig.setup_buckets_and_key(step).await;
+        for ((key, body), crc) in [("empty", &b""[..]), ("check", &b"123456789"[..])]
+            .into_iter()
+            .zip(expected)
+        {
+            let extra = if body.is_empty() {
+                &[("content-length", "0")][..]
+            } else {
+                &[]
+            };
+            let r = rig
+                .s3(
+                    Method::Put,
+                    &format!("/slice/a/{key}"),
+                    &[],
+                    extra,
+                    body.to_vec(),
+                )
+                .await;
+            expect_status(step, key, 200, &r);
+            assert_eq!(stored_extent_crcs(&rig, &format!("a/{key}")).await, [crc]);
+        }
+        assert_eq!(
+            rig.sql_count(
+                "SELECT COUNT(*) FROM pragma_table_info('extents') WHERE name='plain_crc64'"
+            ),
+            0
+        );
+    }
+}
+
+async fn stored_extent_crcs(rig: &Rig, key: &str) -> Vec<Option<Vec<u8>>> {
+    let id: String = rig.bridge.catalog.sql.with_conn(|c| {
+        c.query_row(
+            "SELECT generation_id FROM objects WHERE key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    let record = rig
+        .bridge
+        .cfg
+        .records
+        .generation_key(&GenerationId::new(id));
+    velmora_bridge::recovery::read_generation(&rig.bridge.safety, &rig.bridge.kek, &record)
+        .await
+        .unwrap()
+        .unwrap()
+        .extents
+        .into_iter()
+        .map(|e| e.plain_crc64)
+        .collect()
+}
+
+fn direct_extent_crcs<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Vec<Option<Vec<u8>>> {
+    parts
+        .into_iter()
+        .map(|plain| {
+            let mut crc = velmora_s3_proto::Crc64Nvme::default();
+            crc.update(plain);
+            Some(crc.finish().to_vec())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multipart_records_omit_crc64_without_a_sealed_staging_carrier() {
+    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024"), ("RECORD_PLAIN_CRC64", "on")]).await;
+    let step = "multipart extent CRC64";
+    rig.setup_buckets_and_key(step).await;
+    let part_size = 17 * MIB + 11;
+    let body = test_bytes(2, part_size + 127);
+    let r = rig
+        .multipart_put(step, "/slice/a/multipart-crc", &body, part_size)
+        .await;
+    expect_status(step, "CompleteMultipartUpload", 200, &r);
+    assert_eq!(
+        stored_extent_crcs(&rig, "a/multipart-crc").await,
+        [None, None, None, None]
+    );
+}
+
 /// A PutObject above one extent is stored in slices. Each slice is an
 /// extent like any other: it is posted and verified, and the object is
 /// rebuilt from its recovery record and read from Usenet.
@@ -2481,7 +2578,7 @@ async fn rebuild_from_usenet(packed_plans: &str) {
 async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
     use velmora_bridge::replay::ReplayCursor;
 
-    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024")]).await;
+    let rig = Rig::with_vars(&[("MAX_PUT_BYTES", "103809024"), ("RECORD_PLAIN_CRC64", "on")]).await;
     let s = "sliced setup";
     rig.setup_buckets_and_key(s).await;
     // Three slices of the default 8 MiB: two full ones and 4 MiB + 1 B.
@@ -2516,6 +2613,12 @@ async fn a_sliced_put_posts_verifies_and_reads_back_from_usenet() {
         "intent rows after the publish",
         0,
         rig.sql_count("SELECT COUNT(*) FROM write_intents"),
+    );
+
+    let expected_crcs = direct_extent_crcs(body.chunks(8 * MIB));
+    assert_eq!(
+        stored_extent_crcs(&rig, "a/sliced.bin").await,
+        expected_crcs
     );
 
     let s = "sliced post-and-verify";

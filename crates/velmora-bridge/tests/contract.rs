@@ -1653,6 +1653,7 @@ fn sample_extent(bucket: &BucketId) -> ExtentRow {
         wrapped_file_key: Some(vec![0; 73]),
         plain_md5: [0; 16],
         plain_sha256: [0; 32],
+        plain_crc64: None,
         cipher_sha256: [0; 32],
         safety_state: SafetyState::Held,
         article_count: None,

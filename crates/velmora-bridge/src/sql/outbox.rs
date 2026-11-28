@@ -391,6 +391,7 @@ pub(super) async fn job_extent<S: Sql>(
         wrapped_file_key: r.opt_blob()?,
         plain_md5: r.array()?,
         plain_sha256: r.array()?,
+        plain_crc64: None,
         cipher_sha256: r.array()?,
         safety_state: r.parsed(SafetyState::parse)?,
         article_count: r.opt_num()?,

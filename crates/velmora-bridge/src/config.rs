@@ -394,6 +394,9 @@ pub struct BridgeConfig {
     /// addendum, so a rollback past it posts and releases extents
     /// without their parity.
     pub parity: bool,
+    /// Record CRC64NVME in sealed records for PutObject extents
+    /// (`RECORD_PLAIN_CRC64`). Off by default; reading is independent.
+    pub record_plain_crc64: bool,
     /// The layout of new recovery records (`RECORD_LAYOUT`,
     /// [`crate::recovery::Layout`]): `flat`, or `tenant` for the
     /// directory of the tenant. It names what is written only. Every
@@ -970,6 +973,11 @@ impl BridgeConfig {
         if parity && !packed_plans {
             return Err(ConfigError::Refused("PARITY without PACKED_PLANS"));
         }
+        let record_plain_crc64 = match get("RECORD_PLAIN_CRC64").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("RECORD_PLAIN_CRC64".into())),
+        };
         let records = match get("RECORD_LAYOUT").as_deref().map(str::trim) {
             None | Some("") | Some("flat") => crate::recovery::Layout::flat(),
             Some("tenant") => crate::recovery::Layout::default_tenant(),
@@ -1204,6 +1212,7 @@ impl BridgeConfig {
             gc_orphans,
             packed_plans,
             parity,
+            record_plain_crc64,
             records,
             replay_read_ahead,
             required_backbones,

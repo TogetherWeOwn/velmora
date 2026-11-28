@@ -28,6 +28,7 @@ mod upload;
 mod wire;
 
 pub use auth::{verify, AuthMode, Authority, Credential, VerifiedRequest, SINGLE_VALUE_HEADERS};
+pub use checksum::Crc64Nvme;
 pub use read::{plan_read, ByteRange, Conditions, ObjectMetadata, ReadPlan, StoredChecksum};
 pub use upload::{is_aws_chunked, ChecksumAlgorithm, DecodedUpload, UploadValidator};
 pub use wire::{

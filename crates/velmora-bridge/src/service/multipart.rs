@@ -819,6 +819,7 @@ where
                 extent: &extent_id,
             },
             &charge,
+            false, // Parts have no sealed CRC carrier through Complete.
             observed,
         )
         .await?;
@@ -850,6 +851,7 @@ where
         wrapped_file_key: Some(stored.wrapped_file_key.to_vec()),
         plain_md5: stored.plain_md5,
         plain_sha256: stored.plain_sha256,
+        plain_crc64: None,
         cipher_sha256: stored.cipher_sha256,
         safety_state: SafetyState::Held,
         article_count: None,
@@ -984,6 +986,7 @@ where
         bucket: &a.bucket.id,
         ids: &ids,
         slice_bytes,
+        record_crc64: false,
         rng: &mut rng,
     };
     let stored = match store_slices(sink, body, lengths, &charge, &mut validator).await {
@@ -1038,6 +1041,7 @@ where
             wrapped_file_key: Some(slice.sealed.wrapped_file_key.to_vec()),
             plain_md5: slice.sealed.plain_md5,
             plain_sha256: slice.sealed.plain_sha256,
+            plain_crc64: None,
             cipher_sha256: slice.sealed.cipher_sha256,
             safety_state: SafetyState::Held,
             article_count: None,
@@ -1568,7 +1572,9 @@ where
         };
         // The recovery record is durable before the publication batch.
         // It describes the staged extents as this generation will hold
-        // them; the batch applies only if the upload is unchanged.
+        // them; the batch applies only if the upload is unchanged. Parts
+        // omit the plaintext CRC until a sealed staging carrier exists:
+        // the catalogue does not persist it between requests.
         let commit = CompleteUpload {
             generation,
             placements,

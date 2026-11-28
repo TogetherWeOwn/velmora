@@ -305,6 +305,7 @@ fn golden_manifest() -> GenerationManifest {
         wrapped_file_key: vec![0xa0 + seq as u8; 40],
         plain_md5: vec![seq as u8; 16],
         plain_sha256: vec![0x10 + seq as u8; 32],
+        plain_crc64: None,
         cipher_sha256: vec![0x20 + seq as u8; 32],
         created_at: 1_700_000_000_000 + i64::from(seq),
     };
@@ -331,6 +332,52 @@ fn golden_manifest() -> GenerationManifest {
         },
         extents: (0..5).map(extent).collect(),
     }
+}
+
+#[test]
+fn extent_record_crc64_is_compatible_in_both_directions() {
+    // The old format had no version tag on an extent. Pin its field set
+    // independently of the current Rust type (binary fields are b64 strings).
+    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+    struct V1Extent {
+        id: String,
+        seq: u32,
+        plain_offset: u64,
+        plain_size: u64,
+        cipher_size: u64,
+        media_header: String,
+        key_mode: u8,
+        wrapped_file_key: String,
+        plain_md5: String,
+        plain_sha256: String,
+        cipher_sha256: String,
+        created_at: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct V1Manifest {
+        v: u32,
+        extents: Vec<V1Extent>,
+    }
+
+    let v1_bytes = include_bytes!("golden/generation-v1.json");
+    let old: V1Manifest = serde_json::from_slice(v1_bytes).unwrap();
+    let mut new: GenerationManifest = serde_json::from_slice(v1_bytes).unwrap();
+    let mut rows: Vec<_> = (0..new.extents.len())
+        .map(|i| new.extent(i).unwrap())
+        .collect();
+    assert!(rows.iter().all(|row| row.plain_crc64.is_none()));
+    assert_eq!(serde_json::to_vec(&new).unwrap().as_slice(), v1_bytes);
+
+    let crc = 0xae8b14860a799888_u64.to_be_bytes();
+    rows[0].plain_crc64 = Some(crc);
+    new = GenerationManifest::new(&new.bucket(), &new.generation().unwrap(), &rows).unwrap();
+    let v2_bytes = serde_json::to_vec(&new).unwrap();
+    let old_reading_v2: V1Manifest = serde_json::from_slice(&v2_bytes).unwrap();
+    assert_eq!(old_reading_v2.v, old.v);
+    assert_eq!(old_reading_v2.extents, old.extents);
+    let new_reading_v2: GenerationManifest = serde_json::from_slice(&v2_bytes).unwrap();
+    assert_eq!(new_reading_v2.extent(0).unwrap().plain_crc64, Some(crc));
+    assert_eq!(new_reading_v2.extent(1).unwrap().plain_crc64, None);
 }
 
 /// Whether the vectors are written, not compared: only when

@@ -47,11 +47,32 @@ static CRC32C: [u32; 256] = table32(0x82F6_3B78);
 /// CRC-64/NVME, reflected polynomial.
 static CRC64NVME: [u64; 256] = table64(0x9A6C_9329_AC4B_C9B5);
 
+/// Incremental CRC-64/NVME, in the same format as the S3 checksum.
+pub struct Crc64Nvme(u64);
+
+impl Default for Crc64Nvme {
+    fn default() -> Self {
+        Self(!0)
+    }
+}
+
+impl Crc64Nvme {
+    pub fn update(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = CRC64NVME[((self.0 ^ u64::from(*b)) & 0xff) as usize] ^ (self.0 >> 8);
+        }
+    }
+
+    pub fn finish(self) -> [u8; 8] {
+        (!self.0).to_be_bytes()
+    }
+}
+
 /// The running state of one checksum.
 pub(crate) enum Running {
     Crc32(crc32fast::Hasher),
     Crc32c(u32),
-    Crc64Nvme(u64),
+    Crc64Nvme(Crc64Nvme),
     Sha1(Sha1),
     Sha256(Sha256),
 }
@@ -61,7 +82,7 @@ impl Running {
         match algorithm {
             ChecksumAlgorithm::Crc32 => Self::Crc32(crc32fast::Hasher::new()),
             ChecksumAlgorithm::Crc32c => Self::Crc32c(!0),
-            ChecksumAlgorithm::Crc64Nvme => Self::Crc64Nvme(!0),
+            ChecksumAlgorithm::Crc64Nvme => Self::Crc64Nvme(Crc64Nvme::default()),
             ChecksumAlgorithm::Sha1 => Self::Sha1(Sha1::new()),
             ChecksumAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
         }
@@ -75,11 +96,7 @@ impl Running {
                     *c = CRC32C[((*c ^ u32::from(*b)) & 0xff) as usize] ^ (*c >> 8);
                 }
             }
-            Self::Crc64Nvme(c) => {
-                for b in bytes {
-                    *c = CRC64NVME[((*c ^ u64::from(*b)) & 0xff) as usize] ^ (*c >> 8);
-                }
-            }
+            Self::Crc64Nvme(c) => c.update(bytes),
             Self::Sha1(h) => h.update(bytes),
             Self::Sha256(h) => h.update(bytes),
         }
@@ -90,7 +107,7 @@ impl Running {
         match self {
             Self::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
             Self::Crc32c(c) => (!c).to_be_bytes().to_vec(),
-            Self::Crc64Nvme(c) => (!c).to_be_bytes().to_vec(),
+            Self::Crc64Nvme(c) => c.finish().to_vec(),
             Self::Sha1(h) => h.finalize().to_vec(),
             Self::Sha256(h) => h.finalize().to_vec(),
         }

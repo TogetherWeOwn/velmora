@@ -367,6 +367,7 @@ impl Fx {
             wrapped_file_key: Some(Self::bytes::<73>(n).to_vec()),
             plain_md5: Self::bytes(n),
             plain_sha256: Self::bytes(n),
+            plain_crc64: None,
             cipher_sha256: Self::bytes(n),
             safety_state: SafetyState::Held,
             article_count: None,
