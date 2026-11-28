@@ -39,10 +39,13 @@ operator host's own feeder is private to that host, as are its paths.
 
 Mail Workers use a service binding to `velmora-alerts` with `entrypoint =
 "MailAlerts"`. The named entrypoint accepts `POST /v1/alert` for `mail:<event>`
-sources; the public URL rejects them even with a valid bearer token. Set
-`MAIL_ALERTS_ENABLED=on` only when ready to accept these reports. If a report
-includes `Idempotency-Key`, it must match its JSON `key`. Replays of the
-same source and key are acknowledged without adding a second alert email.
+sources; the public URL rejects them even with a valid bearer token. Apply
+`migrations/0003_mail_idem.sql` to the alerts state database, then set
+`MAIL_ALERTS_ENABLED=on` in the alerts deploy config before callers bind to
+`MailAlerts`. The receiver stores a fixed title and no caller detail. Reports
+are grouped by event code and page at most once per code per hour. An optional
+`Idempotency-Key` must match the JSON `key`; repeats of the same source and
+key do not add another occurrence within the eight-day retention window.
 
 ## Email rules
 

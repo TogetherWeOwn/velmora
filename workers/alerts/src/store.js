@@ -27,23 +27,28 @@ export async function setMetaIfAbsent(db, k, v) {
 /**
  * Records that `a` holds now. A key that was not active starts a new
  * active run (active_since = now). Returns the row after the update,
- * or null for a replay of an occurrence identified by an idempotency key.
+ * or null if this mail occurrence was already counted.
  */
-export async function observe(db, a, now, { once = false } = {}) {
-  const conflict = once ? "DO NOTHING " :
-    "DO UPDATE SET source = excluded.source, severity = excluded.severity, " +
-    "  title = excluded.title, detail = excluded.detail, " +
-    "  active_since = CASE WHEN alerts.active = 1 THEN alerts.active_since ELSE ?6 END, " +
-    "  sent_in_run = CASE WHEN alerts.active = 1 THEN alerts.sent_in_run ELSE 0 END, " +
-    "  active = 1, last_seen_at = ?6, seen_unsent = alerts.seen_unsent + 1 ";
-  return db
-    .prepare(
-      "INSERT INTO alerts(key, source, severity, title, detail, active, active_since, last_seen_at, seen_unsent) " +
-        "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1) ON CONFLICT(key) " + conflict +
-        "RETURNING key, source, severity, title, detail, active_since, last_seen_at, last_sent_at, seen_unsent, sent_in_run",
-    )
-    .bind(a.key, a.source, a.severity ?? "page", a.title, a.detail, now)
-    .first();
+export async function observe(db, a, now, { mailOccurrence } = {}) {
+  const insert = mailOccurrence === undefined ? "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1) " :
+    "SELECT ?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1 WHERE changes() = 1 ";
+  const observation = db.prepare(
+    "INSERT INTO alerts(key, source, severity, title, detail, active, active_since, last_seen_at, seen_unsent) " + insert +
+      "ON CONFLICT(key) DO UPDATE SET source = excluded.source, severity = excluded.severity, " +
+      "  title = excluded.title, detail = excluded.detail, " +
+      "  active_since = CASE WHEN alerts.active = 1 THEN alerts.active_since ELSE ?6 END, " +
+      "  sent_in_run = CASE WHEN alerts.active = 1 THEN alerts.sent_in_run ELSE 0 END, " +
+      "  active = 1, last_seen_at = ?6, seen_unsent = alerts.seen_unsent + 1 " +
+      "RETURNING key, source, severity, title, detail, active_since, last_seen_at, last_sent_at, seen_unsent, sent_in_run",
+  ).bind(a.key, a.source, a.severity ?? "page", a.title, a.detail, now);
+  if (mailOccurrence === undefined) return observation.first();
+  // D1 executes a batch in a single transaction, in order. Count only
+  // when the immediately preceding insert reserved a new occurrence.
+  const [, result] = await db.batch([
+    db.prepare("INSERT OR IGNORE INTO mail_idem(key, at) VALUES (?1, ?2)").bind(mailOccurrence, now),
+    observation,
+  ]);
+  return result.results?.[0] ?? null;
 }
 
 /**
@@ -138,9 +143,12 @@ export async function claimSend(db, row, now, { forMs = 0, dailyCap = 30 } = {})
       "UPDATE alerts SET last_sent_at = ?2, seen_unsent = 0 " +
         "  , sent_in_run = sent_in_run + 1 " +
         "WHERE key = ?1 AND active = 1 AND (last_sent_at IS NULL OR last_sent_at <= ?3) " +
+        "  AND (?4 IS NULL OR seen_unsent = ?4) " +
         "RETURNING key, source, title, detail, active_since",
     )
-    .bind(row.key, now, now - gap)
+    // An aggregated mail row can gain occurrences between observation and
+    // claim. Leave those pending rather than clearing an uncounted report.
+    .bind(row.key, now, now - gap, row.source.startsWith("mail:") ? Number(row.seen_unsent) : null)
     .first();
   if (!claimed) return null;
   await db.prepare("INSERT INTO sends(at, key, kind) VALUES (?1, ?2, 'alert')").bind(now, row.key).run();
@@ -174,6 +182,11 @@ export async function dlqSince(db, since) {
 export async function prune(db, now) {
   await db.prepare("DELETE FROM sends WHERE at < ?1").bind(now - 8 * DAY).run();
   await db.prepare("DELETE FROM dlq WHERE at < ?1").bind(now - 30 * DAY).run();
+}
+
+export async function pruneMailIdem(db, now) {
+  await db.prepare("DELETE FROM mail_idem WHERE key IN (SELECT key FROM mail_idem WHERE at < ?1 ORDER BY at LIMIT 1000)")
+    .bind(now - 8 * DAY).run();
 }
 
 /** What the daily digest lists. */

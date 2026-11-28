@@ -17,10 +17,26 @@ export class FakeD1 {
     }
     return this;
   }
+  async batch(statements) {
+    this.db.exec("BEGIN");
+    try {
+      const results = statements.map((statement) => statement.runForBatch());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
   prepare(sql) {
     const self = this;
     let params = [];
+    const runForBatch = () => {
+      self.log.push(sql);
+      return { results: self.db.prepare(sql).all(...params), success: true };
+    };
     const stmt = {
+      runForBatch,
       bind(...p) {
         params = p;
         return stmt;
@@ -30,8 +46,7 @@ export class FakeD1 {
         return self.db.prepare(sql).get(...params) ?? null;
       },
       async all() {
-        self.log.push(sql);
-        return { results: self.db.prepare(sql).all(...params), success: true };
+        return runForBatch();
       },
       async run() {
         self.log.push(sql);
