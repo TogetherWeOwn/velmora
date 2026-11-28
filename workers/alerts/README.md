@@ -37,6 +37,13 @@ operator host's own feeder is private to that host, as are its paths.
 
 `severity: "info"` goes to the digest only.
 
+Mail Workers use a service binding to `velmora-alerts` with `entrypoint =
+"MailAlerts"`. The named entrypoint accepts `POST /v1/alert` for `mail:<event>`
+sources; the public URL rejects them even with a valid bearer token. Set
+`MAIL_ALERTS_ENABLED=on` only when ready to accept these reports. If a report
+includes `Idempotency-Key`, it must match its JSON `key`. Replays of the
+same source and key are acknowledged without adding a second alert email.
+
 ## Email rules
 
 - **Per key:** one email, then reminders while it keeps holding, after

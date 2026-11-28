@@ -159,6 +159,17 @@ export async function ingest(request, env, now) {
   if (!env.INGEST_TOKEN || !timingSafeEqual(auth, `Bearer ${env.INGEST_TOKEN}`)) {
     return json(401, { error: "unauthorized" });
   }
+  return ingestEvent(request, env, now);
+}
+
+/** Called only by the named service-binding entrypoint, never by default fetch. */
+export async function ingestMail(request, env, now, ctx) {
+  if (env.MAIL_ALERTS_ENABLED !== "on") return json(503, { error: "mail alerts disabled" });
+  if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY) return json(413, { error: "body too large" });
+  return ingestEvent(request, env, now, ctx);
+}
+
+async function ingestEvent(request, env, now, mailCtx) {
   let b;
   try {
     const raw = await request.text();
@@ -170,22 +181,34 @@ export async function ingest(request, env, now) {
   const source = String(b?.source ?? "");
   const key = String(b?.key ?? "").toLowerCase();
   const severity = b?.severity === "info" ? "info" : "page";
-  if (!SOURCES.has(source) && source !== "test") return json(400, { error: "source must be host or ci" });
+  if (mailCtx) {
+    if (!/^mail:[a-z][a-z0-9_]{0,94}$/.test(source)) return json(400, { error: "source must be mail:<event>" });
+  } else if (!SOURCES.has(source) && source !== "test") {
+    return json(400, { error: "source must be host or ci" });
+  }
   if (!KEY_RE.test(key)) return json(400, { error: "key: 1-100 of a-z 0-9 . _ : -" });
   if (typeof b?.title !== "string" || b.title.length === 0) return json(400, { error: "title required" });
+  const idempotencyKey = mailCtx ? request.headers.get("idempotency-key") : null;
+  if (idempotencyKey !== null && idempotencyKey !== b.key) return json(400, { error: "idempotency key must match key" });
+  const namespacedKey = `${source}:${key}`;
   const row = await store.observe(
     env.STATE,
     {
-      key: `${source}:${key}`,
+      key: namespacedKey,
       source,
       severity,
       title: oneLine(b.title).slice(0, 200),
       detail: String(b.detail ?? "").slice(0, 4000),
     },
     now,
+    { once: idempotencyKey !== null },
   );
-  const sent = severity === "page" ? (await maybeSend(env, row, now, 0)) === "sent" : false;
-  return json(200, { key: row.key, emailed: sent });
+  if (!row || severity !== "page") return json(200, { key: namespacedKey, emailed: false });
+  const sending = maybeSend(env, row, now, 0);
+  // Finish the email claim even if the calling Worker times out. A replay
+  // must not be needed to recover a claim that was already taken.
+  mailCtx?.waitUntil(sending);
+  return json(200, { key: namespacedKey, emailed: (await sending) === "sent" });
 }
 
 export default {

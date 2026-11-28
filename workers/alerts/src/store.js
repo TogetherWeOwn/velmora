@@ -26,18 +26,20 @@ export async function setMetaIfAbsent(db, k, v) {
 
 /**
  * Records that `a` holds now. A key that was not active starts a new
- * active run (active_since = now). Returns the row after the update.
+ * active run (active_since = now). Returns the row after the update,
+ * or null for a replay of an occurrence identified by an idempotency key.
  */
-export async function observe(db, a, now) {
+export async function observe(db, a, now, { once = false } = {}) {
+  const conflict = once ? "DO NOTHING " :
+    "DO UPDATE SET source = excluded.source, severity = excluded.severity, " +
+    "  title = excluded.title, detail = excluded.detail, " +
+    "  active_since = CASE WHEN alerts.active = 1 THEN alerts.active_since ELSE ?6 END, " +
+    "  sent_in_run = CASE WHEN alerts.active = 1 THEN alerts.sent_in_run ELSE 0 END, " +
+    "  active = 1, last_seen_at = ?6, seen_unsent = alerts.seen_unsent + 1 ";
   return db
     .prepare(
       "INSERT INTO alerts(key, source, severity, title, detail, active, active_since, last_seen_at, seen_unsent) " +
-        "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1) " +
-        "ON CONFLICT(key) DO UPDATE SET source = excluded.source, severity = excluded.severity, " +
-        "  title = excluded.title, detail = excluded.detail, " +
-        "  active_since = CASE WHEN alerts.active = 1 THEN alerts.active_since ELSE ?6 END, " +
-        "  sent_in_run = CASE WHEN alerts.active = 1 THEN alerts.sent_in_run ELSE 0 END, " +
-        "  active = 1, last_seen_at = ?6, seen_unsent = alerts.seen_unsent + 1 " +
+        "VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, 1) ON CONFLICT(key) " + conflict +
         "RETURNING key, source, severity, title, detail, active_since, last_seen_at, last_sent_at, seen_unsent, sent_in_run",
     )
     .bind(a.key, a.source, a.severity ?? "page", a.title, a.detail, now)

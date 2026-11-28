@@ -1,5 +1,5 @@
 name = "velmora-alerts"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
 
@@ -14,6 +14,8 @@ workers_dev = true
 #   HEARTBEAT_URL    optional: a dead-man URL pinged after every check run
 
 [vars]
+# Named service-binding ingress only; inert until explicitly enabled.
+MAIL_ALERTS_ENABLED = "off"
 # Sender: any address on a zone of this account with Email Routing enabled.
 ALERT_FROM = "alerts@<zone with email routing>"
 # Optional thresholds (seconds unless named otherwise); defaults in src/checks.js:
