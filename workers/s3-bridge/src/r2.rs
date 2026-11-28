@@ -25,8 +25,8 @@ use velmora_bridge::recovery::{
     is_protected_key, record_name, RecordKind, Unpublished, ERR_RECORD_DELETE,
 };
 use velmora_bridge::{
-    BlobEntry, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt, ReadAheadBlob,
-    Result, StreamMeta,
+    BlobEntry, BlobIdentity, BlobMeta, BlobStore, BridgeError, ByteSpan, ByteStream, PutReceipt,
+    ReadAheadBlob, Result, StreamMeta,
 };
 use worker::js_sys::{ArrayBuffer, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::prelude::wasm_bindgen;
@@ -503,6 +503,20 @@ impl BlobStore for R2Blobs {
     async fn head(&self, key: &str) -> Result<Option<u64>> {
         let object = self.bucket.head(key).await.map_err(blob_err("head"))?;
         Ok(object.map(|o| o.size()))
+    }
+
+    /// The SHA-256 R2 checked the body against at a `put` (the digest
+    /// `put` hands it), from the object's checksums. A blob written by
+    /// `put_stream` has none.
+    async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
+        let object = self.bucket.head(key).await.map_err(blob_err("head"))?;
+        Ok(object.map(|o| BlobIdentity {
+            size: o.size(),
+            sha256: o
+                .checksum()
+                .sha256
+                .and_then(|digest| <[u8; 32]>::try_from(digest.as_slice()).ok()),
+        }))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {

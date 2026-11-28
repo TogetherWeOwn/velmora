@@ -100,6 +100,13 @@ async fn hot_with(tune: impl FnOnce(&mut BridgeConfig)) -> Hot {
         .seed_permits(&rig.bridge.cfg.providers)
         .await
         .unwrap();
+    // A catalogue whose first sweep of the eviction order has run: these
+    // tests are about drains, not the sweep after a new rule.
+    rig.bridge
+        .catalog
+        .set_evict_rule_seen(&rig.bridge.rule_fingerprint())
+        .await
+        .unwrap();
     let (bucket, signer) = rig.standard(BUCKET).await;
     Hot {
         rig,
@@ -155,7 +162,9 @@ impl Hot {
     fn mark_released(&self, extent: &ExtentRow) {
         self.sql(
             "UPDATE extents SET safety_state = 'released', hot_safety_bytes = cipher_size, \
-               last_read_at = created_at, evict_seq = evict_seq + 1 WHERE id = ?1",
+               last_read_at = created_at, evict_seq = evict_seq + 1, \
+               release_evidence = '[{\"backbone\":\"alpha\",\"kind\":\"body\",\"plan_rev\":' || plan_rev || '}]' \
+             WHERE id = ?1",
             extent,
         );
     }

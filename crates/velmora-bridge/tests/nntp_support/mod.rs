@@ -1971,6 +1971,9 @@ impl Catalog for MemCatalog {
     async fn guard_selftest(&self) -> Result<bool> {
         unused()
     }
+    async fn gc_enqueue_scrub_safety(&self, _: &ExtentId, _: UnixMs) -> Result<()> {
+        unused()
+    }
     async fn gc_due(&self, _: UnixMs, _: u32, _: bool) -> Result<Vec<GcRow>> {
         unused()
     }
@@ -2130,6 +2133,8 @@ pub async fn rig(specs: &[Spec]) -> Rig {
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         verify: Default::default(),
+        scrub: Default::default(),
+        eviction_paused: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         admin_read_token: None,

@@ -96,6 +96,8 @@ struct Counts {
     r2_lists: u64,
     queue_sends: u64,
     queue_messages: u64,
+    /// Of `queue_messages`: eviction steps (a drain or a sweep).
+    queue_evict_messages: u64,
     queue_redeliveries: u64,
     nntp_connects: u64,
     nntp_posts: u64,
@@ -346,9 +348,11 @@ struct MeterJobs {
 
 impl JobSink for MeterJobs {
     async fn send(&self, job: &Job, delay_secs: u32) -> Result<()> {
+        let evict = matches!(job, Job::Evict { .. });
         self.hub.add(|c| {
             c.queue_sends += 1;
             c.queue_messages += 1;
+            c.queue_evict_messages += u64::from(evict);
         });
         self.inner.send(job, delay_secs).await
     }
@@ -1704,7 +1708,13 @@ async fn bench_counts_late_queue_release_at_verify() {
 fn assert_no_duplicate_dispatch(b: &Bench) {
     let counts = b.hub.counts.borrow();
     let cron = &counts["stage:cron"];
-    assert_eq!(cron.queue_messages, 0, "the dispatcher sent a job again");
+    // An eviction step the dispatcher starts (here the first sweep of the
+    // eviction order under the rule) is not a job sent again.
+    assert_eq!(
+        cron.queue_messages - cron.queue_evict_messages,
+        0,
+        "the dispatcher sent a job again"
+    );
     let empty: u64 = counts.values().map(|c| c.outbox_empty_claims).sum();
     assert_eq!(empty, 0, "a claim found nothing to do");
 }

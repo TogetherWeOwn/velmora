@@ -57,17 +57,31 @@ fn wipe(rig: &Rig) {
     }
 }
 
-/// Catalogue rows for comparing two independent fresh replays.
+/// Catalogue rows for comparing two independent fresh replays: every
+/// column, the scrub's included.
 fn fresh_replay_rows(rig: &Rig) -> String {
+    replay_rows(rig, false)
+}
+
+/// The rows the golden pins: [`fresh_replay_rows`] without the scrub's
+/// columns of `extents`, which its migrations added after the golden was
+/// captured. The test that compares with the golden checks those
+/// separately, at their defaults.
+fn golden_replay_rows(rig: &Rig) -> String {
+    replay_rows(rig, true)
+}
+
+fn replay_rows(rig: &Rig, but_the_scrubs: bool) -> String {
     let mut out = String::new();
     for t in TABLES {
         // A fresh replay allocates a new internal scan identity (SQLite
         // rowid or PostgreSQL seq); it does not change the posting job.
-        let columns = if t == "outbox" {
-            "extent_id, generation_id, stage, attempts, next_at, lease_token, lease_owner, \
-             lease_until, cursor, last_error, updated_at, sent_at"
-        } else {
-            "*"
+        let columns = match t {
+            "outbox" => "extent_id, generation_id, stage, attempts, next_at, lease_token, \
+                         lease_owner, lease_until, cursor, last_error, updated_at, sent_at"
+                .to_owned(),
+            "extents" if but_the_scrubs => extents_columns_but_the_scrubs(rig),
+            _ => "*".to_owned(),
         };
         for row in rig
             .bridge
@@ -81,6 +95,34 @@ fn fresh_replay_rows(rig: &Rig) -> String {
         }
     }
     out
+}
+
+fn extents_columns_but_the_scrubs(rig: &Rig) -> String {
+    let db = &rig.bridge.catalog.sql.inner;
+    let sql = match db.dialect() {
+        Dialect::Postgres => {
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'extents' \
+             ORDER BY ordinal_position"
+        }
+        _ => "SELECT name FROM pragma_table_info('extents') ORDER BY cid",
+    };
+    let scrubs = [
+        "scrub_enrolled",
+        "last_scrubbed_at",
+        "scrub_result",
+        "scrub_next_at",
+    ];
+    let mut columns = Vec::new();
+    for row in db.fixture_query_now(sql, &[]).unwrap() {
+        let SqlValue::Text(name) = &row[0] else {
+            panic!("a column name: {row:?}")
+        };
+        if !scrubs.contains(&name.as_str()) {
+            columns.push(name.clone());
+        }
+    }
+    columns.join(", ")
 }
 
 fn outbox_identities(rig: &Rig) -> Option<Vec<Row>> {
@@ -279,7 +321,22 @@ async fn default_replay_preserves_main_reports_and_catalogue_bytes() {
     assert_eq!(reports.iter().map(|step| step.extents).sum::<u32>(), 255);
     assert_eq!(rig.bridge.safety.most_reading.get(), 1);
     let report_bytes = serde_json::to_vec(&reports).unwrap();
-    let catalogue_bytes = fresh_replay_rows(&rig);
+    let catalogue_bytes = golden_replay_rows(&rig);
+    // A replay restores no scrub state: every extent's is at its default.
+    assert_eq!(
+        rig.bridge
+            .catalog
+            .sql
+            .inner
+            .fixture_query_now(
+                "SELECT COUNT(*) FROM extents WHERE scrub_enrolled <> 0 \
+                 OR last_scrubbed_at IS NOT NULL OR scrub_result IS NOT NULL \
+                 OR scrub_next_at IS NOT NULL",
+                &[],
+            )
+            .unwrap()[0][0],
+        SqlValue::Int(0)
+    );
     assert_eq!(
         (
             hex(&Sha256::digest(&report_bytes)),

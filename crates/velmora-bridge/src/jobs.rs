@@ -28,23 +28,28 @@
 //!   of extents that Usenet is proven to hold, never a catalogue row and
 //!   never a pinned copy, so it is not data deletion and `GC_MODE` does
 //!   not apply to it. The only keys it can name are an extent's
-//!   `x/<extent>` and `c/<extent>`.
+//!   `x/<extent>` and `c/<extent>`. The one write it makes is the safety
+//!   copy of a released extent it keeps for want of a release, from the
+//!   extent's verified cache fill, so that the cache's lifecycle rule
+//!   cannot take the extent's last R2 copy.
 
 use std::collections::BTreeMap;
+
+use sha2::{Digest, Sha256};
 
 use crate::config::{GcMode, HotCtlMode, Maintenance, ORPHAN_GRACE_MS};
 use crate::hotctl::{self, Counters, Rates, Reason, Sample, Signals, State, Step};
 use crate::ports::{
-    BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector, MAX_QUEUE_DELAY_SECS,
-    PERMIT_SECS,
+    BlobMeta, BlobStore, Bridge, Catalog, Clock, JobSink, Kek, Lease, NntpConnector,
+    MAX_QUEUE_DELAY_SECS, PERMIT_SECS,
 };
 use crate::post::{settle, Stop, POST_SOCKET_BYTES};
 use crate::recovery::delete_blob;
 use crate::stamp::Advance;
 use crate::types::{
-    BlobStoreKind, DispatchReport, EvictCandidate, ExtentId, FailClass, GcRow, GcStep,
-    GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job, JobOutcome, Oldest,
-    OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
+    BlobStoreKind, DispatchReport, EvictCandidate, EvictCheck, EvictCursor, EvictRule, ExtentId,
+    FailClass, GcRow, GcStep, GenerationId, HotCtlMax, HotCtlRates, HotCtlReport, HotShape, Job,
+    JobOutcome, Oldest, OutboxStage, Resend, Result, UnixMs, JOB_VERSION,
 };
 use crate::verify::release_labels;
 
@@ -349,6 +354,11 @@ pub const ORPHAN_SCAN: u32 = 500;
 pub const ORPHAN_BATCH: u32 = 100;
 /// Extents one eviction job handles before it re-enqueues itself.
 pub const EVICT_BATCH: u32 = 50;
+
+/// Rows of the eviction order one step reads at most before it filters
+/// them ([`Catalog::evict_window`]): the bound on a step's reads when
+/// many rows in a row may not go.
+pub const EVICT_WINDOW: u32 = 200;
 /// Least time between two totals of the evictable bytes by the
 /// dispatcher. The total reads one index entry per evictable extent, so
 /// it is not taken on every run; the tier may sit over the cap for this
@@ -508,6 +518,7 @@ where
                 }
             }
             Job::Sweep { v, write } if *v == JOB_VERSION => self.sweep_write(write).await,
+            Job::Scrub { v } if *v == JOB_VERSION => self.run_scrub().await,
             // Run by the adapter that holds the recovery store
             // (`crate::copy`), never here: one that arrives all the same
             // is dropped, and the next pass does its work.
@@ -769,27 +780,238 @@ where
     /// cap. Only a first step that is retried after an error totals the
     /// tier again and goes on from there.
     pub async fn evict_batch(&self, remaining: u64) -> Result<u64> {
+        // Paused (`EVICTION=paused`): a step that was queued before does
+        // nothing, so no eviction decided under an earlier configuration
+        // deletes under a later one.
+        if self.cfg.eviction_paused {
+            return Ok(0);
+        }
         // As in garbage collection: no delete on a catalogue that is
         // behind its stamp.
         if self.catalogue_rolled_back().await? {
             return Ok(0);
         }
-        let mut excess = remaining;
-        if excess == 0 {
-            let cap = self.effective_cap().await?;
-            let total = self.catalog.evictable_bytes().await?;
-            if total <= cap {
-                return Ok(0);
+        // Safety writes (eviction's and the scrub's) whose invocation
+        // ended before their collection guard: collected if unreferenced,
+        // whatever `SCRUB` says.
+        self.reconcile_put_intents(self.clock.now()).await?;
+        // Kept fills still to be written: from an earlier step that ran
+        // out of its share when the tier was no longer over its cap, or a
+        // sweep of the whole order after the rule changed. A sweep begun
+        // under another rule than the one now starts over.
+        let stored = self.catalog.evict_cursor().await?;
+        let fingerprint = self.rule_fingerprint();
+        let (pending, sweep) = match &stored {
+            EvictCursor::Promote(inner) => (Some((**inner).clone()), None),
+            EvictCursor::Sweep(fp, inner) if *fp == fingerprint => {
+                (Some((**inner).clone()), Some(fingerprint.clone()))
             }
-            excess = total - low_watermark(cap);
+            EvictCursor::Sweep(..) => (Some(EvictCursor::Start), Some(fingerprint.clone())),
+            _ => (None, None),
+        };
+        let marker = |resume: EvictCursor| match &sweep {
+            Some(fp) => EvictCursor::Sweep(fp.clone(), Box::new(resume)),
+            None => EvictCursor::Promote(Box::new(resume)),
+        };
+        let mut excess = remaining;
+        // A marker's step writes fills and evicts nothing: it does not
+        // total the tier (an aggregate over the whole eviction order, on
+        // every step of a sweep). The fresh drain it queues at its end
+        // totals it.
+        if excess == 0 {
+            if pending.is_none() {
+                let cap = self.effective_cap().await?;
+                let total = self.catalog.evictable_bytes().await?;
+                if total <= cap {
+                    return Ok(0);
+                }
+                excess = total - low_watermark(cap);
+            }
         } else if !self.catalog.hot_drain_claim(remaining).await? {
             // A second delivery of a step that already ran, or a step of
             // a drain that another one replaced: its `remaining` is stale.
             return Ok(0);
         }
         let mut freed = 0u64;
-        let rows = self.catalog.evict_candidates(EVICT_BATCH).await?;
-        let mut more = rows.len() >= EVICT_BATCH as usize;
+        // A new drain starts at the head of the order; its later steps go
+        // on where the step before left the listing. Each step reads one
+        // bounded window, however many rows in it may not go, and moves
+        // the cursor past it even when none could.
+        // A step that writes the fills a marker names evicts nothing: its
+        // window starts at the marker, not where the oldest copies are.
+        let promote_only = pending.is_some();
+        let cursor = match (pending, remaining) {
+            (Some(inner), _) => inner,
+            (None, 0) => EvictCursor::Start,
+            (None, _) => stored,
+        };
+        let (rule, counting) = self.evict_rule();
+        let window = self
+            .catalog
+            // A marker's step evicts nothing: the whole window is its, not
+            // only as far as a batch of rows that may go.
+            .evict_window(
+                &cursor,
+                EVICT_WINDOW,
+                if promote_only {
+                    EVICT_WINDOW
+                } else {
+                    EVICT_BATCH
+                },
+                &rule,
+            )
+            .await?;
+        // Kept for want of a release under the backbones that count now.
+        // A cache fill that is the extent's only R2 copy is written to the
+        // safety store now, from its verified bytes: the cache bucket's
+        // lifecycle rule expires fills by age, whatever eviction decides,
+        // and the safety store has no such rule. The cursor moves past a
+        // kept fill only once it is written: past the step's share, or
+        // with no memory to spare now, the next step reads it again.
+        let mut promoted = 0;
+        let mut again = None;
+        // Write-ahead: while kept fills may still be written, a marker at
+        // the first of them is on record, so a step that fails part way
+        // (a store or catalogue error) leaves them to a later step, even
+        // with the tier under its cap. The step's own cursor write at its
+        // end replaces it.
+        if let Some(first) = window.unproven.iter().find(|kept| {
+            kept.promote
+                && kept.row.cache_bytes > 0
+                && (kept.row.safety_bytes == 0 || sweep.is_some())
+        }) {
+            self.catalog
+                .set_evict_cursor(&marker(first.resume.clone()))
+                .await?;
+        }
+        // Whether each kept fill is still in the cache: HEADs, a few at a
+        // time rather than one after another, and only as far as the step
+        // gets.
+        'chunks: for chunk in window.unproven.chunks(EVICT_HEADS_AT_ONCE) {
+            let heads = chunk.iter().map(|kept| async move {
+                match kept.row.cache_bytes {
+                    0 => Ok(true),
+                    _ => self
+                        .cache
+                        .head(&kept.row.extent.cache_key())
+                        .await
+                        .map(|head| head.is_some()),
+                }
+            });
+            let present = futures_util::future::join_all(heads).await;
+            for (kept, present) in chunk.iter().zip(present) {
+                if kept.row.cache_bytes == 0 {
+                    continue;
+                }
+                // A fill the cache's lifecycle rule took is no longer
+                // counted, and its bytes are no longer part of what this
+                // drain has to free: they would make it take other copies.
+                if !present? {
+                    excess = excess.saturating_sub(self.forget_gone_fill(&kept.row).await?);
+                    continue;
+                }
+                if !kept.promote {
+                    continue;
+                }
+                // A counted safety copy is taken at its word, but by a
+                // sweep, which looks: a count can outlive its copy (a
+                // finish that lost its compare-and-set after the deletes).
+                if kept.row.safety_bytes > 0
+                    && (sweep.is_none()
+                        || self
+                            .safety
+                            .head(&kept.row.extent.safety_key())
+                            .await?
+                            .is_some())
+                {
+                    continue;
+                }
+                if promoted == EVICT_PROMOTE_PER_STEP {
+                    again = Some((kept.resume.clone(), 0));
+                    break 'chunks;
+                }
+                match self.promote_cache_fill(&kept.row).await? {
+                    Promoted::Written => promoted += 1,
+                    // Nothing to write (no fill left, other bytes, not
+                    // released): not the step's share, and not waited for.
+                    Promoted::Nothing => {}
+                    Promoted::Busy => {
+                        again = Some((kept.resume.clone(), EVICT_PROMOTE_BUSY_SECS));
+                        break 'chunks;
+                    }
+                }
+            }
+        }
+        if rule.scrub && !window.unproven.is_empty() {
+            // And the scrub looks at them soon: its re-verify records a
+            // release under the backbones that count now.
+            let kept: Vec<ExtentId> = window
+                .unproven
+                .iter()
+                .filter(|x| x.promote)
+                .map(|x| x.row.extent.clone())
+                .collect();
+            self.catalog
+                .scrub_watch_soon(&kept, self.clock.now())
+                .await?;
+        }
+        if let Some((resume, delay)) = again {
+            // Nothing is evicted in this step; the next one goes on from
+            // the first fill not yet written. With nothing left to free,
+            // the cursor itself says so, and the next step starts as a
+            // drain does but writes those fills first.
+            let next = if excess == 0 || promote_only {
+                self.catalog.set_evict_cursor(&marker(resume)).await?;
+                Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: 0,
+                }
+            } else {
+                self.catalog.set_evict_cursor(&resume).await?;
+                self.catalog.hot_drain_set(excess).await?;
+                Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: excess,
+                }
+            };
+            self.jobs.send(&next, delay).await?;
+            return Ok(0);
+        }
+        if let Some(fp) = &sweep {
+            if window.more {
+                // The sweep goes on with the next window.
+                self.catalog
+                    .set_evict_cursor(&EvictCursor::Sweep(
+                        fp.clone(),
+                        Box::new(window.next.clone()),
+                    ))
+                    .await?;
+                let next = Job::Evict {
+                    v: JOB_VERSION,
+                    remaining: 0,
+                };
+                self.jobs.send(&next, 0).await?;
+                return Ok(0);
+            }
+            // The whole order is swept under this rule.
+            self.catalog.set_evict_rule_seen(fp).await?;
+            crate::trace::alert(|| format!("evict-sweep-done rule={fp}"));
+        }
+        if promote_only {
+            // The fills the marker named are written. Eviction itself
+            // starts over at the head of the order, so that the oldest
+            // copies go first: a fresh drain, if the tier is over its cap.
+            self.catalog.set_evict_cursor(&EvictCursor::Start).await?;
+            let next = Job::Evict {
+                v: JOB_VERSION,
+                remaining: 0,
+            };
+            self.jobs.send(&next, 0).await?;
+            return Ok(0);
+        }
+        self.catalog.set_evict_cursor(&window.next).await?;
+        let rows = window.rows;
+        let mut more = window.more;
         // One extent that fails must not hold up the ones behind it. It
         // stays counted, and the first error makes the job retry.
         let mut failed = None;
@@ -797,16 +1019,20 @@ where
             if excess == 0 {
                 break;
             }
-            match self.evict_one(row).await {
-                Ok(Some(bytes)) => {
+            match self.evict_one(row, counting.as_deref()).await {
+                Ok(Evicted::Freed(bytes)) => {
                     freed = freed.saturating_add(bytes);
                     excess = excess.saturating_sub(bytes);
                 }
+                // Kept on purpose: the extents behind it still go, or a
+                // kept extent at the head of the order would end every
+                // drain there.
+                Ok(Evicted::Kept) => {}
                 // Another eviction job is at work on the same list, or a
                 // read just refilled the extent. Stop here rather than
                 // evict past the low watermark together; if the tier is
                 // still over the cap, the dispatcher starts a new drain.
-                Ok(None) => {
+                Ok(Evicted::Contended) => {
                     more = false;
                     break;
                 }
@@ -832,17 +1058,205 @@ where
         Ok(freed)
     }
 
-    /// Evicts one extent's evictable R2 copies and returns the bytes it
-    /// freed. `None` when something else changed the extent meanwhile:
-    /// either the catalogue refused the eviction (nothing was deleted), or
-    /// it could not be finished as begun.
-    async fn evict_one(&self, row: &EvictCandidate) -> Result<Option<u64>> {
+    /// Evicts one extent's evictable R2 copies: the bytes it freed,
+    /// [`Evicted::Kept`] when a copy may be the one a repair needs
+    /// (nothing is deleted), or [`Evicted::Contended`] when something else
+    /// changed the extent meanwhile: either the catalogue refused the
+    /// eviction (nothing was deleted), or it could not be finished as
+    /// begun.
+    /// With the scrub on, the backbones whose losses fence eviction: the
+    /// ones the scrub checks (`verify::release_labels`).
+    fn scrub_counting(&self) -> Option<Vec<String>> {
+        self.cfg
+            .scrub
+            .on
+            .then(|| crate::verify::release_labels(&self.cfg.providers))
+    }
+
+    /// A fingerprint of the release rule's inputs: which backbones count,
+    /// `REQUIRED_BACKBONES`, `VERIFY_MODE`, and `SCRUB` (which decides
+    /// whether a loss on record keeps a row from promotion). A change of any of them
+    /// can make a released extent unreleasable, so the eviction order is
+    /// swept once under the new one.
+    pub fn rule_fingerprint(&self) -> String {
+        let mut labels = crate::verify::release_labels(&self.cfg.providers);
+        labels.sort();
+        labels.dedup();
+        let mode = match self.cfg.verify.mode {
+            crate::config::VerifyMode::Body => "body",
+            crate::config::VerifyMode::Light => "light",
+        };
+        // `SCRUB` decides whether a loss on record keeps a row from the
+        // sweep's promotion, so a toggle sweeps too.
+        let digest = Sha256::digest(format!(
+            "{}|{}|{mode}|scrub={}",
+            labels.join(","),
+            self.cfg.required_backbones,
+            self.cfg.scrub.on
+        ));
+        digest[..12].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The rule eviction applies, and with the scrub on the backbones
+    /// whose losses fence it. One for the drain and `/_admin/evict`.
+    pub(crate) fn evict_rule(&self) -> (EvictRule, Option<Vec<String>>) {
+        let counting = self.scrub_counting();
+        let rule = EvictRule {
+            counting: crate::verify::release_labels(&self.cfg.providers),
+            required: self.cfg.required_backbones,
+            scrub: counting.is_some(),
+            mode: self.cfg.verify.mode,
+        };
+        (rule, counting)
+    }
+
+    /// Whether the safety store holds the extent's copy: a blob whose size
+    /// and digest, as the store checked them when it was stored, are the
+    /// ones the catalogue records. A blob that is only there (a streamed
+    /// put, whose digest the store never checked, or other bytes) is not.
+    pub(crate) async fn safety_in_place(&self, extent: &ExtentId) -> Result<bool> {
+        match self.catalog.extent_cipher(extent).await? {
+            Some(cipher) => self.safety_holds(extent, &cipher).await,
+            None => Ok(false),
+        }
+    }
+
+    /// [`Self::safety_in_place`], with the ciphertext already read.
+    pub(crate) async fn safety_holds(
+        &self,
+        extent: &ExtentId,
+        cipher: &crate::types::ExtentCipher,
+    ) -> Result<bool> {
+        Ok(self
+            .safety
+            .head_identity(&extent.safety_key())
+            .await?
+            .is_some_and(|blob| blob.is(cipher.size, &cipher.sha256)))
+    }
+
+    /// Writes the verified cache fill of a released extent that eviction
+    /// keeps for want of a release to the safety store, and counts it.
+    /// Bytes that are not the extent's are never written, and nothing is
+    /// written for an extent that is not released (pinned or deleted).
+    /// The write takes its share of the jobs' memory first, and leaves a
+    /// write-ahead intent, as the scrub's do: an invocation that ends
+    /// between the write and the collection guard leaves the copy to the
+    /// next reconciliation, by eviction or the scrub.
+    async fn promote_cache_fill(&self, kept: &EvictCandidate) -> Result<Promoted> {
+        let Some(cipher) = self.catalog.extent_cipher(&kept.extent).await? else {
+            return Ok(Promoted::Nothing);
+        };
+        if !cipher.released {
+            return Ok(Promoted::Nothing);
+        }
+        let Ok(_charge) = self.budget.charge_job(cipher.size).await else {
+            return Ok(Promoted::Busy);
+        };
+        let Some(bytes) = self.cache.get(&kept.extent.cache_key(), None).await? else {
+            // The lifecycle rule took it: no longer counted.
+            self.catalog
+                .hot_forget(&kept.extent, kept.seq, false, true)
+                .await?;
+            return Ok(Promoted::Nothing);
+        };
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if bytes.len() as u64 != cipher.size || digest != cipher.sha256 {
+            crate::trace::alert(|| {
+                format!(
+                    "evict-promote-refused {} its cache fill is not its ciphertext",
+                    kept.extent.as_str()
+                )
+            });
+            return Ok(Promoted::Nothing);
+        }
+        let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
+        self.catalog.scrub_put_intent(&kept.extent, until).await?;
+        let meta = BlobMeta {
+            bucket: &cipher.bucket,
+            extent: &kept.extent,
+            cipher_sha256: &cipher.sha256,
+        };
+        self.safety
+            .put(&kept.extent.safety_key(), bytes, &meta)
+            .await?;
+        // A copy written after the extent stopped being referenced is
+        // collected (a no-op while it is referenced).
+        self.catalog
+            .gc_enqueue_scrub_safety(&kept.extent, self.clock.now())
+            .await?;
+        if self.catalog.evict_promoted(kept).await? {
+            crate::trace::alert(|| {
+                format!(
+                    "evict-promote {} kept for want of a release; its verified cache fill is \
+                     now its safety copy",
+                    kept.extent.as_str()
+                )
+            });
+        }
+        Ok(Promoted::Written)
+    }
+
+    /// A kept fill that is gone from the cache (the lifecycle rule took
+    /// it) is no longer counted, if the row is as listed. The bytes no
+    /// longer counted (0 when the row moved).
+    async fn forget_gone_fill(&self, kept: &EvictCandidate) -> Result<u64> {
+        Ok(
+            match self
+                .catalog
+                .hot_forget(&kept.extent, kept.seq, false, true)
+                .await?
+            {
+                true => kept.cache_bytes,
+                false => 0,
+            },
+        )
+    }
+
+    async fn evict_one(
+        &self,
+        row: &EvictCandidate,
+        counting: Option<&[String]>,
+    ) -> Result<Evicted> {
         if !self.catalog.begin_evict(row).await? {
-            return Ok(None);
+            return Ok(Evicted::Contended);
+        }
+        if row.pinned {
+            // The cache fill of a pinned extent may be its only R2 copy
+            // until its safety copy is in place (a repair that could not
+            // write it yet, or other bytes under the key): checked after
+            // the claim, by what the store checked at the put, and then
+            // the claim again. The scrub moves the sequence before it
+            // deletes a safety object, and never deletes one whose digest
+            // the store checked, so the copy found here is still there
+            // when the fill goes.
+            if !self.safety_in_place(&row.extent).await? {
+                return Ok(Evicted::Kept);
+            }
+            if self.catalog.evict_safety_still_ok(row, None).await? == EvictCheck::Moved {
+                return Ok(Evicted::Contended);
+            }
         }
         // Both keys go whatever the counts say, so a copy the catalogue
         // did not count goes too. The one exception is the safety copy of
         // a pinned extent, which is not part of the claim.
+        // The safety copy only if nothing pinned the extent again since
+        // the begin (the scrub re-pins a released extent and puts its
+        // copy back) and, with the scrub on, no loss of it is on record.
+        if !row.pinned {
+            // Re-pinned since the begin, or, with the scrub on, a loss of
+            // the extent was recorded after the listing: either R2 copy
+            // may be what the repair needs (the cache fill can be the
+            // only one left). Nothing is deleted and nothing is finished:
+            // the counts stand, and the next listing leaves the extent
+            // out while the loss is on record. A moved sequence (a re-pin,
+            // a refill, another job) ends the drain as a refused claim
+            // does; a loss alone is passed over.
+            match self.catalog.evict_safety_still_ok(row, counting).await? {
+                EvictCheck::Delete => {}
+                EvictCheck::Keep => return Ok(Evicted::Kept),
+                EvictCheck::Moved => return Ok(Evicted::Contended),
+            }
+        }
         if !row.pinned {
             delete_blob(&self.safety, &row.extent.safety_key()).await?;
         }
@@ -851,8 +1265,8 @@ where
         // took the extent, since `begin_evict`. The counts stand, and
         // what this drain still has to evict is no longer known.
         Ok(match self.catalog.finish_evict(row).await? {
-            true => Some(row.evictable_bytes()),
-            false => None,
+            true => Evicted::Freed(row.evictable_bytes()),
+            false => Evicted::Contended,
         })
     }
 
@@ -1124,8 +1538,10 @@ where
     }
 
     /// The dispatcher's hot-tier check: at most one total per
-    /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap.
-    /// `GC_MODE` does not gate it: eviction removes no data.
+    /// [`EVICT_CHECK_SECS`], and an eviction job if it exceeds the cap or
+    /// kept fills are still to be written (a promotion marker). `true`
+    /// when it sent one. `GC_MODE` does not gate it: eviction removes no
+    /// data.
     async fn evict_check(&self, now: UnixMs, report: &mut DispatchReport) -> Result<bool> {
         let every_ms = i64::from(EVICT_CHECK_SECS) * 1000;
         if !self.catalog.hot_check_due(now, every_ms).await? {
@@ -1134,16 +1550,45 @@ where
         let shape = self.catalog.hot_shape().await?;
         report.hot_ctl = self.hot_ctl_check(now, shape).await;
         let over = shape.evictable_bytes > self.effective_cap().await?;
-        if over {
+        // Over the cap, or with kept fills still to be written (a step
+        // that came during a pause left its marker): a drain starts.
+        // A change of the rule's inputs starts a promote-only sweep of the
+        // whole order, whatever the cap.
+        let cursor = self.catalog.evict_cursor().await?;
+        let mut marked = matches!(cursor, EvictCursor::Promote(_) | EvictCursor::Sweep(..));
+        if !self.cfg.eviction_paused && !matches!(cursor, EvictCursor::Sweep(..)) {
+            let fingerprint = self.rule_fingerprint();
+            match self.catalog.evict_rule_seen().await? {
+                Some(seen) if seen == fingerprint => {}
+                // A rule no sweep has covered yet, the first one included:
+                // a sweep depends on no count made before it.
+                _ => {
+                    self.catalog
+                        .set_evict_cursor(&EvictCursor::Sweep(
+                            fingerprint.clone(),
+                            Box::new(EvictCursor::Start),
+                        ))
+                        .await?;
+                    crate::trace::alert(|| format!("evict-sweep-start rule={fingerprint}"));
+                    marked = true;
+                }
+            }
+        }
+        let started = !self.cfg.eviction_paused && (over || marked);
+        if started {
             let job = Job::Evict {
                 v: JOB_VERSION,
                 remaining: 0,
             };
             self.jobs.send(&job, 0).await?;
         }
+        // Safety writes whose invocation ended before their collection
+        // guard are reconciled here too, whether or not a drain runs or
+        // the scrub is on (catalogue writes only).
+        self.reconcile_put_intents(now).await?;
         // Recorded last: a check that failed is due again on the next run.
         self.catalog.hot_checked(now).await?;
-        Ok(over)
+        Ok(started)
     }
 
     /// The whole cron handler: bounded catalogue reads and queue sends,
@@ -1306,12 +1751,33 @@ where
             report.recount_failed = true;
         }
 
+        // A scrub run, when none holds the lease. An extra, like the
+        // checks above.
+        if self.cfg.scrub.on {
+            match self.scrub_check(now).await {
+                Ok(sent) => report.scrub_enqueued = sent,
+                Err(_) => report.scrub_failed = true,
+            }
+        }
+
         if let Some(e) = send_failed {
             return Err(e);
         }
 
         self.catalog.record_dispatch(now).await?;
         Ok(report)
+    }
+
+    /// Sends a scrub run ([`crate::scrub`]) if no run holds the lease.
+    /// One a cron run at most: runs are under the cron interval
+    /// (`SCRUB_RUN_SECS`), so they do not overlap.
+    async fn scrub_check(&self, now: UnixMs) -> Result<bool> {
+        let state = self.catalog.scrub_state().await?;
+        if state.lease_until.is_some_and(|until| until >= now) {
+            return Ok(false);
+        }
+        self.jobs.send(&Job::Scrub { v: JOB_VERSION }, 0).await?;
+        Ok(true)
     }
 
     /// Goes on with a recount of the usage counters, or starts the
@@ -1349,4 +1815,35 @@ where
         }
         Ok(())
     }
+}
+
+/// At most this many kept cache fills are written to the safety store per
+/// eviction step (each one a read and a write of up to one extent); the
+/// next step goes on from the first one not written.
+const EVICT_PROMOTE_PER_STEP: usize = 8;
+
+/// Cache HEADs of kept fills a step has in flight at once.
+const EVICT_HEADS_AT_ONCE: usize = 16;
+
+/// The next step's delay when the jobs' memory had no room for a write.
+const EVICT_PROMOTE_BUSY_SECS: u32 = 60;
+
+/// What one promotion did (`promote_cache_fill`).
+enum Promoted {
+    /// The copy was written.
+    Written,
+    /// Nothing to write.
+    Nothing,
+    /// No memory to spare now: tried again in a later step.
+    Busy,
+}
+
+/// What one eviction did (`evict_one`).
+enum Evicted {
+    /// The bytes it freed.
+    Freed(u64),
+    /// Kept on purpose, nothing deleted: the drain goes on past it.
+    Kept,
+    /// Another job or a read changed the extent: the drain stops.
+    Contended,
 }

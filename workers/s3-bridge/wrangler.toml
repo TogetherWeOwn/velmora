@@ -244,6 +244,26 @@ PERMITS = "do"
 #     PACKED_PLANS on: on without it, the Worker refuses its configuration. An addendum that is stored is posted and read whatever the switch says. A Worker from before
 #     this switch ignores an addendum: it reads every plan as before, and an extent it posts or releases is left
 #     without its parity articles. Not set here: production posts no parity yet.
+#   SCRUB (off): off | on. On: every cron run sends one scrub run to the aux queue while no run holds the scrub's lease.
+#     Released extents have independent STAT and full read-back deadlines on each counting backbone. The first passes
+#     are staggered across each interval from activation or release, whichever is later. New intervals apply to new deadlines.
+#     A loss confirmed by the same check after SCRUB_CONFIRM_SECS re-pins the extent from verified bytes and sends
+#     it back to verify. Repair-source reads do not complete any scheduled check. See src/scrub.rs.
+#     Turning it on or off, or changing which backbones count, follows the durability fence in ops/README.md
+#     (Scrub): EVICTION paused and SCRUB_REPAIRS_PER_RUN at 0, a 16-minute wait, the change, then both back. Not set here.
+#   EVICTION (on): on | paused. Paused: the dispatcher starts no hot-tier drain and a queued eviction step does
+#     nothing, and /_admin/evict is refused. For the durability fence only; the tier may sit over its cap
+#     meanwhile. Not set here.
+#   SCRUB_EXTENTS_PER_RUN (96, 8 to 10000): extents one run checks at most; at least what the breaker needs.
+#   SCRUB_SOCKETS (2, 1 to COLD_SOCKETS): drill connections the repair-source reader can use.
+#   SCRUB_INTERVAL_DAYS (30): days between STAT checks of a copy.
+#   SCRUB_FULL_INTERVAL_DAYS (90): days between full read-backs of a copy.
+#   SCRUB_CONFIRM_SECS (3600, at least 3600 outside dev): wait before a loss is looked at again, and repaired only if it is still there.
+#   SCRUB_RUN_SECS (240, 30 to 290): wall time a run takes new extents for; under the cron interval, so runs never overlap.
+#   SCRUB_REPAIRS_PER_RUN (8): extents one run re-pins at most; 0 means detect only.
+#   D1_ROLLBACK_RETIRED (unset): 1 once the frozen D1 is no longer a rollback target of a PostgreSQL catalogue. With
+#     CATALOG_BACKEND pg or pg-frozen, SCRUB on without it makes the Worker refuse its configuration: a scrub repair on
+#     PostgreSQL is not replayed into D1 by a rollback. See ops/README.md, Scrub. Not set here.
 
 # off | on (CopyObject only; UploadPartCopy does not read it). On only in a
 # release after the one that added extent references (migration 0005): a

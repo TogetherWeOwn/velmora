@@ -25,6 +25,15 @@
 //! Every statement that changes `safety_state` bumps the sequence too, so
 //! a listing never survives a state change.
 //!
+//! The job asks once more right before it deletes the safety copy
+//! (`evict_safety_still_ok`): a moved sequence (a re-pin, a refill) or a
+//! scrub loss recorded after the listing deletes nothing.
+//!
+//! The job lists bounded windows of the eviction order (`evict_window`):
+//! a row that would delete an extent's last R2 copy may go only while the
+//! extent is releasable under the backbones that count now and, with
+//! `SCRUB` on, has no loss on record there.
+//!
 //! The counts are not exact, and they are not a bound in either
 //! direction. Each error is limited to one extent's bytes and repairs
 //! itself:
@@ -45,7 +54,9 @@
 use super::uploads::{int, ms, text, Cols};
 use super::SqlCatalog;
 use crate::ports::{Sql, SqlValue};
-use crate::types::{EvictCandidate, ExtentId, HotStats, Result, UnixMs};
+use crate::types::{
+    EvictCandidate, EvictCursor, EvictRule, EvictWindow, ExtentId, HotStats, Result, UnixMs,
+};
 
 /// True for an extent whose safety copy is pinned. The text matches the
 /// `extents_safety` index.
@@ -101,6 +112,154 @@ const CANDIDATES: &str = concat!(
     evictable!(),
     " ORDER BY last_read_at, id LIMIT ?1"
 );
+
+/// True while the scrub has a loss of the extent `extents.id` on record:
+/// one key lookup in `scrub_copies` per row.
+/// True while the scrub has a loss of the extent `$x` on record on one of
+/// the backbones that count now (`$labels`, a JSON array, as the scrub's
+/// own `HAS_LOSS` reads it): key lookups in `scrub_copies`. A loss on a
+/// backbone that no longer counts is never checked again, so it must not
+/// keep the extent's copies.
+// A scalar subquery with LIMIT 1, not EXISTS: PostgreSQL may turn an
+// EXISTS into one hashed pass over all of `scrub_copies`; this stays one
+// key lookup per row on both engines.
+macro_rules! scrub_loss_on_record {
+    ($x:literal, $labels:literal) => {
+        concat!(
+            "(SELECT 1 FROM scrub_copies s WHERE s.extent_id = ",
+            $x,
+            " AND s.backbone IN (SELECT ",
+            $labels,
+            ") AND (s.stat_loss_at IS NOT NULL OR s.full_loss_at IS NOT NULL) LIMIT 1) IS NOT NULL"
+        )
+    };
+}
+
+/// One bounded window of the eviction order: `?1` rows of the
+/// `extents_evictable` index after the keyset, read before anything is
+/// decided about them, so a long run of rows that may not go costs one
+/// window per step, not a scan. Each row carries what the job needs to
+/// decide in one place (`crate::verify::evidence_releasable`, the
+/// release rule itself): its release evidence and plan, and, with the
+/// scrub on, whether a loss of it is on record on a counting backbone.
+macro_rules! evict_window {
+    ($loss:expr, $keyset:literal, $order:literal) => {
+        concat!(
+            "SELECT id, hot_safety_bytes, hot_cache_bytes, evict_seq, ",
+            pinned!(),
+            " AS pinned, last_read_at, release_evidence, plan_rev, safety_state, ",
+            $loss,
+            " FROM extents WHERE ",
+            evictable!(),
+            $keyset,
+            " ORDER BY ",
+            $order,
+            " LIMIT ?1"
+        )
+    };
+}
+macro_rules! loss_flag {
+    ($labels:literal) => {
+        concat!(
+            "CASE WHEN ",
+            scrub_loss_on_record!("extents.id", $labels),
+            " THEN 1 ELSE 0 END"
+        )
+    };
+}
+pub const EVICT_WINDOW: &str = evict_window!("0", "", "last_read_at, id");
+pub const EVICT_WINDOW_AFTER: &str = evict_window!(
+    "0",
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at, id"
+);
+pub const EVICT_WINDOW_SCRUB: &str = evict_window!(
+    loss_flag!("value FROM json_each(?2)"),
+    "",
+    "last_read_at, id"
+);
+pub const EVICT_WINDOW_SCRUB_AFTER: &str = evict_window!(
+    loss_flag!("value FROM json_each(?4)"),
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at, id"
+);
+pub const EVICT_WINDOW_PG: &str = evict_window!("0", "", "last_read_at ASC NULLS FIRST, id");
+pub const EVICT_WINDOW_AFTER_PG: &str = evict_window!(
+    "0",
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at ASC NULLS FIRST, id"
+);
+pub const EVICT_WINDOW_SCRUB_PG: &str = evict_window!(
+    loss_flag!("jsonb_array_elements_text(CAST(?2 AS jsonb))"),
+    "",
+    "last_read_at ASC NULLS FIRST, id"
+);
+pub const EVICT_WINDOW_SCRUB_AFTER_PG: &str = evict_window!(
+    loss_flag!("jsonb_array_elements_text(CAST(?4 AS jsonb))"),
+    " AND (last_read_at, id) > (?2, ?3)",
+    "last_read_at ASC NULLS FIRST, id"
+);
+
+// With the scrub on, an extent eviction keeps for want of a release under
+// the backbones that count now is looked at by the scrub soon (its own
+// deadline, unless it has one): the re-verify writes a safety copy, which
+// no lifecycle rule expires, rather than leaving the extent to a cache
+// fill that the cache bucket's lifecycle rule may expire.
+const WATCH_SOON: &str = "UPDATE extents SET scrub_next_at = ?2 \
+    WHERE id = ?1 AND scrub_next_at IS NULL AND safety_state = 'released'";
+
+// The extent's ciphertext as recorded: what a blob must be to be its copy.
+const EXTENT_CIPHER: &str =
+    "SELECT bucket_id, cipher_size, cipher_sha256, safety_state FROM extents WHERE id = ?1";
+
+// Eviction wrote a released extent's verified cache fill to the safety
+// store (kept for want of a release): it is counted, if the row is as
+// listed.
+// A stale count (the copy it counts is gone: a finish that lost its
+// compare-and-set after the deletes) is taken as no copy.
+const EVICT_PROMOTED: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
+    evict_seq = evict_seq + 1 \
+    WHERE id = ?1 AND evict_seq = ?2 AND safety_state = 'released' \
+      AND hot_safety_bytes IN (0, cipher_size)";
+
+// A released extent's checked bytes were written to the safety store
+// outside eviction (the scrub on a loss, a cold fill of an extent that is
+// not releasable): counted, whatever the sequence.
+const SAFETY_WRITTEN: &str = "UPDATE extents SET hot_safety_bytes = cipher_size, \
+    evict_seq = evict_seq + 1 \
+    WHERE id = ?1 AND safety_state = 'released' AND hot_safety_bytes IN (0, cipher_size)";
+
+// The fingerprint of the rule a promote-only sweep last covered the whole
+// eviction index under.
+const EVICT_RULE_SEEN: &str = "SELECT v FROM scan_cursors WHERE k = 'evict-rule'";
+const SET_EVICT_RULE_SEEN: &str =
+    "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict-rule', ?1)";
+const SET_EVICT_RULE_SEEN_PG: &str = "INSERT INTO scan_cursors(k, v) VALUES ('evict-rule', ?1) \
+    ON CONFLICT (k) DO UPDATE SET v = excluded.v";
+
+// One extent, as the window reads it, right before `/_admin/evict` deletes
+// its copies: its sequence, whether its last R2 copy may go now, and its
+// ciphertext.
+macro_rules! evict_point {
+    ($loss:expr) => {
+        concat!(
+            "SELECT evict_seq, ",
+            pinned!(),
+            " AS pinned, release_evidence, plan_rev, ",
+            $loss,
+            ", bucket_id, cipher_size, cipher_sha256 FROM extents WHERE id = ?1"
+        )
+    };
+}
+const EVICT_POINT: &str = evict_point!("0");
+const EVICT_POINT_SCRUB: &str = evict_point!(loss_flag!("value FROM json_each(?2)"));
+const EVICT_POINT_SCRUB_PG: &str =
+    evict_point!(loss_flag!("jsonb_array_elements_text(CAST(?2 AS jsonb))"));
+
+const EVICT_CURSOR: &str = "SELECT v FROM scan_cursors WHERE k = 'evict'";
+const SET_EVICT_CURSOR: &str = "INSERT OR REPLACE INTO scan_cursors(k, v) VALUES ('evict', ?1)";
+const SET_EVICT_CURSOR_PG: &str =
+    "INSERT INTO scan_cursors(k, v) VALUES ('evict', ?1) ON CONFLICT (k) DO UPDATE SET v = excluded.v";
 
 /// The periodic statements with the index each must be answered from
 /// alone, without touching the table or sorting. Tests hold them to it.
@@ -170,6 +329,270 @@ pub(super) async fn evict_candidates<S: Sql>(
     Ok(out)
 }
 
+/// One bounded window of the eviction order after `cursor`, and of it at
+/// most `take` rows that may go under `rule`:
+/// - a pinned extent's cache fill (the job checks that its safety copy is
+///   in place before it deletes the fill);
+/// - any other row deletes the extent's last R2 copy, so only while the
+///   extent is releasable under the backbones that count now, by the
+///   release rule itself over its stored evidence
+///   ([`crate::verify::evidence_releasable`]), and, with the scrub on,
+///   has no loss on record there.
+///
+/// The cursor that comes back is past the last row looked at, whether or
+/// not any could go; `more` is false once the window reached the end.
+/// `unproven` names the rows kept for want of a release.
+pub(super) async fn evict_window<S: Sql>(
+    c: &SqlCatalog<S>,
+    cursor: &EvictCursor,
+    window: u32,
+    take: u32,
+    rule: &EvictRule,
+) -> Result<EvictWindow> {
+    let pg = c.sql.dialect() == crate::ports::Dialect::Postgres;
+    let mut params = vec![SqlValue::Int(i64::from(window))];
+    if let EvictCursor::After(read, id) = cursor {
+        params.push(SqlValue::Int(*read));
+        params.push(text(id));
+    }
+    if rule.scrub {
+        params.push(labels(&rule.counting)?);
+    }
+    let after = matches!(cursor, EvictCursor::After(..));
+    let sql = match (rule.scrub, after, pg) {
+        (false, false, false) => EVICT_WINDOW,
+        (false, true, false) => EVICT_WINDOW_AFTER,
+        (true, false, false) => EVICT_WINDOW_SCRUB,
+        (true, true, false) => EVICT_WINDOW_SCRUB_AFTER,
+        (false, false, true) => EVICT_WINDOW_PG,
+        (false, true, true) => EVICT_WINDOW_AFTER_PG,
+        (true, false, true) => EVICT_WINDOW_SCRUB_PG,
+        (true, true, true) => EVICT_WINDOW_SCRUB_AFTER_PG,
+    };
+    let rows = c.sql.query(sql, &params).await?;
+    let full = rows.len() as u64 >= u64::from(window);
+    let mut out = EvictWindow {
+        rows: Vec::new(),
+        next: EvictCursor::Start,
+        more: full,
+        unproven: Vec::new(),
+    };
+    let mut last = None;
+    for row in rows {
+        let mut r = Cols::new(row);
+        let candidate = EvictCandidate {
+            extent: ExtentId::new(r.text()?),
+            safety_bytes: r.num()?,
+            cache_bytes: r.num()?,
+            seq: r.num()?,
+            pinned: r.num::<i64>()? != 0,
+        };
+        let read: Option<i64> = r.opt_num()?;
+        let evidence = r.opt_text()?;
+        let plan_rev: u32 = r.num()?;
+        let state = r.text()?;
+        let loss = r.num::<i64>()? != 0;
+        // Where a later step reads this row again: past the row before
+        // it, or from the head for a row without a read stamp.
+        let resume = match read {
+            None => EvictCursor::Start,
+            Some(_) => last.clone().unwrap_or_else(|| cursor.clone()),
+        };
+        // A row without a read stamp sorts first; the next window starts
+        // at the stamped rows (only a legacy row has none).
+        last = Some(EvictCursor::After(
+            read.unwrap_or(i64::MIN),
+            match read {
+                Some(_) => candidate.extent.as_str().to_owned(),
+                None => String::new(),
+            },
+        ));
+        let may = candidate.pinned || releasable_now(evidence.as_deref(), plan_rev, loss, rule);
+        if !may {
+            // Only a released extent's fill is promoted: `deleted` names a
+            // safety copy given up (a restore without one, a drill), not
+            // an extent out of service, so its fill is kept, unwritten.
+            if !candidate.pinned && !loss {
+                out.unproven.push(crate::types::EvictKept {
+                    row: candidate.clone(),
+                    resume: resume.clone(),
+                    promote: state == "released",
+                });
+            }
+            continue;
+        }
+        out.rows.push(candidate);
+        if out.rows.len() as u64 >= u64::from(take) {
+            // Stopped inside the window: the rest of it is next.
+            out.more = true;
+            break;
+        }
+    }
+    if out.more {
+        out.next = last.unwrap_or(EvictCursor::Start);
+    }
+    Ok(out)
+}
+
+/// The last-copy rule: an extent's last R2 copy may go only while it is
+/// releasable under the backbones that count now, by the release rule
+/// over its stored evidence, and, with the scrub on, has no loss on
+/// record there.
+fn releasable_now(evidence: Option<&str>, plan_rev: u32, loss: bool, rule: &EvictRule) -> bool {
+    !loss
+        && crate::verify::evidence_releasable(
+            evidence,
+            plan_rev,
+            &rule.counting,
+            rule.required,
+            rule.mode,
+        )
+}
+
+/// The extent right before `/_admin/evict` deletes its copies: its
+/// sequence, whether its last R2 copy may go now under `rule` (never while
+/// pinned), and its ciphertext. `None` when it is not there.
+pub(super) async fn evict_point<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+    rule: &EvictRule,
+) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
+    let mut params = vec![text(extent.as_str())];
+    let sql = if rule.scrub {
+        params.push(labels(&rule.counting)?);
+        c.sql
+            .dialect()
+            .pick(EVICT_POINT_SCRUB, EVICT_POINT_SCRUB_PG)
+    } else {
+        EVICT_POINT
+    };
+    let Some(row) = c.sql.query(sql, &params).await?.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut r = Cols::new(row);
+    let seq: u64 = r.num()?;
+    let pinned = r.num::<i64>()? != 0;
+    let evidence = r.opt_text()?;
+    let plan_rev: u32 = r.num()?;
+    let loss = r.num::<i64>()? != 0;
+    let may = !pinned && releasable_now(evidence.as_deref(), plan_rev, loss, rule);
+    Ok(Some((seq, may, cipher_cols(&mut r)?)))
+}
+
+fn cipher_cols(r: &mut Cols) -> Result<crate::types::ExtentCipher> {
+    let bucket = crate::types::BucketId::new(r.text()?);
+    let size: u64 = r.num()?;
+    let sha256: [u8; 32] = r.blob()?.try_into().map_err(|_| {
+        crate::types::BridgeError::Sql("extent cipher_sha256 is not 32 bytes".into())
+    })?;
+    Ok(crate::types::ExtentCipher {
+        bucket,
+        size,
+        sha256,
+        released: false,
+    })
+}
+
+/// The extent's ciphertext as recorded ([`EXTENT_CIPHER`]).
+pub(super) async fn extent_cipher<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+) -> Result<Option<crate::types::ExtentCipher>> {
+    let Some(row) = c
+        .sql
+        .query(EXTENT_CIPHER, &[text(extent.as_str())])
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let mut r = Cols::new(row);
+    let mut cipher = cipher_cols(&mut r)?;
+    cipher.released = r.text()? == "released";
+    Ok(Some(cipher))
+}
+
+/// Eviction wrote the verified cache fill of a kept extent to the safety
+/// store: counted if the row is as listed ([`EVICT_PROMOTED`]).
+pub(super) async fn evict_promoted<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -> Result<bool> {
+    let changed = c
+        .sql
+        .exec(EVICT_PROMOTED, &[text(x.extent.as_str()), int(x.seq)?])
+        .await?;
+    Ok(changed == 1)
+}
+
+/// Gives each of `extents` (released, kept by eviction for want of a
+/// release) a scrub deadline of `at` unless it has one ([`WATCH_SOON`]).
+pub(super) async fn scrub_watch_soon<S: Sql>(
+    c: &SqlCatalog<S>,
+    extents: &[ExtentId],
+    at: UnixMs,
+) -> Result<()> {
+    for extent in extents {
+        c.sql
+            .exec(WATCH_SOON, &[text(extent.as_str()), ms(at)])
+            .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn evict_cursor<S: Sql>(c: &SqlCatalog<S>) -> Result<EvictCursor> {
+    let rows = c.sql.query(EVICT_CURSOR, &[]).await?;
+    Ok(match rows.into_iter().next() {
+        Some(row) => EvictCursor::parse(&Cols::new(row).text()?),
+        None => EvictCursor::Start,
+    })
+}
+
+/// The scrub wrote a released extent's cache fill to the safety store
+/// ([`SAFETY_WRITTEN`]).
+pub(super) async fn safety_copy_written<S: Sql>(
+    c: &SqlCatalog<S>,
+    extent: &ExtentId,
+) -> Result<()> {
+    c.sql.exec(SAFETY_WRITTEN, &[text(extent.as_str())]).await?;
+    Ok(())
+}
+
+/// The rule fingerprint the last full sweep covered ([`EVICT_RULE_SEEN`]).
+pub(super) async fn evict_rule_seen<S: Sql>(c: &SqlCatalog<S>) -> Result<Option<String>> {
+    let rows = c.sql.query(EVICT_RULE_SEEN, &[]).await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(Some(Cols::new(row).text()?)),
+        None => Ok(None),
+    }
+}
+
+pub(super) async fn set_evict_rule_seen<S: Sql>(
+    c: &SqlCatalog<S>,
+    fingerprint: &str,
+) -> Result<()> {
+    c.sql
+        .exec(
+            c.sql
+                .dialect()
+                .pick(SET_EVICT_RULE_SEEN, SET_EVICT_RULE_SEEN_PG),
+            &[text(fingerprint)],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn set_evict_cursor<S: Sql>(
+    c: &SqlCatalog<S>,
+    cursor: &EvictCursor,
+) -> Result<()> {
+    c.sql
+        .exec(
+            c.sql.dialect().pick(SET_EVICT_CURSOR, SET_EVICT_CURSOR_PG),
+            &[text(&cursor.encode())],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Starts an eviction: `true` only if the extent is exactly as `x`
 /// describes it. One statement, so the check and the claim cannot be
 /// separated.
@@ -197,6 +620,76 @@ pub(super) async fn begin_evict<S: Sql>(c: &SqlCatalog<S>, x: &EvictCandidate) -
         )
         .await?;
     Ok(changed == 1)
+}
+
+/// No row: the sequence moved. `0`: pinned (or, with `SCRUB` on, a loss
+/// on record), so nothing goes. `1`: the copies go.
+const EVICT_SAFETY_STILL_OK: &str = concat!(
+    "SELECT CASE WHEN ",
+    pinned!(),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
+);
+/// With `SCRUB` on: and no loss of the extent on a counting backbone is
+/// on the scrub's record (`?3`, as for `CANDIDATES_SCRUB`). Only with it
+/// on, so that eviction does not need the scrub's tables before they are
+/// applied.
+const EVICT_SAFETY_STILL_OK_SCRUB: &str = concat!(
+    "SELECT CASE WHEN ",
+    pinned!(),
+    " OR ",
+    scrub_loss_on_record!("?1", "value FROM json_each(?3)"),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
+);
+const EVICT_SAFETY_STILL_OK_SCRUB_PG: &str = concat!(
+    "SELECT CASE WHEN ",
+    pinned!(),
+    " OR ",
+    scrub_loss_on_record!("?1", "jsonb_array_elements_text(CAST(?3 AS jsonb))"),
+    " THEN 0 ELSE 1 END FROM extents WHERE id = ?1 AND evict_seq = ?2"
+);
+
+fn labels(backbones: &[String]) -> Result<SqlValue> {
+    serde_json::to_string(backbones)
+        .map(SqlValue::Text)
+        .map_err(|_| crate::types::BridgeError::Invalid("backbone labels"))
+}
+
+/// Whether the safety copy of an eviction that `begin_evict` started may
+/// still go: the extent is not pinned, nothing moved its sequence since
+/// the begin (a re-pin by the scrub moves it), and, with `scrub` (the
+/// backbones that count now), the scrub has no loss of it on record
+/// there.
+///
+/// The last condition is the fence against a re-pin made after this
+/// check: the scrub re-pins only a loss whose record is older than two
+/// queue invocations (`scrub::REPIN_MIN_LOSS_AGE_MS`), so an eviction
+/// that passed this check without seeing that record deleted within its
+/// invocation, before the re-pin, and the re-pin then finds the copy
+/// gone and writes it again. One that sees the record keeps the copy.
+pub(super) async fn evict_safety_still_ok<S: Sql>(
+    c: &SqlCatalog<S>,
+    x: &EvictCandidate,
+    scrub: Option<&[String]>,
+) -> Result<crate::types::EvictCheck> {
+    use crate::types::EvictCheck;
+    let mut params = vec![text(x.extent.as_str()), int(x.seq.saturating_add(1))?];
+    let sql = match scrub {
+        Some(backbones) => {
+            params.push(labels(backbones)?);
+            c.sql
+                .dialect()
+                .pick(EVICT_SAFETY_STILL_OK_SCRUB, EVICT_SAFETY_STILL_OK_SCRUB_PG)
+        }
+        None => EVICT_SAFETY_STILL_OK,
+    };
+    let rows = c.sql.query(sql, &params).await?;
+    match rows.into_iter().next() {
+        Some(row) => Ok(match Cols::new(row).num::<i64>()? {
+            1 => EvictCheck::Delete,
+            _ => EvictCheck::Keep,
+        }),
+        None => Ok(EvictCheck::Moved),
+    }
 }
 
 /// Ends an eviction after the blobs are deleted: the claimed copies are
@@ -436,6 +929,22 @@ pub(super) fn pg_statements() -> Vec<(String, Vec<SqlValue>)> {
         (CANDIDATES_PG.to_owned(), vec![I]),
         (BEGIN_EVICT_PINNED.to_owned(), vec![T, I, I, I]),
         (BEGIN_EVICT_UNPINNED.to_owned(), vec![T, I, I, I]),
+        (EVICT_SAFETY_STILL_OK.to_owned(), vec![T, I]),
+        (EVICT_SAFETY_STILL_OK_SCRUB_PG.to_owned(), vec![T, I, T]),
+        (EVICT_WINDOW_PG.to_owned(), vec![I]),
+        (EVICT_WINDOW_AFTER_PG.to_owned(), vec![I, I, T]),
+        (EVICT_WINDOW_SCRUB_PG.to_owned(), vec![I, T]),
+        (EVICT_WINDOW_SCRUB_AFTER_PG.to_owned(), vec![I, I, T, T]),
+        (WATCH_SOON.to_owned(), vec![T, I]),
+        (EXTENT_CIPHER.to_owned(), vec![T]),
+        (EVICT_PROMOTED.to_owned(), vec![T, I]),
+        (EVICT_POINT.to_owned(), vec![T]),
+        (EVICT_POINT_SCRUB_PG.to_owned(), vec![T, T]),
+        (EVICT_CURSOR.to_owned(), vec![]),
+        (SET_EVICT_CURSOR_PG.to_owned(), vec![T]),
+        (SAFETY_WRITTEN.to_owned(), vec![T]),
+        (EVICT_RULE_SEEN.to_owned(), vec![]),
+        (SET_EVICT_RULE_SEEN_PG.to_owned(), vec![T]),
         (FINISH_EVICT_PINNED.to_owned(), vec![T, I]),
         (FINISH_EVICT_UNPINNED.to_owned(), vec![T, I]),
         (RECORD_CACHE_FILL.to_owned(), vec![T, I]),

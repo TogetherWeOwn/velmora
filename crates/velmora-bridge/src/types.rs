@@ -1271,6 +1271,133 @@ pub struct HotShape {
     pub oldest_read_at: Option<UnixMs>,
 }
 
+/// Where the eviction job's listing is in the eviction order, between the
+/// steps of one drain (`scan_cursors`, key `evict`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvictCursor {
+    /// The head of the order.
+    Start,
+    /// After the row with this read stamp and id.
+    After(i64, String),
+    /// Kept fills from this cursor on are still to be written to the
+    /// safety store: the next step does that first, even when the tier is
+    /// no longer over its cap.
+    Promote(Box<EvictCursor>),
+    /// A promote-only sweep of the whole eviction order under the rule
+    /// with this fingerprint, at this cursor: after a change of the
+    /// rule's inputs, every kept fill is written to the safety store,
+    /// whatever the cap.
+    Sweep(String, Box<EvictCursor>),
+}
+
+impl EvictCursor {
+    /// A value this code did not write reads as the start.
+    pub fn parse(v: &str) -> EvictCursor {
+        if let Some(rest) = v.strip_prefix("sweep:") {
+            return match rest.split_once(':') {
+                Some((fp, inner)) if !fp.is_empty() => match EvictCursor::parse(inner) {
+                    inner @ (EvictCursor::Start | EvictCursor::After(..)) => {
+                        EvictCursor::Sweep(fp.to_owned(), Box::new(inner))
+                    }
+                    _ => EvictCursor::Start,
+                },
+                _ => EvictCursor::Start,
+            };
+        }
+        if let Some(rest) = v.strip_prefix("promote:") {
+            return match EvictCursor::parse(rest) {
+                // Never nested: a value this code did not write.
+                EvictCursor::Promote(_) | EvictCursor::Sweep(..) => EvictCursor::Start,
+                inner => EvictCursor::Promote(Box::new(inner)),
+            };
+        }
+        match v.split_once(':') {
+            Some(("after", rest)) => match rest.split_once(':') {
+                Some((read, id)) => read
+                    .parse()
+                    .map(|read| EvictCursor::After(read, id.to_owned()))
+                    .unwrap_or(EvictCursor::Start),
+                None => EvictCursor::Start,
+            },
+            _ => EvictCursor::Start,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self {
+            EvictCursor::Start => "start".to_owned(),
+            EvictCursor::After(read, id) => format!("after:{read}:{id}"),
+            EvictCursor::Promote(inner) => format!("promote:{}", inner.encode()),
+            EvictCursor::Sweep(fp, inner) => format!("sweep:{fp}:{}", inner.encode()),
+        }
+    }
+}
+
+/// What lets a row of the eviction order go when it would delete the
+/// extent's last R2 copy: the release rule over its stored evidence
+/// ([`crate::verify::evidence_releasable`]) under the `counting`
+/// backbones, `required` and `mode`, and, with `scrub`, no scrub loss on
+/// record on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictRule {
+    pub counting: Vec<String>,
+    pub required: u32,
+    pub scrub: bool,
+    /// `VERIFY_MODE`: whether the release rule asks for a full pass.
+    pub mode: crate::config::VerifyMode,
+}
+
+/// One bounded window of the eviction order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictWindow {
+    /// The rows in it that may go, in order.
+    pub rows: Vec<EvictCandidate>,
+    /// Where the next window starts.
+    pub next: EvictCursor,
+    /// False once the window reached the end of the order.
+    pub more: bool,
+    /// The unpinned extents in it kept for want of a release under the
+    /// backbones that count now (with no loss on record), in order.
+    pub unproven: Vec<EvictKept>,
+}
+
+/// A released extent the window keeps for want of a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictKept {
+    pub row: EvictCandidate,
+    /// The cursor from which a later step reads this row again.
+    pub resume: EvictCursor,
+    /// Released: its fill is written to the safety store. Otherwise (its
+    /// safety copy was given up) it is only kept.
+    pub promote: bool,
+}
+
+/// An extent's ciphertext as the catalogue records it: what a blob must
+/// be to be its copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtentCipher {
+    pub bucket: BucketId,
+    pub size: u64,
+    pub sha256: [u8; 32],
+    /// The extent is released (not pinned, not deleted).
+    pub released: bool,
+}
+
+/// The answer right before a started eviction deletes the safety copy
+/// (`Catalog::evict_safety_still_ok`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictCheck {
+    /// Unchanged since the begin and not fenced: the copies go.
+    Delete,
+    /// Unchanged since the begin, but the scrub has a loss of it on
+    /// record: both copies stay and the drain goes on past it.
+    Keep,
+    /// Its sequence moved since the begin (a re-pin, a refill, another
+    /// job): nothing is deleted, and the drain's target is no longer
+    /// known.
+    Moved,
+}
+
 /// An evictable extent as the catalogue listed it. `begin_evict` refuses
 /// it if anything here has changed since.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1427,6 +1554,11 @@ pub enum Job {
         pass: UnixMs,
         cursor: String,
     },
+    /// One run of the scrub (`crate::scrub`): the run takes the scrub's
+    /// lease, so a duplicate does nothing.
+    Scrub {
+        v: u8,
+    },
 }
 
 impl Job {
@@ -1562,6 +1694,191 @@ pub struct DispatchReport {
     pub recount_drift: Option<u64>,
     /// The recount step failed; the rest of the run went on without it.
     pub recount_failed: bool,
+    /// A scrub run was sent (`SCRUB=on` and no run holds the lease).
+    pub scrub_enqueued: bool,
+    /// The scrub check failed; the rest of the run went on without it.
+    pub scrub_failed: bool,
+}
+
+/// What the scrub found when it last checked an extent
+/// (`extents.scrub_result`, [`crate::scrub`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubResult {
+    /// Every article was read intact, and every backbone that counts
+    /// toward a release said it holds every article.
+    Ok,
+    /// A loss was seen for the first time: checked again after
+    /// `SCRUB_CONFIRM_SECS`, and repaired only if it is still there.
+    Suspect,
+    /// The loss was confirmed and the extent re-pinned: its safety copy
+    /// is back, and the verify stage posts what a backbone lacks.
+    Repairing,
+    /// Still re-pinned when the repair should have ended.
+    Stalled,
+    /// The loss was confirmed and no copy anywhere is intact.
+    Unrecoverable,
+    /// Not checked: no live object holds the extent (deleted or
+    /// overwritten, waiting for garbage collection), or not all of its
+    /// articles are posted. Looked at again after the interval.
+    Skipped,
+    /// The read broke off and every backbone said it holds every article:
+    /// nothing is known. Looked at again after `SCRUB_CONFIRM_SECS`; a
+    /// second time in a row is an alert.
+    Deferred,
+}
+
+impl ScrubResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubResult::Ok => "ok",
+            ScrubResult::Suspect => "suspect",
+            ScrubResult::Repairing => "repairing",
+            ScrubResult::Stalled => "stalled",
+            ScrubResult::Unrecoverable => "unrecoverable",
+            ScrubResult::Skipped => "skipped",
+            ScrubResult::Deferred => "deferred",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ScrubResult> {
+        Some(match s {
+            "ok" => ScrubResult::Ok,
+            "suspect" => ScrubResult::Suspect,
+            "repairing" => ScrubResult::Repairing,
+            "stalled" => ScrubResult::Stalled,
+            "unrecoverable" => ScrubResult::Unrecoverable,
+            "skipped" => ScrubResult::Skipped,
+            "deferred" => ScrubResult::Deferred,
+            _ => return None,
+        })
+    }
+}
+
+/// An extent the scrub is due to check, with what it found last time.
+#[derive(Clone, Debug)]
+pub struct ScrubCandidate {
+    pub extent: ExtentRow,
+    /// `None` = never checked, or a value this version does not know.
+    pub last: Option<ScrubResult>,
+    pub last_scrubbed_at: Option<UnixMs>,
+    pub watch_at: Option<UnixMs>,
+    pub checks: Vec<ScrubCheck>,
+}
+
+/// An independently due check of one backbone's copy of an extent.
+#[derive(Clone, Debug)]
+pub struct ScrubCheck {
+    pub backbone: String,
+    pub full: bool,
+    pub due_at: UnixMs,
+    /// The nominal deadline, unchanged by a retry or repair.
+    pub phase_at: UnixMs,
+    pub loss_at: Option<UnixMs>,
+}
+
+/// The totals of one scrub run, added to `scrub_state` when it ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubRun {
+    pub checked: u32,
+    pub ok: u32,
+    pub suspect: u32,
+    /// Re-pinned in this run.
+    pub repaired: u32,
+    pub unrecoverable: u32,
+    pub stalled: u32,
+    /// The breaker tripped in this run: the label of the backbone.
+    pub incident: Option<String>,
+    /// The backbones no loss is repaired on when the run ends: those of
+    /// the incidents before it and of its own, or none once runs without
+    /// a trip have checked enough extents to have tripped it.
+    pub blocked: Vec<String>,
+    /// [`ScrubState::incident_clean`] when the run ends.
+    pub incident_clean: u64,
+    /// Independent clean streaks for the blocked backbones.
+    pub incident_clean_by: Vec<(String, u64)>,
+    /// Blocked backbones that require successful BODY checks to clear.
+    pub incident_body_by: Vec<String>,
+    /// Ciphertext bytes read from Usenet.
+    pub bytes_read: u64,
+    /// Articles a provider did not serve intact that another one did,
+    /// where no backbone said it lacks them: a copy that answers `STAT`
+    /// and serves other bytes, or a read that broke off.
+    pub refetched: u32,
+    /// Why the run ended.
+    pub ended: ScrubEnd,
+}
+
+/// Why a scrub run ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrubEnd {
+    /// Nothing more was due.
+    #[default]
+    Idle,
+    /// `SCRUB_EXTENTS_PER_RUN` extents were checked.
+    Quota,
+    /// `SCRUB_RUN_SECS` were up.
+    Time,
+    /// A provider had no free slot: the rest waits for the next run.
+    Busy,
+    /// The breaker tripped.
+    Incident,
+    /// The lease was lost (a later run took it) or the catalogue failed.
+    Stopped,
+}
+
+impl ScrubEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrubEnd::Idle => "idle",
+            ScrubEnd::Quota => "quota",
+            ScrubEnd::Time => "time",
+            ScrubEnd::Busy => "busy",
+            ScrubEnd::Incident => "incident",
+            ScrubEnd::Stopped => "stopped",
+        }
+    }
+}
+
+/// The scrub's totals and lease (`scrub_state`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubState {
+    /// Moves on with every take of the lease.
+    pub lease_token: u64,
+    pub lease_until: Option<UnixMs>,
+    pub runs: u64,
+    pub checked: u64,
+    pub ok: u64,
+    pub suspect: u64,
+    pub repaired: u64,
+    pub unrecoverable: u64,
+    pub stalled: u64,
+    pub incidents: u64,
+    pub bytes_read: u64,
+    pub last_run_at: Option<UnixMs>,
+    pub last_unrecoverable_at: Option<UnixMs>,
+    pub last_incident_at: Option<UnixMs>,
+    /// The backbones no loss is repaired on, as a JSON array of labels
+    /// (`scrub_state.last_incident`); `None` = none.
+    pub last_incident: Option<String>,
+    /// Checks in a row, across runs, that found nothing lacking on a
+    /// backbone under an incident; a trip or a check that still lacks
+    /// there sets it back to 0, and at
+    /// [`crate::scrub::INCIDENT_MIN_EXTENTS`] the incidents clear.
+    pub incident_clean: u64,
+    /// Independent clean streaks for the blocked backbones.
+    pub incident_clean_by: Vec<(String, u64)>,
+    /// Blocked backbones that require successful BODY checks to clear.
+    pub incident_body_by: Vec<String>,
+}
+
+impl ScrubState {
+    /// The backbones under an incident ([`Self::last_incident`]).
+    pub fn blocked(&self) -> Vec<String> {
+        match self.last_incident.as_deref() {
+            None => Vec::new(),
+            Some(text) => serde_json::from_str(text).unwrap_or_else(|_| vec![text.to_owned()]),
+        }
+    }
 }
 
 /// The oldest message that waits in the queues of one kind, as far as

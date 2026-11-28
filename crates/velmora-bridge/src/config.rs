@@ -420,6 +420,14 @@ pub struct BridgeConfig {
     /// How the verify stage checks an extent (`VERIFY_MODE` and its
     /// companions).
     pub verify: VerifyConfig,
+    /// The background read-back of released extents (`SCRUB` and its
+    /// companions, [`crate::scrub`]).
+    pub scrub: ScrubConfig,
+    /// `EVICTION=paused`: no eviction starts, and a queued step does
+    /// nothing. For changes of which backbones count and of `SCRUB` (the
+    /// procedure in ops/README.md): no eviction decided under one
+    /// configuration deletes under another.
+    pub eviction_paused: bool,
     /// NNTP sockets one post job opens at most, over all its providers.
     pub post_sockets: u32,
     /// Connections one invocation reads cold extents over
@@ -543,6 +551,116 @@ impl Default for VerifyConfig {
             escalate_secs: DEFAULT_VERIFY_ESCALATE_SECS,
             size_commands: Vec::new(),
         }
+    }
+}
+
+/// Extents one scrub run checks at most when `SCRUB_EXTENTS_PER_RUN` is
+/// unset. Need: 6 TB at 105,800 extents per TB, every 30 days, one run
+/// every 5 minutes = 73 per run; 96 leaves room to about 7.8 TB. One run
+/// of 96 extents of 8 MiB over 2 drill connections (about 10.5 MiB/s,
+/// measured by the X2 read-back) takes about 73 s of the 300 s between
+/// runs, and about 29 s of CPU at the measured 38 ms per MiB.
+pub const DEFAULT_SCRUB_EXTENTS_PER_RUN: u32 = 96;
+/// Drill connections one scrub run reads over when `SCRUB_SOCKETS` is
+/// unset: 2 of the 14 production drill connections.
+pub const DEFAULT_SCRUB_SOCKETS: u32 = 2;
+/// Days between STAT passes of each copy (`SCRUB_INTERVAL_DAYS`).
+pub const DEFAULT_SCRUB_INTERVAL_DAYS: u32 = 30;
+/// Days between full read-backs of each copy (`SCRUB_FULL_INTERVAL_DAYS`).
+pub const DEFAULT_SCRUB_FULL_INTERVAL_DAYS: u32 = 90;
+/// Seconds before a loss the scrub found is checked again, and repaired
+/// only if it is still there (`SCRUB_CONFIRM_SECS`): the repair-data
+/// design's rule of a second look at least an hour later, which is also
+/// far past the measured propagation between backbones (minutes).
+pub const DEFAULT_SCRUB_CONFIRM_SECS: u32 = 3600;
+/// Wall time one scrub run takes new extents for (`SCRUB_RUN_SECS`):
+/// under the 300 s between cron runs, so runs never overlap.
+pub const DEFAULT_SCRUB_RUN_SECS: u32 = 240;
+/// Extents one scrub run re-pins at most (`SCRUB_REPAIRS_PER_RUN`): 8
+/// extents of 8.4 MB pinned and re-verified per 5 minutes, under 1 % of
+/// the measured posting rate of the post-only account.
+pub const DEFAULT_SCRUB_REPAIRS_PER_RUN: u32 = 8;
+
+/// The scrub ([`crate::scrub`]): a read-back of released extents from
+/// Usenet alone, and the repair of what it finds lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScrubConfig {
+    /// `SCRUB=on`. Off (the default), the dispatcher sends no scrub job
+    /// and a scrub job that arrives does nothing.
+    pub on: bool,
+    pub extents_per_run: u32,
+    pub sockets: u32,
+    pub interval_days: u32,
+    pub full_interval_days: u32,
+    pub confirm_secs: u32,
+    pub run_secs: u32,
+    pub repairs_per_run: u32,
+}
+
+impl Default for ScrubConfig {
+    fn default() -> Self {
+        ScrubConfig {
+            on: false,
+            extents_per_run: DEFAULT_SCRUB_EXTENTS_PER_RUN,
+            sockets: DEFAULT_SCRUB_SOCKETS,
+            interval_days: DEFAULT_SCRUB_INTERVAL_DAYS,
+            full_interval_days: DEFAULT_SCRUB_FULL_INTERVAL_DAYS,
+            confirm_secs: DEFAULT_SCRUB_CONFIRM_SECS,
+            run_secs: DEFAULT_SCRUB_RUN_SECS,
+            repairs_per_run: DEFAULT_SCRUB_REPAIRS_PER_RUN,
+        }
+    }
+}
+
+impl ScrubConfig {
+    /// `dev`: a development deployment, where the confirm interval may
+    /// be short (tests, drills). Elsewhere it is at least
+    /// [`DEFAULT_SCRUB_CONFIRM_SECS`]: the second look of a loss comes an
+    /// hour after the first at the soonest.
+    fn from_vars(get: &impl Fn(&str) -> Option<String>, dev: bool) -> Result<Self, ConfigError> {
+        let on = match get("SCRUB").as_deref().map(str::trim) {
+            None | Some("") | Some("off") => false,
+            Some("on") => true,
+            Some(_) => return Err(ConfigError::Invalid("SCRUB".into())),
+        };
+        let d = ScrubConfig::default();
+        Ok(ScrubConfig {
+            on,
+            // At least as many as the breaker needs to trip, or to clear.
+            extents_per_run: number_or(
+                get,
+                "SCRUB_EXTENTS_PER_RUN",
+                d.extents_per_run,
+                (crate::scrub::INCIDENT_MIN_EXTENTS, 10_000),
+            )?,
+            sockets: number_or(get, "SCRUB_SOCKETS", d.sockets, (1, MAX_COLD_SOCKETS))?,
+            interval_days: number_or(get, "SCRUB_INTERVAL_DAYS", d.interval_days, (1, 3650))?,
+            full_interval_days: number_or(
+                get,
+                "SCRUB_FULL_INTERVAL_DAYS",
+                d.full_interval_days,
+                (1, 3650),
+            )?,
+            confirm_secs: number_or(
+                get,
+                "SCRUB_CONFIRM_SECS",
+                d.confirm_secs,
+                (
+                    if dev { 1 } else { DEFAULT_SCRUB_CONFIRM_SECS },
+                    30 * 86_400,
+                ),
+            )?,
+            // Under the cron interval of 300 s: runs must not overlap. At
+            // least 30 s: 8 extents at the measured 3.3 s each, so a run
+            // can check what the breaker needs to trip or to clear.
+            run_secs: number_or(get, "SCRUB_RUN_SECS", d.run_secs, (30, 290))?,
+            repairs_per_run: number_or(
+                get,
+                "SCRUB_REPAIRS_PER_RUN",
+                d.repairs_per_run,
+                (0, 10_000),
+            )?,
+        })
     }
 }
 
@@ -999,6 +1117,12 @@ impl BridgeConfig {
         let verify_delay_secs: u32 = number(&get, "VERIFY_DELAY_SECS")?;
 
         let post_sockets = number_or(&get, "POST_SOCKETS", DEFAULT_POST_SOCKETS, (1, 8))?;
+        let scrub = ScrubConfig::from_vars(&get, environment == Environment::Dev)?;
+        let eviction_paused = match get("EVICTION").as_deref().map(str::trim) {
+            None | Some("") | Some("on") => false,
+            Some("paused") => true,
+            Some(_) => return Err(ConfigError::Invalid("EVICTION".into())),
+        };
         let cold_sockets = number_or(
             &get,
             "COLD_SOCKETS",
@@ -1211,6 +1335,8 @@ impl BridgeConfig {
             release_at_verify,
             verify_delay_secs,
             verify,
+            scrub,
+            eviction_paused,
             post_sockets,
             cold_sockets,
             propagation_grace_secs,

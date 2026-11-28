@@ -77,6 +77,39 @@ fn optional_text(
         .ok_or(invalid)
 }
 
+/// `SCRUB=on` needs a PostgreSQL catalogue, and with it
+/// `D1_ROLLBACK_RETIRED=1`.
+///
+/// The frozen D1 catalogue has none of the scrub's schema (it ships as
+/// PostgreSQL stages only), so on D1 the Worker refuses `SCRUB=on`; with
+/// it off nothing reads the scrub's tables or columns.
+///
+/// A scrub repair moves a released extent of any age back to `held` and
+/// writes its repair only to the catalogue it runs on. A rollback to the
+/// frozen D1 replays only extents created after the cutover, so it would
+/// bring such an extent back as released, counted on a backbone that
+/// lacks it.
+/// The setting says the frozen D1 is no longer a rollback target; until
+/// then the Worker refuses this configuration.
+pub fn scrub_backend_allowed(
+    postgres: bool,
+    scrub: bool,
+    retired: Option<&str>,
+) -> core::result::Result<(), &'static str> {
+    let retired = match retired.map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err("invalid D1_ROLLBACK_RETIRED"),
+    };
+    if scrub && !postgres {
+        return Err("SCRUB needs the PostgreSQL catalogue");
+    }
+    if scrub && !retired {
+        return Err("SCRUB on PostgreSQL needs D1_ROLLBACK_RETIRED=1");
+    }
+    Ok(())
+}
+
 /// One line per write transaction over the single-Sync size bound, which
 /// then goes one Sync per statement. No SQL and no values.
 fn log_oversize(statements: usize) {
@@ -207,6 +240,23 @@ impl Sql for CatalogSql {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_on_postgres_waits_for_the_d1_rollback_target_to_retire() {
+        let refused = Err("SCRUB on PostgreSQL needs D1_ROLLBACK_RETIRED=1");
+        assert_eq!(scrub_backend_allowed(true, true, None), refused);
+        assert_eq!(scrub_backend_allowed(true, true, Some("0")), refused);
+        assert_eq!(scrub_backend_allowed(true, true, Some("1")), Ok(()));
+        assert_eq!(scrub_backend_allowed(true, false, None), Ok(()));
+        let d1 = Err("SCRUB needs the PostgreSQL catalogue");
+        assert_eq!(scrub_backend_allowed(false, true, None), d1);
+        assert_eq!(scrub_backend_allowed(false, true, Some("1")), d1);
+        assert_eq!(scrub_backend_allowed(false, false, None), Ok(()));
+        assert_eq!(
+            scrub_backend_allowed(false, false, Some("yes")),
+            Err("invalid D1_ROLLBACK_RETIRED")
+        );
+    }
 
     #[test]
     fn backend_defaults_to_d1_and_refuses_typos() {

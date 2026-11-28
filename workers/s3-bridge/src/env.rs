@@ -150,6 +150,11 @@ fn build(env: &Env) -> Result<WorkerBridge, String> {
     set_abandon(abandon);
     let binding = |name: &'static str| move |_| format!("missing binding {name}");
     let catalog = CatalogSql::from_env(env)?;
+    crate::catalog_sql::scrub_backend_allowed(
+        velmora_bridge::Sql::dialect(&catalog) == velmora_bridge::Dialect::Postgres,
+        cfg.scrub.on,
+        get("D1_ROLLBACK_RETIRED").as_deref(),
+    )?;
     // `PERMITS`: where provider permits come from. With the gate bound,
     // a Worker on `d1` still tells a gate that holds slot rows to let
     // go, so the switch can be turned back.

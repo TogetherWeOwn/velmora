@@ -303,6 +303,8 @@ impl Fx {
             catalogue_id: "main".to_string(),
             dev_trust_http: false,
             verify: Default::default(),
+            scrub: Default::default(),
+            eviction_paused: false,
             providers,
             admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         };
@@ -334,6 +336,13 @@ impl Fx {
             budget: ByteBudget::new(BUDGET),
             cfg,
         };
+        // A catalogue whose first sweep of the eviction order has run:
+        // these tests are about the dispatcher's other work.
+        bridge
+            .catalog
+            .set_evict_rule_seen(&bridge.rule_fingerprint())
+            .await
+            .unwrap();
         Fx {
             bridge,
             sql,
@@ -1263,6 +1272,8 @@ async fn dispatch_does_no_blob_or_nntp_io() {
             recount_rows: 0,
             recount_drift: None,
             recount_failed: false,
+            scrub_enqueued: false,
+            scrub_failed: false,
         }
     );
     let sent: Vec<Job> = fx.bridge.jobs.take().into_iter().map(|s| s.job).collect();
@@ -1523,11 +1534,18 @@ async fn dispatch_redrives_done_extents_when_a_backbone_is_added() {
     assert!(report.release_paused);
     assert_eq!(fx.outbox(&o, "stage").await, "done");
     fx.bridge.cfg.providers[1].release = true;
+    // The sweep a new rule starts is covered in `scrub.rs`.
+    fx.bridge
+        .catalog
+        .set_evict_rule_seen(&fx.bridge.rule_fingerprint())
+        .await
+        .unwrap();
 
     let report = fx.bridge.dispatch().await.unwrap();
     assert_eq!((report.redriven, report.enqueued), (1, 1));
     assert!(!report.release_paused);
-    assert_eq!(fx.bridge.jobs.sent()[0].job, o.job(OutboxStage::Verify));
+    let sent: Vec<Job> = fx.bridge.jobs.sent().into_iter().map(|s| s.job).collect();
+    assert!(sent.contains(&o.job(OutboxStage::Verify)), "{sent:?}");
     assert_eq!(fx.outbox(&o, "stage").await, "verify");
     fx.pump().await;
     assert_eq!(fx.outbox(&o, "stage").await, "done");
@@ -1590,6 +1608,12 @@ async fn release_with_a_backbone_that_never_has_the_extent() {
     p2.backbone = "bb2".to_string();
     p2.port = third.addr().port();
     fx.bridge.cfg.providers.extend([p1, p2]);
+    // The sweep a new rule starts is covered in `scrub.rs`.
+    fx.bridge
+        .catalog
+        .set_evict_rule_seen(&fx.bridge.rule_fingerprint())
+        .await
+        .unwrap();
 
     let bucket = fx.bucket("scratch", true).await;
     let o = fx.put(&bucket, "k", &plaintext()).await;

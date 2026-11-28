@@ -222,12 +222,15 @@ fn sql_down() -> BridgeError {
     BridgeError::Sql("no answer".into())
 }
 
-/// A blob store whose writes can be made to fail.
+/// A blob store whose operations can be made to fail.
 #[derive(Default)]
 pub struct Blobs {
     pub inner: MemBlobStore,
-    /// Every call crosses it first.
     pub trip: Tripwire,
+    /// `head` calls so far.
+    pub heads: Cell<u64>,
+    /// The next GET on this store fails without removing the blob.
+    pub fail_next_get: Cell<bool>,
     pub fail_put: Cell<bool>,
     pub frozen: Cell<bool>,
     pub frozen_write_attempts: Cell<u32>,
@@ -238,8 +241,11 @@ pub struct Blobs {
     pub puts: RefCell<Vec<(String, [u8; 32])>>,
     /// The next list call waits until `list_held` is cleared again.
     pub hold_list: Cell<bool>,
-    /// A list call is waiting.
+    /// A list call is waiting. Set and cleared through
+    /// [`Blobs::release_list`] and the held call, which notify.
     pub list_held: Cell<bool>,
+    /// Wakes whoever waits on `list_held` changing.
+    pub list_changed: tokio::sync::Notify,
     /// With `hold_list`: the held call reads its keys before it waits,
     /// not after.
     pub list_first: Cell<bool>,
@@ -253,6 +259,10 @@ pub struct Blobs {
     pub fail_deletes: Cell<u32>,
     /// Called once, with the key, at the start of the next delete.
     pub before_delete: Hook,
+    /// Called once, with the key, right after the next `head_identity`
+    /// has its answer: what another request commits between that check
+    /// and what the caller does next.
+    pub after_identity: Hook,
     /// Called once, with the key, at the start of the next put.
     pub before_put: Hook,
     /// One-shot hooks for interleavings that must await real catalogue I/O.
@@ -371,6 +381,28 @@ impl std::ops::Deref for Blobs {
 }
 
 impl Blobs {
+    /// Waits, at most [`HOLD_TIMEOUT`], until a list call is held.
+    pub async fn list_is_held(&self) {
+        let held = async {
+            loop {
+                let changed = self.list_changed.notified();
+                if self.list_held.get() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(HOLD_TIMEOUT, held)
+            .await
+            .expect("no list call was made");
+    }
+
+    /// Lets the held list call go on.
+    pub fn release_list(&self) {
+        self.list_held.set(false);
+        self.list_changed.notify_waiters();
+    }
+
     fn allow_write(&self) -> Result<()> {
         if self.frozen.get() {
             self.frozen_write_attempts
@@ -475,6 +507,9 @@ impl BlobStore for Blobs {
         })
     }
     async fn get(&self, key: &str, span: Option<ByteSpan>) -> Result<Option<Vec<u8>>> {
+        if self.fail_next_get.replace(false) {
+            return Err(blob_down());
+        }
         self.read_turn().await;
         if let Some((failing, left)) = self.fail_gets.borrow_mut().as_mut() {
             if failing == key && *left > 0 {
@@ -514,11 +549,20 @@ impl BlobStore for Blobs {
         answer
     }
     async fn head(&self, key: &str) -> Result<Option<u64>> {
+        self.heads.set(self.heads.get() + 1);
         if self.fail_head.borrow().as_deref() == Some(key) {
             return Err(BridgeError::Blob("store: head failed".into()));
         }
         self.read_turn().await;
         self.trip.guard(blob_down, self.inner.head(key)).await
+    }
+    async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
+        let answer = self
+            .trip
+            .guard(blob_down, self.inner.head_identity(key))
+            .await;
+        fire(&self.after_identity, key);
+        answer
     }
     async fn delete(&self, key: &str) -> Result<()> {
         self.allow_write()?;
@@ -568,15 +612,21 @@ impl BlobStore for Blobs {
             false => None,
         };
         self.list_held.set(true);
-        // Bounded: a test that never lets go fails instead of hanging.
-        let deadline = Instant::now() + HOLD_TIMEOUT;
-        while self.list_held.get() {
-            assert!(
-                Instant::now() < deadline,
-                "the held list call was never let go"
-            );
-            tokio::task::yield_now().await;
-        }
+        self.list_changed.notify_waiters();
+        // Bounded in time: a test that never lets go fails instead of
+        // hanging, however long the other side takes.
+        let released = async {
+            loop {
+                let changed = self.list_changed.notified();
+                if !self.list_held.get() {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(HOLD_TIMEOUT, released)
+            .await
+            .expect("the held list call was never let go");
         match early {
             Some(keys) => keys,
             None => self.inner.list(prefix, start_after, limit).await,
@@ -606,8 +656,15 @@ pub struct FailSql {
     /// Stalls one matching write at the tripwire until the test releases it.
     pub stall_exec_matching: Cell<Option<&'static str>>,
     pub selected_exec: Tripwire,
+    /// Stalls one read whose text contains the string, after letting the
+    /// given number of such reads through, at the tripwire.
+    pub stall_query_matching: Cell<Option<(&'static str, u32)>>,
+    pub selected_query: Tripwire,
     /// Stalls one batch with a matching first text parameter.
     pub stall_batch_key: Cell<Option<&'static str>>,
+    /// Runs one batch with a statement whose text contains the string,
+    /// then answers it with an error: a commit whose reply was lost.
+    pub lose_batch_matching: Cell<Option<&'static str>>,
     pub selected_batch: Tripwire,
     /// Runs the given SQL once, just before a read whose text contains
     /// the string, after letting the given number of such reads through:
@@ -736,9 +793,18 @@ impl Sql for FailSql {
             return Err(BridgeError::Sql("database down".into()));
         }
         self.interleave(sql);
-        self.trip
-            .guard(sql_down, self.inner.query(sql, params))
-            .await
+        let call = self.trip.guard(sql_down, self.inner.query(sql, params));
+        if let Some((text, pass)) = self.stall_query_matching.get() {
+            if sql.contains(text) {
+                if pass == 0 {
+                    self.stall_query_matching.set(None);
+                    self.selected_query.arm(0, Trip::Stall);
+                    return self.selected_query.guard(sql_down, call).await;
+                }
+                self.stall_query_matching.set(Some((text, pass - 1)));
+            }
+        }
+        call.await
     }
     async fn exec(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         if self.frozen.get() {
@@ -817,6 +883,15 @@ impl Sql for FailSql {
                 return self.inner.batch(stmts).await;
             }
         }
+        let lose = self
+            .lose_batch_matching
+            .get()
+            .is_some_and(|text| stmts.iter().any(|(sql, _)| sql.contains(text)));
+        if lose {
+            self.lose_batch_matching.set(None);
+            self.inner.batch(stmts).await?;
+            return Err(BridgeError::Sql("no answer".into()));
+        }
         let stall = self.stall_batch_key.get().is_some_and(|key| {
             stmts.iter().any(
                 |(_, params)| matches!(params.first(), Some(SqlValue::Text(found)) if found == key),
@@ -873,6 +948,8 @@ pub fn config(providers: Vec<ProviderConfig>) -> BridgeConfig {
         catalogue_id: "main".to_string(),
         dev_trust_http: false,
         verify: Default::default(),
+        scrub: Default::default(),
+        eviction_paused: false,
         providers,
         admin_token: Secret::new("admin-token-fixture-admin-token-fixture".to_string()),
         admin_read_token: None,
@@ -950,7 +1027,10 @@ fn rig_on<N: NntpConnector + 'static>(
                 fail_read_for: RefCell::new(None),
                 stall_exec_matching: Cell::new(None),
                 selected_exec: Tripwire::default(),
+                stall_query_matching: Cell::new(None),
+                selected_query: Tripwire::default(),
                 stall_batch_key: Cell::new(None),
+                lose_batch_matching: Cell::new(None),
                 selected_batch: Tripwire::default(),
                 before_matching: RefCell::new(None),
                 fail_batches: Cell::new(0),

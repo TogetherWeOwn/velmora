@@ -181,6 +181,25 @@ pub fn log_alerts(to: fn(&str)) {
     ALERTS.with(|log| log.set(Some(to)));
 }
 
+thread_local! {
+    static SCRUB_RUNS: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sends one line to `to` at the end of each scrub run
+/// ([`crate::scrub`]): extents checked and what was found, bytes read,
+/// why the run ended and how long it took. No key, bucket, message-id
+/// or host.
+pub fn log_scrub_runs(to: fn(&str)) {
+    SCRUB_RUNS.with(|log| log.set(Some(to)));
+}
+
+/// Hands the line to the log set with [`log_scrub_runs`], if any.
+pub(crate) fn scrub_run(line: impl FnOnce() -> String) {
+    if let Some(to) = SCRUB_RUNS.with(std::cell::Cell::get) {
+        to(&line());
+    }
+}
+
 /// Hands the line to the log set with [`log_alerts`], if any.
 pub(crate) fn alert(line: impl FnOnce() -> String) {
     if let Some(to) = ALERTS.with(std::cell::Cell::get) {

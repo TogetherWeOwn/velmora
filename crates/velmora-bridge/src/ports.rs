@@ -19,17 +19,17 @@ use crate::replay::{ReplayExtent, ReplayMark, ReplayProbe, ReplayPublish, Restor
 pub use crate::types::Result;
 use crate::types::{
     AccessKeyRow, AccessKeySummary, ArticleRow, BackboneStatus, Backlog, Bucket, BucketId,
-    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, ExtentId,
-    ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow, HotStats,
-    IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
+    ByteSpan, CommitGeneration, CompleteUpload, CopyGeneration, DueRow, EvictCandidate, EvictCheck,
+    ExtentId, ExtentPlacement, ExtentRow, FailClass, GcRow, GcStep, GenerationId, GenerationRow,
+    HotStats, IntentFence, IntentStats, Job, JobExtent, KekBytes, ListEntry, ListPage, ListQuery,
     ObjectStatus, OpenUpload, OutboxStage, OutboxStats, PartExtent, Perm, Precondition,
     ProviderConfig, ProviderFault, ProviderLoad, Resend, SafetyState, SizeCommand, UnixMs,
     UploadId, UploadListQuery, UploadPartRow, UploadRow, UploadState, VerificationRow,
     VerifyEscalation, WriteId,
 };
 use crate::types::{
-    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, UsageCounters, UsageRecount,
-    UsageSnapshot,
+    BridgeError, BucketUsage, ByteStream, RecountState, RecountStep, ScrubCandidate, ScrubResult,
+    ScrubRun, ScrubState, UsageCounters, UsageRecount, UsageSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,6 +192,25 @@ pub struct StreamMeta<'a> {
     pub extent: &'a ExtentId,
 }
 
+/// What a store says of a blob without reading its bytes
+/// ([`BlobStore::head_identity`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobIdentity {
+    pub size: u64,
+    /// The SHA-256 the store itself checked the body against when it was
+    /// stored ([`BlobStore::put`] gives the store the digest to check).
+    /// `None` when the store did not check one (a streamed put).
+    pub sha256: Option<[u8; 32]>,
+}
+
+impl BlobIdentity {
+    /// The store checked these bytes against this size and digest: they
+    /// are the extent's ciphertext.
+    pub fn is(&self, size: u64, sha256: &[u8; 32]) -> bool {
+        self.size == size && self.sha256.as_ref() == Some(sha256)
+    }
+}
+
 /// What the store holds after [`BlobStore::put_stream`], as the store
 /// itself reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +324,14 @@ pub trait BlobStore {
     }
     /// Object size, `None` = absent.
     async fn head(&self, key: &str) -> Result<Option<u64>>;
+    /// The size and the digest the store checked at the put, `None` =
+    /// absent. This default knows no digest.
+    async fn head_identity(&self, key: &str) -> Result<Option<BlobIdentity>> {
+        Ok(self
+            .head(key)
+            .await?
+            .map(|size| BlobIdentity { size, sha256: None }))
+    }
     /// Idempotent. Refuses a recovery record (any key under `m/`, which
     /// includes the tenant keys under `m/tk/`) and a rollback stamp (any
     /// key under `rs/`) with [`crate::recovery::ERR_RECORD_DELETE`]
@@ -1340,6 +1367,10 @@ pub trait Catalog {
     async fn guard_selftest(&self) -> Result<bool>;
 
     // gc
+    /// After scrub writes a safety copy but cannot re-pin it, queues a new
+    /// delete only for a published extent in a disposable bucket with no
+    /// live generation or open upload referencing it.
+    async fn gc_enqueue_scrub_safety(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>>;
     /// Re-checks that no live generation and no open upload references
     /// the extent; applies catalogue-only actions.
@@ -1599,6 +1630,146 @@ pub trait Catalog {
     /// Switches the counters off: their triggers write nothing again.
     async fn usage_off(&self) -> Result<()>;
 
+    // scrub (`crate::scrub`); a catalogue without it has none
+    /// Takes the scrub's lease until `until` if no run holds it at `now`.
+    /// `Some(token)`: the token that fences this run's writes.
+    async fn scrub_take(&self, _now: UnixMs, _until: UnixMs) -> Result<Option<u64>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// The scrub's lease and running totals.
+    async fn scrub_state(&self) -> Result<ScrubState> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Enroll a bounded page under the lease; true means more may be pending.
+    async fn scrub_enroll(
+        &self,
+        _token: u64,
+        _backbones: &[String],
+        _now: UnixMs,
+        _intervals_ms: [i64; 2],
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Up to `limit` extents with due checks or repair watches, oldest first.
+    async fn scrub_due(
+        &self,
+        _backbones: &[String],
+        _now: UnixMs,
+        _limit: u32,
+    ) -> Result<Vec<ScrubCandidate>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Move only the named checks, recording their own loss timestamps.
+    /// `verified`: a scheduled BODY check passed at that time for that
+    /// plan revision, which moves `extents.last_verified_at` forward
+    /// (never back) in the same batch.
+    async fn scrub_advance(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+        _verified: Option<(UnixMs, u32)>,
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Labels of counting copies that still have an unresolved check failure.
+    async fn scrub_has_loss(
+        &self,
+        _extent: &ExtentId,
+        _backbones: &[String],
+    ) -> Result<Vec<String>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Remove the schedules of a tombstoned extent under the scrub lease.
+    async fn scrub_retire(&self, _token: u64, _extent: &ExtentId) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Records a check of a released or held extent, if the run of
+    /// `token` still holds the lease. `false`: nothing was written.
+    async fn scrub_record(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _result: ScrubResult,
+        _now: UnixMs,
+        _next_at: Option<UnixMs>,
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Whether a live generation references the extent.
+    async fn scrub_live(&self, _extent: &ExtentId) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Takes an extent the scrub cannot check off its due list.
+    async fn scrub_drop(&self, _token: u64, _extent: &ExtentId) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Re-pins a released extent in one guarded batch: `held` again, its
+    /// outbox row from `done` back to `verify` (due at `now`), the result
+    /// `repairing`, due again at `next_at`. Only if the run of `token`
+    /// holds the lease, the extent is released, its posting is done and
+    /// a live generation references it; `false`: nothing was written.
+    ///
+    /// `unread`: the backbones that get a failed full read of the current
+    /// plan in the same batch (no provider served the extent's bytes), so
+    /// verify reads them in full and no release counts them before that.
+    async fn scrub_repin(
+        &self,
+        _token: u64,
+        _extent: &ExtentId,
+        _at: (UnixMs, UnixMs),
+        _unread: &[String],
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Records, before a scrub safety PUT, that a PUT of the extent's safety
+    /// copy may land until `until`.
+    async fn scrub_put_intent(&self, _extent: &ExtentId, _until: UnixMs) -> Result<()> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Recorded PUT intents whose PUT can no longer land at `now`, oldest
+    /// expiry first: `(key, extent)`.
+    async fn scrub_put_intents_due(
+        &self,
+        _now: UnixMs,
+        _limit: u32,
+    ) -> Result<Vec<(String, ExtentId)>> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Removes a reconciled PUT intent, by its key.
+    async fn scrub_drop_put_intent(&self, _key: &str) -> Result<()> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Whether the re-pin made at `at` is the one on the extent's row: the
+    /// point read after a re-pin batch whose reply was lost.
+    async fn scrub_repin_landed(&self, _extent: &ExtentId, _at: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Stores the backbones under an incident (`scrub_state.last_incident`)
+    /// at once, under the lease of `token`.
+    async fn scrub_block(
+        &self,
+        _token: u64,
+        _blocked: &[String],
+        _body: &[String],
+    ) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Moves an extent's due time only: a check that could not finish.
+    async fn scrub_defer(&self, _token: u64, _extent: &ExtentId, _next_at: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Frees the lease only (a run that failed before its first extent),
+    /// if the run of `token` still holds it.
+    async fn scrub_free(&self, _token: u64, _now: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+    /// Adds a run's totals and frees the lease, if the run of `token`
+    /// still holds it.
+    async fn scrub_end(&self, _token: u64, _run: &ScrubRun, _now: UnixMs) -> Result<bool> {
+        Err(BridgeError::Invalid("this catalogue has no scrub"))
+    }
+
     // hot tier
     /// Pinned and evictable byte totals (`GET /_admin/status`).
     async fn hot_stats(&self) -> Result<HotStats>;
@@ -1623,6 +1794,81 @@ pub trait Catalog {
     ) -> Result<bool>;
     /// Extents with evictable bytes, least recently read first.
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>>;
+    /// One bounded window of `window` rows of the eviction order after
+    /// `cursor`, and of them at most `take` that may go under `rule`: the
+    /// cache fill of a pinned extent, or an extent releasable under the
+    /// backbones that count now (with the scrub on, and no loss on record
+    /// there). The default lists the head of the order unfiltered.
+    async fn evict_window(
+        &self,
+        _cursor: &crate::types::EvictCursor,
+        _window: u32,
+        take: u32,
+        _rule: &crate::types::EvictRule,
+    ) -> Result<crate::types::EvictWindow> {
+        let rows = self.evict_candidates(take).await?;
+        let more = rows.len() as u64 >= u64::from(take);
+        Ok(crate::types::EvictWindow {
+            rows,
+            next: crate::types::EvictCursor::Start,
+            more,
+            unproven: Vec::new(),
+        })
+    }
+    /// Gives each released extent of `extents` a scrub deadline of `at`
+    /// unless it has one (with the scrub on: eviction kept them for want of
+    /// a release under the backbones that count now).
+    async fn scrub_watch_soon(&self, _extents: &[ExtentId], _at: UnixMs) -> Result<()> {
+        Ok(())
+    }
+    /// The extent's ciphertext as recorded. `None` when the catalogue
+    /// cannot tell (the default) or the extent is not there: then no blob
+    /// is taken for its copy.
+    async fn extent_cipher(
+        &self,
+        _extent: &ExtentId,
+    ) -> Result<Option<crate::types::ExtentCipher>> {
+        Ok(None)
+    }
+    /// One extent, read right before `/_admin/evict` deletes its copies:
+    /// its eviction sequence, whether its last R2 copy may go now under
+    /// `rule` as [`Catalog::evict_window`] decides it (never while pinned),
+    /// and its ciphertext. The default cannot tell: `None`.
+    async fn evict_point(
+        &self,
+        _extent: &ExtentId,
+        _rule: &crate::types::EvictRule,
+    ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
+        Ok(None)
+    }
+    /// A released extent's checked bytes were written to the safety store
+    /// outside eviction (the scrub on a loss, a cold fill of an extent
+    /// that is not releasable): the copy is counted.
+    async fn safety_copy_written(&self, _extent: &ExtentId) -> Result<()> {
+        Ok(())
+    }
+    /// The fingerprint of the eviction rule the last full promote-only
+    /// sweep covered, if any.
+    async fn evict_rule_seen(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+    /// Records the fingerprint a full promote-only sweep covered.
+    async fn set_evict_rule_seen(&self, _fingerprint: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Eviction wrote a kept extent's verified cache fill to the safety
+    /// store: it is counted if the row is as `x` was listed.
+    async fn evict_promoted(&self, _x: &EvictCandidate) -> Result<bool> {
+        Ok(false)
+    }
+    /// Where the current drain's listing is ([`Catalog::evict_window`]).
+    async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
+        Ok(crate::types::EvictCursor::Start)
+    }
+    /// Stores the drain's listing position.
+    async fn set_evict_cursor(&self, _cursor: &crate::types::EvictCursor) -> Result<()> {
+        Ok(())
+    }
     /// Starts an eviction in one statement that re-checks the extent:
     /// `true` only if it is exactly as listed (sequence, byte counts,
     /// pinned or not). With `x.pinned` only the cache fill is claimed.
@@ -1630,6 +1876,21 @@ pub trait Catalog {
     /// Ends an eviction after the blob deletes. `false` when a hot copy
     /// was recorded since `begin_evict`; the counts then stand.
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool>;
+    /// Asked right before the safety copy of a started eviction is
+    /// deleted: [`EvictCheck::Moved`] once its sequence moved since
+    /// `begin_evict` (a re-pin, a refill, another job), and, with `scrub`
+    /// (`SCRUB` is on: the backbones that count now),
+    /// [`EvictCheck::Keep`] while the scrub has a loss of the extent on
+    /// record on one of them: the copy may be the one the re-pin of that
+    /// loss keeps. The default keeps the old behaviour of a catalogue
+    /// that cannot tell.
+    async fn evict_safety_still_ok(
+        &self,
+        _x: &EvictCandidate,
+        _scrub: Option<&[String]>,
+    ) -> Result<EvictCheck> {
+        Ok(EvictCheck::Delete)
+    }
     /// Counts the extent's cache fill and stamps the read. Called before
     /// and after the cache write.
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()>;

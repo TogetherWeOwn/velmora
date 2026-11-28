@@ -79,11 +79,20 @@ mod permits;
 mod publish;
 mod recovery;
 mod replay;
+mod scrub;
 mod uploads;
 pub mod usage;
 
 pub(crate) use health::LOGIN_REFUSED_COOLDOWN_MAX_MS;
 /// Hot-tier statements that must use covering partial indexes.
+/// The eviction job's bounded windows (from the head, after a cursor),
+/// with the scrub's loss check, for SQLite and PostgreSQL: plan tests.
+pub const HOT_EVICT_WINDOWS: [&str; 4] = [
+    hot::EVICT_WINDOW_SCRUB,
+    hot::EVICT_WINDOW_SCRUB_AFTER,
+    hot::EVICT_WINDOW_SCRUB_PG,
+    hot::EVICT_WINDOW_SCRUB_AFTER_PG,
+];
 pub const HOT_INDEX_ONLY: [(&str, &str); 4] = [
     hot::INDEX_ONLY[0],
     hot::INDEX_ONLY[1],
@@ -126,6 +135,13 @@ const GUARD_SELFTEST_KEY: &str = "guard_selftest_marker";
 /// in the crate can turn the proof of a record into the one that
 /// deletes it.
 pub(crate) struct GuardRefused(());
+
+/// The scrub's due query, word for word as it runs (for a test of its
+/// query plan).
+#[doc(hidden)]
+pub fn scrub_range_queries(dialect: crate::ports::Dialect) -> [&'static str; 4] {
+    scrub::range_queries(dialect)
+}
 
 /// The catalogue over any [`Sql`] backend.
 pub struct SqlCatalog<S: Sql> {
@@ -751,6 +767,9 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     }
 
     // gc
+    async fn gc_enqueue_scrub_safety(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
+        gc::gc_enqueue_scrub_safety(self, extent, now).await
+    }
     async fn gc_due(&self, now: UnixMs, limit: u32, disposable_only: bool) -> Result<Vec<GcRow>> {
         gc::gc_due(self, now, limit, disposable_only).await
     }
@@ -1012,6 +1031,104 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
         usage::off(self).await
     }
 
+    // scrub
+    async fn scrub_take(&self, now: UnixMs, until: UnixMs) -> Result<Option<u64>> {
+        scrub::take(self, now, until).await
+    }
+    async fn scrub_state(&self) -> Result<crate::types::ScrubState> {
+        scrub::state(self).await
+    }
+    async fn scrub_enroll(
+        &self,
+        token: u64,
+        backbones: &[String],
+        now: UnixMs,
+        intervals_ms: [i64; 2],
+    ) -> Result<bool> {
+        scrub::enroll(self, token, backbones, now, intervals_ms).await
+    }
+    async fn scrub_due(
+        &self,
+        backbones: &[String],
+        now: UnixMs,
+        limit: u32,
+    ) -> Result<Vec<crate::types::ScrubCandidate>> {
+        scrub::due(self, backbones, now, limit).await
+    }
+    async fn scrub_advance(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        updates: &[(crate::types::ScrubCheck, UnixMs, Option<UnixMs>)],
+        verified: Option<(UnixMs, u32)>,
+    ) -> Result<bool> {
+        scrub::advance(self, token, extent, updates, verified).await
+    }
+    async fn scrub_has_loss(&self, extent: &ExtentId, backbones: &[String]) -> Result<Vec<String>> {
+        scrub::has_loss(self, extent, backbones).await
+    }
+    async fn scrub_retire(&self, token: u64, extent: &ExtentId) -> Result<bool> {
+        scrub::retire(self, token, extent).await
+    }
+    async fn scrub_record(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        result: crate::types::ScrubResult,
+        now: UnixMs,
+        next_at: Option<UnixMs>,
+    ) -> Result<bool> {
+        scrub::record(self, token, extent, result, now, next_at).await
+    }
+    async fn scrub_live(&self, extent: &ExtentId) -> Result<bool> {
+        scrub::live(self, extent).await
+    }
+    async fn scrub_drop(&self, token: u64, extent: &ExtentId) -> Result<bool> {
+        scrub::drop_due(self, token, extent).await
+    }
+    async fn scrub_put_intent(&self, extent: &ExtentId, until: UnixMs) -> Result<()> {
+        scrub::put_intent(self, extent, until).await
+    }
+    async fn scrub_put_intents_due(
+        &self,
+        now: UnixMs,
+        limit: u32,
+    ) -> Result<Vec<(String, ExtentId)>> {
+        scrub::put_intents_due(self, now, limit).await
+    }
+    async fn scrub_drop_put_intent(&self, key: &str) -> Result<()> {
+        scrub::drop_put_intent(self, key).await
+    }
+    async fn scrub_repin_landed(&self, extent: &ExtentId, at: UnixMs) -> Result<bool> {
+        scrub::repin_landed(self, extent, at).await
+    }
+    async fn scrub_repin(
+        &self,
+        token: u64,
+        extent: &ExtentId,
+        (now, next_at): (UnixMs, UnixMs),
+        unread: &[String],
+    ) -> Result<bool> {
+        scrub::repin(self, token, extent, (now, next_at), unread).await
+    }
+    async fn scrub_free(&self, token: u64, now: UnixMs) -> Result<bool> {
+        scrub::free(self, token, now).await
+    }
+    async fn scrub_block(&self, token: u64, blocked: &[String], body: &[String]) -> Result<bool> {
+        scrub::block(self, token, blocked, body).await
+    }
+    async fn scrub_defer(&self, token: u64, extent: &ExtentId, next_at: UnixMs) -> Result<bool> {
+        scrub::defer(self, token, extent, next_at).await
+    }
+    async fn scrub_end(
+        &self,
+        token: u64,
+        run: &crate::types::ScrubRun,
+        now: UnixMs,
+    ) -> Result<bool> {
+        scrub::end(self, token, run, now).await
+    }
+
     // hot tier
     async fn hot_stats(&self) -> Result<HotStats> {
         hot::hot_stats(self).await
@@ -1041,11 +1158,58 @@ impl<S: Sql> Catalog for SqlCatalog<S> {
     async fn evict_candidates(&self, limit: u32) -> Result<Vec<EvictCandidate>> {
         hot::evict_candidates(self, limit).await
     }
+    async fn evict_window(
+        &self,
+        cursor: &crate::types::EvictCursor,
+        window: u32,
+        take: u32,
+        rule: &crate::types::EvictRule,
+    ) -> Result<crate::types::EvictWindow> {
+        hot::evict_window(self, cursor, window, take, rule).await
+    }
+    async fn scrub_watch_soon(&self, extents: &[ExtentId], at: UnixMs) -> Result<()> {
+        hot::scrub_watch_soon(self, extents, at).await
+    }
+    async fn extent_cipher(&self, extent: &ExtentId) -> Result<Option<crate::types::ExtentCipher>> {
+        hot::extent_cipher(self, extent).await
+    }
+    async fn evict_point(
+        &self,
+        extent: &ExtentId,
+        rule: &crate::types::EvictRule,
+    ) -> Result<Option<(u64, bool, crate::types::ExtentCipher)>> {
+        hot::evict_point(self, extent, rule).await
+    }
+    async fn safety_copy_written(&self, extent: &ExtentId) -> Result<()> {
+        hot::safety_copy_written(self, extent).await
+    }
+    async fn evict_rule_seen(&self) -> Result<Option<String>> {
+        hot::evict_rule_seen(self).await
+    }
+    async fn set_evict_rule_seen(&self, fingerprint: &str) -> Result<()> {
+        hot::set_evict_rule_seen(self, fingerprint).await
+    }
+    async fn evict_promoted(&self, x: &EvictCandidate) -> Result<bool> {
+        hot::evict_promoted(self, x).await
+    }
+    async fn evict_cursor(&self) -> Result<crate::types::EvictCursor> {
+        hot::evict_cursor(self).await
+    }
+    async fn set_evict_cursor(&self, cursor: &crate::types::EvictCursor) -> Result<()> {
+        hot::set_evict_cursor(self, cursor).await
+    }
     async fn begin_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::begin_evict(self, x).await
     }
     async fn finish_evict(&self, x: &EvictCandidate) -> Result<bool> {
         hot::finish_evict(self, x).await
+    }
+    async fn evict_safety_still_ok(
+        &self,
+        x: &EvictCandidate,
+        scrub: Option<&[String]>,
+    ) -> Result<crate::types::EvictCheck> {
+        hot::evict_safety_still_ok(self, x, scrub).await
     }
     async fn record_cache_fill(&self, extent: &ExtentId, now: UnixMs) -> Result<()> {
         hot::record_cache_fill(self, extent, now).await
@@ -1189,7 +1353,7 @@ mod pg_manifest_tests {
         let statements = pg_background_statements();
         // Count every generated replay and hot-controller lookup arity,
         // plus both wire signatures for the nullable hot-controller guard.
-        assert_eq!(statements.len(), 342, "background inventory entry count");
+        assert_eq!(statements.len(), 393, "background inventory entry count");
         for (sql, params) in statements {
             assert_bind_arity(&sql, params.len());
         }
@@ -1206,6 +1370,7 @@ pub fn pg_background_statements() -> Vec<(String, Vec<SqlValue>)> {
         usage::pg_statements(),
         hot::pg_statements(),
         hotctl::pg_statements(),
+        scrub::pg_statements(),
         health::pg_statements(),
         permits::pg_statements(),
         crate::gate::pg_statements(),

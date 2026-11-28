@@ -1443,6 +1443,30 @@ os.execv({shutil.which('psql')!r}, [{shutil.which('psql')!r}, *sys.argv[1:]])
             self.assertIn('0005_kofra_indexes.sql: applied', self.migrate(script=script).stdout)
             self.assertEqual(self.index_oid('kofra_p'), before)
 
+    def test_a_live_cutover_schema_takes_the_shipped_later_stages_online(self):
+        # The production upgrade: a schema at the cutover baseline with app
+        # access granted takes every shipped later stage as an online
+        # migration over a network with round-trip latency.
+        later = sorted(f.name for f in (BRIDGE / "pg").glob("[0-9][0-9][0-9][0-9]_*.sql")
+                       if f.name[:4] > STAGES[-1])
+        self.assertTrue(later, "a stage ships after the cutover baseline")
+        self.migrate("--to", STAGES[-1], script=MIGRATE)
+        self.owner_sql(f'GRANT USAGE ON SCHEMA "{self.schema}" TO kofra_app')
+        original = self.env.read_text()
+        with delayed_pg() as proxy_port:
+            lines = [f"PGHOST=127.0.0.1" if line.startswith("PGHOST=") else line
+                     for line in original.splitlines() if not line.startswith("PGPORT=")]
+            lines.append(f"PGPORT={proxy_port}")
+            self.env.write_text("\n".join(lines) + "\n")
+            try:
+                applied = self.migrate(script=MIGRATE).stdout
+            finally:
+                self.env.write_text(original)
+        for name in later:
+            self.assertIn(f"{name}: applied", applied)
+        self.assertEqual(self.migrate('--pending', script=MIGRATE).stdout, '')
+        self.assertIn('Schema matches D1', self.migrate('--verify', script=MIGRATE).stdout)
+
     def test_full_shipped_chain_verifies(self):
         self.migrate(script=MIGRATE)
         self.assertEqual(self.migrate('--pending', script=MIGRATE).stdout, '')

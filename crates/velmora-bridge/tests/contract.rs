@@ -613,7 +613,8 @@ fn missing_secret_fails_closed() {
     // Worker-only optional variables, validated by the Worker catalogue
     // selector instead of BridgeConfig. Nothing BridgeConfig reads may
     // be added here to bypass its missing-variable checks.
-    const WORKER_ONLY_OPTIONAL: [&str; 2] = ["CATALOG_BACKEND", "PG_WRITE_TX"];
+    const WORKER_ONLY_OPTIONAL: [&str; 3] =
+        ["CATALOG_BACKEND", "PG_WRITE_TX", "D1_ROLLBACK_RETIRED"];
     let (prod, dev) = wrangler_vars();
     let full = with_secrets(prod, &prod_providers());
     let dev = with_secrets(dev, PROVIDER_PLAIN);
@@ -1502,6 +1503,8 @@ async fn ddl_applies_cleanly_with_fixed_times() {
             "restore_state",
             "rollback_stamp",
             "scan_cursors",
+            "scrub_copies",
+            "scrub_state",
             "tx_guard",
             "upload_part_extents",
             "upload_parts",
@@ -3371,4 +3374,77 @@ fn production_places_the_fetch_handler_in_us_east_1_and_dev_does_not() {
         .collect();
     assert_eq!(dev, ["env.dev.placement"], "dev states its own placement");
     assert_eq!(table_body("[env.dev.placement]"), ["mode=off"]);
+}
+
+/// The scrub's settings: off unless `on`; a run checks at least as many
+/// extents as the breaker needs; outside dev the second look at a loss
+/// comes an hour after the first at the soonest.
+#[test]
+fn scrub_settings_are_bounded() {
+    let (prod, dev) = wrangler_vars();
+    let prod = with_secrets(prod, &prod_providers());
+    let dev = with_secrets(dev, PROVIDER_PLAIN);
+    let with = |base: &BTreeMap<String, String>, pairs: &[(&str, &str)]| {
+        let mut m = base.clone();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.to_string());
+        }
+        load(&m)
+    };
+    let invalid = |k: &str| Err(ConfigError::Invalid(k.to_string()));
+    let cfg = load(&prod).unwrap();
+    assert!(!cfg.scrub.on, "off as shipped");
+    assert_eq!(cfg.scrub, velmora_bridge::config::ScrubConfig::default());
+    assert_eq!(
+        (cfg.scrub.interval_days, cfg.scrub.full_interval_days),
+        (30, 90)
+    );
+    let custom = with(
+        &prod,
+        &[
+            ("SCRUB_INTERVAL_DAYS", "7"),
+            ("SCRUB_FULL_INTERVAL_DAYS", "19"),
+        ],
+    )
+    .unwrap()
+    .scrub;
+    assert_eq!((custom.interval_days, custom.full_interval_days), (7, 19));
+    for name in ["SCRUB_INTERVAL_DAYS", "SCRUB_FULL_INTERVAL_DAYS"] {
+        assert_eq!(with(&prod, &[(name, "0")]).map(|_| ()), invalid(name));
+        assert_eq!(with(&prod, &[(name, "3651")]).map(|_| ()), invalid(name));
+    }
+    assert!(with(&prod, &[("SCRUB", "on")]).unwrap().scrub.on);
+    for bad in ["1", "ON", "true"] {
+        assert_eq!(with(&prod, &[("SCRUB", bad)]).map(|_| ()), invalid("SCRUB"));
+    }
+    assert_eq!(
+        with(&prod, &[("SCRUB_EXTENTS_PER_RUN", "7")]).map(|_| ()),
+        invalid("SCRUB_EXTENTS_PER_RUN")
+    );
+    assert_eq!(
+        with(&prod, &[("SCRUB_EXTENTS_PER_RUN", "8")])
+            .unwrap()
+            .scrub
+            .extents_per_run,
+        8
+    );
+    assert_eq!(
+        with(&prod, &[("SCRUB_CONFIRM_SECS", "3599")]).map(|_| ()),
+        invalid("SCRUB_CONFIRM_SECS")
+    );
+    assert_eq!(
+        with(&dev, &[("SCRUB_CONFIRM_SECS", "60")])
+            .unwrap()
+            .scrub
+            .confirm_secs,
+        60
+    );
+    assert_eq!(
+        with(&prod, &[("SCRUB_RUN_SECS", "291")]).map(|_| ()),
+        invalid("SCRUB_RUN_SECS")
+    );
+    assert_eq!(
+        with(&prod, &[("SCRUB_SOCKETS", "9")]).map(|_| ()),
+        invalid("SCRUB_SOCKETS")
+    );
 }

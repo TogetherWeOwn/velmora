@@ -3562,6 +3562,13 @@ async fn rows_written(packed_plans: &str, counters: bool, dropped: bool) -> (u64
     )
     .await;
     let s = "rows written";
+    // A catalogue whose first sweep of the eviction order has run: the
+    // figures are the life of an object, not of the catalogue.
+    rig.bridge
+        .catalog
+        .set_evict_rule_seen(&rig.bridge.rule_fingerprint())
+        .await
+        .unwrap();
     let sql = &rig.bridge.catalog.sql;
     if !counters {
         // The usage counters as the migration leaves them: off.
@@ -3682,8 +3689,10 @@ async fn rows_written_per_extent() {
     // 48, not 46, while `extents_safety` and the two indexes it replaces
     // exist side by side: its entry at the upload and at the start of
     // the release. The drops give both back and three more.
+    // 49 with the scrub's pending index (migration 0006): a released extent
+    // has an entry there, written once by the release.
     assert!(
-        uncounted.0 <= 48,
+        uncounted.0 <= 49,
         "rows written per packed extent: {}",
         uncounted.0
     );
@@ -3725,8 +3734,9 @@ async fn rows_written_per_extent() {
 #[tokio::test(flavor = "current_thread")]
 async fn rows_written_per_extent_after_the_index_drops() {
     let packed = rows_written("on", false, true).await;
+    // 44 with the scrub's due index entry of a released extent.
     assert!(
-        packed.0 <= 43,
+        packed.0 <= 44,
         "rows written per packed extent: {}",
         packed.0
     );

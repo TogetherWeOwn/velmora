@@ -306,6 +306,13 @@ pub const MIGRATION_0025: &str =
 /// (`verifications.lease_token`).
 pub const MIGRATION_0026: &str =
     include_str!("../../../workers/s3-bridge/migrations/0026_verification_claim.sql");
+/// The scrub's schema in the local SQLite catalogue: the twin of
+/// PostgreSQL stage 0005, which the frozen D1 never takes.
+pub const MIGRATION_SCRUB: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0005_scrub.sql");
+/// The scrub's extents indexes: the twin of PostgreSQL stage 0006.
+pub const MIGRATION_SCRUB_INDEXES: &str =
+    include_str!("../../../workers/s3-bridge/migrations-local/0006_scrub_indexes.sql");
 
 /// Per-bucket S3 CORS configuration in the local SQLite schema.
 pub const MIGRATION_BUCKET_CORS: &str =
@@ -539,6 +546,8 @@ impl RusqliteSql {
         db.apply(MIGRATION_0025)?;
         db.apply(MIGRATION_0026)?;
         db.apply(MIGRATION_BUCKET_CORS)?;
+        db.apply(MIGRATION_SCRUB)?;
+        db.apply(MIGRATION_SCRUB_INDEXES)?;
         Ok(db)
     }
 
@@ -690,6 +699,7 @@ pub struct MemBlobStore {
     got: RefCell<Vec<String>>,
     refuse_puts: Cell<bool>,
     read_time: RefCell<Option<(FixedClock, i64)>>,
+    unchecked: RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl MemBlobStore {
@@ -736,8 +746,18 @@ impl MemBlobStore {
         self.blobs.borrow_mut().remove(key).is_some()
     }
 
-    /// Overwrites stored bytes (tamper tests).
+    /// The store keeps no checked digest for the blob, as R2 for one
+    /// written by a streamed put: [`BlobStore::head_identity`] gives its
+    /// size only.
+    pub fn forget_digest(&self, key: &str) -> bool {
+        self.contains(key) && self.unchecked.borrow_mut().insert(key.to_owned())
+    }
+
+    /// Overwrites stored bytes (tamper tests). The store's checked digest
+    /// is gone with them: R2 cannot hold bytes other than the ones it
+    /// checked, so a blob with other bytes is one it never checked.
     pub fn corrupt(&self, key: &str, f: impl FnOnce(&mut Vec<u8>)) -> bool {
+        self.unchecked.borrow_mut().insert(key.to_owned());
         match self.blobs.borrow_mut().get_mut(key) {
             Some(b) => {
                 f(&mut b.bytes);
@@ -757,6 +777,7 @@ impl BlobStore for MemBlobStore {
         if self.refuse_puts.get() {
             return Err(BridgeError::Blob("mem: put refused".into()));
         }
+        self.unchecked.borrow_mut().remove(key);
         self.blobs.borrow_mut().insert(
             key.to_string(),
             StoredBlob {
@@ -817,11 +838,24 @@ impl BlobStore for MemBlobStore {
         Ok(self.blobs.borrow().get(key).map(|b| b.bytes.len() as u64))
     }
 
+    async fn head_identity(&self, key: &str) -> Result<Option<crate::ports::BlobIdentity>> {
+        let checked = !self.unchecked.borrow().contains(key);
+        Ok(self
+            .blobs
+            .borrow()
+            .get(key)
+            .map(|b| crate::ports::BlobIdentity {
+                size: b.bytes.len() as u64,
+                sha256: checked.then_some(b.cipher_sha256),
+            }))
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         if is_protected_key(key) {
             return Err(ERR_RECORD_DELETE);
         }
         self.blobs.borrow_mut().remove(key);
+        self.unchecked.borrow_mut().remove(key);
         Ok(())
     }
 

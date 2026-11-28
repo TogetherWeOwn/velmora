@@ -279,6 +279,21 @@ impl TestNntpServer {
             || spool.posted.iter().any(|a| a.message_id == want)
     }
 
+    /// Replace a posted article's body without changing its STAT presence.
+    pub async fn replace_posted_body(&self, id: &str, body: &[u8]) -> bool {
+        let id = normalize_id(id);
+        let mut spool = self.shared.spool.lock().await;
+        let Some(article) = spool.posted.iter_mut().find(|a| a.message_id == id) else {
+            return false;
+        };
+        let Some(headers) = article.raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        article.raw.truncate(headers + 4);
+        article.raw.extend_from_slice(body);
+        true
+    }
+
     /// Hide a message-ID: retrieval answers `430` until [`Self::unhide`].
     /// Simulates propagation gaps and article loss per spool.
     pub async fn hide(&self, id: &str) {

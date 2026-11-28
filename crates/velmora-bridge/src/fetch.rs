@@ -379,6 +379,24 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ProviderSession<'a, C, N, T> {
         self.session.is_some()
     }
 
+    /// How long the session may still sit unused, in milliseconds: until
+    /// its slot, last renewed at `held_from`, has only the goodbye and the
+    /// slack left. A caller that waits for anything else ends it then.
+    pub(crate) fn idle_ms(&self) -> u32 {
+        let life = i64::from(
+            self.permit
+                .class
+                .permit_secs()
+                .saturating_sub(QUIT_SECS + READ_SLACK_SECS),
+        ) * 1000;
+        let left = self
+            .held_from
+            .0
+            .saturating_add(life)
+            .saturating_sub(self.clock.now().0);
+        u32::try_from(left.clamp(0, life)).unwrap_or(0)
+    }
+
     /// The slot this session holds.
     pub(crate) fn permit(&self) -> &Permit {
         &self.permit
@@ -1068,9 +1086,19 @@ pub struct ColdStats {
     /// Extents that lost more than their parity could rebuild
     /// (`extent-unrecoverable`).
     pub unrecoverable: u32,
+    /// Those refetches per provider id.
+    pub failed: Vec<(String, u32)>,
 }
 
 impl ColdStats {
+    fn refetch(&mut self, provider: &str) {
+        self.refetched += 1;
+        match self.failed.iter_mut().find(|f| f.0 == provider) {
+            Some(f) => f.1 += 1,
+            None => self.failed.push((provider.to_owned(), 1)),
+        }
+    }
+
     fn count(&mut self, provider: &str, bytes: u64) {
         match self.share.iter_mut().find(|s| s.0 == provider) {
             Some(s) => {
@@ -1409,6 +1437,10 @@ pub(crate) struct ColdReader<'a, C: Catalog, N: NntpConnector, T: Clock> {
     reserve: Option<Charge>,
     /// What the last rebuild found no room for, in bytes.
     lacked: u64,
+    /// The reader of a background job (the scrub): where a drill would
+    /// take a read slot (a provider without drill connections), it takes
+    /// a background one, which leaves the reads their reserve.
+    background: bool,
 }
 
 /// The tier a reader asks `p` in, lowest first. A read: its `priority`.
@@ -1530,6 +1562,13 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             .saturating_add(life)
             .saturating_sub(self.clock.now().0);
         Some(u32::try_from(left.clamp(0, life)).unwrap_or(0))
+    }
+
+    /// The permit holder of every slot the reader takes. A caller that
+    /// opens sessions of its own in the same invocation passes it, so a
+    /// provider with `max_ips` counts the invocation once.
+    pub(crate) fn holder(&self) -> &str {
+        &self.holder
     }
 
     /// What the reader did so far.
@@ -1743,12 +1782,16 @@ impl<'a, C: Catalog, N: NntpConnector, T: Clock> ColdReader<'a, C, N, T> {
             }
             let began = self.clock.now();
             let opened = join_all(asked.iter().map(|&i| {
+                let class = match (self.background, class_of(drill, order[i])) {
+                    (true, PermitClass::Read) => PermitClass::Background,
+                    (_, class) => class,
+                };
                 ProviderSession::open(
                     self.catalog,
                     self.nntp,
                     self.clock,
                     order[i],
-                    class_of(drill, order[i]),
+                    class,
                     &self.holder,
                 )
             }))
@@ -2618,17 +2661,17 @@ async fn read_shared<C: Catalog, N: NntpConnector, T: Clock>(
                         .count(&session.provider.id, row.cipher_len);
                 } else {
                     b.asks[slot] = MISSING_ASKS;
-                    stats.borrow_mut().refetched += 1;
+                    stats.borrow_mut().refetch(&session.provider.id);
                 }
             }
             Checked::Corrupt => {
                 b.asks[slot] = MISSING_ASKS;
-                stats.borrow_mut().refetched += 1;
+                stats.borrow_mut().refetch(&session.provider.id);
             }
             Checked::Missing => {
                 b.asks[slot] += 1;
                 if b.asks[slot] == MISSING_ASKS {
-                    stats.borrow_mut().refetched += 1;
+                    stats.borrow_mut().refetch(&session.provider.id);
                 }
             }
             // Not asked for.
@@ -2665,6 +2708,7 @@ where
             lacked: 0,
             drill: false,
             shunned: Vec::new(),
+            background: false,
         })
     }
 
@@ -2698,6 +2742,18 @@ where
         })
     }
 
+    /// The reader of a scrub run ([`crate::scrub`]): a drill reader of
+    /// `sockets` connections that, where a drill would take a read slot,
+    /// takes a background one, so a job never holds the slot a request's
+    /// cold read is kept.
+    pub(crate) fn scrub_reader(&self, sockets: u32) -> Result<ColdReader<'_, C, N, T>> {
+        Ok(ColdReader {
+            holder: request_holder("scrub")?,
+            background: true,
+            ..self.drill_reader(sockets)?
+        })
+    }
+
     /// Writes a verified extent to the cache and counts it.
     ///
     /// The fill is counted before it is written and again after:
@@ -2708,7 +2764,18 @@ where
     ///
     /// Without the first count nothing is written: an uncounted copy
     /// could outlive the cap. `false` = not written for that reason.
+    ///
+    /// A released extent that is not releasable under the rule that holds
+    /// now is the exception: a cache fill is not a durable copy (the
+    /// cache's lifecycle rule expires it), so its verified bytes go to the
+    /// safety store instead ([`Self::fill_safety_copy`]), which reads
+    /// take as they take the cache. No cache-only copy of such an extent
+    /// is ever written, so none is left for a later pass to protect, and
+    /// the fill holds one buffer, as any other. `false` = not written.
     pub(crate) async fn cache_fill(&self, extent: &ExtentRow, cipher: Vec<u8>) -> Result<bool> {
+        if self.unreleasable_now(extent) {
+            return Ok(self.fill_safety_copy(extent, cipher).await);
+        }
         let meta = BlobMeta {
             bucket: &extent.bucket_id,
             extent: &extent.id,
@@ -2723,6 +2790,76 @@ where
             .await?;
         let _ = count().await;
         Ok(true)
+    }
+
+    /// Released, and not releasable by its evidence under the rule that
+    /// holds now.
+    fn unreleasable_now(&self, extent: &ExtentRow) -> bool {
+        extent.safety_state == crate::types::SafetyState::Released
+            && !crate::verify::evidence_releasable(
+                extent.release_evidence.as_deref(),
+                extent.plan_rev,
+                &crate::verify::release_labels(&self.cfg.providers),
+                self.cfg.required_backbones,
+                self.cfg.verify.mode,
+            )
+    }
+
+    /// Writes the verified bytes of a cold fill of an unreleasable extent
+    /// as its safety copy, as eviction's promotion does: behind a
+    /// write-ahead intent, with the collection guard after it, and
+    /// counted. A blob the store checked as the extent's is kept;
+    /// anything else under the key (other bytes, or a streamed put whose
+    /// digest the store never checked) is replaced. The scrub deletes a
+    /// safety object only at a repair, after a sequence-checked uncount
+    /// and the re-pin to held; fills and evictions count a copy only on a
+    /// released extent, so a fill write it removes there is not a counted
+    /// copy, and it came from a verified Usenet read, so the next read
+    /// fills again. It never fails the read: when the write cannot
+    /// be made, nothing is written anywhere, and the next read of the
+    /// extent fills it again. `true` = the copy is there.
+    async fn fill_safety_copy(&self, extent: &ExtentRow, cipher: Vec<u8>) -> bool {
+        let key = extent.id.safety_key();
+        let written = async {
+            if self
+                .safety
+                .head_identity(&key)
+                .await?
+                .is_some_and(|blob| blob.is(extent.cipher_size, &extent.cipher_sha256))
+            {
+                return Ok::<_, crate::types::BridgeError>(());
+            }
+            let until = self.clock.now().plus_ms(crate::jobtable::JOB_MAX_AGE_MS);
+            self.catalog.scrub_put_intent(&extent.id, until).await?;
+            let meta = BlobMeta {
+                bucket: &extent.bucket_id,
+                extent: &extent.id,
+                cipher_sha256: &extent.cipher_sha256,
+            };
+            self.safety.put(&key, cipher, &meta).await?;
+            self.catalog
+                .gc_enqueue_scrub_safety(&extent.id, self.clock.now())
+                .await?;
+            self.catalog.safety_copy_written(&extent.id).await?;
+            crate::trace::alert(|| {
+                format!(
+                    "fill-protect {} not releasable; its verified cold fill is its safety copy",
+                    extent.id.as_str()
+                )
+            });
+            Ok(())
+        };
+        let done = written.await.is_ok();
+        if !done {
+            crate::trace::alert(|| {
+                format!(
+                    "fill-protect-failed {} not releasable and the safety write failed; \
+                     nothing was cached, the next read fills it again",
+                    extent.id.as_str()
+                )
+            });
+        }
+        done
     }
 
     /// Reads `extents` from Usenet one after the other with one reader,
@@ -2751,8 +2888,8 @@ where
 
     /// Rebuilds an extent's ciphertext from Usenet when neither blob store
     /// has it ([`ColdReader::fetch`]). The assembled extent is checked
-    /// against `cipher_sha256` and written to the cache before it is
-    /// returned, so nothing unverified is ever served or cached. The
+    /// against `cipher_sha256` and written to the cache (or the safety
+    /// store, [`Self::cache_fill`]) before it is returned, so nothing unverified is ever served or cached. The
     /// bytes are verified whether or not the cache took them, so the
     /// read itself succeeds either way.
     pub async fn fetch_cold(&self, extent: &ExtentRow) -> Result<ColdFetch> {
@@ -2833,6 +2970,7 @@ mod tests {
             room: std::rc::Rc::new(ByteBudget::new(0)),
             reserve: None,
             lacked: 0,
+            background: false,
         };
         let mut out = [None, None];
         let mut full = [false, false];

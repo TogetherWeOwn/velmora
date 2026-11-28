@@ -93,8 +93,9 @@ const MEASURED: &[(&str, Option<u64>)] = &[
         Some(3),
     ),
     (
+        // The row and entries in `extents_evictable` and `extents_scrub_pending`.
         r#"UPDATE extents SET safety_state='released', released_at=2, hot_safety_bytes=cipher_size, last_read_at=COALESCE(last_read_at, created_at), evict_seq=evict_seq+1 WHERE id='x_c'"#,
-        Some(2),
+        Some(3),
     ),
     (
         r#"INSERT INTO tx_guard(ok) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE extent_id='x_c')"#,
